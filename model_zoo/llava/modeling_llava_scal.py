@@ -554,7 +554,7 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
                 "caption_length": kwargs.get("caption_length", None),
             }
         )
-        )
+        
         return model_inputs
 
     def _reorder_cache(self, *args, **kwargs):
