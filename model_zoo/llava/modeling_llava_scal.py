@@ -545,7 +545,15 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
                 "pixel_values": pixel_values,
+
+                # keep custom kwargs during generate()
+                "keys": kwargs.get("keys", None),
+                "weight": kwargs.get("weight", None),
+                "pos": kwargs.get("pos", None),
+                "adjust_method": kwargs.get("adjust_method", None),
+                "caption_length": kwargs.get("caption_length", None),
             }
+        )
         )
         return model_inputs
 
