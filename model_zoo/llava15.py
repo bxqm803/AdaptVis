@@ -8,7 +8,7 @@ from transformers import AutoProcessor, LlamaTokenizerFast, CLIPImageProcessor
 import pdb
 # import probe_llava
 from .llava import  LlavaForConditionalGeneration, LlavaForConditionalGenerationScal
-
+from multiq_utils import build_object_pool, build_questions, parse_prediction
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -463,7 +463,78 @@ class LlavaWrapper:
         else:
             return (acc / index_of_total, correct_id)
 
+    def load_prompt_records_with_sampling(self, dataset, option):
+        qst_ans_file = f'prompts/{dataset}_with_answer_{option}_options.jsonl'
+        prompt_records = []
+        with open(qst_ans_file, 'r') as file:
+            for line in file:
+                data = json.loads(line)
+                prompt_records.append({
+                    "question": data["question"],
+                    "answer": data["answer"],
+                })
+
+        SAMPLE = True
+        TEST = os.getenv('TEST_MODE', 'False') == 'True'
+        total_data_count = len(prompt_records)
+
+        if SAMPLE:
+            idx_file_path = f'./output/sampled_idx_{dataset}.npy'
+            if os.path.exists(idx_file_path):
+                sampled_indices = np.load(idx_file_path).tolist()
+            else:
+                sampled_indices = random.sample(range(total_data_count), int(0.2 * total_data_count))
+                sampled_indices.sort()
+                np.save(idx_file_path, np.array(sampled_indices))
+
+            if TEST:
+                all_indices = set(range(total_data_count))
+                unsampled_indices = list(all_indices - set(sampled_indices))
+                unsampled_indices.sort()
+                sampled_indices = unsampled_indices
+
+            prompt_records = [prompt_records[i] for i in sampled_indices]
+            return prompt_records, sampled_indices
+
+        return prompt_records, list(range(total_data_count))
     
+    def run_single_prompt(self, image, prompt, method, weight, threshold=1.0, weight1=1.0, weight2=1.0):
+        single_input = self.processor(
+            images=image,
+            text=prompt,
+            return_tensors="pt"
+        ).to(self.device)
+
+        if method == 'scaling_vis':
+            output = self.model.generate(
+                **single_input,
+                max_new_tokens=20,
+                output_attentions=False,
+                use_cache=True,
+                weight=weight,
+            )
+        elif method == 'adapt_vis':
+        # 第一版你先别用 adapt_vis，先保留接口
+            output = self.model.generate(
+                **single_input,
+                max_new_tokens=20,
+                output_attentions=False,
+               use_cache=True,
+                weight=weight,
+            )
+        else:
+            output = self.model.generate(
+                **single_input,
+                max_new_tokens=20,
+                output_attentions=False,
+                use_cache=True,
+            )
+   
+        gen = self.processor.batch_decode(
+            output[:, single_input["input_ids"].shape[1]:],
+            skip_special_tokens=True
+        )[0]
+        return gen
     
     @torch.no_grad()
     def get_judge_scores_vsr_batched(self, dataset, joint_loader, method, weight, threshold, weight1, weight2):

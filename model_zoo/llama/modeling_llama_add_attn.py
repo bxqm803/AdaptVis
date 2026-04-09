@@ -51,6 +51,7 @@ _CONFIG_FOR_DOC = "LLaMAConfig"
 
 SAVE_ATTN=True
 SAVE_ORI=True
+SAVE_LAYER_ONLY = True
 
 def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, past_key_values_length: int = 0):
     """
@@ -300,6 +301,7 @@ class LLaMAAttention(nn.Module):
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        '''
         if SAVE_ATTN : # save the change in attention weights for analysis
             save_path = os.getenv("SAVE_ATTN_PATH")
             if not save_path:
@@ -313,7 +315,33 @@ class LLaMAAttention(nn.Module):
 
             unchanged_attn_weights = nn.functional.softmax(unchanged_attn_weights, dim=-1, dtype=torch.float32).to(
                 query_states.dtype)
+                '''
+        
+        if SAVE_ATTN:
+            save_path = os.getenv("SAVE_ATTN_PATH")
+            if not save_path:
+                raise ValueError("SAVE_ATTN_PATH not set.")
 
+            target_layer = int(os.getenv("SAVE_ATTN_LAYER", "17"))
+
+            if (not SAVE_LAYER_ONLY) or (idx == target_layer):
+                unchanged_attn_weights = unchanged_attn_weights + attention_mask
+                unchanged_attn_weights = torch.max(
+                    unchanged_attn_weights,
+                    torch.tensor(torch.finfo(unchanged_attn_weights.dtype).min, device=unchanged_attn_weights.device)
+                )
+
+                unchanged_attn_weights = nn.functional.softmax(
+                    unchanged_attn_weights, dim=-1, dtype=torch.float32
+                ).to(query_states.dtype)
+
+        # 最后一个 query token，对应 image token 区间
+                if start_idx >= 0 and end_idx >= start_idx:
+                    ori = unchanged_attn_weights[:, :, -1, start_idx:end_idx + 1]   # [bsz, heads, image_tokens]
+                    ori = ori.mean(dim=1).squeeze(0)  # [image_tokens]
+                    np.save(f"{save_path}attn_map_layer{idx}.npy", ori.cpu().detach().numpy())
+        
+        
         attn_weights = self.att_out(attn_weights)       
         value_states = self.value_out(value_states)
 
