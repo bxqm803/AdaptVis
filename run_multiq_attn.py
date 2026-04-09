@@ -80,9 +80,9 @@ def main():
         image = item["image_options"][0]
 
         questions, meta = build_questions(
-            base_question=rec["question"],
+            base_prompt=rec["question"],
             base_answer=rec["answer"][0] if isinstance(rec["answer"], list) else rec["answer"],
-             sample_idx=local_idx,
+            sample_idx=local_idx,
             object_pool=object_pool,
         )
 
