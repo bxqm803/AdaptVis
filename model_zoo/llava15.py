@@ -501,6 +501,8 @@ class LlavaWrapper:
     def run_single_prompt(self, image, prompt, method, weight, threshold=1.0, weight1=1.0, weight2=1.0):
         if weight is None:
             weight = 1.0
+        if method in ("scaling_vis", "adapt_vis"):
+            change_greedy_to_add_weight()
 
         single_input = self.processor(
             images=image,
