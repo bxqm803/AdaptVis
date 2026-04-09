@@ -6,6 +6,28 @@ WH_RE = re.compile(
     flags=re.IGNORECASE | re.DOTALL
 )
 
+def clean_prompt_to_wh_question(prompt: str):
+    s = prompt.strip()
+
+    s = s.replace("<image>", " ")
+    s = s.replace("\n", " ")
+
+    if "USER:" in s:
+        s = s.split("USER:", 1)[1].strip()
+
+    if "ASSISTANT:" in s:
+        s = s.split("ASSISTANT:", 1)[0].strip()
+
+    s = re.sub(
+        r"Answer with left,\s*right,\s*on or under\.\s*$",
+        "",
+        s,
+        flags=re.IGNORECASE
+    )
+
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
 RELS = ["left", "right", "on", "under"]
 
 INV_REL = {
