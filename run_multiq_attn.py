@@ -57,6 +57,10 @@ def main():
     dataset = get_dataset(args.dataset, image_preprocess=image_preprocess, download=args.download)
 
     prompt_records, sampled_indices = model.load_prompt_records_with_sampling(args.dataset, args.option)
+    print("DEBUG first raw prompt:")
+    print(repr(prompt_records[0]["question"]))
+    print("DEBUG first raw answer:")
+    print(repr(prompt_records[0]["answer"]))
     object_pool = build_object_pool(prompt_records)
 
     TEST = os.getenv('TEST_MODE', 'False') == 'True'
@@ -78,7 +82,7 @@ def main():
         questions, meta = build_questions(
             base_question=rec["question"],
             base_answer=rec["answer"][0] if isinstance(rec["answer"], list) else rec["answer"],
-            sample_idx=local_idx,
+             sample_idx=local_idx,
             object_pool=object_pool,
         )
 
