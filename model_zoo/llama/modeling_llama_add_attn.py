@@ -963,6 +963,13 @@ class LLaMAForCausalLMScal(LLaMAPreTrainedModel):
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
+
+                # keep custom kwargs during generate()
+                "keys": kwargs.get("keys", None),
+                "weight": kwargs.get("weight", None),
+                "pos": kwargs.get("pos", None),
+                "caption_length": kwargs.get("caption_length", None),
+                "adjust_method": kwargs.get("adjust_method", None),
             }
         )
         return model_inputs
