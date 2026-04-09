@@ -499,37 +499,53 @@ class LlavaWrapper:
         return prompt_records, list(range(total_data_count))
     
     def run_single_prompt(self, image, prompt, method, weight, threshold=1.0, weight1=1.0, weight2=1.0):
+        if weight is None:
+            weight = 1.0
+
         single_input = self.processor(
             images=image,
             text=prompt,
-            return_tensors="pt"
+            padding="max_length",
+            return_tensors="pt",
+            max_length=77
         ).to(self.device)
+
+    # 原仓库里 image token 是靠 input_ids 中的特殊 token 来定位的
+        image_id = (single_input["input_ids"] == 32001)
 
         if method == 'scaling_vis':
             output = self.model.generate(
-                **single_input,
+                input_ids=single_input["input_ids"],
+                pixel_values=single_input["pixel_values"],
+                attention_mask=single_input.get("attention_mask", None),
                 max_new_tokens=20,
                 output_attentions=False,
                 use_cache=True,
-                weight=weight,
+                weight=float(weight),
+                keys=image_id,
             )
         elif method == 'adapt_vis':
-        # 第一版你先别用 adapt_vis，先保留接口
-            output = self.model.generate(
-                **single_input,
+        # 第一版先简化，先别折腾动态权重，保持和 scaling_vis 一样的调用风格
+                output = self.model.generate(
+                input_ids=single_input["input_ids"],
+                pixel_values=single_input["pixel_values"],
+                attention_mask=single_input.get("attention_mask", None),
                 max_new_tokens=20,
                 output_attentions=False,
-               use_cache=True,
-                weight=weight,
+                use_cache=True,
+                weight=float(weight),
+                keys=image_id,
             )
         else:
             output = self.model.generate(
-                **single_input,
+                input_ids=single_input["input_ids"],
+                pixel_values=single_input["pixel_values"],
+                attention_mask=single_input.get("attention_mask", None),
                 max_new_tokens=20,
                 output_attentions=False,
                 use_cache=True,
             )
-   
+
         gen = self.processor.batch_decode(
             output[:, single_input["input_ids"].shape[1]:],
             skip_special_tokens=True
