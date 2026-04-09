@@ -67,11 +67,11 @@ def clean_question_text(question: str):
     q = re.sub(r"\s+", " ", q).strip()
     return q
 
-def parse_wh_question(question: str):
-    q = clean_question_text(question)
+def parse_wh_question(prompt: str):
+    q = clean_prompt_to_wh_question(prompt)
     m = WH_RE.search(q)
     if not m:
-        raise ValueError(f"Cannot parse question: {question}")
+        raise ValueError(f"Cannot parse question: {prompt}")
     obj1, obj2 = m.group(1), m.group(2)
     return obj1.strip(), obj2.strip()
 
