@@ -75,8 +75,10 @@ def parse_wh_question(prompt: str):
     m = WH_RE.search(q)
     if not m:
         raise ValueError(f"Cannot parse question: {prompt}")
-    obj1, obj2 = m.group(1), m.group(2)
-    return obj1.strip(), obj2.strip()
+    be_verb = m.group(1).lower()   # is / are
+    obj1 = m.group(2).strip()
+    obj2 = m.group(3).strip()
+    return be_verb, obj1, obj2
 
 def normalize_rel(answer: str):
     rel = answer.strip().lower()
