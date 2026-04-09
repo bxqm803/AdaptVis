@@ -30,6 +30,7 @@ def clean_prompt_to_wh_question(prompt: str):
 
 RELS = ["left", "right", "on", "under"]
 
+
 INV_REL = {
     "left": "right",
     "right": "left",
@@ -44,6 +45,9 @@ SYN_REL = {
     "under": "beneath",
 }
 
+def wrap_prompt_user(question_text: str):
+    return f"<image>\nUSER: {question_text}\nASSISTANT:"
+    
 def clean_question_text(question: str):
     q = question.strip()
 
@@ -98,8 +102,8 @@ def pick_obj3_obj4(object_pool, obj1, obj2, sample_idx):
     picks = rng.sample(candidates, 2)
     return picks[0], picks[1]
 
-def build_questions(base_question, base_answer, sample_idx, object_pool):
-    obj1, obj2 = parse_wh_question(base_question)
+def build_questions(base_prompt, base_answer, sample_idx, object_pool):
+    obj1, obj2 = parse_wh_question(base_prompt)
     gold_rel = normalize_rel(base_answer)
     inv_rel = INV_REL[gold_rel]
     syn_rel = SYN_REL[gold_rel]
@@ -110,8 +114,10 @@ def build_questions(base_question, base_answer, sample_idx, object_pool):
     items.append({
         "qid": "q0",
         "mode": "orig",
-        "prompt": f"USER: <image>\nWhere is the {obj1} in relation to the {obj2}? "
-                  f"Answer with left, right, on or under.\nASSISTANT:",
+        "prompt": wrap_prompt_user(
+            f"Where is the {obj1} in relation to the {obj2}? "
+            f"Answer with left, right, on or under."
+        ),
         "gold": gold_rel,
     })
 
@@ -119,23 +125,19 @@ def build_questions(base_question, base_answer, sample_idx, object_pool):
         "q1": (f"Is the {obj1} {gold_rel} the {obj2}? Answer with T or F only.", "T"),
         "q2": (f"Is the {obj2} {inv_rel} the {obj1}? Answer with T or F only.", "T"),
         "q3": (f"Is the {obj1} not {gold_rel} the {obj2}? Answer with T or F only.", "F"),
-        "q4": (f"Given the {obj1} and the {obj2} in the image, is the {obj1} {gold_rel} the {obj2}? "
-               f"Answer with T or F only.", "T"),
-        "q5": (f"Given the {obj3} and the {obj4} in the image, is the {obj1} {gold_rel} the {obj2}? "
-               f"Answer with T or F only.", "T"),
+        "q4": (f"Given the {obj1} and the {obj2} in the image, is the {obj1} {gold_rel} the {obj2}? Answer with T or F only.", "T"),
+        "q5": (f"Given the {obj3} and the {obj4} in the image, is the {obj1} {gold_rel} the {obj2}? Answer with T or F only.", "T"),
         "q6": (f"Is the {obj2} {gold_rel} the {obj1}? Answer with T or F only.", "F"),
         "q7": (f"Is the {obj1} {syn_rel} the {obj2}? Answer with T or F only.", "T"),
-        "q8": (f"In the image, is it true that the {obj1} {gold_rel} the {obj2}? "
-               f"Answer with T or F only.", "T"),
-        "q9": (f"Would it be correct to say that the {obj1} {gold_rel} the {obj2}? "
-               f"Answer with T or F only.", "T"),
+        "q8": (f"In the image, is it true that the {obj1} {gold_rel} the {obj2}? Answer with T or F only.", "T"),
+        "q9": (f"Would it be correct to say that the {obj1} {gold_rel} the {obj2}? Answer with T or F only.", "T"),
     }
 
-    for qid, (question_text, gold) in tf_questions.items():
+    for qid, (qtext, gold) in tf_questions.items():
         items.append({
             "qid": qid,
             "mode": "tf",
-            "prompt": f"USER: <image>\n{question_text}\nASSISTANT:",
+            "prompt": wrap_prompt_user(qtext),
             "gold": gold,
         })
 
@@ -145,7 +147,8 @@ def build_questions(base_question, base_answer, sample_idx, object_pool):
         "gold_rel": gold_rel,
         "obj3": obj3,
         "obj4": obj4,
-        "base_question": clean_question_text(base_question),
+        "base_prompt": base_prompt,
+        "base_question_clean": clean_prompt_to_wh_question(base_prompt),
         "base_answer": gold_rel,
     }
     return items, meta
