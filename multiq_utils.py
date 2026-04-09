@@ -47,6 +47,9 @@ SYN_REL = {
 
 def wrap_prompt_user(question_text: str):
     return f"<image>\nUSER: {question_text}\nASSISTANT:"
+
+def tf_be_verb(be_verb: str):
+    return "Is" if be_verb == "is" else "Are"
     
 def clean_question_text(question: str):
     q = question.strip()
@@ -90,7 +93,7 @@ def build_object_pool(prompt_records):
     pool = set()
     for rec in prompt_records:
         q = rec["question"]
-        obj1, obj2 = parse_wh_question(q)
+        _, obj1, obj2 = parse_wh_question(q)
         pool.add(obj1)
         pool.add(obj2)
     return sorted(pool)
@@ -104,7 +107,7 @@ def pick_obj3_obj4(object_pool, obj1, obj2, sample_idx):
     return picks[0], picks[1]
 
 def build_questions(base_prompt, base_answer, sample_idx, object_pool):
-    obj1, obj2 = parse_wh_question(base_prompt)
+    _, obj1, obj2 = parse_wh_question(base_prompt)
     gold_rel = normalize_rel(base_answer)
     inv_rel = INV_REL[gold_rel]
     syn_rel = SYN_REL[gold_rel]
@@ -121,7 +124,6 @@ def build_questions(base_prompt, base_answer, sample_idx, object_pool):
         ),
         "gold": gold_rel,
     })
-
     tf_questions = {
         "q1": (f"Is the {obj1} {gold_rel} the {obj2}? Answer with T or F only.", "T"),
         "q2": (f"Is the {obj2} {inv_rel} the {obj1}? Answer with T or F only.", "T"),
