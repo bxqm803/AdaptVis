@@ -2,7 +2,7 @@ import re
 import random
 
 WH_RE = re.compile(
-    r"Where is the (.+?) in relation to the (.+?)\?",
+    r"Where (is|are) the (.+?) in relation to the (.+?)\?",
     flags=re.IGNORECASE | re.DOTALL
 )
 
@@ -60,7 +60,6 @@ def clean_question_text(question: str):
     if "ASSISTANT:" in q:
         q = q.split("ASSISTANT:", 1)[0].strip()
 
-    # 去掉原始 prompt 里附带的答案说明
     q = re.sub(
         r"Answer with left,\s*right,\s*on or under\.\s*$",
         "",
