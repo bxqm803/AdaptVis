@@ -14,8 +14,6 @@ from misc import seed_all
 from multiq_utils import build_object_pool, build_questions, parse_prediction
 
 
-
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda", type=str)
@@ -40,6 +38,76 @@ def parse_args():
     parser.add_argument("--out-dir", default="./output_multiq", type=str)
     return parser.parse_args()
 
+from PIL import Image
+
+def get_shape_only_vis_image(model, raw_image_path):
+    img = Image.open(raw_image_path).convert("RGB")
+
+    image_processor = getattr(model.processor, "image_processor", None)
+    if image_processor is None:
+        image_processor = getattr(model, "feature_extractor", None)
+    if image_processor is None:
+        return np.array(img).astype(np.float32) / 255.0
+
+    # 1) resize like processor
+    if getattr(image_processor, "do_resize", False):
+        size = image_processor.size
+        if isinstance(size, dict):
+            short_edge = size.get("shortest_edge", None)
+            height = size.get("height", None)
+            width = size.get("width", None)
+
+            if short_edge is not None:
+                w, h = img.size
+                if w < h:
+                    new_w = short_edge
+                    new_h = int(round(h * short_edge / w))
+                else:
+                    new_h = short_edge
+                    new_w = int(round(w * short_edge / h))
+                img = img.resize((new_w, new_h), Image.BICUBIC)
+            elif height is not None and width is not None:
+                img = img.resize((width, height), Image.BICUBIC)
+
+    # 2) center crop like processor
+    if getattr(image_processor, "do_center_crop", False):
+        crop_size = image_processor.crop_size
+        if isinstance(crop_size, dict):
+            crop_h = crop_size.get("height", None)
+            crop_w = crop_size.get("width", None)
+            if crop_h is not None and crop_w is not None:
+                w, h = img.size
+                left = max((w - crop_w) // 2, 0)
+                top = max((h - crop_h) // 2, 0)
+                img = img.crop((left, top, left + crop_w, top + crop_h))
+
+    return np.array(img).astype(np.float32) / 255.0
+
+
+def save_attn_overlay_shapeonly(attn_npy_path, out_png_path, base_img_np, alpha=0.45):
+    arr = np.load(attn_npy_path).astype(np.float32).reshape(-1)
+
+    side = int(round(np.sqrt(len(arr))))
+    if side * side != len(arr):
+        raise ValueError(f"Attention length {len(arr)} is not a square number")
+
+    heat = arr.reshape(side, side)
+    heat = heat - heat.min()
+    if heat.max() > 0:
+        heat = heat / heat.max()
+
+    h, w = base_img_np.shape[:2]
+    heat_img = Image.fromarray((heat * 255).astype(np.uint8)).resize((w, h), resample=Image.BILINEAR)
+    heat_np = np.array(heat_img).astype(np.float32) / 255.0
+
+    plt.figure(figsize=(6, 6))
+    plt.imshow(base_img_np)
+    plt.imshow(heat_np, cmap="jet", alpha=alpha)
+    plt.axis("off")
+    plt.tight_layout(pad=0)
+    plt.savefig(out_png_path, bbox_inches="tight", pad_inches=0, dpi=180)
+    plt.close()
+    
 def normalize_tf_label(x):
     if x is None:
         return "UNK"
@@ -164,7 +232,8 @@ def main():
             attn_png = os.path.join(sample_dir, f"{qid}_attn.png")
 
             if os.path.exists(attn_npy):
-                save_attn_png(attn_npy, attn_png)
+                base_img_np = get_shape_only_vis_image(model, image_path)
+                save_attn_overlay_shapeonly(attn_npy, attn_png, base_img_np)
                 os.remove(attn_npy)
 
             meta_out["questions"].append({
