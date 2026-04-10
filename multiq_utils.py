@@ -125,15 +125,15 @@ def build_questions(base_prompt, base_answer, sample_idx, object_pool):
         "gold": gold_rel,
     })
     tf_questions = {
-        "q1": (f"Is the {obj1} {gold_rel} the {obj2}? Answer with T or F only.", "T"),
-        "q2": (f"Is the {obj2} {inv_rel} the {obj1}? Answer with T or F only.", "T"),
-        "q3": (f"Is the {obj1} not {gold_rel} the {obj2}? Answer with T or F only.", "F"),
-        "q4": (f"Given the {obj1} and the {obj2} in the image, is the {obj1} {gold_rel} the {obj2}? Answer with T or F only.", "T"),
-        "q5": (f"Given the {obj3} and the {obj4} in the image, is the {obj1} {gold_rel} the {obj2}? Answer with T or F only.", "T"),
-        "q6": (f"Is the {obj2} {gold_rel} the {obj1}? Answer with T or F only.", "F"),
-        "q7": (f"Is the {obj1} {syn_rel} the {obj2}? Answer with T or F only.", "T"),
-        "q8": (f"In the image, is it true that the {obj1} {gold_rel} the {obj2}? Answer with T or F only.", "T"),
-        "q9": (f"Would it be correct to say that the {obj1} {gold_rel} the {obj2}? Answer with T or F only.", "T"),
+        "q1": (f"Is the {obj1} {gold_rel} the {obj2}? Answer with True or False only.", "True"),
+        "q2": (f"Is the {obj2} {inv_rel} the {obj1}? Answer with True or False only.", "True"),
+        "q3": (f"Is the {obj1} not {gold_rel} the {obj2}? Answer with True or False only.", "False"),
+        "q4": (f"Given the {obj1} and the {obj2} in the image, is the {obj1} {gold_rel} the {obj2}? Answer with True or False only.", "True"),
+        "q5": (f"Given the {obj3} and the {obj4} in the image, is the {obj1} {gold_rel} the {obj2}? Answer with True or False only.", "True"),
+        "q6": (f"Is the {obj2} {gold_rel} the {obj1}? Answer with True or False only.", "False"),
+        "q7": (f"Is the {obj1} {syn_rel} the {obj2}? Answer with True or False only.", "True"),
+        "q8": (f"In the image, is it true that the {obj1} {gold_rel} the {obj2}? Answer with True or False only.", "True"),
+        "q9": (f"Would it be correct to say that the {obj1} {gold_rel} the {obj2}? Answer with True or False only.", "True"),
     }
 
     for qid, (qtext, gold) in tf_questions.items():
