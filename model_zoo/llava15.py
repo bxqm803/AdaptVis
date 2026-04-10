@@ -124,8 +124,6 @@ def _add_weight_greedy_search(
         # prepare model inputs
         # prepare model inputs
         model_kwargs["weight"] = weight
-        if keys is not None:
-            model_kwargs["keys"] = keys
         if adjust_method is not None:
             model_kwargs["adjust_method"] = adjust_method
         if pos is not None:
