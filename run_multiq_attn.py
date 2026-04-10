@@ -201,6 +201,7 @@ def main():
         }
 
         q_correct_map = {}
+        q_trace_summary = {}
 
         for q in questions:
             qid = q["qid"]
@@ -243,6 +244,14 @@ def main():
                     indent=2,
                     ensure_ascii=False,
                 )
+            q_trace_summary[qid] = {
+                "trace_json": trace_json_name,
+                "num_tokens": len(token_trace),
+                "first_token": token_trace[0]["token_text"] if token_trace else "",
+                "first_prob": token_trace[0]["chosen_prob"] if token_trace else None,
+                "final_token": token_trace[-1]["token_text"] if token_trace else "",
+                "final_prob": token_trace[-1]["chosen_prob"] if token_trace else None,
+            }
 
             if q["mode"] == "tf":
                 correct = (normalize_tf_label(pred) == normalize_tf_label(q["gold"]))
@@ -295,6 +304,26 @@ def main():
             "q9": "C" if q_correct_map.get("q9", False) else "W",
             "pattern_q1_q9": pattern_q1_q9,
             "num_correct_q1_q9": sum(q_correct_map.get(f"q{i}", False) for i in range(1, 10)),
+            "q0_trace_json": os.path.join(image_stem, "q0_token_trace.json"),
+            "q1_trace_json": os.path.join(image_stem, "q1_token_trace.json"),
+            "q2_trace_json": os.path.join(image_stem, "q2_token_trace.json"),
+            "q3_trace_json": os.path.join(image_stem, "q3_token_trace.json"),
+            "q4_trace_json": os.path.join(image_stem, "q4_token_trace.json"),
+            "q5_trace_json": os.path.join(image_stem, "q5_token_trace.json"),
+            "q6_trace_json": os.path.join(image_stem, "q6_token_trace.json"),
+            "q7_trace_json": os.path.join(image_stem, "q7_token_trace.json"),
+            "q8_trace_json": os.path.join(image_stem, "q8_token_trace.json"),
+            "q9_trace_json": os.path.join(image_stem, "q9_token_trace.json"),
+            "q0_final_prob": q_trace_summary.get("q0", {}).get("final_prob", None),
+            "q1_final_prob": q_trace_summary.get("q1", {}).get("final_prob", None),
+            "q2_final_prob": q_trace_summary.get("q2", {}).get("final_prob", None),
+            "q3_final_prob": q_trace_summary.get("q3", {}).get("final_prob", None),
+            "q4_final_prob": q_trace_summary.get("q4", {}).get("final_prob", None),
+            "q5_final_prob": q_trace_summary.get("q5", {}).get("final_prob", None),
+            "q6_final_prob": q_trace_summary.get("q6", {}).get("final_prob", None),
+            "q7_final_prob": q_trace_summary.get("q7", {}).get("final_prob", None),
+            "q8_final_prob": q_trace_summary.get("q8", {}).get("final_prob", None),
+            "q9_final_prob": q_trace_summary.get("q9", {}).get("final_prob", None),
         })
 
         with open(os.path.join(sample_dir, "meta.json"), "w", encoding="utf-8") as f:
@@ -321,6 +350,26 @@ def main():
                 "q9",
                 "pattern_q1_q9",
                 "num_correct_q1_q9",
+                "q0_trace_json",
+                "q1_trace_json",
+                "q2_trace_json",
+                "q3_trace_json",
+                "q4_trace_json",
+                "q5_trace_json",
+                "q6_trace_json",
+                "q7_trace_json",
+                "q8_trace_json",
+                "q9_trace_json",
+                "q0_final_prob",
+                "q1_final_prob",
+                "q2_final_prob",
+                "q3_final_prob",
+                "q4_final_prob",
+                "q5_final_prob",
+                "q6_final_prob",
+                "q7_final_prob",
+                "q8_final_prob",
+                "q9_final_prob",
             ],
         )
         writer.writeheader()
