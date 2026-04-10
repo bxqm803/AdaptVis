@@ -243,8 +243,13 @@ class Controlled_Images(Dataset):
         image = Image.open(test_case["image_path"]).convert('RGB')
         if self.image_preprocess is not None:
             image = self.image_preprocess(image)
-        
-        item = edict({"image_options": [image], "caption_options": test_case['caption_options']})
+
+        item = edict({
+            "image_options": [image],
+            "caption_options": test_case["caption_options"],
+            "image_path": test_case["image_path"],
+            "image_name": os.path.basename(test_case["image_path"]),
+        })
         return item
 
     def download(self):
