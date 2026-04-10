@@ -122,6 +122,17 @@ def _add_weight_greedy_search(
     
     while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
         # prepare model inputs
+        # prepare model inputs
+        model_kwargs["weight"] = weight
+        if keys is not None:
+            model_kwargs["keys"] = keys
+        if adjust_method is not None:
+            model_kwargs["adjust_method"] = adjust_method
+        if pos is not None:
+            model_kwargs["pos"] = pos
+        if caption_length is not None:
+            model_kwargs["caption_length"] = caption_length
+
         model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
         import pdb
         # 
