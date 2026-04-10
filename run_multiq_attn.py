@@ -210,7 +210,7 @@ def main():
             os.environ["SAVE_ATTN_PATH"] = qdir + "/"
             os.environ["SAVE_ATTN_LAYER"] = str(args.attn_layer)
 
-            pred_text = model.run_single_prompt(
+            pred_text, token_trace = model.run_single_prompt(
                 image=image,
                 prompt=q["prompt"],
                 method=args.method,
@@ -218,9 +218,31 @@ def main():
                 threshold=args.threshold,
                 weight1=args.weight1,
                 weight2=args.weight2,
+                return_trace=True,
+                trace_topk=10,
             )
 
             pred = parse_prediction(pred_text, q["mode"])
+
+            trace_json_name = f"{qid}_token_trace.json"
+            trace_json_path = os.path.join(sample_dir, trace_json_name)
+
+            with open(trace_json_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "qid": qid,
+                        "mode": q["mode"],
+                        "prompt": q["prompt"],
+                        "gold": q["gold"],
+                        "pred_text": pred_text,
+                        "pred": pred,
+                        "correct": correct,
+                        "token_trace": token_trace,
+                    },
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
 
             if q["mode"] == "tf":
                 correct = (normalize_tf_label(pred) == normalize_tf_label(q["gold"]))
@@ -245,6 +267,12 @@ def main():
                 "pred": pred,
                 "correct": correct,
                 "attn_png": f"{qid}_attn.png",
+                "token_trace_json": trace_json_name,
+                "num_generated_tokens": len(token_trace),
+                "first_token": token_trace[0]["token_text"] if token_trace else "",
+                "first_token_prob": token_trace[0]["chosen_prob"] if token_trace else None,
+                "final_token": token_trace[-1]["token_text"] if token_trace else "",
+                "final_token_prob": token_trace[-1]["chosen_prob"] if token_trace else None,
             })
 
         pattern_q1_q9 = "_".join(
