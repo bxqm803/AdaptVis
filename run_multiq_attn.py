@@ -14,15 +14,7 @@ from misc import seed_all
 from multiq_utils import build_object_pool, build_questions, parse_prediction
 
 
-def normalize_tf_label(x):
-    if x is None:
-        return "UNK"
-    x = str(x).strip().lower()
-    if x in {"t", "true", "yes"}:
-        return "True"
-    if x in {"f", "false", "no"}:
-        return "False"
-    return "UNK"
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -48,6 +40,16 @@ def parse_args():
     parser.add_argument("--out-dir", default="./output_multiq", type=str)
     return parser.parse_args()
 
+def normalize_tf_label(x):
+    if x is None:
+        return "UNK"
+    x = str(x).strip().lower()
+    if x in {"t", "true", "yes"}:
+        return "True"
+    if x in {"f", "false", "no"}:
+        return "False"
+    return "UNK"
+    
 def save_attn_png(npy_path, png_path):
     arr = np.load(npy_path)
     n = len(arr)
