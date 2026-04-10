@@ -128,8 +128,6 @@ def _add_weight_greedy_search(
             model_kwargs["adjust_method"] = adjust_method
         if pos is not None:
             model_kwargs["pos"] = pos
-        if caption_length is not None:
-            model_kwargs["caption_length"] = caption_length
 
         model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
         import pdb
@@ -512,13 +510,12 @@ class LlavaWrapper:
         single_input = self.processor(
             images=image,
             text=prompt,
-            padding="max_length",
+            padding=True,
+            truncation=True,
             return_tensors="pt",
-            max_length=77
         ).to(self.device)
 
-    # 原仓库里 image token 是靠 input_ids 中的特殊 token 来定位的
-        image_id = (single_input["input_ids"] == 32001)
+        image_id = (single_input["input_ids"] == self.model.config.image_token_index)
 
         if method == 'scaling_vis':
             output = self.model.generate(
