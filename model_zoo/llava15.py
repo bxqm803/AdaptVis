@@ -17,7 +17,7 @@ import json
 import os
 from collections import Counter
 # from model_zoo.utils import normalize_answer,chat_completion_request,run_conversation
-
+import inspect
 from PIL import Image
 import math
 MODEL='llava-hf/llava-1.5-7b-hf'
@@ -512,7 +512,7 @@ class LlavaWrapper:
 
         trace = []
         for step_idx, token_id in enumerate(gen_ids.tolist()):
-            step_score = step_scores[step_idx][0]   # shape: [vocab]
+            step_score = step_scores[step_idx][0]   # [vocab]
             step_prob = torch.softmax(step_score, dim=-1)
 
             chosen_score = float(step_score[token_id].item())
@@ -526,14 +526,13 @@ class LlavaWrapper:
                     skip_special_tokens=False,
                     clean_up_tokenization_spaces=False,
                 ),
-                "chosen_score": chosen_score,   # processed score
+                "chosen_score": chosen_score,
                 "chosen_prob": chosen_prob,
                 "topk": [],
             }
 
             if step_logits is not None:
-                raw_logit = step_logits[step_idx][0]
-                step_info["chosen_raw_logit"] = float(raw_logit[token_id].item())
+                step_info["chosen_raw_logit"] = float(step_logits[step_idx][0][token_id].item())
 
             k = min(topk, step_prob.shape[-1])
             topk_prob, topk_ids = torch.topk(step_prob, k=k)
@@ -582,7 +581,6 @@ class LlavaWrapper:
             images=image,
             text=prompt,
             padding=True,
-            # 这里先不加 truncation=True，避免你之前那个 warning
             return_tensors="pt",
         ).to(self.device)
 
@@ -600,7 +598,7 @@ class LlavaWrapper:
             output_scores=True,
         )
 
-    # 如果当前 transformers 版本支持，就把原始 logits 也拿出来
+    # new enough transformers -> also return raw logits
         if "output_logits" in inspect.signature(self.model.generate).parameters:
             gen_kwargs["output_logits"] = True
 
