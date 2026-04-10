@@ -100,8 +100,8 @@ def main():
 
         image_name = item.get("image_name", f"sample_{local_idx:04d}")
         image_path = item.get("image_path", "")
-        image_stem = os.path.splitext(image_name)[0]   # 去掉 .jpeg / .jpg / .png
-        sample_dir = os.path.join(args.out_dir, args.dataset, image_stem))
+        image_stem = os.path.splitext(image_name)[0]   
+        sample_dir = os.path.join(args.out_dir, args.dataset, image_stem)
         os.makedirs(sample_dir, exist_ok=True)
 
         if image_path and os.path.exists(image_path):
