@@ -13,6 +13,17 @@ from dataset_zoo import get_dataset
 from misc import seed_all
 from multiq_utils import build_object_pool, build_questions, parse_prediction
 
+
+def normalize_tf_label(x):
+    if x is None:
+        return "UNK"
+    x = str(x).strip().lower()
+    if x in {"t", "true", "yes"}:
+        return "True"
+    if x in {"f", "false", "no"}:
+        return "False"
+    return "UNK"
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda", type=str)
@@ -140,7 +151,11 @@ def main():
             )
 
             pred = parse_prediction(pred_text, q["mode"])
-            correct = (pred == q["gold"])
+
+            if q["mode"] == "tf":
+                correct = (normalize_tf_label(pred) == normalize_tf_label(q["gold"]))
+            else:
+                correct = (pred == q["gold"])
             q_correct_map[qid] = correct
 
             attn_npy = os.path.join(qdir, f"attn_map_layer{args.attn_layer}.npy")
