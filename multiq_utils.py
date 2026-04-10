@@ -163,9 +163,9 @@ def parse_prediction(text: str, mode: str):
         m = re.search(r"\b(left|right|on|under)\b", t)
         return m.group(1) if m else "UNK"
 
-    m = re.search(r"\b(t|true|f|false)\b", t)
+    m = re.search(r"\b(t|true|f|false|yes|no)\b", t)
     if not m:
         return "UNK"
 
     tok = m.group(1)
-    return "T" if tok in {"t", "true"} else "F"
+    return "T" if tok in {"t", "true", "yes"} else "F"
