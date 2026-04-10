@@ -28,9 +28,6 @@ def clean_prompt_to_wh_question(prompt: str):
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-RELS = ["left", "right", "on", "under"]
-
-
 INV_REL = {
     "left": "right",
     "right": "left",
@@ -38,9 +35,18 @@ INV_REL = {
     "under": "on",
 }
 
-SYN_REL = {
+# internal label -> natural surface form for prompts
+REL_TO_PHRASE = {
     "left": "to the left of",
     "right": "to the right of",
+    "on": "on",
+    "under": "under",
+}
+
+# alternative natural paraphrase
+SYN_REL = {
+    "left": "on the left of",
+    "right": "on the right of",
     "on": "on top of",
     "under": "beneath",
 }
@@ -105,12 +111,16 @@ def pick_obj3_obj4(object_pool, obj1, obj2, sample_idx):
     rng = random.Random(sample_idx)
     picks = rng.sample(candidates, 2)
     return picks[0], picks[1]
-
+    
 def build_questions(base_prompt, base_answer, sample_idx, object_pool):
     _, obj1, obj2 = parse_wh_question(base_prompt)
     gold_rel = normalize_rel(base_answer)
+
     inv_rel = INV_REL[gold_rel]
-    syn_rel = SYN_REL[gold_rel]
+    gold_phrase = REL_TO_PHRASE[gold_rel]
+    inv_phrase = REL_TO_PHRASE[inv_rel]
+    syn_phrase = SYN_REL[gold_rel]
+
     obj3, obj4 = pick_obj3_obj4(object_pool, obj1, obj2, sample_idx)
 
     items = []
@@ -124,16 +134,17 @@ def build_questions(base_prompt, base_answer, sample_idx, object_pool):
         ),
         "gold": gold_rel,
     })
+
     tf_questions = {
-        "q1": (f"Is the {obj1} {gold_rel} the {obj2}? Answer with True or False only.", "True"),
-        "q2": (f"Is the {obj2} {inv_rel} the {obj1}? Answer with True or False only.", "True"),
-        "q3": (f"Is the {obj1} not {gold_rel} the {obj2}? Answer with True or False only.", "False"),
-        "q4": (f"Given the {obj1} and the {obj2} in the image, is the {obj1} {gold_rel} the {obj2}? Answer with True or False only.", "True"),
-        "q5": (f"Given the {obj3} and the {obj4} in the image, is the {obj1} {gold_rel} the {obj2}? Answer with True or False only.", "True"),
-        "q6": (f"Is the {obj2} {gold_rel} the {obj1}? Answer with True or False only.", "False"),
-        "q7": (f"Is the {obj1} {syn_rel} the {obj2}? Answer with True or False only.", "True"),
-        "q8": (f"In the image, is it true that the {obj1} {gold_rel} the {obj2}? Answer with True or False only.", "True"),
-        "q9": (f"Would it be correct to say that the {obj1} {gold_rel} the {obj2}? Answer with True or False only.", "True"),
+        "q1": (f"Is the {obj1} {gold_phrase} the {obj2}? Answer with True or False only.", "True"),
+        "q2": (f"Is the {obj2} {inv_phrase} the {obj1}? Answer with True or False only.", "True"),
+        "q3": (f"Is the {obj1} not {gold_phrase} the {obj2}? Answer with True or False only.", "False"),
+        "q4": (f"Given the {obj1} and the {obj2} in the image, is the {obj1} {gold_phrase} the {obj2}? Answer with True or False only.", "True"),
+        "q5": (f"Given the {obj3} and the {obj4} in the image, is the {obj1} {gold_phrase} the {obj2}? Answer with True or False only.", "True"),
+        "q6": (f"Is the {obj2} {gold_phrase} the {obj1}? Answer with True or False only.", "False"),
+        "q7": (f"Is the {obj1} {syn_phrase} the {obj2}? Answer with True or False only.", "True"),
+        "q8": (f"In the image, is it true that the {obj1} is {gold_phrase} the {obj2}? Answer with True or False only.", "True"),
+        "q9": (f"Would it be correct to say that the {obj1} is {gold_phrase} the {obj2}? Answer with True or False only.", "True"),
     }
 
     for qid, (qtext, gold) in tf_questions.items():
@@ -168,4 +179,4 @@ def parse_prediction(text: str, mode: str):
         return "UNK"
 
     tok = m.group(1)
-    return "T" if tok in {"t", "true", "yes"} else "F"
+    return "True" if tok in {"t", "true", "yes"} else "False"
