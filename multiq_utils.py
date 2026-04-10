@@ -160,13 +160,12 @@ def parse_prediction(text: str, mode: str):
     t = text.strip().lower()
 
     if mode == "orig":
-        for rel in RELS:
-            if rel in t:
-                return rel
+        m = re.search(r"\b(left|right|on|under)\b", t)
+        return m.group(1) if m else "UNK"
+
+    m = re.search(r"\b(t|true|f|false)\b", t)
+    if not m:
         return "UNK"
 
-    if t.startswith("t"):
-        return "T"
-    if t.startswith("f"):
-        return "F"
-    return "UNK"
+    tok = m.group(1)
+    return "T" if tok in {"t", "true"} else "F"
