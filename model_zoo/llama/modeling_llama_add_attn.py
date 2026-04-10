@@ -277,7 +277,11 @@ class LLaMAAttention(nn.Module):
                     start_idx = true_indices[0].item()
                     end_idx = true_indices[-1].item()
                     square_size = end_idx - start_idx + 1
-                    mask = torch.zeros((attn_weights.size()[2], attn_weights.size()[2]), dtype=torch.bool)
+                    mask = torch.zeros(
+                        (attn_weights.size()[2], attn_weights.size()[2]),
+                        dtype=torch.bool,
+                        device=attn_weights.device,
+                    )
                     if caption_length:
                         mask[-len(caption_length[0]):,start_idx:start_idx + square_size+1] = True
                     else:
