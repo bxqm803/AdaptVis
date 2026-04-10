@@ -1,10 +1,12 @@
 import os
 import json
 import math
+import csv
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
+from tqdm import tqdm
 
 from model_zoo import get_model
 from dataset_zoo import get_dataset
@@ -25,7 +27,12 @@ def parse_args():
     parser.add_argument("--option", default="four", type=str)
     parser.add_argument("--seed", default=1, type=int)
     parser.add_argument("--sample-index", default=0, type=int)
-    parser.add_argument("--limit", default=1, type=int)
+    parser.add_argument(
+        "--limit",
+        default=-1,
+        type=int,
+        help="-1 means run all remaining samples"
+    )
     parser.add_argument("--attn-layer", default=17, type=int)
     parser.add_argument("--out-dir", default="./output_multiq", type=str)
     return parser.parse_args()
@@ -70,11 +77,16 @@ def main():
     else:
         sub_dataset = dataset
 
-    end_idx = min(args.sample_index + args.limit, len(prompt_records))
+    if args.limit < 0:
+        end_idx = len(prompt_records)
+    else:
+        end_idx = min(args.sample_index + args.limit, len(prompt_records))
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    for local_idx in range(args.sample_index, end_idx):
+    summary_rows = []
+
+    for local_idx in tqdm(range(args.sample_index, end_idx), desc="Samples"):
         rec = prompt_records[local_idx]
         item = sub_dataset[local_idx]
         image = item["image_options"][0]
@@ -86,15 +98,23 @@ def main():
             object_pool=object_pool,
         )
 
-        sample_dir = os.path.join(args.out_dir, args.dataset, f"sample_{local_idx:04d}")
+        image_name = item.get("image_name", f"sample_{local_idx:04d}")
+        image_path = item.get("image_path", "")
+        image_stem = image_name
+
+        sample_dir = os.path.join(args.out_dir, args.dataset, image_stem)
         os.makedirs(sample_dir, exist_ok=True)
 
         meta_out = {
             "local_index": local_idx,
+            "image_name": image_name,
+            "image_path": image_path,
             "test_mode": TEST,
             **meta,
             "questions": []
         }
+
+        q_correct_map = {}
 
         for q in questions:
             qid = q["qid"]
@@ -116,6 +136,7 @@ def main():
 
             pred = parse_prediction(pred_text, q["mode"])
             correct = (pred == q["gold"])
+            q_correct_map[qid] = correct
 
             attn_npy = os.path.join(qdir, f"attn_map_layer{args.attn_layer}.npy")
             attn_png = os.path.join(sample_dir, f"{qid}_attn.png")
@@ -135,8 +156,58 @@ def main():
                 "attn_png": f"{qid}_attn.png",
             })
 
+        pattern_q1_q9 = "_".join(
+            "C" if q_correct_map.get(f"q{i}", False) else "W"
+            for i in range(1, 10)
+        )
+
+        summary_rows.append({
+            "image_name": image_name,
+            "image_path": image_path,
+            "local_index": local_idx,
+            "q1": "C" if q_correct_map.get("q1", False) else "W",
+            "q2": "C" if q_correct_map.get("q2", False) else "W",
+            "q3": "C" if q_correct_map.get("q3", False) else "W",
+            "q4": "C" if q_correct_map.get("q4", False) else "W",
+            "q5": "C" if q_correct_map.get("q5", False) else "W",
+            "q6": "C" if q_correct_map.get("q6", False) else "W",
+            "q7": "C" if q_correct_map.get("q7", False) else "W",
+            "q8": "C" if q_correct_map.get("q8", False) else "W",
+            "q9": "C" if q_correct_map.get("q9", False) else "W",
+            "pattern_q1_q9": pattern_q1_q9,
+            "num_correct_q1_q9": sum(q_correct_map.get(f"q{i}", False) for i in range(1, 10)),
+        })
+
         with open(os.path.join(sample_dir, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta_out, f, indent=2, ensure_ascii=False)
+
+    summary_csv = os.path.join(args.out_dir, args.dataset, "summary.csv")
+    os.makedirs(os.path.join(args.out_dir, args.dataset), exist_ok=True)
+
+    with open(summary_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "image_name",
+                "image_path",
+                "local_index",
+                "q1",
+                "q2",
+                "q3",
+                "q4",
+                "q5",
+                "q6",
+                "q7",
+                "q8",
+                "q9",
+                "pattern_q1_q9",
+                "num_correct_q1_q9",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+    print(f"Saved summary to: {summary_csv}")
 
 if __name__ == "__main__":
     main()
