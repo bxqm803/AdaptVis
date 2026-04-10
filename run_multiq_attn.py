@@ -225,6 +225,12 @@ def main():
 
             pred = parse_prediction(pred_text, q["mode"])
 
+            if q["mode"] == "tf":
+                correct = (normalize_tf_label(pred) == normalize_tf_label(q["gold"]))
+            else:
+                correct = (pred == q["gold"])
+            q_correct_map[qid] = correct
+
             trace_json_name = f"{qid}_token_trace.json"
             trace_json_path = os.path.join(sample_dir, trace_json_name)
 
@@ -252,12 +258,6 @@ def main():
                 "final_token": token_trace[-1]["token_text"] if token_trace else "",
                 "final_prob": token_trace[-1]["chosen_prob"] if token_trace else None,
             }
-
-            if q["mode"] == "tf":
-                correct = (normalize_tf_label(pred) == normalize_tf_label(q["gold"]))
-            else:
-                correct = (pred == q["gold"])
-            q_correct_map[qid] = correct
 
             attn_npy = os.path.join(qdir, f"attn_map_layer{args.attn_layer}.npy")
             attn_png = os.path.join(sample_dir, f"{qid}_attn.png")
