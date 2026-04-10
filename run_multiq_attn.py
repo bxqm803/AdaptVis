@@ -7,7 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 from tqdm import tqdm
-
+import shutil
 from model_zoo import get_model
 from dataset_zoo import get_dataset
 from misc import seed_all
@@ -100,11 +100,16 @@ def main():
 
         image_name = item.get("image_name", f"sample_{local_idx:04d}")
         image_path = item.get("image_path", "")
-        image_stem = image_name
-
-        sample_dir = os.path.join(args.out_dir, args.dataset, image_stem)
+        image_stem = os.path.splitext(image_name)[0]   # 去掉 .jpeg / .jpg / .png
+        sample_dir = os.path.join(args.out_dir, args.dataset, image_stem))
         os.makedirs(sample_dir, exist_ok=True)
 
+        if image_path and os.path.exists(image_path):
+            raw_img_name = os.path.basename(image_path)
+            dst_img_path = os.path.join(sample_dir, raw_img_name)
+            if not os.path.exists(dst_img_path):
+                shutil.copy2(image_path, dst_img_path)
+                
         meta_out = {
             "local_index": local_idx,
             "image_name": image_name,
