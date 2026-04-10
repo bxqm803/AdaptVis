@@ -500,10 +500,81 @@ class LlavaWrapper:
             return prompt_records, sampled_indices
 
         return prompt_records, list(range(total_data_count))
+
+    def _build_generation_trace(self, generation_output, prompt_len, topk=10):
+        tokenizer = self.processor.tokenizer
+
+        sequences = generation_output.sequences
+        gen_ids = sequences[0][prompt_len:]   # only newly generated tokens
+
+        step_scores = generation_output.scores or []
+        step_logits = getattr(generation_output, "logits", None)
+
+        trace = []
+        for step_idx, token_id in enumerate(gen_ids.tolist()):
+            step_score = step_scores[step_idx][0]   # shape: [vocab]
+            step_prob = torch.softmax(step_score, dim=-1)
+
+            chosen_score = float(step_score[token_id].item())
+            chosen_prob = float(step_prob[token_id].item())
+
+            step_info = {
+                "step": step_idx,
+                "token_id": int(token_id),
+                "token_text": tokenizer.decode(
+                    [token_id],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                ),
+                "chosen_score": chosen_score,   # processed score
+                "chosen_prob": chosen_prob,
+                "topk": [],
+            }
+
+            if step_logits is not None:
+                raw_logit = step_logits[step_idx][0]
+                step_info["chosen_raw_logit"] = float(raw_logit[token_id].item())
+
+            k = min(topk, step_prob.shape[-1])
+            topk_prob, topk_ids = torch.topk(step_prob, k=k)
+            topk_score = step_score[topk_ids]
+
+            for rank in range(k):
+                cand_id = int(topk_ids[rank].item())
+                cand = {
+                    "rank": rank + 1,
+                    "token_id": cand_id,
+                    "token_text": tokenizer.decode(
+                        [cand_id],
+                        skip_special_tokens=False,
+                        clean_up_tokenization_spaces=False,
+                    ),
+                    "score": float(topk_score[rank].item()),
+                    "prob": float(topk_prob[rank].item()),
+                }
+                if step_logits is not None:
+                    cand["raw_logit"] = float(step_logits[step_idx][0][cand_id].item())
+                step_info["topk"].append(cand)
+
+            trace.append(step_info)
+
+        return trace
     
-    def run_single_prompt(self, image, prompt, method, weight, threshold=1.0, weight1=1.0, weight2=1.0):
+    def run_single_prompt(
+        self,
+        image,
+        prompt,
+        method,
+        weight,
+        threshold=1.0,
+        weight1=1.0,
+        weight2=1.0,
+        return_trace=False,
+        trace_topk=10,
+    ):
         if weight is None:
             weight = 1.0
+
         if method in ("scaling_vis", "adapt_vis"):
             change_greedy_to_add_weight()
 
@@ -511,49 +582,45 @@ class LlavaWrapper:
             images=image,
             text=prompt,
             padding=True,
-            truncation=True,
+            # 这里先不加 truncation=True，避免你之前那个 warning
             return_tensors="pt",
         ).to(self.device)
 
         image_id = (single_input["input_ids"] == self.model.config.image_token_index)
+        prompt_len = single_input["input_ids"].shape[1]
 
-        if method == 'scaling_vis':
-            output = self.model.generate(
-                input_ids=single_input["input_ids"],
-                pixel_values=single_input["pixel_values"],
-                attention_mask=single_input.get("attention_mask", None),
-                max_new_tokens=20,
-                output_attentions=False,
-                use_cache=True,
-                weight=float(weight),
-                keys=image_id,
-            )
-        elif method == 'adapt_vis':
-        # 第一版先简化，先别折腾动态权重，保持和 scaling_vis 一样的调用风格
-                output = self.model.generate(
-                input_ids=single_input["input_ids"],
-                pixel_values=single_input["pixel_values"],
-                attention_mask=single_input.get("attention_mask", None),
-                max_new_tokens=20,
-                output_attentions=False,
-                use_cache=True,
-                weight=float(weight),
-                keys=image_id,
-            )
-        else:
-            output = self.model.generate(
-                input_ids=single_input["input_ids"],
-                pixel_values=single_input["pixel_values"],
-                attention_mask=single_input.get("attention_mask", None),
-                max_new_tokens=20,
-                output_attentions=False,
-                use_cache=True,
-            )
+        gen_kwargs = dict(
+            input_ids=single_input["input_ids"],
+            pixel_values=single_input["pixel_values"],
+            attention_mask=single_input.get("attention_mask", None),
+            max_new_tokens=20,
+            output_attentions=False,
+            use_cache=True,
+            return_dict_in_generate=True,
+            output_scores=True,
+        )
 
-        gen = self.processor.batch_decode(
-            output[:, single_input["input_ids"].shape[1]:],
-            skip_special_tokens=True
-        )[0]
+    # 如果当前 transformers 版本支持，就把原始 logits 也拿出来
+        if "output_logits" in inspect.signature(self.model.generate).parameters:
+            gen_kwargs["output_logits"] = True
+
+        if method in ("scaling_vis", "adapt_vis"):
+            gen_kwargs["weight"] = float(weight)
+            gen_kwargs["keys"] = image_id
+
+        output = self.model.generate(**gen_kwargs)
+
+        generated_ids = output.sequences[0][prompt_len:]
+        gen = self.processor.decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        ).strip()
+
+        if return_trace:
+            token_trace = self._build_generation_trace(output, prompt_len, topk=trace_topk)
+            return gen, token_trace
+
         return gen
     
     @torch.no_grad()
