@@ -134,13 +134,9 @@ def _add_weight_greedy_search(
                 output_hidden_states=output_hidden_states,
             )
         else:
-            
             outputs = self(
                 **model_inputs,
-                weight=weight,
-                adjust_method=adjust_method,
-                pos=pos,
-                return_dict=True,
+                  return_dict=True,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
             )
