@@ -3,30 +3,28 @@ import random
 
 WH_RE = re.compile(
     r"Where (is|are) the (.+?) in relation to the (.+?)\?",
-    flags=re.IGNORECASE | re.DOTALL
+    flags=re.IGNORECASE | re.DOTALL,
 )
 
 def clean_prompt_to_wh_question(prompt: str):
     s = prompt.strip()
-
-    s = s.replace("<image>", " ")
     s = s.replace("\n", " ")
-
     if "USER:" in s:
         s = s.split("USER:", 1)[1].strip()
-
     if "ASSISTANT:" in s:
         s = s.split("ASSISTANT:", 1)[0].strip()
-
     s = re.sub(
         r"Answer with left,\s*right,\s*on or under\.\s*$",
         "",
         s,
-        flags=re.IGNORECASE
+        flags=re.IGNORECASE,
     )
-
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+# canonical labels used internally
+RELS = ["left", "right", "on", "under"]
 
 INV_REL = {
     "left": "right",
@@ -35,7 +33,7 @@ INV_REL = {
     "under": "on",
 }
 
-# internal label -> natural surface form for prompts
+# natural phrases used in prompts
 REL_TO_PHRASE = {
     "left": "to the left of",
     "right": "to the right of",
@@ -43,7 +41,7 @@ REL_TO_PHRASE = {
     "under": "under",
 }
 
-# alternative natural paraphrase
+# paraphrases for q7
 SYN_REL = {
     "left": "on the left of",
     "right": "on the right of",
@@ -54,28 +52,19 @@ SYN_REL = {
 def wrap_prompt_user(question_text: str):
     return f"<image>\nUSER: {question_text}\nASSISTANT:"
 
-def tf_be_verb(be_verb: str):
-    return "Is" if be_verb == "is" else "Are"
-    
 def clean_question_text(question: str):
     q = question.strip()
-
-    q = q.replace("<image>", " ")
     q = q.replace("\n", " ")
-
     if "USER:" in q:
         q = q.split("USER:", 1)[1].strip()
-
     if "ASSISTANT:" in q:
         q = q.split("ASSISTANT:", 1)[0].strip()
-
     q = re.sub(
         r"Answer with left,\s*right,\s*on or under\.\s*$",
         "",
         q,
-        flags=re.IGNORECASE
+        flags=re.IGNORECASE,
     )
-
     q = re.sub(r"\s+", " ", q).strip()
     return q
 
@@ -84,7 +73,7 @@ def parse_wh_question(prompt: str):
     m = WH_RE.search(q)
     if not m:
         raise ValueError(f"Cannot parse question: {prompt}")
-    be_verb = m.group(1).lower()   # is / are
+    be_verb = m.group(1).lower()
     obj1 = m.group(2).strip()
     obj2 = m.group(3).strip()
     return be_verb, obj1, obj2
@@ -98,8 +87,7 @@ def normalize_rel(answer: str):
 def build_object_pool(prompt_records):
     pool = set()
     for rec in prompt_records:
-        q = rec["question"]
-        _, obj1, obj2 = parse_wh_question(q)
+        _, obj1, obj2 = parse_wh_question(rec["question"])
         pool.add(obj1)
         pool.add(obj2)
     return sorted(pool)
@@ -109,9 +97,9 @@ def pick_obj3_obj4(object_pool, obj1, obj2, sample_idx):
     if len(candidates) < 2:
         raise ValueError("Not enough distinct objects for Q5.")
     rng = random.Random(sample_idx)
-    picks = rng.sample(candidates, 2)
-    return picks[0], picks[1]
-    
+    obj3, obj4 = rng.sample(candidates, 2)
+    return obj3, obj4
+
 def build_questions(base_prompt, base_answer, sample_idx, object_pool):
     _, obj1, obj2 = parse_wh_question(base_prompt)
     gold_rel = normalize_rel(base_answer)
@@ -124,7 +112,6 @@ def build_questions(base_prompt, base_answer, sample_idx, object_pool):
     obj3, obj4 = pick_obj3_obj4(object_pool, obj1, obj2, sample_idx)
 
     items = []
-
     items.append({
         "qid": "q0",
         "mode": "orig",
