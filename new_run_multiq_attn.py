@@ -188,36 +188,6 @@ def build_target_texts_for_q(qid, meta):
     }
 
 
-def save_prompt_token_single_overlay(prompt_token_attn, base_img_np, target_name, layer_idx, out_png, title):
-    maps = prompt_token_attn.get("maps", {})
-    if target_name not in maps:
-        return False
-    if str(layer_idx) not in maps[target_name]:
-        return False
-
-    vec = np.array(maps[target_name][str(layer_idx)], dtype=np.float32).reshape(-1)
-    side = int(round(np.sqrt(len(vec))))
-    if side * side != len(vec):
-        return False
-
-    heat = vec.reshape(side, side)
-    heat = heat - heat.min()
-    if heat.max() > 0:
-        heat = heat / heat.max()
-
-    h, w = base_img_np.shape[:2]
-    heat_img = Image.fromarray((heat * 255).astype(np.uint8)).resize((w, h), resample=Image.BILINEAR)
-    heat_np = np.array(heat_img).astype(np.float32) / 255.0
-
-    plt.figure(figsize=(6, 6))
-    plt.imshow(base_img_np)
-    plt.imshow(heat_np, cmap="jet", alpha=0.45)
-    plt.title(title)
-    plt.axis("off")
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=180, bbox_inches="tight")
-    plt.close()
-    return True
 
 
 def main():
@@ -260,7 +230,6 @@ def main():
         for i in range(10):
             fieldnames.extend([
                 f"q{i}_trace_json",
-                f"q{i}_prompt_token_attn_json",
                 f"q{i}_final_prob",
             ])
         with open(summary_csv, "w", newline="", encoding="utf-8") as f:
@@ -309,7 +278,7 @@ def main():
         q_correct_map = {}
         q_trace_summary = {}
 
-        for q in questions:
+                for q in questions:
             qid = q["qid"]
             qdir = os.path.join(sample_dir, qid)
             os.makedirs(qdir, exist_ok=True)
@@ -317,9 +286,10 @@ def main():
             os.environ["SAVE_ATTN_PATH"] = qdir + "/"
             os.environ["SAVE_ATTN_LAYER"] = str(args.attn_layer)
 
-            prompt_token_targets = build_target_texts_for_q(q["qid"], meta)
+            target_texts = build_target_texts_for_q(qid, meta)
 
-            pred_text, token_trace, prompt_token_attn = model.run_single_prompt(
+            # 1) 先正常跑一次：拿 prediction / trace，并沿用默认 q0_attn 路径
+            pred_text, token_trace = model.run_single_prompt(
                 image=image,
                 prompt=q["prompt"],
                 method=args.method,
@@ -329,9 +299,9 @@ def main():
                 weight2=args.weight2,
                 return_trace=True,
                 trace_topk=10,
-                return_prompt_token_attn=True,
-                prompt_token_targets=prompt_token_targets,
-                prompt_token_layers=(args.prompt_token_layer,),
+                attn_target_text=None,
+                attn_target_name=None,
+                attn_layer=args.attn_layer,
             )
 
             pred = parse_prediction(pred_text, q["mode"])
@@ -353,7 +323,7 @@ def main():
                         "pred_text": pred_text,
                         "pred": pred,
                         "correct": correct,
-                        "prompt_token_targets": prompt_token_targets,
+                        "target_texts": target_texts,
                         "token_trace": token_trace,
                     },
                     f,
@@ -361,51 +331,68 @@ def main():
                     ensure_ascii=False,
                 )
 
-            prompt_token_attn_json_name = None
+            # 2) 先保存默认 q0_attn 图
+            attn_png = f"{qid}_attn.png"
+            attn_npy = os.path.join(qdir, f"attn_map_layer{args.attn_layer}.npy")
+            if os.path.exists(attn_npy) and base_img_np is not None:
+                save_attn_overlay_shapeonly(
+                    attn_npy,
+                    os.path.join(sample_dir, attn_png),
+                    base_img_np
+                )
+
+            # 3) 再按同一条 q0_attn 路径，分别跑 obj1 / obj2 / rel
             saved_target_pngs = {}
 
-            if prompt_token_attn is not None:
-                prompt_token_attn_json_name = f"{qid}_prompt_token_attn.json"
-                prompt_token_attn_json_path = os.path.join(sample_dir, prompt_token_attn_json_name)
-                with open(prompt_token_attn_json_path, "w", encoding="utf-8") as f:
-                    json.dump(prompt_token_attn, f, indent=2, ensure_ascii=False)
+            for target_name in selected_targets:
+                target_text = target_texts[target_name]
 
-                if args.debug:
-                    print("\n[DEBUG]", image_stem, qid)
-                    print("[DEBUG] prompt:", q["prompt"])
-                    print("[DEBUG] prompt_token_targets:", prompt_token_targets)
-                    print("[DEBUG] span_dict:", prompt_token_attn.get("meta", {}).get("span_dict", {}))
+                _ = model.run_single_prompt(
+                    image=image,
+                    prompt=q["prompt"],
+                    method=args.method,
+                    weight=args.weight,
+                    threshold=args.threshold,
+                    weight1=args.weight1,
+                    weight2=args.weight2,
+                    return_trace=False,
+                    attn_target_text=target_text,
+                    attn_target_name=target_name,
+                    attn_layer=args.attn_layer,
+                )
 
-                if base_img_np is not None:
-                    for target_name in selected_targets:
-                        png_name = f"{qid}_{target_name}_L{args.prompt_token_layer}.png"
-                        png_path = os.path.join(sample_dir, png_name)
-                        ok = save_prompt_token_single_overlay(
-                            prompt_token_attn=prompt_token_attn,
-                            base_img_np=base_img_np,
-                            target_name=target_name,
-                            layer_idx=args.prompt_token_layer,
-                            out_png=png_path,
-                            title=f"{qid} | {target_name} | L{args.prompt_token_layer}",
-                        )
-                        if ok:
-                            saved_target_pngs[target_name] = png_name
+                target_npy = os.path.join(
+                    qdir,
+                    f"attn_map_layer{args.attn_layer}_{target_name}.npy"
+                )
+                target_png = f"{qid}_{target_name}_L{args.attn_layer}.png"
+
+                if os.path.exists(target_npy) and base_img_np is not None:
+                    save_attn_overlay_shapeonly(
+                        target_npy,
+                        os.path.join(sample_dir, target_png),
+                        base_img_np
+                    )
+                    saved_target_pngs[target_name] = target_png
+
+            if args.debug:
+                print("\n[DEBUG]", image_stem, qid)
+                print("[DEBUG] target_texts:", target_texts)
+                print("[DEBUG] default attn exists:", os.path.exists(attn_npy))
+                for target_name in selected_targets:
+                    print(
+                        f"[DEBUG] {target_name} exists:",
+                        os.path.exists(os.path.join(qdir, f"attn_map_layer{args.attn_layer}_{target_name}.npy"))
+                    )
 
             q_trace_summary[qid] = {
                 "trace_json": trace_json_name,
-                "prompt_token_attn_json": prompt_token_attn_json_name,
                 "num_tokens": len(token_trace),
                 "first_token": token_trace[0]["token_text"] if token_trace else "",
                 "first_prob": token_trace[0]["chosen_prob"] if token_trace else None,
                 "final_token": token_trace[-1]["token_text"] if token_trace else "",
                 "final_prob": token_trace[-1]["chosen_prob"] if token_trace else None,
             }
-
-            attn_npy = os.path.join(qdir, f"attn_map_layer{args.attn_layer}.npy")
-            attn_png = os.path.join(sample_dir, f"{qid}_attn.png")
-            if os.path.exists(attn_npy) and base_img_np is not None:
-                save_attn_overlay_shapeonly(attn_npy, attn_png, base_img_np)
-                os.remove(attn_npy)
 
             meta_out["questions"].append({
                 "qid": qid,
@@ -415,11 +402,10 @@ def main():
                 "pred_text": pred_text,
                 "pred": pred,
                 "correct": correct,
-                "attn_png": f"{qid}_attn.png",
+                "attn_png": attn_png,
                 "token_trace_json": trace_json_name,
-                "prompt_token_attn_json": prompt_token_attn_json_name,
-                "prompt_token_targets": prompt_token_targets,
-                "prompt_token_target_pngs": saved_target_pngs,
+                "target_texts": target_texts,
+                "target_attn_pngs": saved_target_pngs,
                 "num_generated_tokens": len(token_trace),
                 "first_token": token_trace[0]["token_text"] if token_trace else "",
                 "first_token_prob": token_trace[0]["chosen_prob"] if token_trace else None,
@@ -455,7 +441,6 @@ def main():
         for i in range(10):
             qid = f"q{i}"
             row[f"{qid}_trace_json"] = os.path.join(image_stem, f"{qid}_token_trace.json")
-            row[f"{qid}_prompt_token_attn_json"] = os.path.join(image_stem, f"{qid}_prompt_token_attn.json")
             row[f"{qid}_final_prob"] = q_trace_summary.get(qid, {}).get("final_prob", None)
 
         summary_rows.append(row)
