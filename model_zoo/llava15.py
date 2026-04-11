@@ -563,6 +563,10 @@ class LlavaWrapper:
         if phrase is None:
             return []
 
+        phrase = phrase.strip()
+        if not phrase:
+            return []
+
         tok = self.processor.tokenizer(
             prompt,
             return_offsets_mapping=True,
@@ -580,18 +584,20 @@ class LlavaWrapper:
             if idx == -1:
                 break
             matches.append((idx, idx + len(phrase_lower)))
-            start = idx + len(phrase_lower)
+            start = idx + 1
+
+        if not matches:
+            return []
+
+        # Only keep the last occurrence.
+        s, e = matches[-1]
 
         token_positions = []
-        for s, e in matches:
-            cur = []
-            for i, (a, b) in enumerate(offsets):
-                if b <= a:
-                    continue
-                if not (b <= s or a >= e):
-                    cur.append(i)
-            if cur:
-                token_positions.extend(cur)
+        for i, (a, b) in enumerate(offsets):
+            if b <= a:
+                continue
+            if not (b <= s or a >= e):
+                token_positions.append(i)
 
         uniq = []
         seen = set()
@@ -617,7 +623,6 @@ class LlavaWrapper:
             "rel": self._find_phrase_token_positions(prompt, target_texts.get("rel")),
         }
 
-        # 2) 做一次 prefill forward，拿 full attentions
         forward_kwargs = dict(
             input_ids=single_input["input_ids"],
             pixel_values=single_input["pixel_values"],
@@ -632,8 +637,7 @@ class LlavaWrapper:
             forward_kwargs["keys"] = image_id
 
         outputs = self.model(**forward_kwargs)
-        all_attns = outputs.attentions   # tuple of [bsz, heads, seq, seq]
-
+        all_attns = outputs.attentions
         img_pos = torch.where(image_id[0])[0]
 
         results = {
@@ -653,12 +657,18 @@ class LlavaWrapper:
             pos_tensor = torch.tensor(pos_list, device=img_pos.device, dtype=torch.long)
 
             for layer_idx in layers:
-                attn = all_attns[layer_idx][0]                # [heads, seq, seq]
-                attn_sub = attn[:, pos_tensor][:, :, img_pos] # [heads, span, img_tokens]
-                vec = attn_sub.mean(dim=0).mean(dim=0)        # avg heads + avg subword span
-                results["maps"][name][str(layer_idx)] = vec.detach().float().cpu().numpy().tolist()
+                attn = all_attns[layer_idx][0]                  # [heads, seq, seq]
+
+                # image query -> text key
+                attn_sub = attn[:, img_pos][:, :, pos_tensor]  # [heads, img_tokens, span]
+                vec = attn_sub.mean(dim=0).mean(dim=-1)        # [img_tokens]
+
+                results["maps"][name][str(layer_idx)] = (
+                    vec.detach().float().cpu().numpy().tolist()
+                )
 
         return results
+
     
     def run_single_prompt(
         self,
