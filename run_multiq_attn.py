@@ -36,6 +36,13 @@ def parse_args():
     )
     parser.add_argument("--attn-layer", default=17, type=int)
     parser.add_argument("--out-dir", default="./output_multiq", type=str)
+    parser.add_argument("--save-self-attn-grid", action="store_true")
+    parser.add_argument(
+        "--self-attn-grid-layers",
+        default="0,4,6,16,24,31",
+        type=str,
+        help="comma-separated layer indices for self-attention grid"
+    )
     return parser.parse_args()
 
 from PIL import Image
