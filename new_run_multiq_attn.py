@@ -278,7 +278,7 @@ def main():
         q_correct_map = {}
         q_trace_summary = {}
 
-                for q in questions:
+        for q in questions:
             qid = q["qid"]
             qdir = os.path.join(sample_dir, qid)
             os.makedirs(qdir, exist_ok=True)
