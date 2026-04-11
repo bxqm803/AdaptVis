@@ -199,7 +199,7 @@ def main():
     print(repr(prompt_records[0]["answer"]))
     object_pool = build_object_pool(prompt_records)
 
-    TEST = os.getenv('TEST_MODE', 'False') == 'True'
+    TEST = os.getenv("TEST_MODE", "False") == "True"
 
     if sampled_indices is not None:
         sub_dataset = torch.utils.data.Subset(dataset, sampled_indices)
@@ -214,6 +214,72 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     summary_rows = []
+    summary_csv = os.path.join(args.out_dir, args.dataset, "summary.csv")
+    os.makedirs(os.path.join(args.out_dir, args.dataset), exist_ok=True)
+
+    def write_summary_csv():
+        with open(summary_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "image_name",
+                    "image_path",
+                    "local_index",
+                    "q1",
+                    "q2",
+                    "q3",
+                    "q4",
+                    "q5",
+                    "q6",
+                    "q7",
+                    "q8",
+                    "q9",
+                    "pattern_q1_q9",
+                    "num_correct_q1_q9",
+                    "q0_trace_json",
+                    "q1_trace_json",
+                    "q2_trace_json",
+                    "q3_trace_json",
+                    "q4_trace_json",
+                    "q5_trace_json",
+                    "q6_trace_json",
+                    "q7_trace_json",
+                    "q8_trace_json",
+                    "q9_trace_json",
+                    "q0_prompt_token_attn_json",
+                    "q1_prompt_token_attn_json",
+                    "q2_prompt_token_attn_json",
+                    "q3_prompt_token_attn_json",
+                    "q4_prompt_token_attn_json",
+                    "q5_prompt_token_attn_json",
+                    "q6_prompt_token_attn_json",
+                    "q7_prompt_token_attn_json",
+                    "q8_prompt_token_attn_json",
+                    "q9_prompt_token_attn_json",
+                    "q0_prompt_token_attn_grid_png",
+                    "q1_prompt_token_attn_grid_png",
+                    "q2_prompt_token_attn_grid_png",
+                    "q3_prompt_token_attn_grid_png",
+                    "q4_prompt_token_attn_grid_png",
+                    "q5_prompt_token_attn_grid_png",
+                    "q6_prompt_token_attn_grid_png",
+                    "q7_prompt_token_attn_grid_png",
+                    "q8_prompt_token_attn_grid_png",
+                    "q9_prompt_token_attn_grid_png",
+                    "q0_final_prob",
+                    "q1_final_prob",
+                    "q2_final_prob",
+                    "q3_final_prob",
+                    "q4_final_prob",
+                    "q5_final_prob",
+                    "q6_final_prob",
+                    "q7_final_prob",
+                    "q8_final_prob",
+                    "q9_final_prob",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(summary_rows)
 
     for local_idx in tqdm(range(args.sample_index, end_idx), desc="Samples"):
         rec = prompt_records[local_idx]
@@ -229,7 +295,8 @@ def main():
 
         image_name = item.get("image_name", f"sample_{local_idx:04d}")
         image_path = item.get("image_path", "")
-        image_stem = os.path.splitext(image_name)[0]   
+        image_stem = os.path.splitext(image_name)[0]
+
         sample_dir = os.path.join(args.out_dir, args.dataset, image_stem)
         os.makedirs(sample_dir, exist_ok=True)
 
@@ -238,14 +305,14 @@ def main():
             dst_img_path = os.path.join(sample_dir, raw_img_name)
             if not os.path.exists(dst_img_path):
                 shutil.copy2(image_path, dst_img_path)
-                
+
         meta_out = {
             "local_index": local_idx,
             "image_name": image_name,
             "image_path": image_path,
             "test_mode": TEST,
             **meta,
-            "questions": []
+            "questions": [],
         }
 
         q_correct_map = {}
@@ -282,9 +349,9 @@ def main():
                 correct = (pred == q["gold"])
             q_correct_map[qid] = correct
 
+            # token trace json
             trace_json_name = f"{qid}_token_trace.json"
             trace_json_path = os.path.join(sample_dir, trace_json_name)
-
             with open(trace_json_path, "w", encoding="utf-8") as f:
                 json.dump(
                     {
@@ -301,8 +368,28 @@ def main():
                     indent=2,
                     ensure_ascii=False,
                 )
+
+            # prompt token attention json + grid
+            prompt_token_attn_json_name = None
+            prompt_token_attn_png_name = None
+
+            if prompt_token_attn is not None:
+                prompt_token_attn_json_name = f"{qid}_prompt_token_attn.json"
+                prompt_token_attn_json_path = os.path.join(sample_dir, prompt_token_attn_json_name)
+                with open(prompt_token_attn_json_path, "w", encoding="utf-8") as f:
+                    json.dump(prompt_token_attn, f, indent=2, ensure_ascii=False)
+
+                prompt_token_attn_png_name = f"{qid}_prompt_token_attn_grid.png"
+                prompt_token_attn_png_path = os.path.join(sample_dir, prompt_token_attn_png_name)
+
+                if image_path and os.path.exists(image_path):
+                    base_img_np = get_shape_only_vis_image(model, image_path)
+                    save_prompt_token_attn_grid(prompt_token_attn, base_img_np, prompt_token_attn_png_path)
+
             q_trace_summary[qid] = {
                 "trace_json": trace_json_name,
+                "prompt_token_attn_json": prompt_token_attn_json_name,
+                "prompt_token_attn_grid_png": prompt_token_attn_png_name,
                 "num_tokens": len(token_trace),
                 "first_token": token_trace[0]["token_text"] if token_trace else "",
                 "first_prob": token_trace[0]["chosen_prob"] if token_trace else None,
@@ -310,10 +397,10 @@ def main():
                 "final_prob": token_trace[-1]["chosen_prob"] if token_trace else None,
             }
 
+            # image-token attn map overlay
             attn_npy = os.path.join(qdir, f"attn_map_layer{args.attn_layer}.npy")
             attn_png = os.path.join(sample_dir, f"{qid}_attn.png")
-
-            if os.path.exists(attn_npy):
+            if os.path.exists(attn_npy) and image_path and os.path.exists(image_path):
                 base_img_np = get_shape_only_vis_image(model, image_path)
                 save_attn_overlay_shapeonly(attn_npy, attn_png, base_img_np)
                 os.remove(attn_npy)
@@ -328,12 +415,18 @@ def main():
                 "correct": correct,
                 "attn_png": f"{qid}_attn.png",
                 "token_trace_json": trace_json_name,
+                "prompt_token_attn_json": prompt_token_attn_json_name,
+                "prompt_token_attn_grid_png": prompt_token_attn_png_name,
                 "num_generated_tokens": len(token_trace),
                 "first_token": token_trace[0]["token_text"] if token_trace else "",
                 "first_token_prob": token_trace[0]["chosen_prob"] if token_trace else None,
                 "final_token": token_trace[-1]["token_text"] if token_trace else "",
                 "final_token_prob": token_trace[-1]["chosen_prob"] if token_trace else None,
             })
+
+            # 每题都刷新一次 meta，防止中断丢太多
+            with open(os.path.join(sample_dir, "meta.json"), "w", encoding="utf-8") as f:
+                json.dump(meta_out, f, indent=2, ensure_ascii=False)
 
         pattern_q1_q9 = "_".join(
             "C" if q_correct_map.get(f"q{i}", False) else "W"
@@ -355,6 +448,7 @@ def main():
             "q9": "C" if q_correct_map.get("q9", False) else "W",
             "pattern_q1_q9": pattern_q1_q9,
             "num_correct_q1_q9": sum(q_correct_map.get(f"q{i}", False) for i in range(1, 10)),
+
             "q0_trace_json": os.path.join(image_stem, "q0_token_trace.json"),
             "q1_trace_json": os.path.join(image_stem, "q1_token_trace.json"),
             "q2_trace_json": os.path.join(image_stem, "q2_token_trace.json"),
@@ -365,6 +459,29 @@ def main():
             "q7_trace_json": os.path.join(image_stem, "q7_token_trace.json"),
             "q8_trace_json": os.path.join(image_stem, "q8_token_trace.json"),
             "q9_trace_json": os.path.join(image_stem, "q9_token_trace.json"),
+
+            "q0_prompt_token_attn_json": os.path.join(image_stem, "q0_prompt_token_attn.json"),
+            "q1_prompt_token_attn_json": os.path.join(image_stem, "q1_prompt_token_attn.json"),
+            "q2_prompt_token_attn_json": os.path.join(image_stem, "q2_prompt_token_attn.json"),
+            "q3_prompt_token_attn_json": os.path.join(image_stem, "q3_prompt_token_attn.json"),
+            "q4_prompt_token_attn_json": os.path.join(image_stem, "q4_prompt_token_attn.json"),
+            "q5_prompt_token_attn_json": os.path.join(image_stem, "q5_prompt_token_attn.json"),
+            "q6_prompt_token_attn_json": os.path.join(image_stem, "q6_prompt_token_attn.json"),
+            "q7_prompt_token_attn_json": os.path.join(image_stem, "q7_prompt_token_attn.json"),
+            "q8_prompt_token_attn_json": os.path.join(image_stem, "q8_prompt_token_attn.json"),
+            "q9_prompt_token_attn_json": os.path.join(image_stem, "q9_prompt_token_attn.json"),
+
+            "q0_prompt_token_attn_grid_png": os.path.join(image_stem, "q0_prompt_token_attn_grid.png"),
+            "q1_prompt_token_attn_grid_png": os.path.join(image_stem, "q1_prompt_token_attn_grid.png"),
+            "q2_prompt_token_attn_grid_png": os.path.join(image_stem, "q2_prompt_token_attn_grid.png"),
+            "q3_prompt_token_attn_grid_png": os.path.join(image_stem, "q3_prompt_token_attn_grid.png"),
+            "q4_prompt_token_attn_grid_png": os.path.join(image_stem, "q4_prompt_token_attn_grid.png"),
+            "q5_prompt_token_attn_grid_png": os.path.join(image_stem, "q5_prompt_token_attn_grid.png"),
+            "q6_prompt_token_attn_grid_png": os.path.join(image_stem, "q6_prompt_token_attn_grid.png"),
+            "q7_prompt_token_attn_grid_png": os.path.join(image_stem, "q7_prompt_token_attn_grid.png"),
+            "q8_prompt_token_attn_grid_png": os.path.join(image_stem, "q8_prompt_token_attn_grid.png"),
+            "q9_prompt_token_attn_grid_png": os.path.join(image_stem, "q9_prompt_token_attn_grid.png"),
+
             "q0_final_prob": q_trace_summary.get("q0", {}).get("final_prob", None),
             "q1_final_prob": q_trace_summary.get("q1", {}).get("final_prob", None),
             "q2_final_prob": q_trace_summary.get("q2", {}).get("final_prob", None),
@@ -377,56 +494,10 @@ def main():
             "q9_final_prob": q_trace_summary.get("q9", {}).get("final_prob", None),
         })
 
-        with open(os.path.join(sample_dir, "meta.json"), "w", encoding="utf-8") as f:
-            json.dump(meta_out, f, indent=2, ensure_ascii=False)
-
-    summary_csv = os.path.join(args.out_dir, args.dataset, "summary.csv")
-    os.makedirs(os.path.join(args.out_dir, args.dataset), exist_ok=True)
-
-    with open(summary_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "image_name",
-                "image_path",
-                "local_index",
-                "q1",
-                "q2",
-                "q3",
-                "q4",
-                "q5",
-                "q6",
-                "q7",
-                "q8",
-                "q9",
-                "pattern_q1_q9",
-                "num_correct_q1_q9",
-                "q0_trace_json",
-                "q1_trace_json",
-                "q2_trace_json",
-                "q3_trace_json",
-                "q4_trace_json",
-                "q5_trace_json",
-                "q6_trace_json",
-                "q7_trace_json",
-                "q8_trace_json",
-                "q9_trace_json",
-                "q0_final_prob",
-                "q1_final_prob",
-                "q2_final_prob",
-                "q3_final_prob",
-                "q4_final_prob",
-                "q5_final_prob",
-                "q6_final_prob",
-                "q7_final_prob",
-                "q8_final_prob",
-                "q9_final_prob",
-            ],
-        )
-        writer.writeheader()
-        writer.writerows(summary_rows)
+        # 每个 sample 完成后就刷新 summary
+        write_summary_csv()
 
     print(f"Saved summary to: {summary_csv}")
-
+    
 if __name__ == "__main__":
     main()
