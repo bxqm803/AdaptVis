@@ -127,12 +127,12 @@ def save_prompt_token_attn_grid(prompt_token_attn, base_img_np, out_png):
     for r, name in enumerate(row_names):
         for c, layer_idx in enumerate(layer_list):
             ax = axes[r, c]
-            if layer_idx not in maps.get(name, {}):
+            if str(layer_idx) not in maps.get(name, {}):
                 ax.axis("off")
                 ax.set_title(f"{name} | L{layer_idx}\nN/A")
                 continue
 
-            vec = maps[name][layer_idx]
+            vec = np.array(maps[name][str(layer_idx)], dtype=np.float32)
             side = int(round(np.sqrt(len(vec))))
             if side * side != len(vec):
                 ax.axis("off")
