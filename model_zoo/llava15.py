@@ -812,16 +812,16 @@ class LlavaWrapper:
         weight2=1.0,
         return_trace=False,
         trace_topk=10,
-        return_prompt_token_attn=False,
-        prompt_token_targets=None,
-        prompt_token_layers=(0, 4, 8, 16, 24, 31),
+        attn_target_text=None,
+        attn_target_name=None,
+        attn_layer=None,
     ):
         if weight is None:
             weight = 1.0
 
         if method in ("scaling_vis", "adapt_vis"):
             change_greedy_to_add_weight()
-
+    
         single_input = self.processor(
             images=image,
             text=prompt,
@@ -834,8 +834,20 @@ class LlavaWrapper:
             if v is not None
         }
 
-        image_id = (single_input["input_ids"] == self._get_image_token_id())
+        image_id = (single_input["input_ids"] == self.model.config.image_token_index)
         prompt_len = single_input["input_ids"].shape[1]
+
+    # ===== 关键：给旧 q0_attn 路径传“指定 query span” =====
+        if attn_layer is not None:
+            os.environ["SAVE_ATTN_LAYER"] = str(attn_layer)
+
+        if attn_target_text is not None:
+            qpos = self._find_phrase_token_positions(prompt, attn_target_text)
+            os.environ["SAVE_ATTN_QUERY_POSITIONS"] = ",".join(str(x) for x in qpos)
+            os.environ["SAVE_ATTN_QUERY_NAME"] = str(attn_target_name or "target")
+        else:
+            os.environ.pop("SAVE_ATTN_QUERY_POSITIONS", None)
+            os.environ.pop("SAVE_ATTN_QUERY_NAME", None)
 
         gen_kwargs = dict(
             input_ids=single_input["input_ids"],
@@ -847,18 +859,6 @@ class LlavaWrapper:
             return_dict_in_generate=True,
             output_scores=True,
         )
-
-        prompt_token_attn = None
-        if return_prompt_token_attn and prompt_token_targets is not None:
-            prompt_token_attn = self._collect_prompt_token_attn_maps(
-                single_input=single_input,
-                image_id=image_id,
-                prompt=prompt,
-                target_texts=prompt_token_targets,
-                method=method,
-                weight=weight,
-                layers=prompt_token_layers,
-            )
 
         if "output_logits" in inspect.signature(self.model.generate).parameters:
             gen_kwargs["output_logits"] = True
@@ -876,16 +876,13 @@ class LlavaWrapper:
             clean_up_tokenization_spaces=False,
         ).strip()
 
-        if return_trace and return_prompt_token_attn:
-            token_trace = self._build_generation_trace(output, prompt_len, topk=trace_topk)
-            return gen, token_trace, prompt_token_attn
+        # 清理环境变量，避免污染下一次调用
+        os.environ.pop("SAVE_ATTN_QUERY_POSITIONS", None)
+        os.environ.pop("SAVE_ATTN_QUERY_NAME", None)
 
         if return_trace:
             token_trace = self._build_generation_trace(output, prompt_len, topk=trace_topk)
             return gen, token_trace
-
-        if return_prompt_token_attn:
-            return gen, prompt_token_attn
 
         return gen
 
