@@ -254,19 +254,21 @@ def main():
 
     iterator = tqdm(range(start_idx, end_idx), desc=f"{args.dataset}:{args.model_name}")
     for local_idx in iterator:
-        sample = sub_dataset[local_idx]
-        if isinstance(sample, dict):
-            image = sample.get("image", sample.get("images", None))
-            image_path = sample.get("image_path", sample.get("img_path", None))
-            image_name = sample.get("image_name", os.path.basename(image_path) if image_path else f"sample_{local_idx}")
-        else:
-            image = sample[0]
-            image_path = None
-            image_name = f"sample_{local_idx}"
+        rec = prompt_records[local_idx]
+        item = sub_dataset[local_idx]
 
-        record = prompt_records[local_idx]
-        print(type(record["answer"]), record["answer"])
-        questions, meta = build_questions(record["question"], record["answer"], local_idx, object_pool)
+        image = item["image_options"][0]
+        image_name = item.get("image_name", f"sample_{local_idx:04d}")
+        image_path = item.get("image_path", "")
+
+        base_answer = rec["answer"][0] if isinstance(rec["answer"], list) else rec["answer"]
+
+        questions, meta = build_questions(
+            base_prompt=rec["question"],
+            base_answer=base_answer,
+            sample_idx=local_idx,
+            object_pool=object_pool,
+        )
 
         image_stem = os.path.splitext(os.path.basename(image_name))[0]
         sample_dir = os.path.join(dataset_out_dir, image_stem)
