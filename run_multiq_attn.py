@@ -114,6 +114,47 @@ def save_attn_overlay_shapeonly(attn_npy_path, out_png_path, base_img_np, alpha=
     plt.tight_layout(pad=0)
     plt.savefig(out_png_path, bbox_inches="tight", pad_inches=0, dpi=180)
     plt.close()
+
+def save_prompt_token_attn_grid(prompt_token_attn, base_img_np, out_png):
+    layer_list = prompt_token_attn["meta"]["layers"]
+    maps = prompt_token_attn["maps"]
+
+    fig, axes = plt.subplots(3, 6, figsize=(18, 9))
+    row_names = ["obj1", "obj2", "rel"]
+
+    h, w = base_img_np.shape[:2]
+
+    for r, name in enumerate(row_names):
+        for c, layer_idx in enumerate(layer_list):
+            ax = axes[r, c]
+            if layer_idx not in maps.get(name, {}):
+                ax.axis("off")
+                ax.set_title(f"{name} | L{layer_idx}\nN/A")
+                continue
+
+            vec = maps[name][layer_idx]
+            side = int(round(np.sqrt(len(vec))))
+            if side * side != len(vec):
+                ax.axis("off")
+                ax.set_title(f"{name} | L{layer_idx}\nnot square")
+                continue
+
+            heat = vec.reshape(side, side)
+            heat = heat - heat.min()
+            if heat.max() > 0:
+                heat = heat / heat.max()
+
+            heat_img = Image.fromarray((heat * 255).astype(np.uint8)).resize((w, h), resample=Image.BILINEAR)
+            heat_np = np.array(heat_img).astype(np.float32) / 255.0
+
+            ax.imshow(base_img_np)
+            ax.imshow(heat_np, cmap="jet", alpha=0.45)
+            ax.axis("off")
+            ax.set_title(f"{name} | L{layer_idx}")
+
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=180, bbox_inches="tight")
+    plt.close()
     
 def normalize_tf_label(x):
     if x is None:
@@ -218,7 +259,7 @@ def main():
             os.environ["SAVE_ATTN_PATH"] = qdir + "/"
             os.environ["SAVE_ATTN_LAYER"] = str(args.attn_layer)
 
-            pred_text, token_trace = model.run_single_prompt(
+            pred_text, token_trace, prompt_token_attn = model.run_single_prompt(
                 image=image,
                 prompt=q["prompt"],
                 method=args.method,
@@ -228,6 +269,9 @@ def main():
                 weight2=args.weight2,
                 return_trace=True,
                 trace_topk=10,
+                return_prompt_token_attn=True,
+                prompt_token_targets=q.get("target_texts", None),
+                prompt_token_layers=(0, 4, 8, 16, 24, 31),
             )
 
             pred = parse_prediction(pred_text, q["mode"])
