@@ -308,6 +308,10 @@ def main():
 
             prompt_token_targets = normalize_prompt_token_targets(q.get("target_texts", None))
 
+            print("DEBUG image type:", type(image))
+            print("DEBUG image is None:", image is None)
+            print("DEBUG image_name:", image_name)
+            print("DEBUG image_path:", image_path)
             pred_text, token_trace, prompt_token_attn = model.run_single_prompt(
                 image=image,
                 prompt=q["prompt"],
