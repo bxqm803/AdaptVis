@@ -579,7 +579,7 @@ class LlavaWrapper:
             idx = prompt_lower.find(phrase_lower, start)
             if idx == -1:
                 break
-           matches.append((idx, idx + len(phrase_lower)))
+            matches.append((idx, idx + len(phrase_lower)))
             start = idx + len(phrase_lower)
 
         token_positions = []
