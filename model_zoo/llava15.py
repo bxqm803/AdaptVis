@@ -637,7 +637,7 @@ class LlavaWrapper:
                 seen.add(x)
         return uniq
 
-        def _get_image_token_id(self):
+    def _get_image_token_id(self):
         cfg = self.model.config
         if hasattr(cfg, "image_token_index") and cfg.image_token_index is not None:
             return int(cfg.image_token_index)
