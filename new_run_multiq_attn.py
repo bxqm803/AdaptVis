@@ -265,6 +265,7 @@ def main():
             image_name = f"sample_{local_idx}"
 
         record = prompt_records[local_idx]
+        print(type(record["answer"]), record["answer"])
         questions, meta = build_questions(record["question"], record["answer"], local_idx, object_pool)
 
         image_stem = os.path.splitext(os.path.basename(image_name))[0]
