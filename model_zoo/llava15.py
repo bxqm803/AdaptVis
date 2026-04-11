@@ -656,7 +656,7 @@ class LlavaWrapper:
                 attn = all_attns[layer_idx][0]                # [heads, seq, seq]
                 attn_sub = attn[:, pos_tensor][:, :, img_pos] # [heads, span, img_tokens]
                 vec = attn_sub.mean(dim=0).mean(dim=0)        # avg heads + avg subword span
-                results["maps"][name][layer_idx] = vec.detach().float().cpu().numpy()
+                results["maps"][name][str(layer_idx)] = vec.detach().float().cpu().numpy().tolist()
 
         return results
     
