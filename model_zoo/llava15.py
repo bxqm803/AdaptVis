@@ -558,6 +558,107 @@ class LlavaWrapper:
             trace.append(step_info)
 
         return trace
+
+    def _find_phrase_token_positions(self, prompt, phrase):
+        if phrase is None:
+            return []
+
+        tok = self.processor.tokenizer(
+            prompt,
+            return_offsets_mapping=True,
+            add_special_tokens=True,
+        )
+
+        offsets = tok["offset_mapping"]
+        prompt_lower = prompt.lower()
+        phrase_lower = phrase.lower()
+
+        matches = []
+        start = 0
+        while True:
+            idx = prompt_lower.find(phrase_lower, start)
+            if idx == -1:
+                break
+           matches.append((idx, idx + len(phrase_lower)))
+            start = idx + len(phrase_lower)
+
+        token_positions = []
+        for s, e in matches:
+            cur = []
+            for i, (a, b) in enumerate(offsets):
+                if b <= a:
+                    continue
+                if not (b <= s or a >= e):
+                    cur.append(i)
+            if cur:
+                token_positions.extend(cur)
+
+        uniq = []
+        seen = set()
+        for x in token_positions:
+            if x not in seen:
+                uniq.append(x)
+                seen.add(x)
+        return uniq
+
+    def _collect_prompt_token_attn_maps(
+        self,
+        single_input,
+        image_id,
+        prompt,
+        target_texts,
+        method,
+        weight,
+        layers=(0, 4, 8, 16, 24, 31),
+    ):
+        span_dict = {
+            "obj1": self._find_phrase_token_positions(prompt, target_texts.get("obj1")),
+            "obj2": self._find_phrase_token_positions(prompt, target_texts.get("obj2")),
+            "rel": self._find_phrase_token_positions(prompt, target_texts.get("rel")),
+        }
+
+        # 2) 做一次 prefill forward，拿 full attentions
+        forward_kwargs = dict(
+            input_ids=single_input["input_ids"],
+            pixel_values=single_input["pixel_values"],
+            attention_mask=single_input.get("attention_mask", None),
+            output_attentions=True,
+            return_dict=True,
+            use_cache=False,
+        )
+
+        if method in ("scaling_vis", "adapt_vis"):
+            forward_kwargs["weight"] = float(weight)
+            forward_kwargs["keys"] = image_id
+
+        outputs = self.model(**forward_kwargs)
+        all_attns = outputs.attentions   # tuple of [bsz, heads, seq, seq]
+
+        img_pos = torch.where(image_id[0])[0]
+
+        results = {
+            "meta": {
+                "layers": list(layers),
+                "span_dict": {k: [int(x) for x in v] for k, v in span_dict.items()},
+                "image_positions": [int(x) for x in img_pos.tolist()],
+            },
+            "maps": {}
+        }
+
+        for name, pos_list in span_dict.items():
+            results["maps"][name] = {}
+            if len(pos_list) == 0:
+                continue
+
+            pos_tensor = torch.tensor(pos_list, device=img_pos.device, dtype=torch.long)
+
+            for layer_idx in layers:
+                attn = all_attns[layer_idx][0]                # [heads, seq, seq]
+                attn_sub = attn[:, pos_tensor][:, :, img_pos] # [heads, span, img_tokens]
+                vec = attn_sub.mean(dim=0).mean(dim=0)        # avg heads + avg subword span
+                results["maps"][name][layer_idx] = vec.detach().float().cpu().numpy()
+
+        return results
     
     def run_single_prompt(
         self,
@@ -570,6 +671,9 @@ class LlavaWrapper:
         weight2=1.0,
         return_trace=False,
         trace_topk=10,
+        return_prompt_token_attn=False,
+        prompt_token_targets=None,
+        prompt_token_layers=(0, 4, 8, 16, 24, 31),
     ):
         if weight is None:
             weight = 1.0
@@ -598,6 +702,18 @@ class LlavaWrapper:
             output_scores=True,
         )
 
+        prompt_token_attn = None
+        if return_prompt_token_attn and prompt_token_targets is not None:
+            prompt_token_attn = self._collect_prompt_token_attn_maps(
+                single_input=single_input,
+                image_id=image_id,
+                prompt=prompt,
+                target_texts=prompt_token_targets,
+                method=method,
+                weight=weight,
+                layers=prompt_token_layers,
+            )
+
     # new enough transformers -> also return raw logits
         if "output_logits" in inspect.signature(self.model.generate).parameters:
             gen_kwargs["output_logits"] = True
@@ -615,9 +731,16 @@ class LlavaWrapper:
             clean_up_tokenization_spaces=False,
         ).strip()
 
+        if return_trace and return_prompt_token_attn:
+            token_trace = self._build_generation_trace(output, prompt_len, topk=trace_topk)
+            return gen, token_trace, prompt_token_attn
+
         if return_trace:
             token_trace = self._build_generation_trace(output, prompt_len, topk=trace_topk)
             return gen, token_trace
+
+        if return_prompt_token_attn:
+            return gen, prompt_token_attn
 
         return gen
     
