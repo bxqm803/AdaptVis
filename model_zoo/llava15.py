@@ -234,95 +234,106 @@ def _add_weight_greedy_search(
     
 def change_greedy_to_add_weight():
     transformers.generation.utils.GenerationMixin._greedy_search = _add_weight_greedy_search
-
+    
 class LlavaWrapper:
-    def __init__(self, root_dir, device,method):
-        
-        if method=='scaling_vis' or method=='adapt_vis':
-            self.model = LlavaForConditionalGenerationScal.from_pretrained(MODEL, revision='a272c74',cache_dir=root_dir,ignore_mismatched_sizes=True).eval().to(device)
-
+    def __init__(self, root_dir, device, method):
+        if method == 'scaling_vis' or method == 'adapt_vis':
+            self.model = LlavaForConditionalGenerationScal.from_pretrained(
+                MODEL,
+                revision='a272c74',
+                cache_dir=root_dir,
+                ignore_mismatched_sizes=True
+            ).eval().to(device)
         else:
-            self.model = LlavaForConditionalGeneration.from_pretrained(MODEL, revision='a272c74', cache_dir=root_dir,ignore_mismatched_sizes=True).eval().to(device)
+            self.model = LlavaForConditionalGeneration.from_pretrained(
+                MODEL,
+                revision='a272c74',
+                cache_dir=root_dir,
+                ignore_mismatched_sizes=True
+            ).eval().to(device)
 
-        self.feature_extractor = CLIPImageProcessor.from_pretrained(MODEL, revision='a272c74',cache_dir=root_dir)
-        self.tokenizer = LlamaTokenizerFast.from_pretrained(MODEL, revision='a272c74',cache_dir=root_dir)
-        self.processor = AutoProcessor.from_pretrained(MODEL, revision='a272c74',cache_dir=root_dir)
+        self.feature_extractor = CLIPImageProcessor.from_pretrained(
+            MODEL, revision='a272c74', cache_dir=root_dir
+        )
+        self.tokenizer = LlamaTokenizerFast.from_pretrained(
+            MODEL, revision='a272c74', cache_dir=root_dir
+        )
+        self.processor = AutoProcessor.from_pretrained(
+            MODEL, revision='a272c74', cache_dir=root_dir
+        )
 
         self.device = device
-    
+
     @torch.no_grad()
     def get_text_embeddings(self, texts, text_batch_size=64, normalize=False):
         num_text = len(texts)
         text_embeds = []
         for i in tqdm(range(0, num_text, text_batch_size)):
-            text = texts[i: min(num_text, i+text_batch_size)]
-            text_input = self.tokenizer(text=text, return_tensors="pt", padding="max_length", max_length=77).to(self.device)
-            text_feats = self.model.llava.get_text_features(**text_input).cpu().numpy()[:, 0, :].to(self.device)
+            text = texts[i: min(num_text, i + text_batch_size)]
+            text_input = self.tokenizer(
+                text=text,
+                return_tensors="pt",
+                padding="max_length",
+                max_length=77
+            ).to(self.device)
+
+            text_feats = self.model.llava.get_text_features(**text_input)[:, 0, :]
+            text_feats = text_feats.detach().cpu().numpy()
+
             if normalize:
-                text_feats = text_feats / np.linalg.norm(text_feats, axis=1, keepdims=True)          
-            text_embeds.append(text_feats)   
-            
+                text_feats = text_feats / np.linalg.norm(text_feats, axis=1, keepdims=True)
+
+            text_embeds.append(text_feats)
+
         return np.concatenate(text_embeds, axis=0)
-    
+
     @torch.no_grad()
     def get_image_embeddings(self, image_loader, normalize=False):
         image_embeds = []
         for batch in tqdm(image_loader):
             images = batch["image"]
             inputs = self.feature_extractor(images=images, return_tensors="pt").to(self.device)
-            image_feats = self.model.llava.get_image_features(**inputs).cpu().numpy()[:, 0, :]
+            image_feats = self.model.llava.get_image_features(**inputs)[:, 0, :]
+            image_feats = image_feats.detach().cpu().numpy()
+
             if normalize:
                 image_feats = image_feats / np.linalg.norm(image_feats, axis=1, keepdims=True)
+
             image_embeds.append(image_feats)
 
         return np.concatenate(image_embeds, axis=0)
-    
-    
+
     def get_retrieval_scores_dataset(self, loader):
         texts = loader.dataset.text
         text_embeds = self.get_text_embeddings(texts, normalize=True)
         image_embeds = self.get_image_embeddings(loader, normalize=True)
         scores = image_embeds @ text_embeds.T
         return scores
-    
-    
+
     @torch.no_grad()
     def get_out_scores_wh_batched(self, dataset, joint_loader, method, weight, option, threshold, weight1, weight2):
+        scores = []
+        index_of_total = 0
+        acc = 0
+        correct_id = []
 
-        
-        scores = []  # To store scores for each batch
-        index_of_total = 0  # Track total number of prompts processed
-        acc = 0  # Track the number of correct predictions
-        correct_id = []  # Track indices of correct predictions
-
-        # Determine the correct question-answer file based on the dataset
         qst_ans_file = f'prompts/{dataset}_with_answer_{option}_options.jsonl'
-        
-        # Load prompts and answers from the question-answer file
+
         with open(qst_ans_file, 'r') as file:
             prompt_list = []
             answer_list = []
-            first_prompt_list = []
-            second_prompt_list = []
             for line in file:
                 data = json.loads(line)
-                # Select prompt based on mode
-                
                 prompt_list.append(data["question"])
-                
-                # Store additional prompts if adjustment method is 'sub'
-                
                 answer_list.append(data["answer"])
 
-        # Sampling configuration
         SAMPLE = False
         TEST = os.getenv('TEST_MODE', 'False') == 'True'
         total_data_count = len(prompt_list)
-        
-        # Perform sampling if enabled
+
         if SAMPLE:
             idx_file_path = f'./output/sampled_idx_{dataset}.npy'
-            
+
             if os.path.exists(idx_file_path):
                 sampled_indices = np.load(idx_file_path).tolist()
             else:
@@ -330,96 +341,119 @@ class LlavaWrapper:
                 sampled_indices.sort()
                 np.save(idx_file_path, np.array(sampled_indices))
 
-            # For testing mode, use unsampled indices
             if TEST:
                 all_indices = set(range(total_data_count))
                 unsampled_indices = list(all_indices - set(sampled_indices))
                 unsampled_indices.sort()
                 sampled_indices = unsampled_indices
 
-            # Subset prompts and answers based on sampled indices
             prompt_list = [prompt_list[i] for i in sampled_indices]
             answer_list = [answer_list[i] for i in sampled_indices]
 
-        # Create directory for saving attention maps
         save_attn_dir = f"./output/{dataset}_weight{weight:.2f}"
         os.makedirs(save_attn_dir, exist_ok=True)
 
-        results = []  # Store results for each generated sequence
+        results = []
         for batch in tqdm(joint_loader):
             batch_scores = []
-            
-            # Set environment variable for attention map save path
+
             os.environ['SAVE_ATTN_PATH'] = f'{save_attn_dir}/{index_of_total}/'
             os.makedirs(os.environ['SAVE_ATTN_PATH'], exist_ok=True)
 
-            # Iterate over each image option in the batch
             for i_option in batch["image_options"]:
                 im_scores = []
-                
+
                 for _ in i_option:
                     prompt = prompt_list[index_of_total]
-                    
-                    # Preprocess input for the model
+
                     single_input = self.processor(
-                        text=prompt, images=_, padding="max_length", return_tensors="pt", max_length=77
-                    ).to(self.device)
-                    
-                    # Create key mask for special token
+                        text=prompt,
+                        images=_,
+                        padding="max_length",
+                        return_tensors="pt",
+                        max_length=77
+                    )
+                    single_input = {
+                        k: (v.to(self.device) if torch.is_tensor(v) else v)
+                        for k, v in single_input.items()
+                        if v is not None
+                    }
+
                     keys = [torch.where(input_id == 32001, 1, 0) for input_id in single_input['input_ids']]
 
-                    # Generate predictions based on specified method
                     if method == 'scaling_vis':
-                        
                         change_greedy_to_add_weight()
                         output = self.model.generate(
-                            **single_input, keys=keys, weight=weight,
-                            max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                            **single_input,
+                            keys=keys,
+                            weight=weight,
+                            max_new_tokens=100,
+                            output_scores=True,
+                            return_dict_in_generate=True
                         )
                         uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
-                        gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
-                    
+                        gen = self.processor.decode(
+                            output['sequences'][0][len(single_input['input_ids'][-1]):],
+                            skip_special_tokens=True
+                        )
+
                     elif method == 'adapt_vis':
                         change_greedy_to_add_weight()
-                       
                         output = self.model.generate(
-                            **single_input,weight=1.0,max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                            **single_input,
+                            weight=1.0,
+                            max_new_tokens=100,
+                            output_scores=True,
+                            return_dict_in_generate=True
                         )
                         uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
-                        print(uncertainty,threshold)
+                        print(uncertainty, threshold)
 
-                        # Adjust attention based on uncertainty
                         if uncertainty < threshold:
                             output = self.model.generate(
-                                **single_input, keys=keys, weight=weight1, 
-                                max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                                **single_input,
+                                keys=keys,
+                                weight=weight1,
+                                max_new_tokens=100,
+                                output_scores=True,
+                                return_dict_in_generate=True
                             )
                         else:
                             output = self.model.generate(
-                                **single_input, keys=keys, weight=weight2, 
-                                max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                                **single_input,
+                                keys=keys,
+                                weight=weight2,
+                                max_new_tokens=100,
+                                output_scores=True,
+                                return_dict_in_generate=True
                             )
-                        gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
+                        gen = self.processor.decode(
+                            output['sequences'][0][len(single_input['input_ids'][-1]):],
+                            skip_special_tokens=True
+                        )
 
                     else:
-                        # Default generation method
                         output = self.model.generate(
-                            **single_input, max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                            **single_input,
+                            max_new_tokens=100,
+                            output_scores=True,
+                            return_dict_in_generate=True
                         )
-                        gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
+                        gen = self.processor.decode(
+                            output['sequences'][0][len(single_input['input_ids'][-1]):],
+                            skip_special_tokens=True
+                        )
                         uncertainty = np.round(float(max(output['scores'][0][0])), 2)
 
-                    # Print prompt, generated text, and expected answer
                     print(f"Prompt: {prompt}\nGeneration: {gen}\nGolden: {answer_list[index_of_total][0]}")
-                    
+
                     result = {
                         "Prompt": prompt,
                         "Generation": gen,
                         "Golden": answer_list[index_of_total][0],
                     }
                     results.append(result)
-                    
-                    # Check if the generation matches the expected answer
+
                     c_option = batch["caption_options"]
                     if len(list(c_option)) == 4:
                         if (answer_list[index_of_total][0] in gen or answer_list[index_of_total][0].lower() in gen.lower()) \
@@ -429,7 +463,7 @@ class LlavaWrapper:
                             answers = [1, 0, 0, 0]
                         else:
                             answers = [0, 0, 1, 0]
-                    
+
                     elif len(list(c_option)) == 2:
                         if (answer_list[index_of_total][0] in gen or answer_list[index_of_total][0].lower() in gen.lower()) \
                                 and not (answer_list[index_of_total][0].lower() == 'on' and 'front' in gen.strip().lower()):
@@ -446,21 +480,18 @@ class LlavaWrapper:
 
             scores.append(batch_scores)
 
-            # Save results to file
             output_file_path = f'./output/results1.5_{dataset}_{method}_{weight}_{option}option_{TEST}.json'
             print("Saving results to", output_file_path)
             with open(output_file_path, 'w', encoding='utf-8') as fout:
                 json.dump(results, fout, ensure_ascii=False, indent=4)
             print(acc, index_of_total, acc / index_of_total)
 
-        # Save accuracy and correct IDs to file
         print(acc / index_of_total)
         output_score_file = output_file_path.replace(".json", "scores.json")
         with open(output_score_file, 'w', encoding='utf-8') as fout:
             json.dump({"acc": acc / index_of_total, "correct_id": correct_id}, fout, ensure_ascii=False, indent=4)
 
-        # Concatenate all scores and return based on dataset type
-        all_scores = np.concatenate(scores, axis=0)  # N x K x L
+        all_scores = np.concatenate(scores, axis=0)
         if dataset in ['Controlled_Images_B', 'Controlled_Images_A']:
             return (all_scores, [])
         else:
@@ -505,14 +536,14 @@ class LlavaWrapper:
         tokenizer = self.processor.tokenizer
 
         sequences = generation_output.sequences
-        gen_ids = sequences[0][prompt_len:]   # only newly generated tokens
+        gen_ids = sequences[0][prompt_len:]
 
         step_scores = generation_output.scores or []
         step_logits = getattr(generation_output, "logits", None)
 
         trace = []
         for step_idx, token_id in enumerate(gen_ids.tolist()):
-            step_score = step_scores[step_idx][0]   # [vocab]
+            step_score = step_scores[step_idx][0]
             step_prob = torch.softmax(step_score, dim=-1)
 
             chosen_score = float(step_score[token_id].item())
@@ -563,7 +594,7 @@ class LlavaWrapper:
         if phrase is None:
             return []
 
-        phrase = phrase.strip()
+        phrase = str(phrase).strip()
         if not phrase:
             return []
 
@@ -589,7 +620,6 @@ class LlavaWrapper:
         if not matches:
             return []
 
-        # Only keep the last occurrence.
         s, e = matches[-1]
 
         token_positions = []
@@ -607,6 +637,96 @@ class LlavaWrapper:
                 seen.add(x)
         return uniq
 
+    def _get_image_token_id(self):
+        cfg = self.model.config
+        if hasattr(cfg, "image_token_index") and cfg.image_token_index is not None:
+            return int(cfg.image_token_index)
+        if hasattr(cfg, "image_token_id") and cfg.image_token_id is not None:
+            return int(cfg.image_token_id)
+        return 32000
+
+    @torch.no_grad()
+    def _infer_num_image_tokens(self, single_input):
+        pixel_values = single_input.get("pixel_values", None)
+
+        if pixel_values is not None and hasattr(self.model, "get_image_features"):
+            try:
+                feats = self.model.get_image_features(pixel_values=pixel_values)
+
+                if isinstance(feats, (list, tuple)) and len(feats) > 0:
+                    f0 = feats[0]
+                    if torch.is_tensor(f0):
+                        if f0.ndim == 2:
+                            return int(f0.shape[0])
+                        if f0.ndim == 3:
+                            return int(f0.shape[1])
+
+                if torch.is_tensor(feats):
+                    if feats.ndim == 2:
+                        return int(feats.shape[0])
+                    if feats.ndim == 3:
+                        return int(feats.shape[1])
+            except Exception:
+                pass
+
+        cfg = self.model.config
+        if hasattr(cfg, "image_seq_length") and cfg.image_seq_length is not None:
+            return int(cfg.image_seq_length)
+
+        return 576
+
+    def _build_single_image_merge_map(self, input_ids_1d, num_image_tokens):
+        image_token_id = self._get_image_token_id()
+        image_placeholder_pos = torch.where(input_ids_1d == image_token_id)[0]
+
+        if image_placeholder_pos.numel() != 1:
+            raise ValueError(
+                f"Expected exactly 1 image placeholder token, got {image_placeholder_pos.numel()}."
+            )
+
+        p = int(image_placeholder_pos[0].item())
+        orig_len = int(input_ids_1d.shape[0])
+
+        merged_text_pos = [None] * orig_len
+        shift = num_image_tokens - 1
+
+        for i in range(orig_len):
+            if i < p:
+                merged_text_pos[i] = i
+            elif i == p:
+                merged_text_pos[i] = None
+            else:
+                merged_text_pos[i] = i + shift
+
+        merged_image_pos = torch.arange(
+            p,
+            p + num_image_tokens,
+            device=input_ids_1d.device,
+            dtype=torch.long,
+        )
+
+        return {
+            "placeholder_pos": p,
+            "merged_image_pos": merged_image_pos,
+            "merged_text_pos": merged_text_pos,
+            "num_image_tokens": num_image_tokens,
+        }
+
+    def _remap_text_positions_to_merged(self, pos_list, merged_text_pos):
+        out = []
+        seen = set()
+        for p in pos_list:
+            p = int(p)
+            if p < 0 or p >= len(merged_text_pos):
+                continue
+            new_p = merged_text_pos[p]
+            if new_p is None:
+                continue
+            if new_p not in seen:
+                out.append(int(new_p))
+                seen.add(int(new_p))
+        return out
+
     def _collect_prompt_token_attn_maps(
         self,
         single_input,
@@ -617,10 +737,20 @@ class LlavaWrapper:
         weight,
         layers=(0, 4, 8, 16, 24, 31),
     ):
-        span_dict = {
+        span_dict_input = {
             "obj1": self._find_phrase_token_positions(prompt, target_texts.get("obj1")),
             "obj2": self._find_phrase_token_positions(prompt, target_texts.get("obj2")),
             "rel": self._find_phrase_token_positions(prompt, target_texts.get("rel")),
+        }
+
+        input_ids_1d = single_input["input_ids"][0]
+        num_image_tokens = self._infer_num_image_tokens(single_input)
+        merge_info = self._build_single_image_merge_map(input_ids_1d, num_image_tokens)
+
+        img_pos = merge_info["merged_image_pos"]
+        span_dict = {
+            k: self._remap_text_positions_to_merged(v, merge_info["merged_text_pos"])
+            for k, v in span_dict_input.items()
         }
 
         forward_kwargs = dict(
@@ -638,11 +768,13 @@ class LlavaWrapper:
 
         outputs = self.model(**forward_kwargs)
         all_attns = outputs.attentions
-        img_pos = torch.where(image_id[0])[0]
 
         results = {
             "meta": {
                 "layers": list(layers),
+                "num_image_tokens": int(num_image_tokens),
+                "image_placeholder_pos": int(merge_info["placeholder_pos"]),
+                "span_dict_input": {k: [int(x) for x in v] for k, v in span_dict_input.items()},
                 "span_dict": {k: [int(x) for x in v] for k, v in span_dict.items()},
                 "image_positions": [int(x) for x in img_pos.tolist()],
             },
@@ -657,11 +789,11 @@ class LlavaWrapper:
             pos_tensor = torch.tensor(pos_list, device=img_pos.device, dtype=torch.long)
 
             for layer_idx in layers:
-                attn = all_attns[layer_idx][0]                  # [heads, seq, seq]
+                attn = all_attns[layer_idx][0]
 
                 # image query -> text key
-                attn_sub = attn[:, img_pos][:, :, pos_tensor]  # [heads, img_tokens, span]
-                vec = attn_sub.mean(dim=0).mean(dim=-1)        # [img_tokens]
+                attn_sub = attn[:, img_pos][:, :, pos_tensor]
+                vec = attn_sub.mean(dim=0).mean(dim=-1)
 
                 results["maps"][name][str(layer_idx)] = (
                     vec.detach().float().cpu().numpy().tolist()
@@ -669,7 +801,6 @@ class LlavaWrapper:
 
         return results
 
-    
     def run_single_prompt(
         self,
         image,
@@ -696,9 +827,14 @@ class LlavaWrapper:
             text=prompt,
             padding=True,
             return_tensors="pt",
-        ).to(self.device)
+        )
+        single_input = {
+            k: (v.to(self.device) if torch.is_tensor(v) else v)
+            for k, v in single_input.items()
+            if v is not None
+        }
 
-        image_id = (single_input["input_ids"] == self.model.config.image_token_index)
+        image_id = (single_input["input_ids"] == self._get_image_token_id())
         prompt_len = single_input["input_ids"].shape[1]
 
         gen_kwargs = dict(
@@ -724,7 +860,6 @@ class LlavaWrapper:
                 layers=prompt_token_layers,
             )
 
-    # new enough transformers -> also return raw logits
         if "output_logits" in inspect.signature(self.model.generate).parameters:
             gen_kwargs["output_logits"] = True
 
@@ -753,75 +888,124 @@ class LlavaWrapper:
             return gen, prompt_token_attn
 
         return gen
-    
+
     @torch.no_grad()
     def get_judge_scores_vsr_batched(self, dataset, joint_loader, method, weight, threshold, weight1, weight2):
-        
-        
         index = 0
         TP, TN, FP, FN = 0, 0, 0, 0
 
-        # Set the directory to save attention maps
         save_attn_dir = f"/home/user/shiqi/mmlm_mech/whatsup_vlms/outputs/{dataset}_weight{weight:.2f}"
         if not os.path.exists(save_attn_dir):
             print("Creating directory for saving attention maps:", save_attn_dir)
             os.makedirs(save_attn_dir)
-        
+
         index_of_total = 0
         results = []
 
-        # Process each batch in the joint loader
         for batch in tqdm(joint_loader):
             batch_scores = []
-            
-            # Create directory for saving attention maps for each batch
+
             os.environ['SAVE_ATTN_PATH'] = f'{save_attn_dir}/{index_of_total}/'
             os.makedirs(os.environ['SAVE_ATTN_PATH'], exist_ok=True)
 
-            # Iterate over image options in the batch
             for i_option in batch["image_options"]:
                 im_scores = []
 
-                # Iterate over caption options
                 for c_option in batch["caption_options"]:
                     prompt = "User: <image>\n Determine whether the description about the spatial relationship is correct or not. Answer with yes or no: "
                     qst = [prompt] * len(list(c_option))
                     end_fix = [" Assistant:"] * len(list(c_option))
                     concatenated_list = [s1 + s2 + s3 for s1, s2, s3 in zip(qst, c_option, end_fix)]
-                    
-                    # Generate responses for each concatenated input
+
                     for idx, text in enumerate(concatenated_list):
-                        # Prepare input data for the model
-                        single_input = self.processor(text=text, images=list(i_option)[idx], padding="max_length", return_tensors="pt", max_length=77).to(self.device)
+                        single_input = self.processor(
+                            text=text,
+                            images=list(i_option)[idx],
+                            padding="max_length",
+                            return_tensors="pt",
+                            max_length=77
+                        )
+                        single_input = {
+                            k: (v.to(self.device) if torch.is_tensor(v) else v)
+                            for k, v in single_input.items()
+                            if v is not None
+                        }
+
                         keys = [torch.where(input_id == 32001, 1, 0) for input_id in single_input['input_ids']]
-                        
-                        # Apply different attention adjustment methods based on the 'method' argument
+
                         if method == 'scaling_vis':
                             change_greedy_to_add_weight()
-                            output = self.model.generate(**single_input, keys=keys, weight=weight, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
+                            output = self.model.generate(
+                                **single_input,
+                                keys=keys,
+                                weight=weight,
+                                max_new_tokens=100,
+                                output_scores=True,
+                                return_dict_in_generate=True
+                            )
                             uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
-                            gen = self.processor.decode(output[0][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True, output_attentions=True)
-                        
+                            gen = self.processor.decode(
+                                output[0][0][len(single_input['input_ids'][-1]):],
+                                skip_special_tokens=True,
+                                output_attentions=True
+                            )
+
                         elif method == 'adapt_vis':
                             change_greedy_to_add_weight()
-                            # Basic generation step
-                            output = self.model.generate(**single_input, weight=1.0,max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
-                            gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True, output_attentions=True)
+                            output = self.model.generate(
+                                **single_input,
+                                weight=1.0,
+                                max_new_tokens=100,
+                                output_scores=True,
+                                return_dict_in_generate=True
+                            )
+                            gen = self.processor.decode(
+                                output['sequences'][0][len(single_input['input_ids'][-1]):],
+                                skip_special_tokens=True,
+                                output_attentions=True
+                            )
                             uncertainty = np.round(float(max(output['scores'][0][0])), 2)
-                            
-                            # Apply weighted generation based on uncertainty
+
                             if uncertainty < threshold:
-                                output = self.model.generate(**single_input, keys=keys, weight=weight1, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
+                                output = self.model.generate(
+                                    **single_input,
+                                    keys=keys,
+                                    weight=weight1,
+                                    max_new_tokens=100,
+                                    output_scores=True,
+                                    return_dict_in_generate=True
+                                )
                             else:
-                                output = self.model.generate(**single_input, keys=keys, weight=weight2, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
-                            gen = self.processor.decode(output[0][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True, output_attentions=True)
+                                output = self.model.generate(
+                                    **single_input,
+                                    keys=keys,
+                                    weight=weight2,
+                                    max_new_tokens=100,
+                                    output_scores=True,
+                                    return_dict_in_generate=True
+                                )
+                            gen = self.processor.decode(
+                                output[0][0][len(single_input['input_ids'][-1]):],
+                                skip_special_tokens=True,
+                                output_attentions=True
+                            )
 
                         else:
-                            output = self.model.generate(**single_input, keys=keys, weight=weight, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
+                            output = self.model.generate(
+                                **single_input,
+                                keys=keys,
+                                weight=weight,
+                                max_new_tokens=100,
+                                output_scores=True,
+                                return_dict_in_generate=True
+                            )
                             uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
-                            gen = self.processor.decode(output[0][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True, output_attentions=True)
-                        
-                        # Check correctness of the generated response
+                            gen = self.processor.decode(
+                                output[0][0][len(single_input['input_ids'][-1]):],
+                                skip_special_tokens=True,
+                                output_attentions=True
+                            )
+
                         label = int(batch['labels'][0][idx])
                         if label == 1:
                             TP += 1 if 'Yes' in gen else 0
@@ -829,10 +1013,9 @@ class LlavaWrapper:
                         else:
                             TN += 1 if 'No' in gen else 0
                             FP += 1 if 'No' not in gen else 0
-                        
+
                         print(f"TP: {TP}, TN: {TN}, FP: {FP}, FN: {FN}")
-                        
-                        # Create result entry for the current sample
+
                         gold = 'Yes' if label == 1 else 'No'
                         result = {
                             "Prompt": prompt,
@@ -842,29 +1025,38 @@ class LlavaWrapper:
                         }
                         results.append(result)
                         index_of_total += 1
-                        
-                index += 1    
-        # Calculate metrics
+
+                index += 1
+
         precision = TP / (TP + FN)
         recall = TN / (TN + FP)
         f1_score = 2 * precision * recall / (precision + recall)
 
-        print(f"TP: {TP}, TN: {TN}, FP: {FP}, FN: {FN}\n"
+        print(
+            f"TP: {TP}, TN: {TN}, FP: {FP}, FN: {FN}\n"
             f"Accuracy: {(TN + TP) / (TN + TP + FN + FP)}\n"
             f"Precision: {precision}\n"
             f"Recall: {recall}\n"
-            f"F1 Score: {f1_score}")
-        
+            f"F1 Score: {f1_score}"
+        )
+
         all_scores = (TP, TN, FP, FN)
-        
-        # Save results to JSON file
+
         output_file_path = f'./outputs/results_{dataset}_{method}_{weight}.json'
         with open(output_file_path, 'w', encoding='utf-8') as fout:
             json.dump(results, fout, ensure_ascii=False, indent=4)
-        
-        # Save evaluation metrics
+
         output_score_file = output_file_path.replace(".json", "_scores.json")
         with open(output_score_file, 'w', encoding='utf-8') as fout:
-            json.dump({"acc": (TN + TP) / (TN + TP + FN + FP), "precision": precision, "recall": recall, "f1": f1_score}, fout, ensure_ascii=False, indent=4)
+            json.dump(
+                {
+                    "acc": (TN + TP) / (TN + TP + FN + FP),
+                    "precision": precision,
+                    "recall": recall,
+                    "f1": f1_score
+                },
+                fout,
+                ensure_ascii=False,
+                indent=4
+            )
         return all_scores
-    
