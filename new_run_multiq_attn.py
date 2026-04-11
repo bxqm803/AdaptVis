@@ -317,7 +317,7 @@ def main():
             os.environ["SAVE_ATTN_PATH"] = qdir + "/"
             os.environ["SAVE_ATTN_LAYER"] = str(args.attn_layer)
 
-            prompt_token_targets = build_target_texts_for_q(qid, meta)
+            prompt_token_targets = build_target_texts_for_q(q["qid"], meta)
 
             pred_text, token_trace, prompt_token_attn = model.run_single_prompt(
                 image=image,
