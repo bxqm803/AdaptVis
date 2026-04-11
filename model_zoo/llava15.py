@@ -637,6 +637,52 @@ class LlavaWrapper:
                 seen.add(x)
         return uniq
 
+        def _get_image_token_id(self):
+        cfg = self.model.config
+        if hasattr(cfg, "image_token_index") and cfg.image_token_index is not None:
+            return int(cfg.image_token_index)
+        if hasattr(cfg, "image_token_id") and cfg.image_token_id is not None:
+            return int(cfg.image_token_id)
+        return 32000
+
+    @torch.no_grad()
+    def _infer_num_image_tokens(self, single_input):
+        cfg = self.model.config
+        if hasattr(cfg, "image_seq_length") and cfg.image_seq_length is not None:
+            return int(cfg.image_seq_length)
+        return 576
+
+    def _remap_prompt_positions_to_merged(self, input_ids_1d, prompt_positions, num_image_tokens):
+        image_token_id = self._get_image_token_id()
+        image_placeholder_pos = torch.where(input_ids_1d == image_token_id)[0]
+
+        if image_placeholder_pos.numel() != 1:
+            raise ValueError(
+                f"Expected exactly 1 image placeholder token, got {image_placeholder_pos.numel()}."
+            )
+
+        p = int(image_placeholder_pos[0].item())
+
+        out = []
+        for pos in prompt_positions:
+            pos = int(pos)
+            if pos < p:
+                out.append(pos)
+            elif pos == p:
+                # <image> 本身不作为文本 query
+                continue
+            else:
+                out.append(pos + (num_image_tokens - 1))
+
+        # 去重，保序
+        uniq = []
+        seen = set()
+        for x in out:
+            if x not in seen:
+                uniq.append(x)
+                seen.add(x)
+        return uniq
+
     def _get_image_token_id(self):
         cfg = self.model.config
         if hasattr(cfg, "image_token_index") and cfg.image_token_index is not None:
@@ -675,132 +721,6 @@ class LlavaWrapper:
 
         return 576
 
-    def _build_single_image_merge_map(self, input_ids_1d, num_image_tokens):
-        image_token_id = self._get_image_token_id()
-        image_placeholder_pos = torch.where(input_ids_1d == image_token_id)[0]
-
-        if image_placeholder_pos.numel() != 1:
-            raise ValueError(
-                f"Expected exactly 1 image placeholder token, got {image_placeholder_pos.numel()}."
-            )
-
-        p = int(image_placeholder_pos[0].item())
-        orig_len = int(input_ids_1d.shape[0])
-
-        merged_text_pos = [None] * orig_len
-        shift = num_image_tokens - 1
-
-        for i in range(orig_len):
-            if i < p:
-                merged_text_pos[i] = i
-            elif i == p:
-                merged_text_pos[i] = None
-            else:
-                merged_text_pos[i] = i + shift
-
-        merged_image_pos = torch.arange(
-            p,
-            p + num_image_tokens,
-            device=input_ids_1d.device,
-            dtype=torch.long,
-        )
-
-        return {
-            "placeholder_pos": p,
-            "merged_image_pos": merged_image_pos,
-            "merged_text_pos": merged_text_pos,
-            "num_image_tokens": num_image_tokens,
-        }
-
-    def _remap_text_positions_to_merged(self, pos_list, merged_text_pos):
-        out = []
-        seen = set()
-        for p in pos_list:
-            p = int(p)
-            if p < 0 or p >= len(merged_text_pos):
-                continue
-            new_p = merged_text_pos[p]
-            if new_p is None:
-                continue
-            if new_p not in seen:
-                out.append(int(new_p))
-                seen.add(int(new_p))
-        return out
-
-    def _collect_prompt_token_attn_maps(
-        self,
-        single_input,
-        image_id,
-        prompt,
-        target_texts,
-        method,
-        weight,
-        layers=(0, 4, 8, 16, 24, 31),
-    ):
-        span_dict_input = {
-            "obj1": self._find_phrase_token_positions(prompt, target_texts.get("obj1")),
-            "obj2": self._find_phrase_token_positions(prompt, target_texts.get("obj2")),
-            "rel": self._find_phrase_token_positions(prompt, target_texts.get("rel")),
-        }
-
-        input_ids_1d = single_input["input_ids"][0]
-        num_image_tokens = self._infer_num_image_tokens(single_input)
-        merge_info = self._build_single_image_merge_map(input_ids_1d, num_image_tokens)
-
-        img_pos = merge_info["merged_image_pos"]
-        span_dict = {
-            k: self._remap_text_positions_to_merged(v, merge_info["merged_text_pos"])
-            for k, v in span_dict_input.items()
-        }
-
-        forward_kwargs = dict(
-            input_ids=single_input["input_ids"],
-            pixel_values=single_input["pixel_values"],
-            attention_mask=single_input.get("attention_mask", None),
-            output_attentions=True,
-            return_dict=True,
-            use_cache=False,
-        )
-
-        if method in ("scaling_vis", "adapt_vis"):
-            forward_kwargs["weight"] = float(weight)
-            forward_kwargs["keys"] = image_id
-
-        outputs = self.model(**forward_kwargs)
-        all_attns = outputs.attentions
-
-        results = {
-            "meta": {
-                "layers": list(layers),
-                "num_image_tokens": int(num_image_tokens),
-                "image_placeholder_pos": int(merge_info["placeholder_pos"]),
-                "span_dict_input": {k: [int(x) for x in v] for k, v in span_dict_input.items()},
-                "span_dict": {k: [int(x) for x in v] for k, v in span_dict.items()},
-                "image_positions": [int(x) for x in img_pos.tolist()],
-            },
-            "maps": {}
-        }
-
-        for name, pos_list in span_dict.items():
-            results["maps"][name] = {}
-            if len(pos_list) == 0:
-                continue
-
-            pos_tensor = torch.tensor(pos_list, device=img_pos.device, dtype=torch.long)
-
-            for layer_idx in layers:
-                attn = all_attns[layer_idx][0]
-
-                # image query -> text key
-                attn_sub = attn[:, img_pos][:, :, pos_tensor]
-                vec = attn_sub.mean(dim=0).mean(dim=-1)
-
-                results["maps"][name][str(layer_idx)] = (
-                    vec.detach().float().cpu().numpy().tolist()
-                )
-
-        return results
-
     def run_single_prompt(
         self,
         image,
@@ -821,7 +741,7 @@ class LlavaWrapper:
 
         if method in ("scaling_vis", "adapt_vis"):
             change_greedy_to_add_weight()
-    
+
         single_input = self.processor(
             images=image,
             text=prompt,
@@ -837,13 +757,23 @@ class LlavaWrapper:
         image_id = (single_input["input_ids"] == self.model.config.image_token_index)
         prompt_len = single_input["input_ids"].shape[1]
 
-    # ===== 关键：给旧 q0_attn 路径传“指定 query span” =====
+        # ===== 关键：给旧 q0_attn 路径传“指定 query rows” =====
         if attn_layer is not None:
             os.environ["SAVE_ATTN_LAYER"] = str(attn_layer)
 
         if attn_target_text is not None:
-            qpos = self._find_phrase_token_positions(prompt, attn_target_text)
-            os.environ["SAVE_ATTN_QUERY_POSITIONS"] = ",".join(str(x) for x in qpos)
+            # 1) 在原始 prompt token 坐标里找 phrase
+            prompt_positions = self._find_phrase_token_positions(prompt, attn_target_text)
+
+            # 2) remap 到 merged 坐标
+            num_image_tokens = self._infer_num_image_tokens(single_input)
+            merged_positions = self._remap_prompt_positions_to_merged(
+                input_ids_1d=single_input["input_ids"][0],
+                prompt_positions=prompt_positions,
+                num_image_tokens=num_image_tokens,
+            )
+
+            os.environ["SAVE_ATTN_QUERY_POSITIONS"] = ",".join(str(x) for x in merged_positions)
             os.environ["SAVE_ATTN_QUERY_NAME"] = str(attn_target_name or "target")
         else:
             os.environ.pop("SAVE_ATTN_QUERY_POSITIONS", None)
