@@ -267,33 +267,54 @@ class LLaMAAttention(nn.Module):
         unchanged_attn_weights = attn_weights.clone()
 
         ######ATTENTION#######
-        if idx<32:
-            if attn_weights.size()[2]==attn_weights.size()[3]:
+        start_idx, end_idx, square_size = -1, -1, -1
+
+        if idx < 32:
+            if attn_weights.size()[2] == attn_weights.size()[3]:
                 true_indices = torch.where(keys)[True]
                 if len(true_indices) == 0:
                     print("No True values found in index.")
                 else:
-                    # pdb.set_trace()
                     start_idx = true_indices[0].item()
                     end_idx = true_indices[-1].item()
                     square_size = end_idx - start_idx + 1
+
+                    # ===== 读取外部指定 query rows；不指定时保持旧 q0_attn 行为 =====
+                    query_pos_str = os.getenv("SAVE_ATTN_QUERY_POSITIONS", "").strip()
+                    if query_pos_str:
+                        query_rows = [int(x) for x in query_pos_str.split(",") if x.strip()]
+                    else:
+                        if caption_length:
+                            query_rows = list(range(q_len - len(caption_length[0]), q_len))
+                        else:
+                            query_rows = [q_len - 1]
+
+                    # 过滤非法 query 位置
+                    query_rows = [q for q in query_rows if 0 <= q < q_len]
+                    if len(query_rows) == 0:
+                        if caption_length:
+                            query_rows = list(range(q_len - len(caption_length[0]), q_len))
+                        else:
+                            query_rows = [q_len - 1]
+
                     mask = torch.zeros(
                         (attn_weights.size()[2], attn_weights.size()[2]),
                         dtype=torch.bool,
                         device=attn_weights.device,
                     )
+
+                    # ===== 保持旧 q0_attn 路径，只换 query rows =====
                     if caption_length:
-                        mask[-len(caption_length[0]):,start_idx:start_idx + square_size+1] = True
+                        # 保持你原来的 +1 逻辑不变
+                        for qrow in query_rows:
+                            mask[qrow, start_idx:start_idx + square_size + 1] = True
                     else:
-                        mask[-1,start_idx:start_idx + square_size] = True
-                        # mask[start_idx:start_idx + square_size,start_idx:start_idx + square_size] = True
-                    # pdb.set_trace()
-                    # pdb.set_trace()
+                        for qrow in query_rows:
+                            mask[qrow, start_idx:start_idx + square_size] = True
+
                     attn_weights[:, :, mask] *= weight
-                    
             else:
-                # print("Not a square matrix, skipping. got size", attn_weights.size())
-                start_idx,end_idx,square_size = -1,-1,-1
+                start_idx, end_idx, square_size = -1, -1, -1
 
         if attention_mask is not None:
             if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
@@ -301,49 +322,73 @@ class LLaMAAttention(nn.Module):
                     f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
                 )
             attn_weights = attn_weights + attention_mask
-            attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
+            attn_weights = torch.max(
+                attn_weights,
+                torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+            )
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        '''
-        if SAVE_ATTN : # save the change in attention weights for analysis
-            save_path = os.getenv("SAVE_ATTN_PATH")
-            if not save_path:
-                raise ValueError("SAVE_ATTN_PATH not set.")
-            unchanged_attn_weights = unchanged_attn_weights + attention_mask
-            unchanged_attn_weights = torch.max(unchanged_attn_weights, torch.tensor(torch.finfo(unchanged_attn_weights.dtype).min))
-            if SAVE_ORI:
-                ori=unchanged_attn_weights[:,:,-1,:]
-                # pdb.set_trace()
-                np.save(f"{save_path}diff_{idx}_start{start_idx}_end{end_idx}.npy", ori.cpu().detach().numpy())
 
-            unchanged_attn_weights = nn.functional.softmax(unchanged_attn_weights, dim=-1, dtype=torch.float32).to(
-                query_states.dtype)
-                '''
-        
         if SAVE_ATTN:
             save_path = os.getenv("SAVE_ATTN_PATH")
             if not save_path:
                 raise ValueError("SAVE_ATTN_PATH not set.")
 
             target_layer = int(os.getenv("SAVE_ATTN_LAYER", "17"))
+            query_pos_str = os.getenv("SAVE_ATTN_QUERY_POSITIONS", "").strip()
+            query_name = os.getenv("SAVE_ATTN_QUERY_NAME", "").strip()
 
             if (not SAVE_LAYER_ONLY) or (idx == target_layer):
                 unchanged_attn_weights = unchanged_attn_weights + attention_mask
                 unchanged_attn_weights = torch.max(
                     unchanged_attn_weights,
-                    torch.tensor(torch.finfo(unchanged_attn_weights.dtype).min, device=unchanged_attn_weights.device)
+                    torch.tensor(
+                        torch.finfo(unchanged_attn_weights.dtype).min,
+                        device=unchanged_attn_weights.device
+                    )
                 )
 
                 unchanged_attn_weights = nn.functional.softmax(
-                    unchanged_attn_weights, dim=-1, dtype=torch.float32
+                    unchanged_attn_weights,
+                    dim=-1,
+                    dtype=torch.float32
                 ).to(query_states.dtype)
 
-        # 最后一个 query token，对应 image token 区间
                 if start_idx >= 0 and end_idx >= start_idx:
-                    ori = unchanged_attn_weights[:, :, -1, start_idx:end_idx + 1]   # [bsz, heads, image_tokens]
-                    ori = ori.mean(dim=1).squeeze(0)  # [image_tokens]
-                    np.save(f"{save_path}attn_map_layer{idx}.npy", ori.cpu().detach().numpy())
+                    # ===== 保存时也保持 q0_attn 旧路径，只换 query rows =====
+                    if query_pos_str:
+                        query_rows = [int(x) for x in query_pos_str.split(",") if x.strip()]
+                    else:
+                        if caption_length:
+                            query_rows = list(range(q_len - len(caption_length[0]), q_len))
+                        else:
+                            query_rows = [q_len - 1]
+
+                    query_rows = [q for q in query_rows if 0 <= q < q_len]
+                    if len(query_rows) == 0:
+                        if caption_length:
+                            query_rows = list(range(q_len - len(caption_length[0]), q_len))
+                        else:
+                            query_rows = [q_len - 1]
+
+                    # [bsz, heads, selected_queries, image_tokens]
+                    ori = unchanged_attn_weights[:, :, query_rows, start_idx:end_idx + 1]
+
+                    # 与旧 q0_attn 一致：最终仍保存成 [image_tokens] 一维图
+                    ori = ori.mean(dim=2).mean(dim=1).squeeze(0)
+
+                    if query_name:
+                        np.save(
+                            f"{save_path}attn_map_layer{idx}_{query_name}.npy",
+                            ori.cpu().detach().numpy()
+                        )
+                    else:
+                        # 完全保留旧文件名，保证原 q0_attn 不受影响
+                        np.save(
+                            f"{save_path}attn_map_layer{idx}.npy",
+                            ori.cpu().detach().numpy()
+                        )
         
         
         attn_weights = self.att_out(attn_weights)       
