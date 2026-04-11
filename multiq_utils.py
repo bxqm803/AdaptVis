@@ -78,11 +78,35 @@ def parse_wh_question(prompt: str):
     obj2 = m.group(3).strip()
     return be_verb, obj1, obj2
 
-def normalize_rel(answer: str):
-    rel = answer.strip().lower()
-    if rel not in RELS:
-        raise ValueError(f"Unexpected relation: {answer}")
-    return rel
+def normalize_rel(answer):
+    if isinstance(answer, (list, tuple)):
+        if len(answer) == 0:
+            raise ValueError("Empty answer list.")
+        answer = answer[0]
+
+    if answer is None:
+        raise ValueError("Answer is None.")
+
+    rel = str(answer).strip().lower()
+
+    mapping = {
+        "left": "left",
+        "right": "right",
+        "on": "on",
+        "under": "under",
+        "below": "under",
+        "beneath": "under",
+        "top": "on",
+        "above": "on",
+        "to the left of": "left",
+        "to the right of": "right",
+        "on top of": "on",
+    }
+
+    if rel not in mapping:
+        raise ValueError(f"Unsupported relation answer: {answer}")
+
+    return mapping[rel]
 
 def build_object_pool(prompt_records):
     pool = set()
