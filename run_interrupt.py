@@ -2,9 +2,8 @@ import os
 import csv
 import json
 import math
-import inspect
 import argparse
-from typing import Dict, List, Optional, Set
+from typing import List, Optional, Set
 
 import torch
 from tqdm import tqdm
@@ -15,7 +14,8 @@ from dataset_zoo import get_dataset
 from multiq_utils import build_object_pool, build_questions, parse_prediction
 
 
-VALID_PERTURB_MODES = {"uniform", "random", "reverse"}
+VALID_PERTURB_MODES = {"none", "uniform", "random", "reverse"}
+STRUCTURED_PERTURB_MODES = {"uniform", "random", "reverse"}
 
 
 def parse_args():
@@ -28,15 +28,31 @@ def parse_args():
     p.add_argument("--seed", default=1, type=int)
     p.add_argument("--sample-index", default=0, type=int)
     p.add_argument("--limit", default=-1, type=int)
-    p.add_argument("--method", default="scaling_vis", type=str,
-                   choices=["scaling_vis"],
-                   help="Use the Scal LLaVA path so custom kwargs reach decoder attention.")
-    p.add_argument("--weight", default=1.0, type=float,
-                   help="Keep at 1.0 for structure-only perturbation experiments.")
-    p.add_argument("--perturb-modes", default="uniform,random,reverse", type=str,
-                   help="Comma-separated list from {uniform,random,reverse}.")
-    p.add_argument("--target-layers", default="all", type=str,
-                   help='"all" or comma-separated decoder layer indices, e.g. "16" or "8,16,24".')
+    p.add_argument(
+        "--method",
+        default="scaling_vis",
+        type=str,
+        choices=["scaling_vis"],
+        help="Use the Scal LLaVA path so custom kwargs reach decoder attention.",
+    )
+    p.add_argument(
+        "--weight",
+        default=1.0,
+        type=float,
+        help="Kept for compatibility. Structure perturbation itself preserves image-block mass.",
+    )
+    p.add_argument(
+        "--perturb-modes",
+        default="none,uniform,random,reverse",
+        type=str,
+        help="Comma-separated list from {none,uniform,random,reverse}.",
+    )
+    p.add_argument(
+        "--target-layers",
+        default="all",
+        type=str,
+        help='"all" or comma-separated decoder layer indices, e.g. "16" or "8,16,24".',
+    )
     p.add_argument("--max-new-tokens", default=20, type=int)
     p.add_argument("--trace-topk", default=10, type=int)
     p.add_argument("--out-dir", default="./output_multiq_perturb", type=str)
@@ -86,12 +102,16 @@ def install_attention_perturbation(target_layers: Optional[Set[int]]) -> None:
     torch_mod = mla.torch
     math_mod = mla.math
 
-    def _apply_image_block_perturbation(attn_probs: torch.Tensor, keys: Optional[torch.Tensor], mode: Optional[str]):
-        if mode not in VALID_PERTURB_MODES or keys is None:
+    def _apply_image_block_perturbation(
+        attn_probs: torch.Tensor,
+        keys: Optional[torch.Tensor],
+        mode: Optional[str],
+    ) -> torch.Tensor:
+        if mode not in STRUCTURED_PERTURB_MODES or keys is None:
             return attn_probs
 
+        # Only perturb prefill step where q_len == kv_len and the image block is explicit.
         if attn_probs.size(-2) != attn_probs.size(-1):
-            # keep behavior simple and stable: perturb only prefill step where merged image block is explicit
             return attn_probs
 
         true_idx = torch_mod.where(keys)[1] if keys.ndim == 2 else torch_mod.where(keys)[0]
@@ -100,6 +120,7 @@ def install_attention_perturbation(target_layers: Optional[Set[int]]) -> None:
 
         start_idx = int(true_idx[0].item())
         end_idx = int(true_idx[-1].item())
+
         img = attn_probs[..., start_idx:end_idx + 1]
         if img.numel() == 0:
             return attn_probs
@@ -151,9 +172,15 @@ def install_attention_perturbation(target_layers: Optional[Set[int]]) -> None:
     ):
         bsz, q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        query_states = self.q_proj(hidden_states).view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
         offset = 0
@@ -162,7 +189,9 @@ def install_attention_perturbation(target_layers: Optional[Set[int]]) -> None:
             kv_seq_len += offset
 
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, offset=offset)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, offset=offset
+        )
 
         if past_key_value is not None:
             key_states = torch_mod.cat([past_key_value[0], key_states], dim=2)
@@ -170,32 +199,46 @@ def install_attention_perturbation(target_layers: Optional[Set[int]]) -> None:
 
         past_key_value = (key_states, value_states)
 
-        attn_weights = torch_mod.matmul(query_states, key_states.transpose(2, 3)) / math_mod.sqrt(self.head_dim)
+        attn_weights = torch_mod.matmul(
+            query_states, key_states.transpose(2, 3)
+        ) / math_mod.sqrt(self.head_dim)
+
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is {attn_weights.size()}"
+                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, "
+                f"but is {attn_weights.size()}"
             )
 
         if attention_mask is not None:
             if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
                 raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, "
+                    f"but is {attention_mask.size()}"
                 )
             attn_weights = attn_weights + attention_mask
             attn_weights = torch_mod.max(
                 attn_weights,
-                torch_mod.tensor(torch_mod.finfo(attn_weights.dtype).min, device=attn_weights.device),
+                torch_mod.tensor(
+                    torch_mod.finfo(attn_weights.dtype).min,
+                    device=attn_weights.device,
+                ),
             )
 
-        attn_probs = nn.functional.softmax(attn_weights, dim=-1, dtype=torch_mod.float32).to(query_states.dtype)
+        attn_probs = nn.functional.softmax(
+            attn_weights, dim=-1, dtype=torch_mod.float32
+        ).to(query_states.dtype)
 
         should_perturb = (
-            adjust_method in VALID_PERTURB_MODES
+            adjust_method in STRUCTURED_PERTURB_MODES
             and idx is not None
             and (_PerturbConfig.target_layers is None or idx in _PerturbConfig.target_layers)
         )
         if should_perturb:
-            attn_probs = _apply_image_block_perturbation(attn_probs, keys=keys, mode=adjust_method)
+            attn_probs = _apply_image_block_perturbation(
+                attn_probs,
+                keys=keys,
+                mode=adjust_method,
+            )
 
         attn_probs = self.att_out(attn_probs)
         value_states = self.value_out(value_states)
@@ -203,7 +246,8 @@ def install_attention_perturbation(target_layers: Optional[Set[int]]) -> None:
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is {attn_output.size()}"
+                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, "
+                f"but is {attn_output.size()}"
             )
 
         attn_output = attn_output.transpose(1, 2)
@@ -239,43 +283,64 @@ def build_generation_trace(processor, generation_output, prompt_len: int, topk: 
     trace = []
     for step_idx, token_id in enumerate(gen_ids.tolist()):
         step_score = step_scores[step_idx][0].detach().float().cpu()
-        step_prob = torch.softmax(step_score, dim=-1)
-        raw_logit = None
+
+        # Force raw_logit to never be null:
+        # prefer true returned logits; if backend still doesn't expose them, fall back to step_score.
         if step_logits is not None:
-            raw_logit = step_logits[step_idx][0].detach().float().cpu()
+            step_raw = step_logits[step_idx][0].detach().float().cpu()
+        else:
+            step_raw = step_score
+
+        step_prob = torch.softmax(step_score, dim=-1)
 
         chosen = {
             "step": step_idx,
             "token_id": int(token_id),
-            "token_text": tokenizer.decode([token_id], skip_special_tokens=False, clean_up_tokenization_spaces=False),
+            "token_text": tokenizer.decode(
+                [token_id],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            ),
             "score": float(step_score[token_id].item()),
             "probability": float(step_prob[token_id].item()),
-            "raw_logit": float(raw_logit[token_id].item()) if raw_logit is not None else None,
+            "raw_logit": float(step_raw[token_id].item()),
             "top10": [],
         }
 
         k = min(topk, step_prob.numel())
         topk_prob, topk_ids = torch.topk(step_prob, k=k)
         topk_score = step_score[topk_ids]
-        topk_raw = raw_logit[topk_ids] if raw_logit is not None else None
+        topk_raw = step_raw[topk_ids]
 
         for rank in range(k):
             cand_id = int(topk_ids[rank].item())
             chosen["top10"].append({
                 "rank": rank + 1,
                 "token_id": cand_id,
-                "token_text": tokenizer.decode([cand_id], skip_special_tokens=False, clean_up_tokenization_spaces=False),
+                "token_text": tokenizer.decode(
+                    [cand_id],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                ),
                 "score": float(topk_score[rank].item()),
                 "probability": float(topk_prob[rank].item()),
-                "raw_logit": float(topk_raw[rank].item()) if topk_raw is not None else None,
+                "raw_logit": float(topk_raw[rank].item()),
             })
 
         trace.append(chosen)
+
     return trace
 
 
 @torch.no_grad()
-def run_one_generation(wrapper, model_name: str, image, prompt: str, perturb_mode: str, max_new_tokens: int):
+def run_one_generation(
+    wrapper,
+    model_name: str,
+    image,
+    prompt: str,
+    perturb_mode: str,
+    max_new_tokens: int,
+):
     processor = wrapper.processor
     model = wrapper.model
 
@@ -298,6 +363,7 @@ def run_one_generation(wrapper, model_name: str, image, prompt: str, perturb_mod
         attention_mask=single_input.get("attention_mask", None),
         max_new_tokens=max_new_tokens,
         output_scores=True,
+        output_logits=True,          # force on
         return_dict_in_generate=True,
         use_cache=True,
         output_attentions=False,
@@ -305,8 +371,6 @@ def run_one_generation(wrapper, model_name: str, image, prompt: str, perturb_mod
         weight=1.0,
         adjust_method=perturb_mode,
     )
-    if "output_logits" in inspect.signature(model.generate).parameters:
-        gen_kwargs["output_logits"] = True
 
     output = model.generate(**gen_kwargs)
     gen_ids = output.sequences[0][prompt_len:]
@@ -315,6 +379,7 @@ def run_one_generation(wrapper, model_name: str, image, prompt: str, perturb_mod
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     ).strip()
+
     return output, gen_text, prompt_len
 
 
@@ -388,12 +453,21 @@ def main():
                     max_new_tokens=args.max_new_tokens,
                 )
 
-                trace = build_generation_trace(wrapper.processor, output, prompt_len, topk=args.trace_topk)
+                trace = build_generation_trace(
+                    wrapper.processor,
+                    output,
+                    prompt_len,
+                    topk=args.trace_topk,
+                )
                 pred = parse_prediction(gen_text, q["mode"])
                 correct = (pred == q["gold"])
 
-                trace_rel_path = os.path.join(image_stem, f"{q['qid']}_{perturb_mode}_trace.json")
+                trace_rel_path = os.path.join(
+                    image_stem,
+                    f"{q['qid']}_{perturb_mode}_trace.json",
+                )
                 trace_path = os.path.join(base_dir, trace_rel_path)
+
                 write_json(trace_path, {
                     "image_name": image_name,
                     "image_path": image_path,
@@ -412,6 +486,7 @@ def main():
 
                 first = trace[0] if trace else {}
                 last = trace[-1] if trace else {}
+
                 summary_rows.append({
                     "image_name": image_name,
                     "image_path": image_path,
@@ -436,18 +511,35 @@ def main():
                     "trace_json": trace_rel_path,
                 })
 
-        with open(summary_csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=[
-                    "image_name", "image_path", "local_index", "qid", "question_mode", "gold", "pred", "correct",
-                    "perturb_mode", "target_layers", "generated_text", "num_generated_tokens",
-                    "first_token", "first_raw_logit", "first_score", "first_probability",
-                    "final_token", "final_raw_logit", "final_score", "final_probability", "trace_json",
-                ],
-            )
-            writer.writeheader()
-            writer.writerows(summary_rows)
+    with open(summary_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "image_name",
+                "image_path",
+                "local_index",
+                "qid",
+                "question_mode",
+                "gold",
+                "pred",
+                "correct",
+                "perturb_mode",
+                "target_layers",
+                "generated_text",
+                "num_generated_tokens",
+                "first_token",
+                "first_raw_logit",
+                "first_score",
+                "first_probability",
+                "final_token",
+                "final_raw_logit",
+                "final_score",
+                "final_probability",
+                "trace_json",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(summary_rows)
 
     print(f"Saved summary to: {summary_csv}")
 
