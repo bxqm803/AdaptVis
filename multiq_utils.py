@@ -162,20 +162,20 @@ def build_questions(base_prompt, base_answer, sample_idx, object_pool):
         ),
         (
             "q2",
-            f"Is the {obj2} {inv_phrase} the {obj1}? Answer with True or False only.",
+            f"Is the {obj2} {inv_phrase} the {obj1}?.",
             "True",
             {"obj1": obj2, "obj2": obj1, "rel": inv_phrase},
         ),
         (
             "q3",
-            f"Is the {obj1} not {gold_phrase} the {obj2}? Answer with True or False only.",
+            f"Is the {obj1} not {gold_phrase} the {obj2}? .",
             "False",
             {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
         ),
         (
             "q4",
             f"Given the {obj1} and the {obj2} in the image, is the {obj1} {gold_phrase} the {obj2}? "
-            f"Answer with True or False only.",
+            f"",
             "True",
             {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
         ),
