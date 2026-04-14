@@ -162,33 +162,33 @@ def build_questions(base_prompt, base_answer, sample_idx, object_pool):
         ),
         (
             "q2",
-            f"Is the {obj2} {inv_phrase} the {obj1}?.",
+            f"Is the {obj2} {inv_phrase} the {obj1}? Answer with True or False only.",
             "True",
             {"obj1": obj2, "obj2": obj1, "rel": inv_phrase},
         ),
         (
             "q3",
-            f"Is the {obj1} not {gold_phrase} the {obj2}? .",
+            f"Is the {obj1} not {gold_phrase} the {obj2}? Answer with True or False only .",
             "False",
             {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
         ),
         (
             "q4",
             f"Given the {obj1} and the {obj2} in the image, is the {obj1} {gold_phrase} the {obj2}? "
-            f"",
+            f"Answer with True or False only",
             "True",
             {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
         ),
         (
             "q5",
             f"Given the {obj3} and the {obj4} in the image, is the {obj1} {gold_phrase} the {obj2}? "
-            f"Answer with False or True only.",
+            f"Answer with True or False only.",
             "True",
             {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
         ),
         (
             "q6",
-            f"Is the {obj2} {gold_phrase} the {obj1}? Answer with False or True only.",
+            f"Is the {obj2} {gold_phrase} the {obj1}? Answer with True or False only.",
             "False",
             {"obj1": obj2, "obj2": obj1, "rel": gold_phrase},
         ),
@@ -201,14 +201,14 @@ def build_questions(base_prompt, base_answer, sample_idx, object_pool):
         (
             "q8",
             f"In the image, is it true that the {obj1} is {gold_phrase} the {obj2}? "
-            f"Answer with False or True only.",
+            f"Answer with True or False only.",
             "True",
             {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
         ),
         (
             "q9",
             f"Would it be correct to say that the {obj1} is {gold_phrase} the {obj2}? "
-            f"Answer with False or True only.",
+            f"Answer with True or False only.",
             "True",
             {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
         ),
