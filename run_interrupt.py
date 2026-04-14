@@ -5,6 +5,9 @@ import math
 import argparse
 from typing import List, Optional, Set
 
+import numpy as np
+from PIL import Image
+
 import torch
 from tqdm import tqdm
 
@@ -16,6 +19,7 @@ from multiq_utils import build_object_pool, build_questions, parse_prediction
 
 VALID_PERTURB_MODES = {"none", "uniform", "random", "reverse"}
 STRUCTURED_PERTURB_MODES = {"uniform", "random", "reverse"}
+VALID_IMAGE_MODES = {"original", "black"}
 
 
 def parse_args():
@@ -53,6 +57,13 @@ def parse_args():
         type=str,
         help='"all" or comma-separated decoder layer indices, e.g. "16" or "8,16,24".',
     )
+    p.add_argument(
+        "--image-mode",
+        default="original",
+        type=str,
+        choices=["original", "black"],
+        help='Input image mode: "original" or "black".',
+    )
     p.add_argument("--max-new-tokens", default=20, type=int)
     p.add_argument("--trace-topk", default=10, type=int)
     p.add_argument("--out-dir", default="./output_multiq_perturb", type=str)
@@ -81,6 +92,39 @@ def parse_target_layers(text: str) -> Optional[Set[int]]:
     if not layers:
         raise ValueError("target-layers must be 'all' or a non-empty comma-separated list of ints.")
     return layers
+
+
+def make_black_image_like(image):
+    """
+    Return a pure black RGB image with the same spatial size as the input image.
+    Works for PIL.Image, numpy arrays, and torch tensors.
+    """
+    if isinstance(image, Image.Image):
+        w, h = image.size
+        return Image.new("RGB", (w, h), color=(0, 0, 0))
+
+    if isinstance(image, torch.Tensor):
+        arr = image.detach().cpu().numpy()
+    else:
+        arr = np.array(image)
+
+    if arr.ndim == 2:
+        h, w = arr.shape
+        black = np.zeros((h, w, 3), dtype=np.uint8)
+        return Image.fromarray(black)
+
+    if arr.ndim == 3:
+        # Handle CHW or HWC
+        if arr.shape[0] in (1, 3) and arr.shape[1] > 4 and arr.shape[2] > 4:
+            # CHW -> HWC
+            _, h, w = arr.shape
+        else:
+            # HWC
+            h, w = arr.shape[:2]
+        black = np.zeros((h, w, 3), dtype=np.uint8)
+        return Image.fromarray(black)
+
+    raise ValueError(f"Unsupported image type/shape for black-image conversion: {type(image)}")
 
 
 class _PerturbConfig:
@@ -284,8 +328,6 @@ def build_generation_trace(processor, generation_output, prompt_len: int, topk: 
     for step_idx, token_id in enumerate(gen_ids.tolist()):
         step_score = step_scores[step_idx][0].detach().float().cpu()
 
-        # Force raw_logit to never be null:
-        # prefer true returned logits; if backend still doesn't expose them, fall back to step_score.
         if step_logits is not None:
             step_raw = step_logits[step_idx][0].detach().float().cpu()
         else:
@@ -363,7 +405,7 @@ def run_one_generation(
         attention_mask=single_input.get("attention_mask", None),
         max_new_tokens=max_new_tokens,
         output_scores=True,
-        output_logits=True,          # force on
+        output_logits=True,
         return_dict_in_generate=True,
         use_cache=True,
         output_attentions=False,
@@ -410,15 +452,19 @@ def main():
     start = args.sample_index
     end = len(prompt_records) if args.limit < 0 else min(len(prompt_records), start + args.limit)
 
-    base_dir = os.path.join(args.out_dir, args.dataset)
+    # 按 image_mode 分目录，避免 original / black 覆盖
+    base_dir = os.path.join(args.out_dir, args.dataset, args.image_mode)
     os.makedirs(base_dir, exist_ok=True)
-    summary_csv = os.path.join(base_dir, "summary.csv")
+    summary_csv = os.path.join(base_dir, f"summary_{args.image_mode}.csv")
     summary_rows = []
 
     for local_idx in tqdm(range(start, end), desc="Samples"):
         rec = prompt_records[local_idx]
         item = sub_dataset[local_idx]
+
         image = item["image_options"][0]
+        if args.image_mode == "black":
+            image = make_black_image_like(image)
 
         questions, meta = build_questions(
             base_prompt=rec["question"],
@@ -439,6 +485,7 @@ def main():
                 "local_index": local_idx,
                 "image_name": image_name,
                 "image_path": image_path,
+                "image_mode": args.image_mode,
                 **meta,
             })
 
@@ -464,7 +511,7 @@ def main():
 
                 trace_rel_path = os.path.join(
                     image_stem,
-                    f"{q['qid']}_{perturb_mode}_trace.json",
+                    f"{q['qid']}_{args.image_mode}_{perturb_mode}_trace.json",
                 )
                 trace_path = os.path.join(base_dir, trace_rel_path)
 
@@ -476,6 +523,7 @@ def main():
                     "mode": q["mode"],
                     "gold": q["gold"],
                     "prompt": q["prompt"],
+                    "image_mode": args.image_mode,
                     "perturb_mode": perturb_mode,
                     "target_layers": "all" if target_layers is None else sorted(target_layers),
                     "generated_text": gen_text,
@@ -496,6 +544,7 @@ def main():
                     "gold": q["gold"],
                     "pred": pred,
                     "correct": correct,
+                    "image_mode": args.image_mode,
                     "perturb_mode": perturb_mode,
                     "target_layers": "all" if target_layers is None else ",".join(str(x) for x in sorted(target_layers)),
                     "generated_text": gen_text,
@@ -523,6 +572,7 @@ def main():
                 "gold",
                 "pred",
                 "correct",
+                "image_mode",
                 "perturb_mode",
                 "target_layers",
                 "generated_text",
