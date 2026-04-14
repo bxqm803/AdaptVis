@@ -14,7 +14,13 @@ from tqdm import tqdm
 from misc import seed_all
 from model_zoo import get_model
 from dataset_zoo import get_dataset
-from multiq_utils import build_object_pool, build_questions, parse_prediction
+#from multiq_utils import build_object_pool, build_questions, parse_prediction
+from multiq_utils_order import (
+    build_object_pool,
+    build_questions,
+    parse_prediction,
+    clean_question_text,
+)
 
 
 VALID_PERTURB_MODES = {"none", "uniform", "random", "reverse"}
