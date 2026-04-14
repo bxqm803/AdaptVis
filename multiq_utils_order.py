@@ -1,5 +1,6 @@
 import re
 import random
+from itertools import permutations
 
 WH_RE = re.compile(
     r"Where (is|are) the (.+?) in relation to the (.+?)\?",
@@ -8,9 +9,6 @@ WH_RE = re.compile(
 
 # Match any answer-order permutation like:
 # "Answer with left, right, on or under."
-# "Answer with right, on, under or left."
-# "Answer with on, under, left or right."
-# "Answer with under, left, right or on."
 ANSWER_ORDER_RE = re.compile(
     r"Answer with\s+"
     r"(?:left|right|on|under)\s*,\s*"
@@ -19,20 +17,6 @@ ANSWER_ORDER_RE = re.compile(
     r"(?:left|right|on|under)\.\s*$",
     flags=re.IGNORECASE,
 )
-
-
-def clean_prompt_to_wh_question(prompt: str):
-    s = prompt.strip()
-    s = s.replace("\n", " ")
-    if "USER:" in s:
-        s = s.split("USER:", 1)[1].strip()
-    if "ASSISTANT:" in s:
-        s = s.split("ASSISTANT:", 1)[0].strip()
-
-    s = re.sub(ANSWER_ORDER_RE, "", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
 
 # canonical labels used internally
 RELS = ["left", "right", "on", "under"]
@@ -59,6 +43,19 @@ SYN_REL = {
     "on": "on top of",
     "under": "beneath",
 }
+
+
+def clean_prompt_to_wh_question(prompt: str):
+    s = prompt.strip()
+    s = s.replace("\n", " ")
+    if "USER:" in s:
+        s = s.split("USER:", 1)[1].strip()
+    if "ASSISTANT:" in s:
+        s = s.split("ASSISTANT:", 1)[0].strip()
+
+    s = re.sub(ANSWER_ORDER_RE, "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 def wrap_prompt_user(question_text: str):
@@ -138,6 +135,11 @@ def pick_obj3_obj4(object_pool, obj1, obj2, sample_idx):
     return obj3, obj4
 
 
+def format_answer_order_text(order):
+    # order is a tuple/list like ("left", "right", "on", "under")
+    return f"Answer with {order[0]}, {order[1]}, {order[2]} or {order[3]}."
+
+
 def build_questions(base_prompt, base_answer, sample_idx, object_pool):
     _, obj1, obj2 = parse_wh_question(base_prompt)
     gold_rel = normalize_rel(base_answer)
@@ -153,15 +155,13 @@ def build_questions(base_prompt, base_answer, sample_idx, object_pool):
 
     items = []
 
-    # q0 + three answer-order variants
-    answer_order_variants = [
-        ("q0", "Answer with left, right, on or under."),
-        ("q1", "Answer with right, on, under or left."),
-        ("q2", "Answer with on, under, left or right."),
-        ("q3", "Answer with under, left, right or on."),
-    ]
+    # 24 answer-order permutations
+    all_orders = list(permutations(RELS))  # deterministic order
 
-    for qid, answer_order_text in answer_order_variants:
+    for idx, order in enumerate(all_orders):
+        qid = f"q{idx:02d}"   # q00 ... q23
+        answer_order_text = format_answer_order_text(order)
+
         items.append({
             "qid": qid,
             "mode": "orig",
@@ -175,78 +175,8 @@ def build_questions(base_prompt, base_answer, sample_idx, object_pool):
                 "obj2": obj2,
                 "rel": None,
             },
+            "answer_order": list(order),   # optional, useful for later analysis
         })
-
-    # Legacy TF questions are intentionally disabled for this experiment.
-    # question_specs = [
-    #     (
-    #         "q1",
-    #         f"Is the {obj1} {gold_phrase} the {obj2}? Answer with False or True only.",
-    #         "True",
-    #         {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
-    #     ),
-    #     (
-    #         "q2",
-    #         f"Is the {obj2} {inv_phrase} the {obj1}? Answer with False or True only.",
-    #         "True",
-    #         {"obj1": obj2, "obj2": obj1, "rel": inv_phrase},
-    #     ),
-    #     (
-    #         "q3",
-    #         f"Is the {obj1} not {gold_phrase} the {obj2}? Answer with False or True only .",
-    #         "False",
-    #         {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
-    #     ),
-    #     (
-    #         "q4",
-    #         f"Given the {obj1} and the {obj2} in the image, is the {obj1} {gold_phrase} the {obj2}? "
-    #         f"Answer with False or True only",
-    #         "True",
-    #         {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
-    #     ),
-    #     (
-    #         "q5",
-    #         f"Given the {obj3} and the {obj4} in the image, is the {obj1} {gold_phrase} the {obj2}? "
-    #         f"Answer with False or True only.",
-    #         "True",
-    #         {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
-    #     ),
-    #     (
-    #         "q6",
-    #         f"Is the {obj2} {gold_phrase} the {obj1}? Answer with False or True only.",
-    #         "False",
-    #         {"obj1": obj2, "obj2": obj1, "rel": gold_phrase},
-    #     ),
-    #     (
-    #         "q7",
-    #         f"Is the {obj1} {syn_phrase} the {obj2}? Answer with False or True only.",
-    #         "True",
-    #         {"obj1": obj1, "obj2": obj2, "rel": syn_phrase},
-    #     ),
-    #     (
-    #         "q8",
-    #         f"In the image, is it true that the {obj1} is {gold_phrase} the {obj2}? "
-    #         f"Answer with False or True only.",
-    #         "True",
-    #         {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
-    #     ),
-    #     (
-    #         "q9",
-    #         f"Would it be correct to say that the {obj1} is {gold_phrase} the {obj2}? "
-    #         f"Answer with False or True only.",
-    #         "True",
-    #         {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
-    #     ),
-    # ]
-    #
-    # for qid, qtext, gold, target_texts in question_specs:
-    #     items.append({
-    #         "qid": qid,
-    #         "mode": "tf",
-    #         "prompt": wrap_prompt_user(qtext),
-    #         "gold": gold,
-    #         "target_texts": target_texts,
-    #     })
 
     meta = {
         "obj1": obj1,
@@ -262,6 +192,7 @@ def build_questions(base_prompt, base_answer, sample_idx, object_pool):
         "base_question_clean": clean_prompt_to_wh_question(base_prompt),
         "base_answer": gold_rel,
         "active_qids": [x["qid"] for x in items],
+        "num_question_variants": len(items),
     }
 
     return items, meta
