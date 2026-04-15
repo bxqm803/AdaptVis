@@ -1,4 +1,3 @@
-# run_qwen_baseline.py
 import os
 import re
 import csv
@@ -28,6 +27,7 @@ def parse_args():
     parser.add_argument("--temperature", default=0.0, type=float)
     parser.add_argument("--cache-dir", default=None, type=str)
     parser.add_argument("--out-dir", default="output_qwen_baseline", type=str)
+    parser.add_argument("--outfile", default=None, type=str)
     return parser.parse_args()
 
 
@@ -114,7 +114,7 @@ def build_inputs(processor, image, question_text):
 def generate_one(model, processor, image, question_text, max_new_tokens=20, temperature=0.0):
     inputs = build_inputs(processor, image, question_text)
 
-    model_device = model.device if hasattr(model, "device") else next(model.parameters()).device
+    model_device = next(model.parameters()).device
     inputs = {
         k: (v.to(model_device) if torch.is_tensor(v) else v)
         for k, v in inputs.items()
@@ -122,6 +122,8 @@ def generate_one(model, processor, image, question_text, max_new_tokens=20, temp
 
     gen_kwargs = {
         "max_new_tokens": max_new_tokens,
+        "return_dict_in_generate": True,
+        "output_scores": True,
     }
 
     if temperature and temperature > 0:
@@ -130,10 +132,10 @@ def generate_one(model, processor, image, question_text, max_new_tokens=20, temp
     else:
         gen_kwargs["do_sample"] = False
 
-    generated_ids = model.generate(**inputs, **gen_kwargs)
+    outputs = model.generate(**inputs, **gen_kwargs)
 
     prompt_len = inputs["input_ids"].shape[1]
-    generated_ids = generated_ids[:, prompt_len:]
+    generated_ids = outputs.sequences[:, prompt_len:]  # [1, gen_len]
 
     output_text = processor.batch_decode(
         generated_ids,
@@ -141,7 +143,87 @@ def generate_one(model, processor, image, question_text, max_new_tokens=20, temp
         clean_up_tokenization_spaces=False,
     )[0].strip()
 
-    return output_text
+    pred_token_ids = generated_ids[0].tolist()
+    pred_tokens = processor.tokenizer.convert_ids_to_tokens(pred_token_ids)
+
+    pred_token_probs = []
+    pred_token_logits = []
+
+    for step, token_id in enumerate(pred_token_ids):
+        step_logits = outputs.scores[step][0]   # [vocab]
+        step_probs = torch.softmax(step_logits, dim=-1)
+
+        pred_token_probs.append(float(step_probs[token_id].item()))
+        pred_token_logits.append(float(step_logits[token_id].item()))
+
+    return {
+        "pred_text": output_text,
+        "pred_token_ids": pred_token_ids,
+        "pred_tokens": pred_tokens,
+        "pred_token_probs": pred_token_probs,
+        "pred_token_logits": pred_token_logits,
+    }
+
+
+@torch.no_grad()
+def score_answer_tokens(model, processor, image, question_text, answer_text):
+    if answer_text is None or len(str(answer_text).strip()) == 0:
+        return {
+            "gold_token_ids": [],
+            "gold_tokens": [],
+            "gold_token_probs": [],
+            "gold_token_logits": [],
+        }
+
+    base_inputs = build_inputs(processor, image, question_text)
+
+    model_device = next(model.parameters()).device
+    base_inputs = {
+        k: (v.to(model_device) if torch.is_tensor(v) else v)
+        for k, v in base_inputs.items()
+    }
+
+    answer_enc = processor.tokenizer(
+        str(answer_text),
+        add_special_tokens=False,
+        return_tensors="pt",
+    )
+    answer_ids = answer_enc["input_ids"].to(model_device)
+    answer_attn = answer_enc["attention_mask"].to(model_device)
+
+    full_input_ids = torch.cat([base_inputs["input_ids"], answer_ids], dim=1)
+    full_attention_mask = torch.cat([base_inputs["attention_mask"], answer_attn], dim=1)
+
+    model_inputs = dict(base_inputs)
+    model_inputs["input_ids"] = full_input_ids
+    model_inputs["attention_mask"] = full_attention_mask
+
+    outputs = model(**model_inputs)
+    logits = outputs.logits  # [1, total_len, vocab]
+
+    base_len = base_inputs["input_ids"].shape[1]
+    gold_len = answer_ids.shape[1]
+
+    gold_token_ids = answer_ids[0].tolist()
+    gold_tokens = processor.tokenizer.convert_ids_to_tokens(gold_token_ids)
+    gold_token_probs = []
+    gold_token_logits = []
+
+    for i, token_id in enumerate(gold_token_ids):
+        # 预测第 i 个 gold token 的位置
+        pos = base_len - 1 + i
+        step_logits = logits[0, pos, :]
+        step_probs = torch.softmax(step_logits, dim=-1)
+
+        gold_token_probs.append(float(step_probs[token_id].item()))
+        gold_token_logits.append(float(step_logits[token_id].item()))
+
+    return {
+        "gold_token_ids": gold_token_ids,
+        "gold_tokens": gold_tokens,
+        "gold_token_probs": gold_token_probs,
+        "gold_token_logits": gold_token_logits,
+    }
 
 
 def main():
@@ -190,7 +272,15 @@ def main():
 
     model_name = args.model_id.split("/")[-1]
     result_jsonl = os.path.join(args.out_dir, f"{args.dataset}_{model_name}_results.jsonl")
-    result_csv = os.path.join(args.out_dir, f"{args.dataset}_{model_name}_results.csv")
+
+    if args.outfile is not None:
+        result_csv = args.outfile
+        out_parent = os.path.dirname(os.path.abspath(result_csv))
+        if out_parent:
+            os.makedirs(out_parent, exist_ok=True)
+    else:
+        result_csv = os.path.join(args.out_dir, f"{args.dataset}_{model_name}_results.csv")
+
     summary_json = os.path.join(args.out_dir, f"{args.dataset}_{model_name}_summary.json")
     summary_csv = os.path.join(args.out_dir, f"{args.dataset}_{model_name}_summary.csv")
 
@@ -211,7 +301,8 @@ def main():
             question_text = strip_legacy_prompt(raw_prompt)
 
             gold = get_gold_label(rec["answer"])
-            pred_text = generate_one(
+
+            gen_out = generate_one(
                 model=model,
                 processor=processor,
                 image=image,
@@ -219,7 +310,18 @@ def main():
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
             )
+
+            pred_text = gen_out["pred_text"]
             pred = normalize_label(pred_text)
+
+            gold_out = score_answer_tokens(
+                model=model,
+                processor=processor,
+                image=image,
+                question_text=question_text,
+                answer_text=gold,
+            )
+
             correct = (pred == gold)
 
             num_total += 1
@@ -236,7 +338,18 @@ def main():
                 "pred_text": pred_text,
                 "pred": pred,
                 "correct": correct,
+
+                "pred_token_ids": json.dumps(gen_out["pred_token_ids"], ensure_ascii=False),
+                "pred_tokens": json.dumps(gen_out["pred_tokens"], ensure_ascii=False),
+                "pred_token_probs": json.dumps(gen_out["pred_token_probs"], ensure_ascii=False),
+                "pred_token_logits": json.dumps(gen_out["pred_token_logits"], ensure_ascii=False),
+
+                "gold_token_ids": json.dumps(gold_out["gold_token_ids"], ensure_ascii=False),
+                "gold_tokens": json.dumps(gold_out["gold_tokens"], ensure_ascii=False),
+                "gold_token_probs": json.dumps(gold_out["gold_token_probs"], ensure_ascii=False),
+                "gold_token_logits": json.dumps(gold_out["gold_token_logits"], ensure_ascii=False),
             }
+
             all_rows.append(row)
             fout.write(json.dumps(row, ensure_ascii=False) + "\n")
 
