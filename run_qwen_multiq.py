@@ -17,7 +17,6 @@ from multiq_utils import (
     parse_prediction,
 )
 
-
 SUPPORTED_VLM_MODELS = [
     "Qwen/Qwen2.5-VL-7B-Instruct",
     "Qwen/Qwen3-VL-8B-Instruct",
@@ -153,6 +152,8 @@ def generate_free(model, processor, image, question_text, max_new_tokens=256, te
         "tokens": tokens,
         "token_probs": token_probs,
         "token_logits": token_logits,
+        "final_prob": token_probs[-1] if len(token_probs) > 0 else None,
+        "final_logit": token_logits[-1] if len(token_logits) > 0 else None,
     }
 
 
@@ -203,13 +204,14 @@ def main():
     else:
         end_index = min(args.start_index + args.limit, len(prompt_records))
 
-    out_root = os.path.join(args.out_dir, args.dataset)
+    model_name = args.model_id.split("/")[-1]
+    out_root = os.path.join(args.out_dir, args.dataset, model_name)
     os.makedirs(out_root, exist_ok=True)
 
     summary_rows = []
     summary_csv = os.path.join(out_root, "summary.csv")
 
-    for local_idx in tqdm(range(args.start_index, end_index), desc=f"{args.dataset}:{args.model_id}"):
+    for local_idx in tqdm(range(args.start_index, end_index), desc=f"{args.dataset}:{model_name}"):
         rec = prompt_records[local_idx]
         item = dataset[local_idx]
 
@@ -240,6 +242,8 @@ def main():
         q_correct_map = {}
         q_prob_map = {}
         q_json_map = {}
+        q_pred_map = {}
+        q_gold_map = {}
 
         for q in questions:
             qid = q["qid"]
@@ -263,14 +267,15 @@ def main():
                 correct = (pred == q["gold"])
 
             q_correct_map[qid] = correct
-            q_prob_map[qid] = gen_out["token_probs"][-1] if len(gen_out["token_probs"]) > 0 else None
-
-            q_json_name = f"{qid}.json"
-            q_json_path = os.path.join(sample_dir, q_json_name)
-            q_json_map[qid] = q_json_name
+            q_prob_map[qid] = gen_out["final_prob"]
+            q_json_map[qid] = f"{qid}.json"
+            q_pred_map[qid] = pred
+            q_gold_map[qid] = q["gold"]
 
             q_record = {
                 "qid": qid,
+                "base_qid": q.get("base_qid"),
+                "order": q.get("order"),
                 "mode": q["mode"],
                 "prompt_raw": q["prompt"],
                 "question_text": question_text,
@@ -282,10 +287,12 @@ def main():
                 "free_tokens": gen_out["tokens"],
                 "free_token_probs": gen_out["token_probs"],
                 "free_token_logits": gen_out["token_logits"],
-                "final_prob": q_prob_map[qid],
+                "final_prob": gen_out["final_prob"],
+                "final_logit": gen_out["final_logit"],
                 "target_texts": q.get("target_texts", {}),
             }
 
+            q_json_path = os.path.join(sample_dir, f"{qid}.json")
             with open(q_json_path, "w", encoding="utf-8") as f:
                 json.dump(q_record, f, indent=2, ensure_ascii=False)
 
@@ -294,55 +301,63 @@ def main():
         with open(os.path.join(sample_dir, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta_out, f, indent=2, ensure_ascii=False)
 
-        pattern_q1_q9 = "_".join(
-            "C" if q_correct_map.get(f"q{i}", False) else "W"
-            for i in range(1, 10)
-        )
+        tf_qids = [f"q{i}_tf" for i in range(1, 10)]
+        ft_qids = [f"q{i}_ft" for i in range(1, 10)]
+
+        pattern_tf = "_".join("C" if q_correct_map.get(qid, False) else "W" for qid in tf_qids)
+        pattern_ft = "_".join("C" if q_correct_map.get(qid, False) else "W" for qid in ft_qids)
 
         row = {
             "image_name": image_name,
             "image_path": image_path,
             "local_index": local_idx,
-            "q1": "C" if q_correct_map.get("q1", False) else "W",
-            "q2": "C" if q_correct_map.get("q2", False) else "W",
-            "q3": "C" if q_correct_map.get("q3", False) else "W",
-            "q4": "C" if q_correct_map.get("q4", False) else "W",
-            "q5": "C" if q_correct_map.get("q5", False) else "W",
-            "q6": "C" if q_correct_map.get("q6", False) else "W",
-            "q7": "C" if q_correct_map.get("q7", False) else "W",
-            "q8": "C" if q_correct_map.get("q8", False) else "W",
-            "q9": "C" if q_correct_map.get("q9", False) else "W",
-            "pattern_q1_q9": pattern_q1_q9,
-            "num_correct_q1_q9": sum(q_correct_map.get(f"q{i}", False) for i in range(1, 10)),
+            "q0": "C" if q_correct_map.get("q0", False) else "W",
+            "pattern_tf": pattern_tf,
+            "num_correct_tf": sum(q_correct_map.get(qid, False) for qid in tf_qids),
+            "pattern_ft": pattern_ft,
+            "num_correct_ft": sum(q_correct_map.get(qid, False) for qid in ft_qids),
+            "order_diff_count": sum(
+                q_correct_map.get(f"q{i}_tf", False) != q_correct_map.get(f"q{i}_ft", False)
+                for i in range(1, 10)
+            ),
         }
 
-        for i in range(10):
-            qid = f"q{i}"
-            row[f"{qid}_json"] = os.path.join(image_stem, q_json_map.get(qid, ""))
+        for i in range(1, 10):
+            row[f"q{i}_tf"] = "C" if q_correct_map.get(f"q{i}_tf", False) else "W"
+            row[f"q{i}_ft"] = "C" if q_correct_map.get(f"q{i}_ft", False) else "W"
+
+        for qid in sorted(q_json_map.keys()):
+            row[f"{qid}_json"] = os.path.join(image_stem, q_json_map[qid])
+            row[f"{qid}_pred"] = q_pred_map.get(qid, "UNK")
+            row[f"{qid}_gold"] = q_gold_map.get(qid, "")
             row[f"{qid}_final_prob"] = q_prob_map.get(qid, None)
 
         summary_rows.append(row)
 
-        with open(summary_csv, "w", newline="", encoding="utf-8") as f:
-            fieldnames = [
-                "image_name",
-                "image_path",
-                "local_index",
-                "q1",
-                "q2",
-                "q3",
-                "q4",
-                "q5",
-                "q6",
-                "q7",
-                "q8",
-                "q9",
-                "pattern_q1_q9",
-                "num_correct_q1_q9",
-            ]
-            for i in range(10):
-                fieldnames.extend([f"q{i}_json", f"q{i}_final_prob"])
+        fieldnames = [
+            "image_name",
+            "image_path",
+            "local_index",
+            "q0",
+            "pattern_tf",
+            "num_correct_tf",
+            "pattern_ft",
+            "num_correct_ft",
+            "order_diff_count",
+        ]
 
+        for i in range(1, 10):
+            fieldnames.extend([f"q{i}_tf", f"q{i}_ft"])
+
+        for qid in sorted(q_json_map.keys()):
+            fieldnames.extend([
+                f"{qid}_json",
+                f"{qid}_pred",
+                f"{qid}_gold",
+                f"{qid}_final_prob",
+            ])
+
+        with open(summary_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(summary_rows)
