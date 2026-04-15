@@ -2,6 +2,7 @@ import os
 import re
 import csv
 import json
+import math
 import argparse
 from pathlib import Path
 
@@ -89,6 +90,24 @@ def make_user_messages(image, question_text):
     ]
 
 
+def make_scored_messages(image, question_text, answer_text):
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": question_text},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": str(answer_text)},
+            ],
+        },
+    ]
+
+
 def build_inputs(processor, messages, add_generation_prompt=True):
     return processor.apply_chat_template(
         messages,
@@ -154,6 +173,129 @@ def generate_free(model, processor, image, question_text, max_new_tokens=256, te
         "token_logits": token_logits,
         "final_prob": token_probs[-1] if len(token_probs) > 0 else None,
         "final_logit": token_logits[-1] if len(token_logits) > 0 else None,
+    }
+
+
+def get_candidate_choices(mode: str):
+    if mode == "orig":
+        return ["left", "right", "on", "under"]
+    return ["True", "False"]
+
+
+def longest_common_prefix_len_list(a, b):
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and int(a[i]) == int(b[i]):
+        i += 1
+    return i
+
+
+def find_subsequence(seq, pattern, start=0):
+    if len(pattern) == 0:
+        return None
+    for i in range(start, len(seq) - len(pattern) + 1):
+        if seq[i:i + len(pattern)] == pattern:
+            return i
+    return None
+
+
+def get_answer_id_variants(tokenizer, answer_text):
+    raw = str(answer_text)
+    candidates = [raw, " " + raw, "\n" + raw]
+    seen = set()
+    variants = []
+    for cand in candidates:
+        ids = tokenizer(cand, add_special_tokens=False)["input_ids"]
+        key = tuple(ids)
+        if len(ids) > 0 and key not in seen:
+            seen.add(key)
+            variants.append(ids)
+    return variants
+
+
+def make_empty_score(answer_text=None):
+    return {
+        "answer": answer_text,
+        "token_ids": [],
+        "tokens": [],
+        "token_probs": [],
+        "token_logits": [],
+        "seq_logprob": float("-inf"),
+    }
+
+
+@torch.no_grad()
+def score_candidate_answer(model, processor, image, question_text, answer_text):
+    if answer_text is None or len(str(answer_text).strip()) == 0:
+        return make_empty_score(answer_text)
+
+    model_device = next(model.parameters()).device
+
+    prefix_messages = make_user_messages(image, question_text)
+    prefix_inputs = build_inputs(processor, prefix_messages, add_generation_prompt=True)
+    prefix_inputs = {
+        k: (v.to(model_device) if torch.is_tensor(v) else v)
+        for k, v in prefix_inputs.items()
+    }
+
+    full_messages = make_scored_messages(image, question_text, answer_text)
+    full_inputs = build_inputs(processor, full_messages, add_generation_prompt=False)
+    full_inputs = {
+        k: (v.to(model_device) if torch.is_tensor(v) else v)
+        for k, v in full_inputs.items()
+    }
+
+    outputs = model(**full_inputs)
+    logits = outputs.logits  # [1, seq_len, vocab]
+
+    prefix_ids = prefix_inputs["input_ids"][0].tolist()
+    full_ids = full_inputs["input_ids"][0].tolist()
+    common_len = longest_common_prefix_len_list(prefix_ids, full_ids)
+
+    variants = get_answer_id_variants(processor.tokenizer, answer_text)
+    ans_start = None
+    matched_ids = None
+
+    for ids in variants:
+        pos = find_subsequence(full_ids, ids, start=max(0, common_len - 32))
+        if pos is not None:
+            ans_start = pos
+            matched_ids = ids
+            break
+
+    if ans_start is None or matched_ids is None:
+        return make_empty_score(answer_text)
+
+    tokens = processor.tokenizer.convert_ids_to_tokens(matched_ids)
+    token_probs = []
+    token_logits = []
+
+    for i, token_id in enumerate(matched_ids):
+        pos = ans_start + i - 1
+        if pos < 0:
+            continue
+
+        step_logits = logits[0, pos, :]
+        step_probs = torch.softmax(step_logits, dim=-1)
+
+        p = float(step_probs[token_id].item())
+        l = float(step_logits[token_id].item())
+
+        token_probs.append(p)
+        token_logits.append(l)
+
+    if len(token_probs) == 0:
+        seq_logprob = float("-inf")
+    else:
+        seq_logprob = float(sum(math.log(max(p, 1e-45)) for p in token_probs))
+
+    return {
+        "answer": answer_text,
+        "token_ids": matched_ids,
+        "tokens": tokens,
+        "token_probs": token_probs,
+        "token_logits": token_logits,
+        "seq_logprob": seq_logprob,
     }
 
 
@@ -246,6 +388,12 @@ def main():
         q_gold_map = {}
         q_raw_text_map = {}
 
+        q_pred_parse_map = {}
+        q_correct_parse_map = {}
+        q_pred_score_map = {}
+        q_correct_score_map = {}
+        q_choice_scores_map = {}
+
         for q in questions:
             qid = q["qid"]
             question_text = strip_legacy_prompt(q["prompt"])
@@ -260,19 +408,54 @@ def main():
             )
 
             pred_text = gen_out["pred_text"]
-            pred = parse_prediction(pred_text, q["mode"])
+
+            # parse-based result
+            pred_parse = parse_prediction(pred_text, q["mode"])
+            if q["mode"] == "tf":
+                correct_parse = (normalize_tf_label(pred_parse) == normalize_tf_label(q["gold"]))
+            else:
+                correct_parse = (pred_parse == q["gold"])
+
+            # score-based result
+            choices = get_candidate_choices(q["mode"])
+            choice_scores = [
+                score_candidate_answer(
+                    model=model,
+                    processor=processor,
+                    image=image,
+                    question_text=question_text,
+                    answer_text=choice,
+                )
+                for choice in choices
+            ]
+
+            if len(choice_scores) > 0:
+                pred_score_out = max(choice_scores, key=lambda x: x["seq_logprob"])
+                pred_score = pred_score_out["answer"]
+            else:
+                pred_score_out = make_empty_score(None)
+                pred_score = "UNK"
 
             if q["mode"] == "tf":
-                correct = (normalize_tf_label(pred) == normalize_tf_label(q["gold"]))
+                correct_score = (normalize_tf_label(pred_score) == normalize_tf_label(q["gold"]))
             else:
-                correct = (pred == q["gold"])
+                correct_score = (pred_score == q["gold"])
 
-            q_correct_map[qid] = correct
+            # summary 主结果默认用 score 版
+            q_correct_map[qid] = correct_score
             q_prob_map[qid] = gen_out["final_prob"]
             q_json_map[qid] = f"{qid}.json"
-            q_pred_map[qid] = pred
+            q_pred_map[qid] = pred_score
             q_gold_map[qid] = q["gold"]
             q_raw_text_map[qid] = pred_text
+
+            q_pred_parse_map[qid] = pred_parse
+            q_correct_parse_map[qid] = correct_parse
+            q_pred_score_map[qid] = pred_score
+            q_correct_score_map[qid] = correct_score
+            q_choice_scores_map[qid] = {
+                x["answer"]: x["seq_logprob"] for x in choice_scores
+            }
 
             q_record = {
                 "qid": qid,
@@ -282,15 +465,23 @@ def main():
                 "prompt_raw": q["prompt"],
                 "question_text": question_text,
                 "gold": q["gold"],
+
                 "pred_text": pred_text,
-                "pred": pred,
-                "correct": correct,
+
+                "pred_parse": pred_parse,
+                "correct_parse": correct_parse,
+
+                "pred_score": pred_score,
+                "correct_score": correct_score,
+                "choice_scores": q_choice_scores_map[qid],
+
                 "free_token_ids": gen_out["token_ids"],
                 "free_tokens": gen_out["tokens"],
                 "free_token_probs": gen_out["token_probs"],
                 "free_token_logits": gen_out["token_logits"],
                 "final_prob": gen_out["final_prob"],
                 "final_logit": gen_out["final_logit"],
+
                 "target_texts": q.get("target_texts", {}),
             }
 
@@ -320,9 +511,16 @@ def main():
 
         for qid in sorted(q_json_map.keys()):
             row[f"{qid}_json"] = os.path.join(image_stem, q_json_map[qid])
-            row[f"{qid}_pred"] = q_pred_map.get(qid, "UNK")
+
+            row[f"{qid}_pred_parse"] = q_pred_parse_map.get(qid, "UNK")
+            row[f"{qid}_correct_parse"] = q_correct_parse_map.get(qid, False)
+
+            row[f"{qid}_pred_score"] = q_pred_score_map.get(qid, "UNK")
+            row[f"{qid}_correct_score"] = q_correct_score_map.get(qid, False)
+
             row[f"{qid}_gold"] = q_gold_map.get(qid, "")
             row[f"{qid}_raw_output"] = q_raw_text_map.get(qid, "")
+            row[f"{qid}_choice_scores"] = json.dumps(q_choice_scores_map.get(qid, {}), ensure_ascii=False)
             row[f"{qid}_final_prob"] = q_prob_map.get(qid, None)
 
         summary_rows.append(row)
@@ -342,9 +540,13 @@ def main():
         for qid in sorted(q_json_map.keys()):
             fieldnames.extend([
                 f"{qid}_json",
-                f"{qid}_pred",
+                f"{qid}_pred_parse",
+                f"{qid}_correct_parse",
+                f"{qid}_pred_score",
+                f"{qid}_correct_score",
                 f"{qid}_gold",
                 f"{qid}_raw_output",
+                f"{qid}_choice_scores",
                 f"{qid}_final_prob",
             ])
 
