@@ -6,6 +6,7 @@ WH_RE = re.compile(
     flags=re.IGNORECASE | re.DOTALL,
 )
 
+
 def clean_prompt_to_wh_question(prompt: str):
     s = prompt.strip()
     s = s.replace("\n", " ")
@@ -49,8 +50,10 @@ SYN_REL = {
     "under": "beneath",
 }
 
+
 def wrap_prompt_user(question_text: str):
     return f"<image>\nUSER: {question_text}\nASSISTANT:"
+
 
 def clean_question_text(question: str):
     q = question.strip()
@@ -68,6 +71,7 @@ def clean_question_text(question: str):
     q = re.sub(r"\s+", " ", q).strip()
     return q
 
+
 def parse_wh_question(prompt: str):
     q = clean_prompt_to_wh_question(prompt)
     m = WH_RE.search(q)
@@ -77,6 +81,7 @@ def parse_wh_question(prompt: str):
     obj1 = m.group(2).strip()
     obj2 = m.group(3).strip()
     return be_verb, obj1, obj2
+
 
 def normalize_rel(answer):
     if isinstance(answer, (list, tuple)):
@@ -108,6 +113,7 @@ def normalize_rel(answer):
 
     return mapping[rel]
 
+
 def build_object_pool(prompt_records):
     pool = set()
     for rec in prompt_records:
@@ -116,6 +122,7 @@ def build_object_pool(prompt_records):
         pool.add(obj2)
     return sorted(pool)
 
+
 def pick_obj3_obj4(object_pool, obj1, obj2, sample_idx):
     candidates = [x for x in object_pool if x not in {obj1, obj2}]
     if len(candidates) < 2:
@@ -123,6 +130,7 @@ def pick_obj3_obj4(object_pool, obj1, obj2, sample_idx):
     rng = random.Random(sample_idx)
     obj3, obj4 = rng.sample(candidates, 2)
     return obj3, obj4
+
 
 def build_questions(base_prompt, base_answer, sample_idx, object_pool):
     _, obj1, obj2 = parse_wh_question(base_prompt)
@@ -137,9 +145,11 @@ def build_questions(base_prompt, base_answer, sample_idx, object_pool):
 
     items = []
 
-    # q0: original WH question, no explicit relation phrase in the prompt body
+    # q0: original WH question
     items.append({
         "qid": "q0",
+        "base_qid": "q0",
+        "order": "orig",
         "mode": "orig",
         "prompt": wrap_prompt_user(
             f"Where is the {obj1} in relation to the {obj2}? "
@@ -153,75 +163,34 @@ def build_questions(base_prompt, base_answer, sample_idx, object_pool):
         },
     })
 
-    question_specs = [
-        (
-            "q1",
-            f"Is the {obj1} {gold_phrase} the {obj2}? Answer with True or False only.",
-            "True",
-            {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
-        ),
-        (
-            "q2",
-            f"Is the {obj2} {inv_phrase} the {obj1}? Answer with True or False only.",
-            "True",
-            {"obj1": obj2, "obj2": obj1, "rel": inv_phrase},
-        ),
-        (
-            "q3",
-            f"Is the {obj1} not {gold_phrase} the {obj2}? Answer with True or False only .",
-            "False",
-            {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
-        ),
-        (
-            "q4",
-            f"Given the {obj1} and the {obj2} in the image, is the {obj1} {gold_phrase} the {obj2}? "
-            f"Answer with True or False only",
-            "True",
-            {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
-        ),
-        (
-            "q5",
-            f"Given the {obj3} and the {obj4} in the image, is the {obj1} {gold_phrase} the {obj2}? "
-            f"Answer with True or False only.",
-            "True",
-            {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
-        ),
-        (
-            "q6",
-            f"Is the {obj2} {gold_phrase} the {obj1}? Answer with True or False only.",
-            "False",
-            {"obj1": obj2, "obj2": obj1, "rel": gold_phrase},
-        ),
-        (
-            "q7",
-            f"Is the {obj1} {syn_phrase} the {obj2}? Answer with True or False only.",
-            "True",
-            {"obj1": obj1, "obj2": obj2, "rel": syn_phrase},
-        ),
-        (
-            "q8",
-            f"In the image, is it true that the {obj1} is {gold_phrase} the {obj2}? "
-            f"Answer with True or False only.",
-            "True",
-            {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
-        ),
-        (
-            "q9",
-            f"Would it be correct to say that the {obj1} is {gold_phrase} the {obj2}? "
-            f"Answer with True or False only.",
-            "True",
-            {"obj1": obj1, "obj2": obj2, "rel": gold_phrase},
-        ),
+    tf_templates = [
+        ("q1", f"Is the {obj1} {gold_phrase} the {obj2}?", "True", {"obj1": obj1, "obj2": obj2, "rel": gold_phrase}),
+        ("q2", f"Is the {obj2} {inv_phrase} the {obj1}?", "True", {"obj1": obj2, "obj2": obj1, "rel": inv_phrase}),
+        ("q3", f"Is the {obj1} not {gold_phrase} the {obj2}?", "False", {"obj1": obj1, "obj2": obj2, "rel": gold_phrase}),
+        ("q4", f"Given the {obj1} and the {obj2} in the image, is the {obj1} {gold_phrase} the {obj2}?", "True", {"obj1": obj1, "obj2": obj2, "rel": gold_phrase}),
+        ("q5", f"Given the {obj3} and the {obj4} in the image, is the {obj1} {gold_phrase} the {obj2}?", "True", {"obj1": obj1, "obj2": obj2, "rel": gold_phrase}),
+        ("q6", f"Is the {obj2} {gold_phrase} the {obj1}?", "False", {"obj1": obj2, "obj2": obj1, "rel": gold_phrase}),
+        ("q7", f"Is the {obj1} {syn_phrase} the {obj2}?", "True", {"obj1": obj1, "obj2": obj2, "rel": syn_phrase}),
+        ("q8", f"In the image, is it true that the {obj1} is {gold_phrase} the {obj2}?", "True", {"obj1": obj1, "obj2": obj2, "rel": gold_phrase}),
+        ("q9", f"Would it be correct to say that the {obj1} is {gold_phrase} the {obj2}?", "True", {"obj1": obj1, "obj2": obj2, "rel": gold_phrase}),
     ]
 
-    for qid, qtext, gold, target_texts in question_specs:
-        items.append({
-            "qid": qid,
-            "mode": "tf",
-            "prompt": wrap_prompt_user(qtext),
-            "gold": gold,
-            "target_texts": target_texts,
-        })
+    answer_orders = [
+        ("tf", "Answer with True or False only."),
+        ("ft", "Answer with False or True only."),
+    ]
+
+    for base_qid, stem, gold, target_texts in tf_templates:
+        for suffix, answer_inst in answer_orders:
+            items.append({
+                "qid": f"{base_qid}_{suffix}",
+                "base_qid": base_qid,
+                "order": suffix,
+                "mode": "tf",
+                "prompt": wrap_prompt_user(f"{stem} {answer_inst}"),
+                "gold": gold,
+                "target_texts": target_texts,
+            })
 
     meta = {
         "obj1": obj1,
@@ -236,9 +205,11 @@ def build_questions(base_prompt, base_answer, sample_idx, object_pool):
         "base_prompt": base_prompt,
         "base_question_clean": clean_prompt_to_wh_question(base_prompt),
         "base_answer": gold_rel,
+        "tf_orders": ["tf", "ft"],
     }
 
     return items, meta
+
 
 def parse_prediction(text: str, mode: str):
     t = text.strip().lower()
