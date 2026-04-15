@@ -15,7 +15,12 @@ from misc import seed_all
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-id", default="Qwen/Qwen3.5-9B", type=str)
+    parser.add_argument(
+        "--model-id",
+        default="Qwen/Qwen3.5-9B",
+        type=str,
+        help="Examples: Qwen/Qwen2.5-VL-7B-Instruct, Qwen/Qwen3-VL-8B-Instruct, Qwen/Qwen3.5-9B",
+    )
     parser.add_argument("--device", default="cuda", type=str)
     parser.add_argument("--dataset", default="Controlled_Images_A", type=str)
     parser.add_argument("--option", default="four", type=str)
@@ -89,8 +94,8 @@ def get_gold_label(answer_field):
     return normalize_label(answer_field)
 
 
-def build_inputs(processor, image, question_text):
-    messages = [
+def make_user_messages(image, question_text):
+    return [
         {
             "role": "user",
             "content": [
@@ -100,19 +105,61 @@ def build_inputs(processor, image, question_text):
         }
     ]
 
+
+def make_scored_messages(image, question_text, answer_text):
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": question_text},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": str(answer_text)},
+            ],
+        },
+    ]
+
+
+def build_inputs(processor, messages, add_generation_prompt):
     inputs = processor.apply_chat_template(
         messages,
         tokenize=True,
-        add_generation_prompt=True,
+        add_generation_prompt=add_generation_prompt,
         return_dict=True,
         return_tensors="pt",
     )
     return inputs
 
 
+def longest_common_prefix_len(a: torch.Tensor, b: torch.Tensor) -> int:
+    n = min(a.shape[0], b.shape[0])
+    i = 0
+    while i < n and int(a[i]) == int(b[i]):
+        i += 1
+    return i
+
+
+def trim_trailing_special_ids(token_ids, tokenizer):
+    special_ids = set()
+    for key in ["eos_token_id", "pad_token_id", "bos_token_id"]:
+        v = getattr(tokenizer, key, None)
+        if v is not None:
+            special_ids.add(int(v))
+
+    trimmed = list(token_ids)
+    while len(trimmed) > 0 and int(trimmed[-1]) in special_ids:
+        trimmed.pop()
+    return trimmed
+
+
 @torch.no_grad()
 def generate_one(model, processor, image, question_text, max_new_tokens=20, temperature=0.0):
-    inputs = build_inputs(processor, image, question_text)
+    messages = make_user_messages(image, question_text)
+    inputs = build_inputs(processor, messages, add_generation_prompt=True)
 
     model_device = next(model.parameters()).device
     inputs = {
@@ -124,6 +171,7 @@ def generate_one(model, processor, image, question_text, max_new_tokens=20, temp
         "max_new_tokens": max_new_tokens,
         "return_dict_in_generate": True,
         "output_scores": True,
+        "pad_token_id": processor.tokenizer.eos_token_id,
     }
 
     if temperature and temperature > 0:
@@ -135,7 +183,7 @@ def generate_one(model, processor, image, question_text, max_new_tokens=20, temp
     outputs = model.generate(**inputs, **gen_kwargs)
 
     prompt_len = inputs["input_ids"].shape[1]
-    generated_ids = outputs.sequences[:, prompt_len:]  # [1, gen_len]
+    generated_ids = outputs.sequences[:, prompt_len:]
 
     output_text = processor.batch_decode(
         generated_ids,
@@ -150,9 +198,8 @@ def generate_one(model, processor, image, question_text, max_new_tokens=20, temp
     pred_token_logits = []
 
     for step, token_id in enumerate(pred_token_ids):
-        step_logits = outputs.scores[step][0]   # [vocab]
+        step_logits = outputs.scores[step][0]
         step_probs = torch.softmax(step_logits, dim=-1)
-
         pred_token_probs.append(float(step_probs[token_id].item()))
         pred_token_logits.append(float(step_logits[token_id].item()))
 
@@ -175,43 +222,40 @@ def score_answer_tokens(model, processor, image, question_text, answer_text):
             "gold_token_logits": [],
         }
 
-    base_inputs = build_inputs(processor, image, question_text)
-
     model_device = next(model.parameters()).device
-    base_inputs = {
+
+    prefix_messages = make_user_messages(image, question_text)
+    prefix_inputs = build_inputs(processor, prefix_messages, add_generation_prompt=True)
+    prefix_inputs = {
         k: (v.to(model_device) if torch.is_tensor(v) else v)
-        for k, v in base_inputs.items()
+        for k, v in prefix_inputs.items()
     }
 
-    answer_enc = processor.tokenizer(
-        str(answer_text),
-        add_special_tokens=False,
-        return_tensors="pt",
-    )
-    answer_ids = answer_enc["input_ids"].to(model_device)
-    answer_attn = answer_enc["attention_mask"].to(model_device)
+    full_messages = make_scored_messages(image, question_text, answer_text)
+    full_inputs = build_inputs(processor, full_messages, add_generation_prompt=False)
+    full_inputs = {
+        k: (v.to(model_device) if torch.is_tensor(v) else v)
+        for k, v in full_inputs.items()
+    }
 
-    full_input_ids = torch.cat([base_inputs["input_ids"], answer_ids], dim=1)
-    full_attention_mask = torch.cat([base_inputs["attention_mask"], answer_attn], dim=1)
+    outputs = model(**full_inputs)
+    logits = outputs.logits
 
-    model_inputs = dict(base_inputs)
-    model_inputs["input_ids"] = full_input_ids
-    model_inputs["attention_mask"] = full_attention_mask
+    prefix_ids = prefix_inputs["input_ids"][0]
+    full_ids = full_inputs["input_ids"][0]
 
-    outputs = model(**model_inputs)
-    logits = outputs.logits  # [1, total_len, vocab]
-
-    base_len = base_inputs["input_ids"].shape[1]
-    gold_len = answer_ids.shape[1]
-
-    gold_token_ids = answer_ids[0].tolist()
+    common_len = longest_common_prefix_len(prefix_ids, full_ids)
+    gold_token_ids = full_ids[common_len:].tolist()
+    gold_token_ids = trim_trailing_special_ids(gold_token_ids, processor.tokenizer)
     gold_tokens = processor.tokenizer.convert_ids_to_tokens(gold_token_ids)
+
     gold_token_probs = []
     gold_token_logits = []
 
     for i, token_id in enumerate(gold_token_ids):
-        # 预测第 i 个 gold token 的位置
-        pos = base_len - 1 + i
+        pos = common_len + i - 1
+        if pos < 0:
+            continue
         step_logits = logits[0, pos, :]
         step_probs = torch.softmax(step_logits, dim=-1)
 
