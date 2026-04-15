@@ -42,6 +42,11 @@ def get_model(model_name, device, method='base',root_dir='data'):
         llava_model = LlavaWrapper(root_dir=root_dir, device=device,method=method)
         image_preprocess = None
         return llava_model, image_preprocess
+    elif model_name == "qwen2.5-vl-7b":
+        from .qwen25vl import QwenWrapper
+        qwen_model = QwenWrapper(root_dir=root_dir, device=device, method=method)
+        image_preprocess = None
+        return qwen_model, image_preprocess
    
    
         
