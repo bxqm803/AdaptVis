@@ -36,7 +36,7 @@ def parse_args():
     parser.add_argument("--seed", default=1, type=int)
     parser.add_argument("--start-index", default=0, type=int)
     parser.add_argument("--limit", default=-1, type=int)
-    parser.add_argument("--max-new-tokens", default=20, type=int)
+    parser.add_argument("--max-new-tokens", default=256, type=int)
     parser.add_argument("--temperature", default=0.0, type=float)
     parser.add_argument("--cache-dir", default=None, type=str)
     parser.add_argument("--out-dir", default="output_qwen_baseline", type=str)
@@ -89,6 +89,44 @@ def normalize_label(text: str):
         return "on"
 
     return None
+
+
+def extract_answer_from_text(text: str, choices=None):
+    if text is None:
+        return None
+
+    s = str(text).strip().lower()
+    if len(s) == 0:
+        return None
+
+    if not choices:
+        return normalize_label(s)
+
+    patterns = {
+        "true": r"\btrue\b|\byes\b",
+        "false": r"\bfalse\b|\bno\b",
+        "left": r"\bleft\b",
+        "right": r"\bright\b",
+        "on": r"\bon\b|\bon top of\b",
+        "under": r"\bunder\b|\bbelow\b|\bbeneath\b",
+        "behind": r"\bbehind\b",
+        "in-front": r"\bin[\s-]?front\b",
+    }
+
+    matches = []
+    for choice in choices:
+        patt = patterns.get(choice)
+        if patt is None:
+            continue
+        for m in re.finditer(patt, s):
+            matches.append((m.start(), choice))
+
+    if len(matches) == 0:
+        return None
+
+    # Prefer the last explicit answer mention in the free-form text.
+    matches.sort(key=lambda x: x[0])
+    return matches[-1][1]
 
 
 def get_gold_label(answer_field):
@@ -179,8 +217,33 @@ def find_subsequence(seq, pattern, start=0):
     return None
 
 
+def get_answer_id_variants(tokenizer, answer_text):
+    raw = str(answer_text)
+    candidates = [raw, " " + raw, "\n" + raw]
+    seen = set()
+    variants = []
+    for cand in candidates:
+        ids = tokenizer(cand, add_special_tokens=False)["input_ids"]
+        key = tuple(ids)
+        if len(ids) > 0 and key not in seen:
+            seen.add(key)
+            variants.append(ids)
+    return variants
+
+
+def make_empty_score(answer_text=None):
+    return {
+        "answer": answer_text,
+        "token_ids": [],
+        "tokens": [],
+        "token_probs": [],
+        "token_logits": [],
+        "seq_logprob": float("-inf"),
+    }
+
+
 @torch.no_grad()
-def generate_one(model, processor, image, question_text, max_new_tokens=20, temperature=0.0):
+def generate_one(model, processor, image, question_text, max_new_tokens=256, temperature=0.0):
     messages = make_user_messages(image, question_text)
     inputs = build_inputs(processor, messages, add_generation_prompt=True)
 
@@ -214,38 +277,31 @@ def generate_one(model, processor, image, question_text, max_new_tokens=20, temp
         clean_up_tokenization_spaces=False,
     )[0].strip()
 
-    pred_token_ids = generated_ids[0].tolist()
-    pred_tokens = processor.tokenizer.convert_ids_to_tokens(pred_token_ids)
+    free_token_ids = generated_ids[0].tolist()
+    free_tokens = processor.tokenizer.convert_ids_to_tokens(free_token_ids)
 
-    pred_token_probs = []
-    pred_token_logits = []
+    free_token_probs = []
+    free_token_logits = []
 
-    for step, token_id in enumerate(pred_token_ids):
+    for step, token_id in enumerate(free_token_ids):
         step_logits = outputs.scores[step][0]
         step_probs = torch.softmax(step_logits, dim=-1)
-        pred_token_probs.append(float(step_probs[token_id].item()))
-        pred_token_logits.append(float(step_logits[token_id].item()))
+        free_token_probs.append(float(step_probs[token_id].item()))
+        free_token_logits.append(float(step_logits[token_id].item()))
 
     return {
         "pred_text": output_text,
-        "pred_token_ids": pred_token_ids,
-        "pred_tokens": pred_tokens,
-        "pred_token_probs": pred_token_probs,
-        "pred_token_logits": pred_token_logits,
+        "free_token_ids": free_token_ids,
+        "free_tokens": free_tokens,
+        "free_token_probs": free_token_probs,
+        "free_token_logits": free_token_logits,
     }
 
 
 @torch.no_grad()
 def score_candidate_answer(model, processor, image, question_text, answer_text):
     if answer_text is None or len(str(answer_text).strip()) == 0:
-        return {
-            "answer": answer_text,
-            "token_ids": [],
-            "tokens": [],
-            "token_probs": [],
-            "token_logits": [],
-            "seq_logprob": float("-inf"),
-        }
+        return make_empty_score(answer_text)
 
     model_device = next(model.parameters()).device
 
@@ -269,30 +325,27 @@ def score_candidate_answer(model, processor, image, question_text, answer_text):
     prefix_ids = prefix_inputs["input_ids"][0].tolist()
     full_ids = full_inputs["input_ids"][0].tolist()
 
-    answer_ids = processor.tokenizer(
-        str(answer_text),
-        add_special_tokens=False,
-    )["input_ids"]
-
     common_len = longest_common_prefix_len_list(prefix_ids, full_ids)
 
-    # Search around the divergence point to find the actual answer span
-    ans_start = find_subsequence(full_ids, answer_ids, start=max(0, common_len - 16))
-    if ans_start is None:
-        return {
-            "answer": answer_text,
-            "token_ids": answer_ids,
-            "tokens": processor.tokenizer.convert_ids_to_tokens(answer_ids),
-            "token_probs": [],
-            "token_logits": [],
-            "seq_logprob": float("-inf"),
-        }
+    variants = get_answer_id_variants(processor.tokenizer, answer_text)
+    ans_start = None
+    matched_ids = None
 
-    tokens = processor.tokenizer.convert_ids_to_tokens(answer_ids)
+    for ids in variants:
+        pos = find_subsequence(full_ids, ids, start=max(0, common_len - 32))
+        if pos is not None:
+            ans_start = pos
+            matched_ids = ids
+            break
+
+    if ans_start is None or matched_ids is None:
+        return make_empty_score(answer_text)
+
+    tokens = processor.tokenizer.convert_ids_to_tokens(matched_ids)
     token_probs = []
     token_logits = []
 
-    for i, token_id in enumerate(answer_ids):
+    for i, token_id in enumerate(matched_ids):
         pos = ans_start + i - 1
         if pos < 0:
             continue
@@ -313,7 +366,7 @@ def score_candidate_answer(model, processor, image, question_text, answer_text):
 
     return {
         "answer": answer_text,
-        "token_ids": answer_ids,
+        "token_ids": matched_ids,
         "tokens": tokens,
         "token_probs": token_probs,
         "token_logits": token_logits,
@@ -383,7 +436,8 @@ def main():
 
     all_rows = []
     num_total = 0
-    num_correct = 0
+    num_correct_from_text = 0
+    num_correct_by_score = 0
 
     with open(result_jsonl, "w", encoding="utf-8") as fout:
         for idx in tqdm(range(args.start_index, end_index), desc="Running"):
@@ -399,7 +453,7 @@ def main():
 
             gold = get_gold_label(rec["answer"])
 
-            # Free-form generation for debugging only
+            # 1) Real free-form output from the model
             gen_out = generate_one(
                 model=model,
                 processor=processor,
@@ -410,11 +464,15 @@ def main():
             )
             pred_text_free = gen_out["pred_text"]
 
-            # Use candidate scoring for the real prediction
+            # 2) Parse answer from the real free-form output
             choices = extract_choices(question_text)
-            if len(choices) == 0 and gold is not None:
-                choices = [gold]
+            if gold is not None and gold not in choices:
+                choices.append(gold)
 
+            pred_from_text = extract_answer_from_text(pred_text_free, choices=choices)
+            correct_from_text = (pred_from_text == gold)
+
+            # 3) Candidate scoring as reference
             choice_scores = [
                 score_candidate_answer(
                     model=model,
@@ -428,24 +486,18 @@ def main():
 
             if len(choice_scores) > 0:
                 pred_out = max(choice_scores, key=lambda x: x["seq_logprob"])
-                pred = pred_out["answer"]
+                pred_by_score = pred_out["answer"]
             else:
-                pred_out = {
-                    "answer": None,
-                    "token_ids": [],
-                    "tokens": [],
-                    "token_probs": [],
-                    "token_logits": [],
-                    "seq_logprob": float("-inf"),
-                }
-                pred = None
+                pred_out = make_empty_score(None)
+                pred_by_score = None
+
+            correct_by_score = (pred_by_score == gold)
 
             gold_out = None
             for item_score in choice_scores:
                 if item_score["answer"] == gold:
                     gold_out = item_score
                     break
-
             if gold_out is None:
                 gold_out = score_candidate_answer(
                     model=model,
@@ -455,10 +507,9 @@ def main():
                     answer_text=gold,
                 )
 
-            correct = (pred == gold)
-
             num_total += 1
-            num_correct += int(correct)
+            num_correct_from_text += int(correct_from_text)
+            num_correct_by_score += int(correct_by_score)
 
             row = {
                 "index": idx,
@@ -471,8 +522,11 @@ def main():
                 "gold": gold,
 
                 "pred_text_free": pred_text_free,
-                "pred": pred,
-                "correct": correct,
+                "pred_from_text": pred_from_text,
+                "correct_from_text": correct_from_text,
+
+                "pred_by_score": pred_by_score,
+                "correct_by_score": correct_by_score,
 
                 "choices": json.dumps(choices, ensure_ascii=False),
                 "choice_seq_logprobs": json.dumps(
@@ -480,11 +534,19 @@ def main():
                     ensure_ascii=False,
                 ),
 
+                # Raw free-form output token info
+                "free_token_ids": json.dumps(gen_out["free_token_ids"], ensure_ascii=False),
+                "free_tokens": json.dumps(gen_out["free_tokens"], ensure_ascii=False),
+                "free_token_probs": json.dumps(gen_out["free_token_probs"], ensure_ascii=False),
+                "free_token_logits": json.dumps(gen_out["free_token_logits"], ensure_ascii=False),
+
+                # Predicted answer token info (score-based reference)
                 "pred_token_ids": json.dumps(pred_out["token_ids"], ensure_ascii=False),
                 "pred_tokens": json.dumps(pred_out["tokens"], ensure_ascii=False),
                 "pred_token_probs": json.dumps(pred_out["token_probs"], ensure_ascii=False),
                 "pred_token_logits": json.dumps(pred_out["token_logits"], ensure_ascii=False),
 
+                # Gold answer token info
                 "gold_token_ids": json.dumps(gold_out["token_ids"], ensure_ascii=False),
                 "gold_tokens": json.dumps(gold_out["tokens"], ensure_ascii=False),
                 "gold_token_probs": json.dumps(gold_out["token_probs"], ensure_ascii=False),
@@ -507,8 +569,10 @@ def main():
         "start_index": args.start_index,
         "end_index": end_index,
         "num_total": num_total,
-        "num_correct": num_correct,
-        "accuracy": (num_correct / num_total) if num_total > 0 else 0.0,
+        "num_correct_from_text": num_correct_from_text,
+        "accuracy_from_text": (num_correct_from_text / num_total) if num_total > 0 else 0.0,
+        "num_correct_by_score": num_correct_by_score,
+        "accuracy_by_score": (num_correct_by_score / num_total) if num_total > 0 else 0.0,
         "result_jsonl": result_jsonl,
         "result_csv": result_csv,
         "cache_dir": cache_dir,
