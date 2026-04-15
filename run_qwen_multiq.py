@@ -15,7 +15,6 @@ from misc import seed_all
 from multiq_utils import (
     build_object_pool,
     build_questions,
-    parse_prediction,
 )
 
 SUPPORTED_VLM_MODELS = [
@@ -176,6 +175,38 @@ def generate_free(model, processor, image, question_text, max_new_tokens=256, te
     }
 
 
+def extract_post_think_text(text: str):
+    if text is None:
+        return "", False
+    low = text.lower()
+    tag = "</think>"
+    idx = low.rfind(tag)
+    if idx == -1:
+        return "", False
+    suffix = text[idx + len(tag):].strip()
+    return suffix, True
+
+
+def parse_answer_from_text(text: str, mode: str):
+    if text is None:
+        return "UNK"
+
+    t = text.strip().lower()
+    if not t:
+        return "UNK"
+
+    if mode == "orig":
+        matches = list(re.finditer(r"\b(left|right|on|under)\b", t))
+        return matches[-1].group(1) if matches else "UNK"
+
+    matches = list(re.finditer(r"\b(true|false|t|f)\b", t))
+    if not matches:
+        return "UNK"
+
+    tok = matches[-1].group(1)
+    return "True" if tok in {"t", "true"} else "False"
+
+
 def get_candidate_choices(mode: str):
     if mode == "orig":
         return ["left", "right", "on", "under"]
@@ -246,7 +277,7 @@ def score_candidate_answer(model, processor, image, question_text, answer_text):
     }
 
     outputs = model(**full_inputs)
-    logits = outputs.logits  # [1, seq_len, vocab]
+    logits = outputs.logits
 
     prefix_ids = prefix_inputs["input_ids"][0].tolist()
     full_ids = full_inputs["input_ids"][0].tolist()
@@ -381,18 +412,17 @@ def main():
             "questions": [],
         }
 
-        q_correct_map = {}
-        q_prob_map = {}
-        q_json_map = {}
-        q_pred_map = {}
-        q_gold_map = {}
-        q_raw_text_map = {}
-
-        q_pred_parse_map = {}
-        q_correct_parse_map = {}
+        q_pred_postthink_map = {}
+        q_correct_postthink_map = {}
         q_pred_score_map = {}
         q_correct_score_map = {}
+        q_gold_map = {}
+        q_raw_text_map = {}
+        q_postthink_text_map = {}
+        q_has_think_close_map = {}
         q_choice_scores_map = {}
+        q_json_map = {}
+        q_final_prob_map = {}
 
         for q in questions:
             qid = q["qid"]
@@ -409,14 +439,16 @@ def main():
 
             pred_text = gen_out["pred_text"]
 
-            # parse-based result
-            pred_parse = parse_prediction(pred_text, q["mode"])
-            if q["mode"] == "tf":
-                correct_parse = (normalize_tf_label(pred_parse) == normalize_tf_label(q["gold"]))
-            else:
-                correct_parse = (pred_parse == q["gold"])
+            # Method 1: only parse text after </think>
+            postthink_text, has_think_close = extract_post_think_text(pred_text)
+            pred_postthink = parse_answer_from_text(postthink_text, q["mode"])
 
-            # score-based result
+            if q["mode"] == "tf":
+                correct_postthink = (normalize_tf_label(pred_postthink) == normalize_tf_label(q["gold"]))
+            else:
+                correct_postthink = (pred_postthink == q["gold"])
+
+            # Method 2: candidate scoring
             choices = get_candidate_choices(q["mode"])
             choice_scores = [
                 score_candidate_answer(
@@ -441,21 +473,19 @@ def main():
             else:
                 correct_score = (pred_score == q["gold"])
 
-            # summary 主结果默认用 score 版
-            q_correct_map[qid] = correct_score
-            q_prob_map[qid] = gen_out["final_prob"]
-            q_json_map[qid] = f"{qid}.json"
-            q_pred_map[qid] = pred_score
-            q_gold_map[qid] = q["gold"]
-            q_raw_text_map[qid] = pred_text
-
-            q_pred_parse_map[qid] = pred_parse
-            q_correct_parse_map[qid] = correct_parse
+            q_pred_postthink_map[qid] = pred_postthink
+            q_correct_postthink_map[qid] = correct_postthink
             q_pred_score_map[qid] = pred_score
             q_correct_score_map[qid] = correct_score
+            q_gold_map[qid] = q["gold"]
+            q_raw_text_map[qid] = pred_text
+            q_postthink_text_map[qid] = postthink_text
+            q_has_think_close_map[qid] = has_think_close
             q_choice_scores_map[qid] = {
                 x["answer"]: x["seq_logprob"] for x in choice_scores
             }
+            q_json_map[qid] = f"{qid}.json"
+            q_final_prob_map[qid] = gen_out["final_prob"]
 
             q_record = {
                 "qid": qid,
@@ -468,8 +498,10 @@ def main():
 
                 "pred_text": pred_text,
 
-                "pred_parse": pred_parse,
-                "correct_parse": correct_parse,
+                "has_think_close": has_think_close,
+                "postthink_text": postthink_text,
+                "pred_postthink": pred_postthink,
+                "correct_postthink": correct_postthink,
 
                 "pred_score": pred_score,
                 "correct_score": correct_score,
@@ -495,33 +527,51 @@ def main():
             json.dump(meta_out, f, indent=2, ensure_ascii=False)
 
         qids = [f"q{i}" for i in range(1, 10)]
-        pattern_q1_q9 = "_".join("C" if q_correct_map.get(qid, False) else "W" for qid in qids)
+
+        pattern_q1_q9_postthink = "_".join(
+            "C" if q_correct_postthink_map.get(qid, False) else "W"
+            for qid in qids
+        )
+        pattern_q1_q9_score = "_".join(
+            "C" if q_correct_score_map.get(qid, False) else "W"
+            for qid in qids
+        )
 
         row = {
             "image_name": image_name,
             "image_path": image_path,
             "local_index": local_idx,
-            "q0": "C" if q_correct_map.get("q0", False) else "W",
-            "pattern_q1_q9": pattern_q1_q9,
-            "num_correct_q1_q9": sum(q_correct_map.get(qid, False) for qid in qids),
+
+            "q0_postthink": "C" if q_correct_postthink_map.get("q0", False) else "W",
+            "q0_score": "C" if q_correct_score_map.get("q0", False) else "W",
+
+            "pattern_q1_q9_postthink": pattern_q1_q9_postthink,
+            "num_correct_q1_q9_postthink": sum(q_correct_postthink_map.get(qid, False) for qid in qids),
+
+            "pattern_q1_q9_score": pattern_q1_q9_score,
+            "num_correct_q1_q9_score": sum(q_correct_score_map.get(qid, False) for qid in qids),
         }
 
         for i in range(1, 10):
-            row[f"q{i}"] = "C" if q_correct_map.get(f"q{i}", False) else "W"
+            row[f"q{i}_postthink"] = "C" if q_correct_postthink_map.get(f"q{i}", False) else "W"
+            row[f"q{i}_score"] = "C" if q_correct_score_map.get(f"q{i}", False) else "W"
 
         for qid in sorted(q_json_map.keys()):
             row[f"{qid}_json"] = os.path.join(image_stem, q_json_map[qid])
 
-            row[f"{qid}_pred_parse"] = q_pred_parse_map.get(qid, "UNK")
-            row[f"{qid}_correct_parse"] = q_correct_parse_map.get(qid, False)
+            row[f"{qid}_gold"] = q_gold_map.get(qid, "")
+            row[f"{qid}_raw_output"] = q_raw_text_map.get(qid, "")
+            row[f"{qid}_has_think_close"] = q_has_think_close_map.get(qid, False)
+            row[f"{qid}_postthink_text"] = q_postthink_text_map.get(qid, "")
+
+            row[f"{qid}_pred_postthink"] = q_pred_postthink_map.get(qid, "UNK")
+            row[f"{qid}_correct_postthink"] = q_correct_postthink_map.get(qid, False)
 
             row[f"{qid}_pred_score"] = q_pred_score_map.get(qid, "UNK")
             row[f"{qid}_correct_score"] = q_correct_score_map.get(qid, False)
 
-            row[f"{qid}_gold"] = q_gold_map.get(qid, "")
-            row[f"{qid}_raw_output"] = q_raw_text_map.get(qid, "")
             row[f"{qid}_choice_scores"] = json.dumps(q_choice_scores_map.get(qid, {}), ensure_ascii=False)
-            row[f"{qid}_final_prob"] = q_prob_map.get(qid, None)
+            row[f"{qid}_final_prob"] = q_final_prob_map.get(qid, None)
 
         summary_rows.append(row)
 
@@ -529,23 +579,31 @@ def main():
             "image_name",
             "image_path",
             "local_index",
-            "q0",
-            "pattern_q1_q9",
-            "num_correct_q1_q9",
+
+            "q0_postthink",
+            "q0_score",
+
+            "pattern_q1_q9_postthink",
+            "num_correct_q1_q9_postthink",
+
+            "pattern_q1_q9_score",
+            "num_correct_q1_q9_score",
         ]
 
         for i in range(1, 10):
-            fieldnames.append(f"q{i}")
+            fieldnames.extend([f"q{i}_postthink", f"q{i}_score"])
 
         for qid in sorted(q_json_map.keys()):
             fieldnames.extend([
                 f"{qid}_json",
-                f"{qid}_pred_parse",
-                f"{qid}_correct_parse",
-                f"{qid}_pred_score",
-                f"{qid}_correct_score",
                 f"{qid}_gold",
                 f"{qid}_raw_output",
+                f"{qid}_has_think_close",
+                f"{qid}_postthink_text",
+                f"{qid}_pred_postthink",
+                f"{qid}_correct_postthink",
+                f"{qid}_pred_score",
+                f"{qid}_correct_score",
                 f"{qid}_choice_scores",
                 f"{qid}_final_prob",
             ])
