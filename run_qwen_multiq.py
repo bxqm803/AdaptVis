@@ -70,9 +70,9 @@ def normalize_tf_label(x):
     if x is None:
         return "UNK"
     x = str(x).strip().lower()
-    if x in {"t", "true", "yes"}:
+    if x in {"t", "true"}:
         return "True"
-    if x in {"f", "false", "no"}:
+    if x in {"f", "false"}:
         return "False"
     return "UNK"
 
@@ -244,6 +244,7 @@ def main():
         q_json_map = {}
         q_pred_map = {}
         q_gold_map = {}
+        q_raw_text_map = {}
 
         for q in questions:
             qid = q["qid"]
@@ -271,6 +272,7 @@ def main():
             q_json_map[qid] = f"{qid}.json"
             q_pred_map[qid] = pred
             q_gold_map[qid] = q["gold"]
+            q_raw_text_map[qid] = pred_text
 
             q_record = {
                 "qid": qid,
@@ -301,35 +303,26 @@ def main():
         with open(os.path.join(sample_dir, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta_out, f, indent=2, ensure_ascii=False)
 
-        tf_qids = [f"q{i}_tf" for i in range(1, 10)]
-        ft_qids = [f"q{i}_ft" for i in range(1, 10)]
-
-        pattern_tf = "_".join("C" if q_correct_map.get(qid, False) else "W" for qid in tf_qids)
-        pattern_ft = "_".join("C" if q_correct_map.get(qid, False) else "W" for qid in ft_qids)
+        qids = [f"q{i}" for i in range(1, 10)]
+        pattern_q1_q9 = "_".join("C" if q_correct_map.get(qid, False) else "W" for qid in qids)
 
         row = {
             "image_name": image_name,
             "image_path": image_path,
             "local_index": local_idx,
             "q0": "C" if q_correct_map.get("q0", False) else "W",
-            "pattern_tf": pattern_tf,
-            "num_correct_tf": sum(q_correct_map.get(qid, False) for qid in tf_qids),
-            "pattern_ft": pattern_ft,
-            "num_correct_ft": sum(q_correct_map.get(qid, False) for qid in ft_qids),
-            "order_diff_count": sum(
-                q_correct_map.get(f"q{i}_tf", False) != q_correct_map.get(f"q{i}_ft", False)
-                for i in range(1, 10)
-            ),
+            "pattern_q1_q9": pattern_q1_q9,
+            "num_correct_q1_q9": sum(q_correct_map.get(qid, False) for qid in qids),
         }
 
         for i in range(1, 10):
-            row[f"q{i}_tf"] = "C" if q_correct_map.get(f"q{i}_tf", False) else "W"
-            row[f"q{i}_ft"] = "C" if q_correct_map.get(f"q{i}_ft", False) else "W"
+            row[f"q{i}"] = "C" if q_correct_map.get(f"q{i}", False) else "W"
 
         for qid in sorted(q_json_map.keys()):
             row[f"{qid}_json"] = os.path.join(image_stem, q_json_map[qid])
             row[f"{qid}_pred"] = q_pred_map.get(qid, "UNK")
             row[f"{qid}_gold"] = q_gold_map.get(qid, "")
+            row[f"{qid}_raw_output"] = q_raw_text_map.get(qid, "")
             row[f"{qid}_final_prob"] = q_prob_map.get(qid, None)
 
         summary_rows.append(row)
@@ -339,25 +332,23 @@ def main():
             "image_path",
             "local_index",
             "q0",
-            "pattern_tf",
-            "num_correct_tf",
-            "pattern_ft",
-            "num_correct_ft",
-            "order_diff_count",
+            "pattern_q1_q9",
+            "num_correct_q1_q9",
         ]
 
         for i in range(1, 10):
-            fieldnames.extend([f"q{i}_tf", f"q{i}_ft"])
+            fieldnames.append(f"q{i}")
 
         for qid in sorted(q_json_map.keys()):
             fieldnames.extend([
                 f"{qid}_json",
                 f"{qid}_pred",
                 f"{qid}_gold",
+                f"{qid}_raw_output",
                 f"{qid}_final_prob",
             ])
 
-        with open(summary_csv, "w", newline="", encoding="utf-8") as f:
+        with open(summary_csv, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(summary_rows)
