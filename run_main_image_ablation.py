@@ -1,26 +1,24 @@
 import os
 import re
-import csv
 import json
 import argparse
+from pathlib import Path
 
 import pandas as pd
-import torch
 from tqdm import tqdm
 
 from misc import seed_all
 from model_zoo import get_model
 from dataset_zoo import get_dataset
 
-# 直接复用仓库现有成功路径
 from run_interrupt import (
     make_black_image_like,
     build_generation_trace,
     write_json,
-    run_one_generation,   # 关键：original / black 复用它
+    run_one_generation,
 )
 
-VALID_IMAGE_MODES = {"original", "black", "no_image"}
+VALID_IMAGE_MODES = {"original", "black"}
 LABELS = ["left", "right", "on", "under"]
 
 
@@ -42,13 +40,13 @@ def parse_args():
     )
     p.add_argument(
         "--image-modes",
-        default="original,black,no_image",
+        default="original,black",
         type=str,
-        help="Comma-separated list from {original, black, no_image}.",
+        help="Comma-separated list from {original, black}.",
     )
     p.add_argument("--max-new-tokens", default=20, type=int)
     p.add_argument("--trace-topk", default=10, type=int)
-    p.add_argument("--out-dir", default="./output_image_ablation", type=str)
+    p.add_argument("--out-dir", default="./output_image_ablation_llava15", type=str)
     return p.parse_args()
 
 
@@ -67,16 +65,9 @@ def clean_question_text(question: str):
     if "USER:" in q:
         q = q.split("USER:", 1)[1].strip()
     if "ASSISTANT:" in q:
-        q = q.split("USER:", 1)[0].strip() if "USER:" in q else q.split("ASSISTANT:", 1)[0].strip()
+        q = q.split("ASSISTANT:", 1)[0].strip()
     q = re.sub(r"\s+", " ", q).strip()
     return q
-
-
-def remove_image_token_from_prompt(prompt: str):
-    text = prompt.replace("<image>\n", "")
-    text = text.replace("<image>", "")
-    text = re.sub(r"\n{2,}", "\n", text).strip()
-    return text
 
 
 def normalize_rel(answer):
@@ -111,55 +102,6 @@ def parse_prediction(text: str):
     t = text.strip().lower()
     m = re.search(r"\b(left|right|on|under)\b", t)
     return m.group(1) if m else "UNK"
-
-
-@torch.no_grad()
-def run_one_generation_no_image(
-    wrapper,
-    prompt: str,
-    max_new_tokens: int,
-):
-    """
-    尝试 text-only 路径。
-    注意：当前 repo 没有官方 no_image 分支，所以这里只是 best effort。
-    """
-    processor = wrapper.processor
-    model = wrapper.model
-
-    prompt_text = remove_image_token_from_prompt(prompt)
-
-    single_input = processor(
-        text=prompt_text,
-        padding=True,
-        return_tensors="pt",
-    )
-    single_input = {
-        k: (v.to(wrapper.device) if torch.is_tensor(v) else v)
-        for k, v in single_input.items()
-        if v is not None
-    }
-
-    prompt_len = int(single_input["input_ids"].shape[1])
-
-    output = model.generate(
-        input_ids=single_input["input_ids"],
-        attention_mask=single_input.get("attention_mask", None),
-        max_new_tokens=max_new_tokens,
-        output_scores=True,
-        output_logits=True,
-        return_dict_in_generate=True,
-        use_cache=True,
-        output_attentions=False,
-    )
-
-    gen_ids = output.sequences[0][prompt_len:]
-    gen_text = processor.decode(
-        gen_ids,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    ).strip()
-
-    return output, gen_text, prompt_len, prompt_text
 
 
 def summarize_mode(df_mode: pd.DataFrame):
@@ -275,23 +217,24 @@ def main():
 
     prompt_records, sampled_indices = wrapper.load_prompt_records_with_sampling(args.dataset, args.option)
     if sampled_indices is not None:
-        sub_dataset = torch.utils.data.Subset(dataset, sampled_indices)
+        sub_dataset = pd.Series(range(len(sampled_indices)))
+        dataset_view = [dataset[i] for i in sampled_indices]
     else:
-        sub_dataset = dataset
+        dataset_view = dataset
 
     start = args.sample_index
     end = len(prompt_records) if args.limit < 0 else min(len(prompt_records), start + args.limit)
 
-    base_dir = os.path.join(args.out_dir, args.dataset)
-    os.makedirs(base_dir, exist_ok=True)
+    base_dir = Path(args.out_dir) / args.dataset
+    base_dir.mkdir(parents=True, exist_ok=True)
 
-    summary_csv = os.path.join(base_dir, "summary_image_ablation.csv")
-    report_txt = os.path.join(base_dir, "report_image_ablation.txt")
+    summary_csv = base_dir / "summary_image_ablation.csv"
+    report_txt = base_dir / "report_image_ablation.txt"
     summary_rows = []
 
     for local_idx in tqdm(range(start, end), desc="Samples"):
         rec = prompt_records[local_idx]
-        item = sub_dataset[local_idx]
+        item = dataset_view[local_idx]
 
         image = item["image_options"][0]
         image_name = item.get("image_name", f"sample_{local_idx:04d}")
@@ -313,35 +256,22 @@ def main():
             }
 
             try:
-                if image_mode == "original":
-                    output, gen_text, prompt_len = run_one_generation(
-                        wrapper=wrapper,
-                        model_name=args.model_name,
-                        image=image,
-                        prompt=prompt,
-                        perturb_mode="none",
-                        max_new_tokens=args.max_new_tokens,
-                    )
-                    prompt_used = prompt
+                run_dir = base_dir / image_mode / Path(image_name).stem
+                run_dir.mkdir(parents=True, exist_ok=True)
 
-                elif image_mode == "black":
-                    black_image = make_black_image_like(image)
-                    output, gen_text, prompt_len = run_one_generation(
-                        wrapper=wrapper,
-                        model_name=args.model_name,
-                        image=black_image,
-                        prompt=prompt,
-                        perturb_mode="none",
-                        max_new_tokens=args.max_new_tokens,
-                    )
-                    prompt_used = prompt
+                # 关键修正：给 patched attention 一个可写路径
+                os.environ["SAVE_ATTN_PATH"] = str(run_dir / "saved_attn.pt")
 
-                else:  # no_image
-                    output, gen_text, prompt_len, prompt_used = run_one_generation_no_image(
-                        wrapper=wrapper,
-                        prompt=prompt,
-                        max_new_tokens=args.max_new_tokens,
-                    )
+                use_image = image if image_mode == "original" else make_black_image_like(image)
+
+                output, gen_text, prompt_len = run_one_generation(
+                    wrapper=wrapper,
+                    model_name=args.model_name,
+                    image=use_image,
+                    prompt=prompt,
+                    perturb_mode="none",
+                    max_new_tokens=args.max_new_tokens,
+                )
 
                 trace = build_generation_trace(
                     wrapper.processor,
@@ -358,7 +288,7 @@ def main():
                     os.path.splitext(image_name)[0],
                     "q0_trace.json",
                 )
-                trace_path = os.path.join(base_dir, trace_rel_path)
+                trace_path = base_dir / trace_rel_path
 
                 write_json(trace_path, {
                     "image_name": image_name,
@@ -366,7 +296,6 @@ def main():
                     "local_index": local_idx,
                     "image_mode": image_mode,
                     "question": question_clean,
-                    "prompt_used": prompt_used,
                     "gold": gold,
                     "generated_text": gen_text,
                     "pred": pred,
@@ -378,7 +307,6 @@ def main():
                 last = trace[-1] if trace else {}
 
                 row.update({
-                    "prompt_used": prompt_used,
                     "generated_text": gen_text,
                     "pred": pred,
                     "correct": correct,
@@ -398,7 +326,6 @@ def main():
                 row.update({
                     "status": "error",
                     "error": repr(e),
-                    "prompt_used": remove_image_token_from_prompt(prompt) if image_mode == "no_image" else prompt,
                     "generated_text": "",
                     "pred": "UNK",
                     "correct": False,
