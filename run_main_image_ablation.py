@@ -6,6 +6,7 @@ import itertools
 from pathlib import Path
 
 import pandas as pd
+import torch
 from tqdm import tqdm
 
 from misc import seed_all
@@ -47,6 +48,7 @@ def parse_args():
     )
     p.add_argument("--max-new-tokens", default=20, type=int)
     p.add_argument("--trace-topk", default=10, type=int)
+    p.add_argument("--first-topk", default=10, type=int, help="Save top-k candidates for the first generated token.")
     p.add_argument("--out-dir", default="./output_image_ablation_perm24_llava15", type=str)
     return p.parse_args()
 
@@ -134,6 +136,83 @@ def parse_prediction(text: str):
     t = text.strip().lower()
     m = re.search(r"\b(left|right|on|under)\b", t)
     return m.group(1) if m else "UNK"
+
+
+def safe_decode_single_token(processor, token_id: int) -> str:
+    try:
+        return processor.decode(
+            [int(token_id)],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+    except Exception:
+        try:
+            return processor.decode(int(token_id))
+        except Exception:
+            return ""
+
+
+def clean_token_text(token_text: str) -> str:
+    if token_text is None:
+        return ""
+    x = str(token_text)
+    x = x.replace("</s>", "").replace("<s>", "").replace("<pad>", "")
+    x = x.replace("Ġ", " ").replace("▁", " ")
+    x = re.sub(r"\s+", " ", x).strip()
+    return x
+
+
+def extract_first_step_topk(processor, output, k=10):
+    """
+    Return top-k for the first generated step using raw logits.
+    Probability is softmax(raw_logits), so top-k by probability == top-k by logit.
+    """
+    if not hasattr(output, "logits") or output.logits is None or len(output.logits) == 0:
+        return []
+
+    first_logits = output.logits[0][0].detach().float().cpu()  # [vocab]
+    probs = torch.softmax(first_logits, dim=-1)
+
+    k = min(k, first_logits.shape[-1])
+    top_logits, top_ids = torch.topk(first_logits, k=k)
+
+    out = []
+    for rank, (tok_id, tok_logit) in enumerate(zip(top_ids.tolist(), top_logits.tolist()), start=1):
+        tok_prob = float(probs[tok_id].item())
+        tok_text = safe_decode_single_token(processor, tok_id)
+        tok_clean = clean_token_text(tok_text)
+
+        out.append({
+            "rank": rank,
+            "token_id": int(tok_id),
+            "token": tok_text,
+            "token_repr": repr(tok_text),
+            "token_clean": tok_clean,
+            "probability": tok_prob,
+            "logit": float(tok_logit),
+        })
+    return out
+
+
+def add_first_topk_to_row(row: dict, first_topk: list, max_k: int):
+    row["first_top10_json"] = json.dumps(first_topk, ensure_ascii=False)
+
+    for r in range(1, max_k + 1):
+        if r <= len(first_topk):
+            item = first_topk[r - 1]
+            row[f"first_top{r}_token_id"] = item["token_id"]
+            row[f"first_top{r}_token"] = item["token"]
+            row[f"first_top{r}_token_repr"] = item["token_repr"]
+            row[f"first_top{r}_token_clean"] = item["token_clean"]
+            row[f"first_top{r}_probability"] = item["probability"]
+            row[f"first_top{r}_logit"] = item["logit"]
+        else:
+            row[f"first_top{r}_token_id"] = None
+            row[f"first_top{r}_token"] = ""
+            row[f"first_top{r}_token_repr"] = ""
+            row[f"first_top{r}_token_clean"] = ""
+            row[f"first_top{r}_probability"] = None
+            row[f"first_top{r}_logit"] = None
 
 
 def summarize_mode(df_mode: pd.DataFrame):
@@ -316,7 +395,6 @@ def main():
                     run_dir = base_dir / image_mode / Path(image_name).stem
                     run_dir.mkdir(parents=True, exist_ok=True)
 
-                    # 关键：patched attention 需要这个环境变量
                     os.environ["SAVE_ATTN_PATH"] = str(run_dir / f"saved_attn_{q['perm_id']}.pt")
 
                     use_image = image if image_mode == "original" else make_black_image_like(image)
@@ -335,6 +413,12 @@ def main():
                         output,
                         prompt_len,
                         topk=args.trace_topk,
+                    )
+
+                    first_topk = extract_first_step_topk(
+                        processor=wrapper.processor,
+                        output=output,
+                        k=args.first_topk,
                     )
 
                     pred = parse_prediction(gen_text)
@@ -361,6 +445,7 @@ def main():
                         "generated_text": gen_text,
                         "pred": pred,
                         "correct": correct,
+                        "first_step_top10": first_topk,
                         "token_trace": trace,
                     })
 
@@ -383,6 +468,8 @@ def main():
                         "trace_json": trace_rel_path,
                     })
 
+                    add_first_topk_to_row(row, first_topk, args.first_topk)
+
                 except Exception as e:
                     row.update({
                         "status": "error",
@@ -400,7 +487,9 @@ def main():
                         "final_score": None,
                         "final_probability": None,
                         "trace_json": "",
+                        "first_top10_json": "[]",
                     })
+                    add_first_topk_to_row(row, [], args.first_topk)
 
                 summary_rows.append(row)
 
