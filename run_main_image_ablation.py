@@ -2,6 +2,7 @@ import os
 import re
 import json
 import argparse
+import itertools
 from pathlib import Path
 
 import pandas as pd
@@ -46,7 +47,7 @@ def parse_args():
     )
     p.add_argument("--max-new-tokens", default=20, type=int)
     p.add_argument("--trace-topk", default=10, type=int)
-    p.add_argument("--out-dir", default="./output_image_ablation_llava15", type=str)
+    p.add_argument("--out-dir", default="./output_image_ablation_perm24_llava15", type=str)
     return p.parse_args()
 
 
@@ -68,6 +69,37 @@ def clean_question_text(question: str):
         q = q.split("ASSISTANT:", 1)[0].strip()
     q = re.sub(r"\s+", " ", q).strip()
     return q
+
+
+def strip_answer_order_clause(question_text: str):
+    q = clean_question_text(question_text)
+    q = re.sub(
+        r"Answer with\s+left,\s*right,\s*on\s+or\s+under(?:\s+only)?\.\s*$",
+        "",
+        q,
+        flags=re.IGNORECASE,
+    )
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+
+def build_q0_permuted_prompts(base_prompt: str):
+    stem = strip_answer_order_clause(base_prompt)
+    out = []
+    for perm in itertools.permutations(LABELS):
+        order_text = ", ".join(perm[:-1]) + f" or {perm[-1]}"
+        prompt_text = f"{stem} Answer with {order_text} only."
+        prompt = f"<image>\nUSER: {prompt_text}\nASSISTANT:"
+        perm_id = "_".join(perm)
+        out.append({
+            "qid": "q0",
+            "perm_id": perm_id,
+            "order": list(perm),
+            "order_text": " | ".join(perm),
+            "prompt_text": prompt_text,
+            "prompt": prompt,
+        })
+    return out
 
 
 def normalize_rel(answer):
@@ -150,7 +182,8 @@ def summarize_mode(df_mode: pd.DataFrame):
 def write_report(path: str, df: pd.DataFrame, image_modes):
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"rows_total: {len(df)}\n")
-        f.write(f"image_modes: {image_modes}\n\n")
+        f.write(f"image_modes: {image_modes}\n")
+        f.write(f"num_perm_id: {df['perm_id'].nunique() if 'perm_id' in df.columns else 0}\n\n")
 
         for mode in image_modes:
             f.write("=" * 120 + "\n")
@@ -206,6 +239,25 @@ def write_report(path: str, df: pd.DataFrame, image_modes):
             f.write(stats["cm"].to_string())
             f.write("\n\n")
 
+            perm_stats = (
+                sub_ok.groupby(["perm_id", "order_text"], as_index=False)
+                .agg(
+                    n=("correct", "size"),
+                    acc=("correct", "mean"),
+                    mean_first_prob=("first_probability", "mean"),
+                    mean_first_logit=("first_raw_logit", "mean"),
+                )
+                .sort_values(["acc", "perm_id"], ascending=[False, True])
+            )
+
+            f.write("top_10_perm_by_acc:\n")
+            f.write(perm_stats.head(10).to_string(index=False))
+            f.write("\n\n")
+
+            f.write("worst_10_perm_by_acc:\n")
+            f.write(perm_stats.tail(10).to_string(index=False))
+            f.write("\n\n")
+
 
 def main():
     args = parse_args()
@@ -217,7 +269,6 @@ def main():
 
     prompt_records, sampled_indices = wrapper.load_prompt_records_with_sampling(args.dataset, args.option)
     if sampled_indices is not None:
-        sub_dataset = pd.Series(range(len(sampled_indices)))
         dataset_view = [dataset[i] for i in sampled_indices]
     else:
         dataset_view = dataset
@@ -228,8 +279,8 @@ def main():
     base_dir = Path(args.out_dir) / args.dataset
     base_dir.mkdir(parents=True, exist_ok=True)
 
-    summary_csv = base_dir / "summary_image_ablation.csv"
-    report_txt = base_dir / "report_image_ablation.txt"
+    summary_csv = base_dir / "summary_image_ablation_perm24.csv"
+    report_txt = base_dir / "report_image_ablation_perm24.txt"
     summary_rows = []
 
     for local_idx in tqdm(range(start, end), desc="Samples"):
@@ -239,109 +290,119 @@ def main():
         image = item["image_options"][0]
         image_name = item.get("image_name", f"sample_{local_idx:04d}")
         image_path = item.get("image_path", "")
-        prompt = rec["question"]
-        question_clean = clean_question_text(prompt)
+        base_question = clean_question_text(rec["question"])
         gold = normalize_rel(rec["answer"][0] if isinstance(rec["answer"], list) else rec["answer"])
 
-        for image_mode in image_modes:
-            row = {
-                "image_name": image_name,
-                "image_path": image_path,
-                "local_index": local_idx,
-                "image_mode": image_mode,
-                "question": question_clean,
-                "gold": gold,
-                "status": "ok",
-                "error": "",
-            }
+        permuted_prompts = build_q0_permuted_prompts(rec["question"])
 
-            try:
-                run_dir = base_dir / image_mode / Path(image_name).stem
-                run_dir.mkdir(parents=True, exist_ok=True)
-
-                # 关键修正：给 patched attention 一个可写路径
-                os.environ["SAVE_ATTN_PATH"] = str(run_dir / "saved_attn.pt")
-
-                use_image = image if image_mode == "original" else make_black_image_like(image)
-
-                output, gen_text, prompt_len = run_one_generation(
-                    wrapper=wrapper,
-                    model_name=args.model_name,
-                    image=use_image,
-                    prompt=prompt,
-                    perturb_mode="none",
-                    max_new_tokens=args.max_new_tokens,
-                )
-
-                trace = build_generation_trace(
-                    wrapper.processor,
-                    output,
-                    prompt_len,
-                    topk=args.trace_topk,
-                )
-
-                pred = parse_prediction(gen_text)
-                correct = (pred == gold)
-
-                trace_rel_path = os.path.join(
-                    image_mode,
-                    os.path.splitext(image_name)[0],
-                    "q0_trace.json",
-                )
-                trace_path = base_dir / trace_rel_path
-
-                write_json(trace_path, {
+        for q in permuted_prompts:
+            for image_mode in image_modes:
+                row = {
                     "image_name": image_name,
                     "image_path": image_path,
                     "local_index": local_idx,
                     "image_mode": image_mode,
-                    "question": question_clean,
+                    "qid": "q0",
+                    "perm_id": q["perm_id"],
+                    "order_text": q["order_text"],
+                    "base_question": base_question,
+                    "prompt_text": q["prompt_text"],
                     "gold": gold,
-                    "generated_text": gen_text,
-                    "pred": pred,
-                    "correct": correct,
-                    "token_trace": trace,
-                })
+                    "status": "ok",
+                    "error": "",
+                }
 
-                first = trace[0] if trace else {}
-                last = trace[-1] if trace else {}
+                try:
+                    run_dir = base_dir / image_mode / Path(image_name).stem
+                    run_dir.mkdir(parents=True, exist_ok=True)
 
-                row.update({
-                    "generated_text": gen_text,
-                    "pred": pred,
-                    "correct": correct,
-                    "num_generated_tokens": len(trace),
-                    "first_token": first.get("token_text", ""),
-                    "first_raw_logit": first.get("raw_logit", None),
-                    "first_score": first.get("score", None),
-                    "first_probability": first.get("probability", None),
-                    "final_token": last.get("token_text", ""),
-                    "final_raw_logit": last.get("raw_logit", None),
-                    "final_score": last.get("score", None),
-                    "final_probability": last.get("probability", None),
-                    "trace_json": trace_rel_path,
-                })
+                    # 关键：patched attention 需要这个环境变量
+                    os.environ["SAVE_ATTN_PATH"] = str(run_dir / f"saved_attn_{q['perm_id']}.pt")
 
-            except Exception as e:
-                row.update({
-                    "status": "error",
-                    "error": repr(e),
-                    "generated_text": "",
-                    "pred": "UNK",
-                    "correct": False,
-                    "num_generated_tokens": 0,
-                    "first_token": "",
-                    "first_raw_logit": None,
-                    "first_score": None,
-                    "first_probability": None,
-                    "final_token": "",
-                    "final_raw_logit": None,
-                    "final_score": None,
-                    "final_probability": None,
-                    "trace_json": "",
-                })
+                    use_image = image if image_mode == "original" else make_black_image_like(image)
 
-            summary_rows.append(row)
+                    output, gen_text, prompt_len = run_one_generation(
+                        wrapper=wrapper,
+                        model_name=args.model_name,
+                        image=use_image,
+                        prompt=q["prompt"],
+                        perturb_mode="none",
+                        max_new_tokens=args.max_new_tokens,
+                    )
+
+                    trace = build_generation_trace(
+                        wrapper.processor,
+                        output,
+                        prompt_len,
+                        topk=args.trace_topk,
+                    )
+
+                    pred = parse_prediction(gen_text)
+                    correct = (pred == gold)
+
+                    trace_rel_path = os.path.join(
+                        image_mode,
+                        os.path.splitext(image_name)[0],
+                        f"q0_{q['perm_id']}_trace.json",
+                    )
+                    trace_path = base_dir / trace_rel_path
+
+                    write_json(trace_path, {
+                        "image_name": image_name,
+                        "image_path": image_path,
+                        "local_index": local_idx,
+                        "image_mode": image_mode,
+                        "qid": "q0",
+                        "perm_id": q["perm_id"],
+                        "order_text": q["order_text"],
+                        "base_question": base_question,
+                        "prompt_text": q["prompt_text"],
+                        "gold": gold,
+                        "generated_text": gen_text,
+                        "pred": pred,
+                        "correct": correct,
+                        "token_trace": trace,
+                    })
+
+                    first = trace[0] if trace else {}
+                    last = trace[-1] if trace else {}
+
+                    row.update({
+                        "generated_text": gen_text,
+                        "pred": pred,
+                        "correct": correct,
+                        "num_generated_tokens": len(trace),
+                        "first_token": first.get("token_text", ""),
+                        "first_raw_logit": first.get("raw_logit", None),
+                        "first_score": first.get("score", None),
+                        "first_probability": first.get("probability", None),
+                        "final_token": last.get("token_text", ""),
+                        "final_raw_logit": last.get("raw_logit", None),
+                        "final_score": last.get("score", None),
+                        "final_probability": last.get("probability", None),
+                        "trace_json": trace_rel_path,
+                    })
+
+                except Exception as e:
+                    row.update({
+                        "status": "error",
+                        "error": repr(e),
+                        "generated_text": "",
+                        "pred": "UNK",
+                        "correct": False,
+                        "num_generated_tokens": 0,
+                        "first_token": "",
+                        "first_raw_logit": None,
+                        "first_score": None,
+                        "first_probability": None,
+                        "final_token": "",
+                        "final_raw_logit": None,
+                        "final_score": None,
+                        "final_probability": None,
+                        "trace_json": "",
+                    })
+
+                summary_rows.append(row)
 
     df = pd.DataFrame(summary_rows)
     df.to_csv(summary_csv, index=False, encoding="utf-8-sig")
