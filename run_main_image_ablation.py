@@ -3,9 +3,7 @@ import re
 import csv
 import json
 import argparse
-from collections import Counter, defaultdict
 
-import numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
@@ -14,15 +12,16 @@ from misc import seed_all
 from model_zoo import get_model
 from dataset_zoo import get_dataset
 
-# 复用现有工具
+# 直接复用仓库现有成功路径
 from run_interrupt import (
     make_black_image_like,
     build_generation_trace,
     write_json,
+    run_one_generation,   # 关键：original / black 复用它
 )
 
-LABELS = ["left", "right", "on", "under"]
 VALID_IMAGE_MODES = {"original", "black", "no_image"}
+LABELS = ["left", "right", "on", "under"]
 
 
 def parse_args():
@@ -33,22 +32,19 @@ def parse_args():
     p.add_argument("--option", default="four", type=str)
     p.add_argument("--download", action="store_true")
     p.add_argument("--seed", default=1, type=int)
-
     p.add_argument("--sample-index", default=0, type=int)
     p.add_argument("--limit", default=-1, type=int)
-
     p.add_argument(
         "--method",
         default="scaling_vis",
         type=str,
         choices=["scaling_vis"],
-        help="Use the same model loading path as the repo.",
     )
     p.add_argument(
         "--image-modes",
         default="original,black,no_image",
         type=str,
-        help='Comma-separated list from {original, black, no_image}.',
+        help="Comma-separated list from {original, black, no_image}.",
     )
     p.add_argument("--max-new-tokens", default=20, type=int)
     p.add_argument("--trace-topk", default=10, type=int)
@@ -71,13 +67,12 @@ def clean_question_text(question: str):
     if "USER:" in q:
         q = q.split("USER:", 1)[1].strip()
     if "ASSISTANT:" in q:
-        q = q.split("ASSISTANT:", 1)[0].strip()
+        q = q.split("USER:", 1)[0].strip() if "USER:" in q else q.split("ASSISTANT:", 1)[0].strip()
     q = re.sub(r"\s+", " ", q).strip()
     return q
 
 
 def remove_image_token_from_prompt(prompt: str):
-    # 原 prompt 常见格式：<image>\nUSER: ...\nASSISTANT:
     text = prompt.replace("<image>\n", "")
     text = text.replace("<image>", "")
     text = re.sub(r"\n{2,}", "\n", text).strip()
@@ -94,7 +89,6 @@ def normalize_rel(answer):
         raise ValueError("Answer is None.")
 
     rel = str(answer).strip().lower()
-
     mapping = {
         "left": "left",
         "right": "right",
@@ -108,10 +102,8 @@ def normalize_rel(answer):
         "to the right of": "right",
         "on top of": "on",
     }
-
     if rel not in mapping:
         raise ValueError(f"Unsupported relation answer: {answer}")
-
     return mapping[rel]
 
 
@@ -122,34 +114,34 @@ def parse_prediction(text: str):
 
 
 @torch.no_grad()
-def run_one_generation_ablation(
+def run_one_generation_no_image(
     wrapper,
-    image,
     prompt: str,
-    image_mode: str,
     max_new_tokens: int,
 ):
+    """
+    尝试 text-only 路径。
+    注意：当前 repo 没有官方 no_image 分支，所以这里只是 best effort。
+    """
     processor = wrapper.processor
     model = wrapper.model
-    device = wrapper.device
 
-    if image_mode == "no_image":
-        prompt_for_model = remove_image_token_from_prompt(prompt)
-        single_input = processor(text=prompt_for_model, padding=True, return_tensors="pt")
-    else:
-        img = image if image_mode == "original" else make_black_image_like(image)
-        prompt_for_model = prompt
-        single_input = processor(images=img, text=prompt_for_model, padding=True, return_tensors="pt")
+    prompt_text = remove_image_token_from_prompt(prompt)
 
+    single_input = processor(
+        text=prompt_text,
+        padding=True,
+        return_tensors="pt",
+    )
     single_input = {
-        k: (v.to(device) if torch.is_tensor(v) else v)
+        k: (v.to(wrapper.device) if torch.is_tensor(v) else v)
         for k, v in single_input.items()
         if v is not None
     }
 
     prompt_len = int(single_input["input_ids"].shape[1])
 
-    gen_kwargs = dict(
+    output = model.generate(
         input_ids=single_input["input_ids"],
         attention_mask=single_input.get("attention_mask", None),
         max_new_tokens=max_new_tokens,
@@ -160,12 +152,6 @@ def run_one_generation_ablation(
         output_attentions=False,
     )
 
-    # 只有有图时才传 pixel_values
-    if "pixel_values" in single_input:
-        gen_kwargs["pixel_values"] = single_input["pixel_values"]
-
-    output = model.generate(**gen_kwargs)
-
     gen_ids = output.sequences[0][prompt_len:]
     gen_text = processor.decode(
         gen_ids,
@@ -173,7 +159,7 @@ def run_one_generation_ablation(
         clean_up_tokenization_spaces=False,
     ).strip()
 
-    return output, gen_text, prompt_len, prompt_for_model
+    return output, gen_text, prompt_len, prompt_text
 
 
 def summarize_mode(df_mode: pd.DataFrame):
@@ -181,8 +167,8 @@ def summarize_mode(df_mode: pd.DataFrame):
     ok = int(df_mode["correct"].fillna(False).sum())
     acc = ok / total if total > 0 else float("nan")
 
-    gold_counts = Counter(df_mode["gold"])
-    pred_counts = Counter(df_mode["pred"])
+    gold_counts = df_mode["gold"].value_counts().to_dict()
+    pred_counts = df_mode["pred"].value_counts().to_dict()
 
     first_logit_mean = pd.to_numeric(df_mode["first_raw_logit"], errors="coerce").mean()
     final_logit_mean = pd.to_numeric(df_mode["final_raw_logit"], errors="coerce").mean()
@@ -230,13 +216,19 @@ def write_report(path: str, df: pd.DataFrame, image_modes):
             f.write("=" * 120 + "\n")
 
             sub = df[df["image_mode"] == mode].copy()
-
             if len(sub) == 0:
                 f.write("No rows.\n\n")
                 continue
 
             errs = sub["status"].fillna("ok").value_counts().to_dict()
             f.write(f"status_counts: {errs}\n\n")
+
+            if "error" in errs:
+                f.write("top_errors:\n")
+                top_errors = sub[sub["status"] == "error"]["error"].value_counts().head(10)
+                for msg, cnt in top_errors.items():
+                    f.write(f"  [{cnt}] {msg}\n")
+                f.write("\n")
 
             sub_ok = sub[sub["status"] == "ok"].copy()
             if len(sub_ok) == 0:
@@ -272,14 +264,6 @@ def write_report(path: str, df: pd.DataFrame, image_modes):
             f.write(stats["cm"].to_string())
             f.write("\n\n")
 
-            # 错例中最常见的预测
-            wrong = sub_ok[sub_ok["correct"] == False]
-            f.write(f"wrong_examples: {len(wrong)}\n")
-            if len(wrong) > 0:
-                wrong_pred_counts = wrong["pred"].value_counts().to_dict()
-                f.write(f"wrong_pred_distribution: {wrong_pred_counts}\n")
-            f.write("\n")
-
 
 def main():
     args = parse_args()
@@ -289,7 +273,6 @@ def main():
     wrapper, image_preprocess = get_model(args.model_name, args.device, args.method)
     dataset = get_dataset(args.dataset, image_preprocess=image_preprocess, download=args.download)
 
-    # 复用 repo 现有 prompt 抽样逻辑
     prompt_records, sampled_indices = wrapper.load_prompt_records_with_sampling(args.dataset, args.option)
     if sampled_indices is not None:
         sub_dataset = torch.utils.data.Subset(dataset, sampled_indices)
@@ -313,7 +296,6 @@ def main():
         image = item["image_options"][0]
         image_name = item.get("image_name", f"sample_{local_idx:04d}")
         image_path = item.get("image_path", "")
-
         prompt = rec["question"]
         question_clean = clean_question_text(prompt)
         gold = normalize_rel(rec["answer"][0] if isinstance(rec["answer"], list) else rec["answer"])
@@ -331,13 +313,35 @@ def main():
             }
 
             try:
-                output, gen_text, prompt_len, prompt_used = run_one_generation_ablation(
-                    wrapper=wrapper,
-                    image=image,
-                    prompt=prompt,
-                    image_mode=image_mode,
-                    max_new_tokens=args.max_new_tokens,
-                )
+                if image_mode == "original":
+                    output, gen_text, prompt_len = run_one_generation(
+                        wrapper=wrapper,
+                        model_name=args.model_name,
+                        image=image,
+                        prompt=prompt,
+                        perturb_mode="none",
+                        max_new_tokens=args.max_new_tokens,
+                    )
+                    prompt_used = prompt
+
+                elif image_mode == "black":
+                    black_image = make_black_image_like(image)
+                    output, gen_text, prompt_len = run_one_generation(
+                        wrapper=wrapper,
+                        model_name=args.model_name,
+                        image=black_image,
+                        prompt=prompt,
+                        perturb_mode="none",
+                        max_new_tokens=args.max_new_tokens,
+                    )
+                    prompt_used = prompt
+
+                else:  # no_image
+                    output, gen_text, prompt_len, prompt_used = run_one_generation_no_image(
+                        wrapper=wrapper,
+                        prompt=prompt,
+                        max_new_tokens=args.max_new_tokens,
+                    )
 
                 trace = build_generation_trace(
                     wrapper.processor,
@@ -348,9 +352,6 @@ def main():
 
                 pred = parse_prediction(gen_text)
                 correct = (pred == gold)
-
-                first = trace[0] if trace else {}
-                last = trace[-1] if trace else {}
 
                 trace_rel_path = os.path.join(
                     image_mode,
@@ -373,6 +374,9 @@ def main():
                     "token_trace": trace,
                 })
 
+                first = trace[0] if trace else {}
+                last = trace[-1] if trace else {}
+
                 row.update({
                     "prompt_used": prompt_used,
                     "generated_text": gen_text,
@@ -389,6 +393,7 @@ def main():
                     "final_probability": last.get("probability", None),
                     "trace_json": trace_rel_path,
                 })
+
             except Exception as e:
                 row.update({
                     "status": "error",
