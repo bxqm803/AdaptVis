@@ -23,7 +23,6 @@ from run_interrupt import (
     write_json,
 )
 
-
 CHOICES = ["left", "right", "on", "under"]
 
 
@@ -35,10 +34,8 @@ def parse_args():
     p.add_argument("--option", default="four", type=str)
     p.add_argument("--download", action="store_true")
     p.add_argument("--seed", default=1, type=int)
-
     p.add_argument("--sample-index", default=0, type=int)
     p.add_argument("--limit", default=-1, type=int)
-
     p.add_argument(
         "--method",
         default="scaling_vis",
@@ -67,7 +64,28 @@ def parse_args():
     )
     p.add_argument("--max-new-tokens", default=20, type=int)
     p.add_argument("--trace-topk", default=10, type=int)
-    p.add_argument("--out-dir", default="./output_interrupt_q0_permute", type=str)
+    p.add_argument("--out-dir", default="./output_interrupt_q0_permute_with_caption", type=str)
+
+    # 新增：caption 相关
+    p.add_argument(
+        "--caption-prompt",
+        default="Describe the image in one concise sentence.",
+        type=str,
+        help="Prompt used to generate one caption per image before the 24 q0 questions.",
+    )
+    p.add_argument(
+        "--caption-max-new-tokens",
+        default=40,
+        type=int,
+        help="Max new tokens for caption generation.",
+    )
+    p.add_argument(
+        "--caption-perturb-mode",
+        default="none",
+        type=str,
+        choices=["none", "uniform", "random", "reverse"],
+        help="Perturbation mode used only when generating the caption.",
+    )
     return p.parse_args()
 
 
@@ -91,7 +109,6 @@ def normalize_rel(answer):
         raise ValueError("Answer is None.")
 
     rel = str(answer).strip().lower()
-
     mapping = {
         "left": "left",
         "right": "right",
@@ -105,10 +122,8 @@ def normalize_rel(answer):
         "to the right of": "right",
         "on top of": "on",
     }
-
     if rel not in mapping:
         raise ValueError(f"Unsupported relation answer: {answer}")
-
     return mapping[rel]
 
 
@@ -121,7 +136,7 @@ def parse_prediction(text: str):
 def strip_answer_order_clause(question_text: str):
     q = clean_question_text(question_text)
     q = re.sub(
-        r"Answer with\s+left,\s*right,\s*on\s+or\s+under\.\s*$",
+        r"Answer with\s+left,\s*right,\s*on\s+or\s+under(?:\s+only)?\.\s*$",
         "",
         q,
         flags=re.IGNORECASE,
@@ -130,18 +145,30 @@ def strip_answer_order_clause(question_text: str):
     return q
 
 
-def build_q0_permuted_prompts(base_prompt):
+def clean_caption_text(text: str):
+    x = str(text).strip()
+    x = re.sub(r"\s+", " ", x)
+    return x
+
+
+def build_q0_permuted_prompts_with_caption(base_prompt, caption_text):
     stem = strip_answer_order_clause(base_prompt)
+    cap = clean_caption_text(caption_text)
+
     out = []
     for perm in itertools.permutations(CHOICES):
         order_text = ", ".join(perm[:-1]) + f" or {perm[-1]}"
-        prompt_text = f"{stem} Answer with {order_text} only."
-        prompt = f"<image>\nUSER: {prompt_text}\nASSISTANT:"
+        prompt_text = (
+            f"Caption: {cap}\n"
+            f"Question: {stem} Answer with {order_text} only."
+        )
+        prompt = f"\nUSER: {prompt_text}\nASSISTANT:"
         perm_id = "_".join(perm)
         out.append({
             "qid": "q0",
             "perm_id": perm_id,
             "order": list(perm),
+            "caption_text": cap,
             "prompt_text": prompt_text,
             "prompt": prompt,
         })
@@ -158,8 +185,8 @@ def main():
 
     wrapper, image_preprocess = get_model(args.model_name, args.device, args.method)
     dataset = get_dataset(args.dataset, image_preprocess=image_preprocess, download=args.download)
-    prompt_records, sampled_indices = wrapper.load_prompt_records_with_sampling(args.dataset, args.option)
 
+    prompt_records, sampled_indices = wrapper.load_prompt_records_with_sampling(args.dataset, args.option)
     if sampled_indices is not None:
         sub_dataset = torch.utils.data.Subset(dataset, sampled_indices)
     else:
@@ -170,6 +197,7 @@ def main():
 
     base_dir = os.path.join(args.out_dir, args.dataset, args.image_mode)
     os.makedirs(base_dir, exist_ok=True)
+
     summary_csv = os.path.join(base_dir, f"summary_{args.image_mode}.csv")
     summary_rows = []
 
@@ -184,14 +212,54 @@ def main():
         image_name = item.get("image_name", f"sample_{local_idx:04d}")
         image_path = item.get("image_path", "")
         image_stem = os.path.splitext(image_name)[0]
+
         sample_dir = os.path.join(base_dir, image_stem)
         os.makedirs(sample_dir, exist_ok=True)
 
         gold = normalize_rel(rec["answer"])
         base_question = clean_question_text(rec["question"])
-        permuted_prompts = build_q0_permuted_prompts(rec["question"])
 
-        meta_path = os.path.join(sample_dir, "meta_q0_permutations.json")
+        # 1) 先生成 caption（每张图一次）
+        caption_output, caption_text_raw, caption_prompt_len = run_one_generation(
+            wrapper=wrapper,
+            model_name=args.model_name,
+            image=image,
+            prompt=f"\nUSER: {args.caption_prompt}\nASSISTANT:",
+            perturb_mode=args.caption_perturb_mode,
+            max_new_tokens=args.caption_max_new_tokens,
+        )
+        caption_text = clean_caption_text(caption_text_raw)
+        caption_trace = build_generation_trace(
+            wrapper.processor,
+            caption_output,
+            caption_prompt_len,
+            topk=args.trace_topk,
+        )
+
+        caption_trace_rel_path = os.path.join(
+            image_stem,
+            f"caption_{args.image_mode}_{args.caption_perturb_mode}_trace.json",
+        )
+        caption_trace_path = os.path.join(base_dir, caption_trace_rel_path)
+
+        write_json(caption_trace_path, {
+            "image_name": image_name,
+            "image_path": image_path,
+            "local_index": local_idx,
+            "image_mode": args.image_mode,
+            "caption_prompt": args.caption_prompt,
+            "caption_perturb_mode": args.caption_perturb_mode,
+            "caption_text": caption_text,
+            "token_trace": caption_trace,
+        })
+
+        # 2) 基于 caption 构造 q0 的 24 个排列问题
+        permuted_prompts = build_q0_permuted_prompts_with_caption(
+            rec["question"],
+            caption_text=caption_text,
+        )
+
+        meta_path = os.path.join(sample_dir, "meta_q0_permutations_with_caption.json")
         if not os.path.exists(meta_path):
             write_json(meta_path, {
                 "local_index": local_idx,
@@ -200,13 +268,22 @@ def main():
                 "image_mode": args.image_mode,
                 "base_question": base_question,
                 "gold": gold,
+                "caption_prompt": args.caption_prompt,
+                "caption_text": caption_text,
+                "caption_perturb_mode": args.caption_perturb_mode,
                 "num_permutations": len(permuted_prompts),
                 "permutations": [
-                    {"perm_id": x["perm_id"], "order": x["order"], "prompt_text": x["prompt_text"]}
+                    {
+                        "perm_id": x["perm_id"],
+                        "order": x["order"],
+                        "caption_text": x["caption_text"],
+                        "prompt_text": x["prompt_text"],
+                    }
                     for x in permuted_prompts
                 ],
             })
 
+        # 3) 跑 24 个排列问题
         for q in permuted_prompts:
             for perturb_mode in perturb_modes:
                 output, gen_text, prompt_len = run_one_generation(
@@ -224,6 +301,7 @@ def main():
                     prompt_len,
                     topk=args.trace_topk,
                 )
+
                 pred = parse_prediction(gen_text)
                 correct = (pred == gold)
 
@@ -241,10 +319,13 @@ def main():
                     "perm_id": q["perm_id"],
                     "order": q["order"],
                     "base_question": base_question,
+                    "caption_text": caption_text,
                     "prompt_text": q["prompt_text"],
                     "gold": gold,
                     "prompt": q["prompt"],
                     "image_mode": args.image_mode,
+                    "caption_prompt": args.caption_prompt,
+                    "caption_perturb_mode": args.caption_perturb_mode,
                     "perturb_mode": perturb_mode,
                     "target_layers": "all" if target_layers is None else sorted(target_layers),
                     "generated_text": gen_text,
@@ -264,6 +345,10 @@ def main():
                     "perm_id": q["perm_id"],
                     "order_text": " | ".join(q["order"]),
                     "base_question": base_question,
+                    "caption_text": caption_text,
+                    "caption_prompt": args.caption_prompt,
+                    "caption_perturb_mode": args.caption_perturb_mode,
+                    "caption_trace_json": caption_trace_rel_path,
                     "prompt_text": q["prompt_text"],
                     "gold": gold,
                     "pred": pred,
@@ -284,39 +369,43 @@ def main():
                     "trace_json": trace_rel_path,
                 })
 
-    with open(summary_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "image_name",
-                "image_path",
-                "local_index",
-                "qid",
-                "perm_id",
-                "order_text",
-                "base_question",
-                "prompt_text",
-                "gold",
-                "pred",
-                "correct",
-                "image_mode",
-                "perturb_mode",
-                "target_layers",
-                "generated_text",
-                "num_generated_tokens",
-                "first_token",
-                "first_raw_logit",
-                "first_score",
-                "first_probability",
-                "final_token",
-                "final_raw_logit",
-                "final_score",
-                "final_probability",
-                "trace_json",
-            ],
-        )
-        writer.writeheader()
-        writer.writerows(summary_rows)
+        with open(summary_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "image_name",
+                    "image_path",
+                    "local_index",
+                    "qid",
+                    "perm_id",
+                    "order_text",
+                    "base_question",
+                    "caption_text",
+                    "caption_prompt",
+                    "caption_perturb_mode",
+                    "caption_trace_json",
+                    "prompt_text",
+                    "gold",
+                    "pred",
+                    "correct",
+                    "image_mode",
+                    "perturb_mode",
+                    "target_layers",
+                    "generated_text",
+                    "num_generated_tokens",
+                    "first_token",
+                    "first_raw_logit",
+                    "first_score",
+                    "first_probability",
+                    "final_token",
+                    "final_raw_logit",
+                    "final_score",
+                    "final_probability",
+                    "trace_json",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(summary_rows)
 
     print(f"Saved summary to: {summary_csv}")
 
