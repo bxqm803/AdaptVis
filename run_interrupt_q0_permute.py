@@ -12,7 +12,6 @@ from misc import seed_all
 from model_zoo import get_model
 from dataset_zoo import get_dataset
 
-# 复用原 run_interrupt.py 里的工具函数
 from run_interrupt import (
     parse_mode_list,
     parse_target_layers,
@@ -41,7 +40,6 @@ def parse_args():
         default="scaling_vis",
         type=str,
         choices=["scaling_vis"],
-        help="Use the Scal LLaVA path so custom kwargs reach decoder attention.",
     )
     p.add_argument(
         "--perturb-modes",
@@ -53,38 +51,33 @@ def parse_args():
         "--target-layers",
         default="all",
         type=str,
-        help='"all" or comma-separated decoder layer indices, e.g. "16" or "8,16,24".',
+        help='"all" or comma-separated decoder layer indices.',
     )
     p.add_argument(
         "--image-mode",
         default="original",
         type=str,
         choices=["original", "black"],
-        help='Input image mode: "original" or "black".',
     )
     p.add_argument("--max-new-tokens", default=20, type=int)
     p.add_argument("--trace-topk", default=10, type=int)
     p.add_argument("--out-dir", default="./output_interrupt_q0_permute_with_caption", type=str)
 
-    # 新增：caption 相关
     p.add_argument(
         "--caption-prompt",
         default="Describe the image in one concise sentence.",
         type=str,
-        help="Prompt used to generate one caption per image before the 24 q0 questions.",
     )
     p.add_argument(
         "--caption-max-new-tokens",
         default=40,
         type=int,
-        help="Max new tokens for caption generation.",
     )
     p.add_argument(
         "--caption-perturb-mode",
         default="none",
         type=str,
         choices=["none", "uniform", "random", "reverse"],
-        help="Perturbation mode used only when generating the caption.",
     )
     return p.parse_args()
 
@@ -162,7 +155,7 @@ def build_q0_permuted_prompts_with_caption(base_prompt, caption_text):
             f"Caption: {cap}\n"
             f"Question: {stem} Answer with {order_text} only."
         )
-        prompt = f"\nUSER: {prompt_text}\nASSISTANT:"
+        prompt = f"<image>\nUSER: {prompt_text}\nASSISTANT:"
         perm_id = "_".join(perm)
         out.append({
             "qid": "q0",
@@ -219,15 +212,16 @@ def main():
         gold = normalize_rel(rec["answer"])
         base_question = clean_question_text(rec["question"])
 
-        # 1) 先生成 caption（每张图一次）
+        # caption：这里必须带 <image>
         caption_output, caption_text_raw, caption_prompt_len = run_one_generation(
             wrapper=wrapper,
             model_name=args.model_name,
             image=image,
-            prompt=f"\nUSER: {args.caption_prompt}\nASSISTANT:",
+            prompt=f"<image>\nUSER: {args.caption_prompt}\nASSISTANT:",
             perturb_mode=args.caption_perturb_mode,
             max_new_tokens=args.caption_max_new_tokens,
         )
+
         caption_text = clean_caption_text(caption_text_raw)
         caption_trace = build_generation_trace(
             wrapper.processor,
@@ -253,7 +247,6 @@ def main():
             "token_trace": caption_trace,
         })
 
-        # 2) 基于 caption 构造 q0 的 24 个排列问题
         permuted_prompts = build_q0_permuted_prompts_with_caption(
             rec["question"],
             caption_text=caption_text,
@@ -283,7 +276,6 @@ def main():
                 ],
             })
 
-        # 3) 跑 24 个排列问题
         for q in permuted_prompts:
             for perturb_mode in perturb_modes:
                 output, gen_text, prompt_len = run_one_generation(
