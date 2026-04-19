@@ -139,7 +139,6 @@ def generate_free(model, processor, image, question_text, max_new_tokens=256, te
 
     token_probs = []
     token_logits = []
-
     for step, token_id in enumerate(token_ids):
         step_logits = outputs.scores[step][0]
         step_probs = torch.softmax(step_logits, dim=-1)
@@ -158,15 +157,30 @@ def generate_free(model, processor, image, question_text, max_new_tokens=256, te
 
 
 def extract_post_think_text(text: str):
+    """
+    兼容两种情况：
+    1) 有 </think>：取后半段
+    2) 没有 </think>：直接返回原始输出，避免 Qwen2.5 全部变成 UNK
+    """
     if text is None:
         return "", False
+
+    text = str(text).strip()
+    if not text:
+        return "", False
+
     low = text.lower()
     tag = "</think>"
     idx = low.rfind(tag)
+
     if idx == -1:
-        return "", False
+        return text, False
+
     suffix = text[idx + len(tag):].strip()
-    return suffix, True
+    if suffix:
+        return suffix, True
+
+    return text, True
 
 
 def parse_answer_from_text(text: str, mode: str):
@@ -184,7 +198,6 @@ def parse_answer_from_text(text: str, mode: str):
     matches = list(re.finditer(r"\b(true|false|t|f)\b", t))
     if not matches:
         return "UNK"
-
     tok = matches[-1].group(1)
     return "True" if tok in {"t", "true"} else "False"
 
@@ -213,6 +226,7 @@ def main():
 
     print(f"Loading model: {args.model_id}")
     print(f"Using cache_dir: {cache_dir}")
+
     if args.model_id not in SUPPORTED_VLM_MODELS:
         print(f"[Warning] {args.model_id} not in tested list: {SUPPORTED_VLM_MODELS}")
 
@@ -253,6 +267,7 @@ def main():
         image_stem = os.path.splitext(image_name)[0]
 
         base_answer = rec["answer"][0] if isinstance(rec["answer"], list) else rec["answer"]
+
         questions, meta = build_questions(
             base_prompt=rec["question"],
             base_answer=base_answer,
@@ -298,6 +313,7 @@ def main():
 
             pred_text = gen_out["pred_text"]
 
+            # 关键修复：没有 </think> 时，直接用原始输出
             postthink_text, has_think_close = extract_post_think_text(pred_text)
             pred_postthink = parse_answer_from_text(postthink_text, q["mode"])
 
@@ -360,8 +376,9 @@ def main():
                 for qid in qids
             )
             row["pattern_q1_q9_postthink"] = pattern_q1_q9_postthink
-            row["num_correct_q1_q9_postthink"] = sum(q_correct_postthink_map.get(qid, False) for qid in qids)
-
+            row["num_correct_q1_q9_postthink"] = sum(
+                q_correct_postthink_map.get(qid, False) for qid in qids
+            )
             for i in range(1, 10):
                 row[f"q{i}_postthink"] = "C" if q_correct_postthink_map.get(f"q{i}", False) else "W"
 
