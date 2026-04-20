@@ -60,6 +60,26 @@ def clean_question_text(question: str):
     return q
 
 
+def strip_answer_clause(question: str):
+    """
+    Remove trailing answer constraint from the original q0 question, e.g.
+    'Answer with left, right, on or under.'
+    """
+    q = str(question).strip()
+
+    patterns = [
+        r"\s*Answer with\s+left\s*,\s*right\s*,\s*on\s*or\s*under\.?\s*$",
+        r"\s*Answer with\s+left\s*,\s*right\s*,\s*on\s*,\s*or\s*under\.?\s*$",
+        r"\s*Answer with\s+under\s*,\s*right\s*,\s*left\s*or\s*on\.?\s*$",
+        r"\s*Answer with\s+.*?\s+only\.?\s*$",
+    ]
+
+    for pat in patterns:
+        q = re.sub(pat, "", q, flags=re.IGNORECASE).strip()
+
+    return q
+
+
 def normalize_rel(answer):
     if isinstance(answer, (list, tuple)):
         if len(answer) == 0:
@@ -217,6 +237,7 @@ def build_summary_fieldnames(save_first_topk=10):
         "image_path",
         "local_index",
         "qid",
+        "raw_question",
         "base_question",
         "prompt_text",
         "gold",
@@ -259,7 +280,6 @@ def main():
     args = parse_args()
     seed_all(args.seed)
 
-    # 即便只跑 none，也保持和现有 run_interrupt.py 一样的 generate 路径
     install_attention_perturbation(target_layers=None)
 
     wrapper, image_preprocess = get_model(args.model_name, args.device, args.method)
@@ -302,9 +322,10 @@ def main():
         os.makedirs(sample_dir, exist_ok=True)
 
         gold = normalize_rel(rec["answer"])
-        base_question = clean_question_text(rec["question"])
 
-        # 不额外添加 "Answer with ... only"
+        raw_question = clean_question_text(rec["question"])
+        base_question = strip_answer_clause(raw_question)
+
         prompt_text = base_question
         prompt = f"<image>\nUSER: {prompt_text}\nASSISTANT:"
 
@@ -346,6 +367,7 @@ def main():
                 "image_path": image_path,
                 "local_index": local_idx,
                 "qid": "q0",
+                "raw_question": raw_question,
                 "base_question": base_question,
                 "prompt_text": prompt_text,
                 "prompt": prompt,
@@ -372,6 +394,7 @@ def main():
                     "image_path": image_path,
                     "image_mode": "original",
                     "qid": "q0",
+                    "raw_question": raw_question,
                     "base_question": base_question,
                     "gold": gold,
                     "prompt_text": prompt_text,
@@ -389,6 +412,7 @@ def main():
             "image_path": image_path,
             "local_index": local_idx,
             "qid": "q0",
+            "raw_question": raw_question,
             "base_question": base_question,
             "prompt_text": prompt_text,
             "gold": gold,
