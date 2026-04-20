@@ -24,6 +24,33 @@ from run_interrupt import (
 
 CHOICES = ["left", "right", "on", "under"]
 
+RUN_VARIANTS = [
+    {
+        "variant": "black_no_caption",
+        "image_mode": "black",
+        "use_caption": False,
+        "caption_source_mode": "black",
+    },
+    {
+        "variant": "original_no_caption",
+        "image_mode": "original",
+        "use_caption": False,
+        "caption_source_mode": "original",
+    },
+    {
+        "variant": "black_with_caption",
+        "image_mode": "black",
+        "use_caption": True,
+        "caption_source_mode": "black",
+    },
+    {
+        "variant": "original_with_caption",
+        "image_mode": "original",
+        "use_caption": True,
+        "caption_source_mode": "original",
+    },
+]
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -53,12 +80,6 @@ def parse_args():
         type=str,
         help='"all" or comma-separated decoder layer indices.',
     )
-    p.add_argument(
-        "--image-mode",
-        default="original",
-        type=str,
-        choices=["original", "black"],
-    )
     p.add_argument("--max-new-tokens", default=20, type=int)
     p.add_argument("--trace-topk", default=10, type=int)
     p.add_argument(
@@ -67,7 +88,7 @@ def parse_args():
         type=int,
         help="How many top candidates to save for the first generated token in summary.",
     )
-    p.add_argument("--out-dir", default="./output_interrupt_q0_permute_with_caption", type=str)
+    p.add_argument("--out-dir", default="./output_interrupt_q0_permute_four_modes", type=str)
 
     p.add_argument(
         "--caption-prompt",
@@ -154,7 +175,6 @@ def normalize_token_text(token_text: str):
     if token_text is None:
         return ""
     x = str(token_text)
-    # 常见 tokenizer 标记
     x = x.replace("Ġ", "")
     x = x.replace("▁", "")
     x = x.strip().lower()
@@ -162,11 +182,6 @@ def normalize_token_text(token_text: str):
 
 
 def extract_first_topk_candidates(trace, topn=10):
-    """
-    从 build_generation_trace 返回的第一步中，尽量鲁棒地抽出 top-k 候选。
-    返回 list[dict]，每个元素包含：
-      token_text, token_norm, raw_logit, probability
-    """
     if not trace:
         return []
 
@@ -207,9 +222,6 @@ def extract_first_topk_candidates(trace, topn=10):
 
 
 def build_first_topk_summary_fields(trace, topn=10):
-    """
-    扁平化 first-step top-k 到 summary 行里。
-    """
     candidates = extract_first_topk_candidates(trace, topn=topn)
 
     row = {
@@ -232,24 +244,31 @@ def build_first_topk_summary_fields(trace, topn=10):
     return row
 
 
-def build_q0_permuted_prompts_with_caption(base_prompt, caption_text):
+def build_q0_permuted_prompts(base_prompt, use_caption=False, caption_text=""):
     stem = strip_answer_order_clause(base_prompt)
     cap = clean_caption_text(caption_text)
 
     out = []
     for perm in itertools.permutations(CHOICES):
         order_text = ", ".join(perm[:-1]) + f" or {perm[-1]}"
-        prompt_text = (
-            f"Caption: {cap}\n"
-            f"Question: {stem} Answer with {order_text} only."
-        )
+
+        if use_caption:
+            prompt_text = (
+                f"Caption: {cap}\n"
+                f"Question: {stem} Answer with {order_text} only."
+            )
+        else:
+            prompt_text = f"{stem} Answer with {order_text} only."
+
         prompt = f"<image>\nUSER: {prompt_text}\nASSISTANT:"
         perm_id = "_".join(perm)
+
         out.append({
             "qid": "q0",
             "perm_id": perm_id,
             "order": list(perm),
-            "caption_text": cap,
+            "use_caption": use_caption,
+            "caption_text": cap if use_caption else "",
             "prompt_text": prompt_text,
             "prompt": prompt,
         })
@@ -258,6 +277,10 @@ def build_q0_permuted_prompts_with_caption(base_prompt, caption_text):
 
 def build_summary_fieldnames(save_first_topk=10):
     fieldnames = [
+        "variant",
+        "use_caption",
+        "caption_source_mode",
+        "image_mode",
         "image_name",
         "image_path",
         "local_index",
@@ -273,7 +296,6 @@ def build_summary_fieldnames(save_first_topk=10):
         "gold",
         "pred",
         "correct",
-        "image_mode",
         "perturb_mode",
         "target_layers",
         "generated_text",
@@ -303,6 +325,60 @@ def build_summary_fieldnames(save_first_topk=10):
     return fieldnames
 
 
+def generate_caption_for_image(
+    wrapper,
+    processor,
+    model_name,
+    image,
+    image_mode_name,
+    args,
+    image_name,
+    image_path,
+    image_stem,
+    local_idx,
+    base_dir,
+    trace_topk_to_use,
+):
+    caption_output, caption_text_raw, caption_prompt_len = run_one_generation(
+        wrapper=wrapper,
+        model_name=model_name,
+        image=image,
+        prompt=f"<image>\nUSER: {args.caption_prompt}\nASSISTANT:",
+        perturb_mode=args.caption_perturb_mode,
+        max_new_tokens=args.caption_max_new_tokens,
+    )
+
+    caption_text = clean_caption_text(caption_text_raw)
+    caption_trace = build_generation_trace(
+        processor,
+        caption_output,
+        caption_prompt_len,
+        topk=trace_topk_to_use,
+    )
+
+    caption_trace_rel_path = os.path.join(
+        image_stem,
+        f"caption_source_{image_mode_name}_{args.caption_perturb_mode}_trace.json",
+    )
+    caption_trace_path = os.path.join(base_dir, caption_trace_rel_path)
+
+    write_json(caption_trace_path, {
+        "image_name": image_name,
+        "image_path": image_path,
+        "local_index": local_idx,
+        "caption_source_mode": image_mode_name,
+        "caption_prompt": args.caption_prompt,
+        "caption_perturb_mode": args.caption_perturb_mode,
+        "caption_text": caption_text,
+        "token_trace": caption_trace,
+    })
+
+    return {
+        "caption_text": caption_text,
+        "caption_trace_rel_path": caption_trace_rel_path,
+    }
+
+
 def main():
     args = parse_args()
     seed_all(args.seed)
@@ -323,23 +399,21 @@ def main():
     start = args.sample_index
     end = len(prompt_records) if args.limit < 0 else min(len(prompt_records), start + args.limit)
 
-    base_dir = os.path.join(args.out_dir, args.dataset, args.image_mode)
+    base_dir = os.path.join(args.out_dir, args.dataset)
     os.makedirs(base_dir, exist_ok=True)
 
-    summary_csv = os.path.join(base_dir, f"summary_{args.image_mode}.csv")
+    summary_csv = os.path.join(base_dir, "summary_all_variants.csv")
     summary_rows = []
     summary_fieldnames = build_summary_fieldnames(save_first_topk=args.save_first_topk)
 
-    # 确保 trace 里至少有我们想保存的 top-k
     trace_topk_to_use = max(args.trace_topk, args.save_first_topk)
 
     for local_idx in tqdm(range(start, end), desc="Samples"):
         rec = prompt_records[local_idx]
         item = sub_dataset[local_idx]
 
-        image = item["image_options"][0]
-        if args.image_mode == "black":
-            image = make_black_image_like(image)
+        original_image = item["image_options"][0]
+        black_image = make_black_image_like(original_image)
 
         image_name = item.get("image_name", f"sample_{local_idx:04d}")
         image_path = item.get("image_path", "")
@@ -351,163 +425,186 @@ def main():
         gold = normalize_rel(rec["answer"])
         base_question = clean_question_text(rec["question"])
 
-        # caption：这里必须带 <image>
-        caption_output, caption_text_raw, caption_prompt_len = run_one_generation(
+        # 先各生成一次 caption：原图一个，黑图一个
+        original_caption_info = generate_caption_for_image(
             wrapper=wrapper,
+            processor=wrapper.processor,
             model_name=args.model_name,
-            image=image,
-            prompt=f"<image>\nUSER: {args.caption_prompt}\nASSISTANT:",
-            perturb_mode=args.caption_perturb_mode,
-            max_new_tokens=args.caption_max_new_tokens,
+            image=original_image,
+            image_mode_name="original",
+            args=args,
+            image_name=image_name,
+            image_path=image_path,
+            image_stem=image_stem,
+            local_idx=local_idx,
+            base_dir=base_dir,
+            trace_topk_to_use=trace_topk_to_use,
         )
 
-        caption_text = clean_caption_text(caption_text_raw)
-        caption_trace = build_generation_trace(
-            wrapper.processor,
-            caption_output,
-            caption_prompt_len,
-            topk=trace_topk_to_use,
+        black_caption_info = generate_caption_for_image(
+            wrapper=wrapper,
+            processor=wrapper.processor,
+            model_name=args.model_name,
+            image=black_image,
+            image_mode_name="black",
+            args=args,
+            image_name=image_name,
+            image_path=image_path,
+            image_stem=image_stem,
+            local_idx=local_idx,
+            base_dir=base_dir,
+            trace_topk_to_use=trace_topk_to_use,
         )
 
-        caption_trace_rel_path = os.path.join(
-            image_stem,
-            f"caption_{args.image_mode}_{args.caption_perturb_mode}_trace.json",
-        )
-        caption_trace_path = os.path.join(base_dir, caption_trace_rel_path)
+        variant_meta = []
 
-        write_json(caption_trace_path, {
-            "image_name": image_name,
-            "image_path": image_path,
-            "local_index": local_idx,
-            "image_mode": args.image_mode,
-            "caption_prompt": args.caption_prompt,
-            "caption_perturb_mode": args.caption_perturb_mode,
-            "caption_text": caption_text,
-            "token_trace": caption_trace,
-        })
+        for variant_cfg in RUN_VARIANTS:
+            variant = variant_cfg["variant"]
+            image_mode = variant_cfg["image_mode"]
+            use_caption = variant_cfg["use_caption"]
+            caption_source_mode = variant_cfg["caption_source_mode"]
 
-        permuted_prompts = build_q0_permuted_prompts_with_caption(
-            rec["question"],
-            caption_text=caption_text,
-        )
+            image = original_image if image_mode == "original" else black_image
 
-        meta_path = os.path.join(sample_dir, "meta_q0_permutations_with_caption.json")
+            if use_caption:
+                if caption_source_mode == "original":
+                    caption_text = original_caption_info["caption_text"]
+                    caption_trace_rel_path = original_caption_info["caption_trace_rel_path"]
+                else:
+                    caption_text = black_caption_info["caption_text"]
+                    caption_trace_rel_path = black_caption_info["caption_trace_rel_path"]
+            else:
+                caption_text = ""
+                caption_trace_rel_path = ""
+
+            permuted_prompts = build_q0_permuted_prompts(
+                rec["question"],
+                use_caption=use_caption,
+                caption_text=caption_text,
+            )
+
+            variant_meta.append({
+                "variant": variant,
+                "image_mode": image_mode,
+                "use_caption": use_caption,
+                "caption_source_mode": caption_source_mode,
+                "caption_text": caption_text,
+                "caption_trace_json": caption_trace_rel_path,
+                "num_permutations": len(permuted_prompts),
+            })
+
+            for q in permuted_prompts:
+                for perturb_mode in perturb_modes:
+                    output, gen_text, prompt_len = run_one_generation(
+                        wrapper=wrapper,
+                        model_name=args.model_name,
+                        image=image,
+                        prompt=q["prompt"],
+                        perturb_mode=perturb_mode,
+                        max_new_tokens=args.max_new_tokens,
+                    )
+
+                    trace = build_generation_trace(
+                        wrapper.processor,
+                        output,
+                        prompt_len,
+                        topk=trace_topk_to_use,
+                    )
+
+                    pred = parse_prediction(gen_text)
+                    correct = (pred == gold)
+
+                    trace_rel_path = os.path.join(
+                        image_stem,
+                        f"{variant}_q0_{q['perm_id']}_{perturb_mode}_trace.json",
+                    )
+                    trace_path = os.path.join(base_dir, trace_rel_path)
+
+                    first_topk_fields = build_first_topk_summary_fields(
+                        trace,
+                        topn=args.save_first_topk,
+                    )
+
+                    write_json(trace_path, {
+                        "variant": variant,
+                        "image_mode": image_mode,
+                        "use_caption": use_caption,
+                        "caption_source_mode": caption_source_mode,
+                        "image_name": image_name,
+                        "image_path": image_path,
+                        "local_index": local_idx,
+                        "qid": "q0",
+                        "perm_id": q["perm_id"],
+                        "order": q["order"],
+                        "base_question": base_question,
+                        "caption_text": caption_text,
+                        "prompt_text": q["prompt_text"],
+                        "gold": gold,
+                        "prompt": q["prompt"],
+                        "caption_prompt": args.caption_prompt,
+                        "caption_perturb_mode": args.caption_perturb_mode,
+                        "perturb_mode": perturb_mode,
+                        "target_layers": "all" if target_layers is None else sorted(target_layers),
+                        "generated_text": gen_text,
+                        "pred": pred,
+                        "correct": correct,
+                        "first_topk_summary": json.loads(first_topk_fields[f"first_top{args.save_first_topk}_json"]),
+                        "token_trace": trace,
+                    })
+
+                    first = trace[0] if trace else {}
+                    last = trace[-1] if trace else {}
+
+                    row = {
+                        "variant": variant,
+                        "use_caption": use_caption,
+                        "caption_source_mode": caption_source_mode,
+                        "image_mode": image_mode,
+                        "image_name": image_name,
+                        "image_path": image_path,
+                        "local_index": local_idx,
+                        "qid": "q0",
+                        "perm_id": q["perm_id"],
+                        "order_text": " | ".join(q["order"]),
+                        "base_question": base_question,
+                        "caption_text": caption_text,
+                        "caption_prompt": args.caption_prompt,
+                        "caption_perturb_mode": args.caption_perturb_mode,
+                        "caption_trace_json": caption_trace_rel_path,
+                        "prompt_text": q["prompt_text"],
+                        "gold": gold,
+                        "pred": pred,
+                        "correct": correct,
+                        "perturb_mode": perturb_mode,
+                        "target_layers": "all" if target_layers is None else ",".join(str(x) for x in sorted(target_layers)),
+                        "generated_text": gen_text,
+                        "num_generated_tokens": len(trace),
+                        "first_token": first.get("token_text", ""),
+                        "first_raw_logit": first.get("raw_logit", None),
+                        "first_score": first.get("score", None),
+                        "first_probability": first.get("probability", None),
+                        "final_token": last.get("token_text", ""),
+                        "final_raw_logit": last.get("raw_logit", None),
+                        "final_score": last.get("score", None),
+                        "final_probability": last.get("probability", None),
+                        "trace_json": trace_rel_path,
+                    }
+
+                    row.update(first_topk_fields)
+                    summary_rows.append(row)
+
+        meta_path = os.path.join(sample_dir, "meta_four_variants.json")
         if not os.path.exists(meta_path):
             write_json(meta_path, {
                 "local_index": local_idx,
                 "image_name": image_name,
                 "image_path": image_path,
-                "image_mode": args.image_mode,
                 "base_question": base_question,
                 "gold": gold,
                 "caption_prompt": args.caption_prompt,
-                "caption_text": caption_text,
                 "caption_perturb_mode": args.caption_perturb_mode,
-                "num_permutations": len(permuted_prompts),
-                "permutations": [
-                    {
-                        "perm_id": x["perm_id"],
-                        "order": x["order"],
-                        "caption_text": x["caption_text"],
-                        "prompt_text": x["prompt_text"],
-                    }
-                    for x in permuted_prompts
-                ],
+                "variants": variant_meta,
             })
-
-        for q in permuted_prompts:
-            for perturb_mode in perturb_modes:
-                output, gen_text, prompt_len = run_one_generation(
-                    wrapper=wrapper,
-                    model_name=args.model_name,
-                    image=image,
-                    prompt=q["prompt"],
-                    perturb_mode=perturb_mode,
-                    max_new_tokens=args.max_new_tokens,
-                )
-
-                trace = build_generation_trace(
-                    wrapper.processor,
-                    output,
-                    prompt_len,
-                    topk=trace_topk_to_use,
-                )
-
-                pred = parse_prediction(gen_text)
-                correct = (pred == gold)
-
-                trace_rel_path = os.path.join(
-                    image_stem,
-                    f"q0_{q['perm_id']}_{args.image_mode}_{perturb_mode}_trace.json",
-                )
-                trace_path = os.path.join(base_dir, trace_rel_path)
-
-                first_topk_fields = build_first_topk_summary_fields(
-                    trace,
-                    topn=args.save_first_topk,
-                )
-
-                write_json(trace_path, {
-                    "image_name": image_name,
-                    "image_path": image_path,
-                    "local_index": local_idx,
-                    "qid": "q0",
-                    "perm_id": q["perm_id"],
-                    "order": q["order"],
-                    "base_question": base_question,
-                    "caption_text": caption_text,
-                    "prompt_text": q["prompt_text"],
-                    "gold": gold,
-                    "prompt": q["prompt"],
-                    "image_mode": args.image_mode,
-                    "caption_prompt": args.caption_prompt,
-                    "caption_perturb_mode": args.caption_perturb_mode,
-                    "perturb_mode": perturb_mode,
-                    "target_layers": "all" if target_layers is None else sorted(target_layers),
-                    "generated_text": gen_text,
-                    "pred": pred,
-                    "correct": correct,
-                    "first_topk_summary": json.loads(first_topk_fields[f"first_top{args.save_first_topk}_json"]),
-                    "token_trace": trace,
-                })
-
-                first = trace[0] if trace else {}
-                last = trace[-1] if trace else {}
-
-                row = {
-                    "image_name": image_name,
-                    "image_path": image_path,
-                    "local_index": local_idx,
-                    "qid": "q0",
-                    "perm_id": q["perm_id"],
-                    "order_text": " | ".join(q["order"]),
-                    "base_question": base_question,
-                    "caption_text": caption_text,
-                    "caption_prompt": args.caption_prompt,
-                    "caption_perturb_mode": args.caption_perturb_mode,
-                    "caption_trace_json": caption_trace_rel_path,
-                    "prompt_text": q["prompt_text"],
-                    "gold": gold,
-                    "pred": pred,
-                    "correct": correct,
-                    "image_mode": args.image_mode,
-                    "perturb_mode": perturb_mode,
-                    "target_layers": "all" if target_layers is None else ",".join(str(x) for x in sorted(target_layers)),
-                    "generated_text": gen_text,
-                    "num_generated_tokens": len(trace),
-                    "first_token": first.get("token_text", ""),
-                    "first_raw_logit": first.get("raw_logit", None),
-                    "first_score": first.get("score", None),
-                    "first_probability": first.get("probability", None),
-                    "final_token": last.get("token_text", ""),
-                    "final_raw_logit": last.get("raw_logit", None),
-                    "final_score": last.get("score", None),
-                    "final_probability": last.get("probability", None),
-                    "trace_json": trace_rel_path,
-                }
-
-                row.update(first_topk_fields)
-                summary_rows.append(row)
 
         with open(summary_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=summary_fieldnames)
