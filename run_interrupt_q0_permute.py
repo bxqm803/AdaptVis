@@ -61,6 +61,12 @@ def parse_args():
     )
     p.add_argument("--max-new-tokens", default=20, type=int)
     p.add_argument("--trace-topk", default=10, type=int)
+    p.add_argument(
+        "--save-first-topk",
+        default=10,
+        type=int,
+        help="How many top candidates to save for the first generated token in summary.",
+    )
     p.add_argument("--out-dir", default="./output_interrupt_q0_permute_with_caption", type=str)
 
     p.add_argument(
@@ -144,6 +150,88 @@ def clean_caption_text(text: str):
     return x
 
 
+def normalize_token_text(token_text: str):
+    if token_text is None:
+        return ""
+    x = str(token_text)
+    # 常见 tokenizer 标记
+    x = x.replace("Ġ", "")
+    x = x.replace("▁", "")
+    x = x.strip().lower()
+    return x
+
+
+def extract_first_topk_candidates(trace, topn=10):
+    """
+    从 build_generation_trace 返回的第一步中，尽量鲁棒地抽出 top-k 候选。
+    返回 list[dict]，每个元素包含：
+      token_text, token_norm, raw_logit, probability
+    """
+    if not trace:
+        return []
+
+    first = trace[0]
+    candidate_keys = ["topk", "top_k", "top_tokens", "top_candidates", "candidates"]
+    candidates = None
+
+    for k in candidate_keys:
+        if k in first and isinstance(first[k], list):
+            candidates = first[k]
+            break
+
+    if candidates is None:
+        return []
+
+    out = []
+    for cand in candidates[:topn]:
+        if not isinstance(cand, dict):
+            continue
+
+        token_text = (
+            cand.get("token_text")
+            if cand.get("token_text") is not None
+            else cand.get("token", cand.get("text", cand.get("decoded", "")))
+        )
+
+        raw_logit = cand.get("raw_logit", cand.get("logit", None))
+        probability = cand.get("probability", None)
+
+        out.append({
+            "token_text": token_text,
+            "token_norm": normalize_token_text(token_text),
+            "raw_logit": raw_logit,
+            "probability": probability,
+        })
+
+    return out
+
+
+def build_first_topk_summary_fields(trace, topn=10):
+    """
+    扁平化 first-step top-k 到 summary 行里。
+    """
+    candidates = extract_first_topk_candidates(trace, topn=topn)
+
+    row = {
+        f"first_top{topn}_json": json.dumps(candidates, ensure_ascii=False)
+    }
+
+    for i in range(1, topn + 1):
+        if i <= len(candidates):
+            c = candidates[i - 1]
+            row[f"first_top{i}_token"] = c.get("token_text", "")
+            row[f"first_top{i}_token_norm"] = c.get("token_norm", "")
+            row[f"first_top{i}_raw_logit"] = c.get("raw_logit", None)
+            row[f"first_top{i}_probability"] = c.get("probability", None)
+        else:
+            row[f"first_top{i}_token"] = ""
+            row[f"first_top{i}_token_norm"] = ""
+            row[f"first_top{i}_raw_logit"] = None
+            row[f"first_top{i}_probability"] = None
+
+    return row
+
+
 def build_q0_permuted_prompts_with_caption(base_prompt, caption_text):
     stem = strip_answer_order_clause(base_prompt)
     cap = clean_caption_text(caption_text)
@@ -166,6 +254,53 @@ def build_q0_permuted_prompts_with_caption(base_prompt, caption_text):
             "prompt": prompt,
         })
     return out
+
+
+def build_summary_fieldnames(save_first_topk=10):
+    fieldnames = [
+        "image_name",
+        "image_path",
+        "local_index",
+        "qid",
+        "perm_id",
+        "order_text",
+        "base_question",
+        "caption_text",
+        "caption_prompt",
+        "caption_perturb_mode",
+        "caption_trace_json",
+        "prompt_text",
+        "gold",
+        "pred",
+        "correct",
+        "image_mode",
+        "perturb_mode",
+        "target_layers",
+        "generated_text",
+        "num_generated_tokens",
+        "first_token",
+        "first_raw_logit",
+        "first_score",
+        "first_probability",
+        f"first_top{save_first_topk}_json",
+    ]
+
+    for i in range(1, save_first_topk + 1):
+        fieldnames.extend([
+            f"first_top{i}_token",
+            f"first_top{i}_token_norm",
+            f"first_top{i}_raw_logit",
+            f"first_top{i}_probability",
+        ])
+
+    fieldnames.extend([
+        "final_token",
+        "final_raw_logit",
+        "final_score",
+        "final_probability",
+        "trace_json",
+    ])
+    return fieldnames
 
 
 def main():
@@ -193,6 +328,10 @@ def main():
 
     summary_csv = os.path.join(base_dir, f"summary_{args.image_mode}.csv")
     summary_rows = []
+    summary_fieldnames = build_summary_fieldnames(save_first_topk=args.save_first_topk)
+
+    # 确保 trace 里至少有我们想保存的 top-k
+    trace_topk_to_use = max(args.trace_topk, args.save_first_topk)
 
     for local_idx in tqdm(range(start, end), desc="Samples"):
         rec = prompt_records[local_idx]
@@ -227,7 +366,7 @@ def main():
             wrapper.processor,
             caption_output,
             caption_prompt_len,
-            topk=args.trace_topk,
+            topk=trace_topk_to_use,
         )
 
         caption_trace_rel_path = os.path.join(
@@ -291,7 +430,7 @@ def main():
                     wrapper.processor,
                     output,
                     prompt_len,
-                    topk=args.trace_topk,
+                    topk=trace_topk_to_use,
                 )
 
                 pred = parse_prediction(gen_text)
@@ -302,6 +441,11 @@ def main():
                     f"q0_{q['perm_id']}_{args.image_mode}_{perturb_mode}_trace.json",
                 )
                 trace_path = os.path.join(base_dir, trace_rel_path)
+
+                first_topk_fields = build_first_topk_summary_fields(
+                    trace,
+                    topn=args.save_first_topk,
+                )
 
                 write_json(trace_path, {
                     "image_name": image_name,
@@ -323,13 +467,14 @@ def main():
                     "generated_text": gen_text,
                     "pred": pred,
                     "correct": correct,
+                    "first_topk_summary": json.loads(first_topk_fields[f"first_top{args.save_first_topk}_json"]),
                     "token_trace": trace,
                 })
 
                 first = trace[0] if trace else {}
                 last = trace[-1] if trace else {}
 
-                summary_rows.append({
+                row = {
                     "image_name": image_name,
                     "image_path": image_path,
                     "local_index": local_idx,
@@ -359,43 +504,13 @@ def main():
                     "final_score": last.get("score", None),
                     "final_probability": last.get("probability", None),
                     "trace_json": trace_rel_path,
-                })
+                }
+
+                row.update(first_topk_fields)
+                summary_rows.append(row)
 
         with open(summary_csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=[
-                    "image_name",
-                    "image_path",
-                    "local_index",
-                    "qid",
-                    "perm_id",
-                    "order_text",
-                    "base_question",
-                    "caption_text",
-                    "caption_prompt",
-                    "caption_perturb_mode",
-                    "caption_trace_json",
-                    "prompt_text",
-                    "gold",
-                    "pred",
-                    "correct",
-                    "image_mode",
-                    "perturb_mode",
-                    "target_layers",
-                    "generated_text",
-                    "num_generated_tokens",
-                    "first_token",
-                    "first_raw_logit",
-                    "first_score",
-                    "first_probability",
-                    "final_token",
-                    "final_raw_logit",
-                    "final_score",
-                    "final_probability",
-                    "trace_json",
-                ],
-            )
+            writer = csv.DictWriter(f, fieldnames=summary_fieldnames)
             writer.writeheader()
             writer.writerows(summary_rows)
 
