@@ -34,7 +34,8 @@ def parse_args():
         type=str,
         choices=["scaling_vis"],
     )
-    p.add_argument("--max-new-tokens", default=20, type=int)
+    p.add_argument("--open-max-new-tokens", default=40, type=int)
+    p.add_argument("--mcq-max-new-tokens", default=20, type=int)
     p.add_argument("--trace-topk", default=10, type=int)
     p.add_argument(
         "--save-first-topk",
@@ -44,7 +45,7 @@ def parse_args():
     )
     p.add_argument(
         "--out-dir",
-        default="./output_q0_main_only",
+        default="./output_q0_open_then_mcq",
         type=str,
     )
     return p.parse_args()
@@ -208,26 +209,60 @@ def extract_first_topk_candidates(trace, topn=10):
     return out
 
 
-def build_first_topk_summary_fields(trace, topn=10):
+def build_first_topk_summary_fields(trace, prefix, topn=10):
     candidates = extract_first_topk_candidates(trace, topn=topn)
     row = {
-        f"first_top{topn}_json": json.dumps(candidates, ensure_ascii=False)
+        f"{prefix}_first_top{topn}_json": json.dumps(candidates, ensure_ascii=False)
     }
 
     for i in range(1, topn + 1):
         if i <= len(candidates):
             c = candidates[i - 1]
-            row[f"first_top{i}_token"] = c.get("token_text", "")
-            row[f"first_top{i}_token_norm"] = c.get("token_norm", "")
-            row[f"first_top{i}_raw_logit"] = c.get("raw_logit", None)
-            row[f"first_top{i}_probability"] = c.get("probability", None)
+            row[f"{prefix}_first_top{i}_token"] = c.get("token_text", "")
+            row[f"{prefix}_first_top{i}_token_norm"] = c.get("token_norm", "")
+            row[f"{prefix}_first_top{i}_raw_logit"] = c.get("raw_logit", None)
+            row[f"{prefix}_first_top{i}_probability"] = c.get("probability", None)
         else:
-            row[f"first_top{i}_token"] = ""
-            row[f"first_top{i}_token_norm"] = ""
-            row[f"first_top{i}_raw_logit"] = None
-            row[f"first_top{i}_probability"] = None
+            row[f"{prefix}_first_top{i}_token"] = ""
+            row[f"{prefix}_first_top{i}_token_norm"] = ""
+            row[f"{prefix}_first_top{i}_raw_logit"] = None
+            row[f"{prefix}_first_top{i}_probability"] = None
 
     return row
+
+
+def add_stage_fieldnames(fieldnames, prefix, save_first_topk=10):
+    stage_fields = [
+        f"{prefix}_prompt_text",
+        f"{prefix}_generated_text",
+        f"{prefix}_num_generated_tokens",
+        f"{prefix}_first_token",
+        f"{prefix}_first_raw_logit",
+        f"{prefix}_first_score",
+        f"{prefix}_first_probability",
+        f"{prefix}_first_top{save_first_topk}_json",
+    ]
+
+    for i in range(1, save_first_topk + 1):
+        stage_fields.extend(
+            [
+                f"{prefix}_first_top{i}_token",
+                f"{prefix}_first_top{i}_token_norm",
+                f"{prefix}_first_top{i}_raw_logit",
+                f"{prefix}_first_top{i}_probability",
+            ]
+        )
+
+    stage_fields.extend(
+        [
+            f"{prefix}_final_token",
+            f"{prefix}_final_raw_logit",
+            f"{prefix}_final_score",
+            f"{prefix}_final_probability",
+            f"{prefix}_trace_json",
+        ]
+    )
+    return fieldnames + stage_fields
 
 
 def build_summary_fieldnames(save_first_topk=10):
@@ -239,41 +274,34 @@ def build_summary_fieldnames(save_first_topk=10):
         "qid",
         "raw_question",
         "base_question",
-        "prompt_text",
         "gold",
         "pred",
         "correct",
         "perturb_mode",
         "target_layers",
-        "generated_text",
-        "num_generated_tokens",
-        "first_token",
-        "first_raw_logit",
-        "first_score",
-        "first_probability",
-        f"first_top{save_first_topk}_json",
+        "open_answer_as_caption",
     ]
 
-    for i in range(1, save_first_topk + 1):
-        fieldnames.extend(
-            [
-                f"first_top{i}_token",
-                f"first_top{i}_token_norm",
-                f"first_top{i}_raw_logit",
-                f"first_top{i}_probability",
-            ]
-        )
+    fieldnames = add_stage_fieldnames(fieldnames, "open", save_first_topk)
+    fieldnames = add_stage_fieldnames(fieldnames, "mcq", save_first_topk)
 
-    fieldnames.extend(
-        [
-            "final_token",
-            "final_raw_logit",
-            "final_score",
-            "final_probability",
-            "trace_json",
-        ]
-    )
     return fieldnames
+
+
+def trace_basic_fields(trace, prefix):
+    first = trace[0] if trace else {}
+    last = trace[-1] if trace else {}
+    return {
+        f"{prefix}_num_generated_tokens": len(trace),
+        f"{prefix}_first_token": first.get("token_text", ""),
+        f"{prefix}_first_raw_logit": first.get("raw_logit", None),
+        f"{prefix}_first_score": first.get("score", None),
+        f"{prefix}_first_probability": first.get("probability", None),
+        f"{prefix}_final_token": last.get("token_text", ""),
+        f"{prefix}_final_raw_logit": last.get("raw_logit", None),
+        f"{prefix}_final_score": last.get("score", None),
+        f"{prefix}_final_probability": last.get("probability", None),
+    }
 
 
 def main():
@@ -301,10 +329,10 @@ def main():
     start = args.sample_index
     end = len(prompt_records) if args.limit < 0 else min(len(prompt_records), start + args.limit)
 
-    base_dir = os.path.join(args.out_dir, args.dataset, "original_q0_main_only")
+    base_dir = os.path.join(args.out_dir, args.dataset, "original_q0_open_then_mcq")
     os.makedirs(base_dir, exist_ok=True)
 
-    summary_csv = os.path.join(base_dir, "summary_q0_main_only.csv")
+    summary_csv = os.path.join(base_dir, "summary_q0_open_then_mcq.csv")
     summary_rows = []
     summary_fieldnames = build_summary_fieldnames(save_first_topk=args.save_first_topk)
     trace_topk_to_use = max(args.trace_topk, args.save_first_topk)
@@ -326,42 +354,44 @@ def main():
         raw_question = clean_question_text(rec["question"])
         base_question = strip_answer_clause(raw_question)
 
-        prompt_text = base_question
-        prompt = f"<image>\nUSER: {prompt_text}\nASSISTANT:"
+        # ---------------------------
+        # Stage 1: open-ended question
+        # ---------------------------
+        open_prompt_text = base_question
+        open_prompt = f"<image>\nUSER: {open_prompt_text}\nASSISTANT:"
 
-        output, gen_text, prompt_len = run_one_generation(
+        open_output, open_gen_text, open_prompt_len = run_one_generation(
             wrapper=wrapper,
             model_name=args.model_name,
             image=image,
-            prompt=prompt,
+            prompt=open_prompt,
             perturb_mode="none",
-            max_new_tokens=args.max_new_tokens,
+            max_new_tokens=args.open_max_new_tokens,
         )
 
-        trace = build_generation_trace(
+        open_trace = build_generation_trace(
             wrapper.processor,
-            output,
-            prompt_len,
+            open_output,
+            open_prompt_len,
             topk=trace_topk_to_use,
         )
 
-        pred = parse_prediction(gen_text)
-        correct = pred == gold
-
-        trace_rel_path = os.path.join(
+        open_trace_rel_path = os.path.join(
             image_stem,
-            "q0_main_original_none_trace.json",
+            "q0_open_original_none_trace.json",
         )
-        trace_path = os.path.join(base_dir, trace_rel_path)
+        open_trace_path = os.path.join(base_dir, open_trace_rel_path)
 
-        first_topk_fields = build_first_topk_summary_fields(
-            trace,
+        open_first_topk_fields = build_first_topk_summary_fields(
+            open_trace,
+            prefix="open",
             topn=args.save_first_topk,
         )
 
         write_json(
-            trace_path,
+            open_trace_path,
             {
+                "stage": "open",
                 "image_mode": "original",
                 "image_name": image_name,
                 "image_path": image_path,
@@ -369,22 +399,85 @@ def main():
                 "qid": "q0",
                 "raw_question": raw_question,
                 "base_question": base_question,
-                "prompt_text": prompt_text,
-                "prompt": prompt,
+                "prompt_text": open_prompt_text,
+                "prompt": open_prompt,
                 "gold": gold,
-                "generated_text": gen_text,
+                "generated_text": open_gen_text,
+                "perturb_mode": "none",
+                "target_layers": "all",
+                "first_topk_summary": json.loads(
+                    open_first_topk_fields[f"open_first_top{args.save_first_topk}_json"]
+                ),
+                "token_trace": open_trace,
+            },
+        )
+
+        # -----------------------------------------
+        # Stage 2: use open answer as caption, then
+        # ask original constrained question
+        # -----------------------------------------
+        mcq_prompt_text = f"Caption: {open_gen_text.strip()}\nQuestion: {raw_question}"
+        mcq_prompt = f"<image>\nUSER: {mcq_prompt_text}\nASSISTANT:"
+
+        mcq_output, mcq_gen_text, mcq_prompt_len = run_one_generation(
+            wrapper=wrapper,
+            model_name=args.model_name,
+            image=image,
+            prompt=mcq_prompt,
+            perturb_mode="none",
+            max_new_tokens=args.mcq_max_new_tokens,
+        )
+
+        mcq_trace = build_generation_trace(
+            wrapper.processor,
+            mcq_output,
+            mcq_prompt_len,
+            topk=trace_topk_to_use,
+        )
+
+        pred = parse_prediction(mcq_gen_text)
+        correct = pred == gold
+
+        mcq_trace_rel_path = os.path.join(
+            image_stem,
+            "q0_mcq_from_open_caption_original_none_trace.json",
+        )
+        mcq_trace_path = os.path.join(base_dir, mcq_trace_rel_path)
+
+        mcq_first_topk_fields = build_first_topk_summary_fields(
+            mcq_trace,
+            prefix="mcq",
+            topn=args.save_first_topk,
+        )
+
+        write_json(
+            mcq_trace_path,
+            {
+                "stage": "mcq_from_open_caption",
+                "image_mode": "original",
+                "image_name": image_name,
+                "image_path": image_path,
+                "local_index": local_idx,
+                "qid": "q0",
+                "raw_question": raw_question,
+                "base_question": base_question,
+                "open_answer_as_caption": open_gen_text,
+                "prompt_text": mcq_prompt_text,
+                "prompt": mcq_prompt,
+                "gold": gold,
+                "generated_text": mcq_gen_text,
                 "pred": pred,
                 "correct": correct,
                 "perturb_mode": "none",
                 "target_layers": "all",
                 "first_topk_summary": json.loads(
-                    first_topk_fields[f"first_top{args.save_first_topk}_json"]
+                    mcq_first_topk_fields[f"mcq_first_top{args.save_first_topk}_json"]
                 ),
-                "token_trace": trace,
+                "token_trace": mcq_trace,
             },
         )
 
-        meta_path = os.path.join(sample_dir, "meta_q0_main_only.json")
+        meta_path = os.path.join(sample_dir, "meta_q0_open_then_mcq.json")
         if not os.path.exists(meta_path):
             write_json(
                 meta_path,
@@ -397,14 +490,10 @@ def main():
                     "raw_question": raw_question,
                     "base_question": base_question,
                     "gold": gold,
-                    "prompt_text": prompt_text,
                     "perturb_mode": "none",
                     "target_layers": "all",
                 },
             )
-
-        first = trace[0] if trace else {}
-        last = trace[-1] if trace else {}
 
         row = {
             "image_mode": "original",
@@ -414,25 +503,25 @@ def main():
             "qid": "q0",
             "raw_question": raw_question,
             "base_question": base_question,
-            "prompt_text": prompt_text,
             "gold": gold,
             "pred": pred,
             "correct": correct,
             "perturb_mode": "none",
             "target_layers": "all",
-            "generated_text": gen_text,
-            "num_generated_tokens": len(trace),
-            "first_token": first.get("token_text", ""),
-            "first_raw_logit": first.get("raw_logit", None),
-            "first_score": first.get("score", None),
-            "first_probability": first.get("probability", None),
-            "final_token": last.get("token_text", ""),
-            "final_raw_logit": last.get("raw_logit", None),
-            "final_score": last.get("score", None),
-            "final_probability": last.get("probability", None),
-            "trace_json": trace_rel_path,
+            "open_answer_as_caption": open_gen_text,
+            "open_prompt_text": open_prompt_text,
+            "open_generated_text": open_gen_text,
+            "open_trace_json": open_trace_rel_path,
+            "mcq_prompt_text": mcq_prompt_text,
+            "mcq_generated_text": mcq_gen_text,
+            "mcq_trace_json": mcq_trace_rel_path,
         }
-        row.update(first_topk_fields)
+
+        row.update(trace_basic_fields(open_trace, "open"))
+        row.update(trace_basic_fields(mcq_trace, "mcq"))
+        row.update(open_first_topk_fields)
+        row.update(mcq_first_topk_fields)
+
         summary_rows.append(row)
 
     with open(summary_csv, "w", newline="", encoding="utf-8") as f:
