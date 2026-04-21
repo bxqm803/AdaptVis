@@ -55,6 +55,11 @@ def parse_args():
         action="store_true",
         help="Skip a sample if bbox.json already exists.",
     )
+    parser.add_argument(
+        "--debug-print-objects",
+        action="store_true",
+        help="Print parsed object names for debugging.",
+    )
     return parser.parse_args()
 
 
@@ -99,30 +104,40 @@ def strip_answer_order_clause(question_text: str):
 
 def normalize_object_name(name: str) -> str:
     name = clean_text(name).lower()
+    name = name.replace("-", " ")
+    name = name.replace("_", " ")
     name = re.sub(r"^(a|an|the)\s+", "", name)
     name = re.sub(r"[?.!,;:]+$", "", name)
-    name = clean_text(name)
+    name = re.sub(r"\s+", " ", name).strip()
     return name
 
 
 def extract_two_objects_from_question(question_text: str):
     """
-    Tries to parse object1/object2 from the original spatial-relation question.
+    Parse object1/object2 from relation questions.
+    Supports:
+      - Where is the X in relation to the Y?
+      - Where are the X in relation to the Y?
+      - Where is/are the X with respect to the Y?
+      - Is the X to the left/right of the Y?
+      - Is the X on/under/above the Y?
     """
     q = strip_legacy_prompt(question_text)
     q = strip_answer_order_clause(q)
+    q = clean_text(q)
     q_low = q.lower()
 
     patterns = [
-        r"where is the (.+?) with respect to the (.+?)\??$",
-        r"is the (.+?) to the left of the (.+?)\??$",
-        r"is the (.+?) to the right of the (.+?)\??$",
-        r"is the (.+?) on the (.+?)\??$",
-        r"is the (.+?) under the (.+?)\??$",
-        r"is the (.+?) below the (.+?)\??$",
-        r"is the (.+?) beneath the (.+?)\??$",
-        r"is the (.+?) above the (.+?)\??$",
-        r"is the (.+?) on top of the (.+?)\??$",
+        r"where\s+(?:is|are)\s+the\s+(.+?)\s+in relation to\s+the\s+(.+?)\??$",
+        r"where\s+(?:is|are)\s+the\s+(.+?)\s+with respect to\s+the\s+(.+?)\??$",
+        r"is\s+the\s+(.+?)\s+to the left of\s+the\s+(.+?)\??$",
+        r"is\s+the\s+(.+?)\s+to the right of\s+the\s+(.+?)\??$",
+        r"is\s+the\s+(.+?)\s+on top of\s+the\s+(.+?)\??$",
+        r"is\s+the\s+(.+?)\s+on\s+the\s+(.+?)\??$",
+        r"is\s+the\s+(.+?)\s+under\s+the\s+(.+?)\??$",
+        r"is\s+the\s+(.+?)\s+below\s+the\s+(.+?)\??$",
+        r"is\s+the\s+(.+?)\s+beneath\s+the\s+(.+?)\??$",
+        r"is\s+the\s+(.+?)\s+above\s+the\s+(.+?)\??$",
     ]
 
     for pat in patterns:
@@ -133,15 +148,41 @@ def extract_two_objects_from_question(question_text: str):
             if obj1 and obj2:
                 return [obj1, obj2]
 
-    # Fallback: try "X with respect to Y"
-    m = re.search(r"(.+?) with respect to (.+?)\??$", q_low, flags=re.IGNORECASE)
-    if m:
-        obj1 = normalize_object_name(m.group(1))
-        obj2 = normalize_object_name(m.group(2))
-        if obj1 and obj2:
-            return [obj1, obj2]
+    return []
+
+
+def extract_two_objects_from_image_name(image_name: str):
+    """
+    Fallback parser from image filename, e.g.
+      beer-bottle_on_armchair.jpeg -> ["beer bottle", "armchair"]
+      scarf_right_of_armchair.jpeg -> ["scarf", "armchair"]
+      sunglasses_left_of_chair.jpeg -> ["sunglasses", "chair"]
+    """
+    stem = os.path.splitext(os.path.basename(image_name))[0].lower()
+
+    relation_markers = [
+        "_left_of_",
+        "_right_of_",
+        "_on_",
+        "_under_",
+    ]
+
+    for marker in relation_markers:
+        if marker in stem:
+            lhs, rhs = stem.split(marker, 1)
+            obj1 = normalize_object_name(lhs)
+            obj2 = normalize_object_name(rhs)
+            if obj1 and obj2:
+                return [obj1, obj2]
 
     return []
+
+
+def get_object_names(question_text: str, image_name: str):
+    names = extract_two_objects_from_question(question_text)
+    if names:
+        return names
+    return extract_two_objects_from_image_name(image_name)
 
 
 def make_user_messages(image, question_text):
@@ -189,8 +230,6 @@ def build_joint_bbox_prompt(object_names, image_w=None, image_h=None):
         size_hint = f"The image size is width={image_w}, height={image_h}. "
 
     obj_list = ", ".join([f'"{x}"' for x in object_names])
-
-    # Build template objects
     obj_template = ", ".join(
         [f'{{"label":"{x}","bbox_2d":[x1,y1,x2,y2]}}' for x in object_names]
     )
@@ -244,10 +283,6 @@ def generate_free(model, processor, image, question_text, max_new_tokens=256, te
 
 
 def extract_post_think_text(text: str):
-    """
-    If the model emits thinking text, keep only the suffix after </think>.
-    If not present, return original text.
-    """
     if text is None:
         return "", False
 
@@ -274,19 +309,15 @@ def extract_json_block(text: str):
         return None
 
     text = str(text).strip()
-
-    # remove markdown fences if any
     text = re.sub(r"^\s*```json\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"^\s*```\s*", "", text)
     text = re.sub(r"\s*```\s*$", "", text)
 
-    # direct parse
     try:
         return json.loads(text)
     except Exception:
         pass
 
-    # try dict block
     matches = re.findall(r"\{.*?\}", text, flags=re.DOTALL)
     for m in matches:
         try:
@@ -294,7 +325,6 @@ def extract_json_block(text: str):
         except Exception:
             continue
 
-    # try greedy dict
     m = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if m:
         try:
@@ -302,7 +332,6 @@ def extract_json_block(text: str):
         except Exception:
             pass
 
-    # try list
     m = re.search(r"\[.*\]", text, flags=re.DOTALL)
     if m:
         try:
@@ -331,7 +360,6 @@ def maybe_rescale_from_1000(bbox, image_w, image_h, auto_rescale_1000=False):
     if not auto_rescale_1000:
         return bbox
 
-    # If all coordinates lie in [0,1000], treat as 1000-normalized coords.
     if all(0 <= float(v) <= 1000 for v in bbox):
         x1, y1, x2, y2 = bbox
         x1 = int(round(float(x1) * image_w / 1000.0))
@@ -381,7 +409,6 @@ def normalize_bbox_item(item, image_w, image_h, auto_rescale_1000=False):
         return None
 
     x1, y1, x2, y2 = bbox
-    # allow slightly malformed output but try to fix ordering
     if x1 > x2:
         x1, x2 = x2, x1
     if y1 > y2:
@@ -398,14 +425,12 @@ def parse_bbox_output(text, image_w, image_h, auto_rescale_1000=False):
     if payload is None:
         return None
 
-    # case 1: single object dict
     if isinstance(payload, dict) and "bbox_2d" in payload:
         item = normalize_bbox_item(payload, image_w, image_h, auto_rescale_1000)
         if item is None:
             return None
         return [item]
 
-    # case 2: {"objects": [...]}
     if isinstance(payload, dict) and "objects" in payload and isinstance(payload["objects"], list):
         out = []
         for x in payload["objects"]:
@@ -414,7 +439,6 @@ def parse_bbox_output(text, image_w, image_h, auto_rescale_1000=False):
                 out.append(item)
         return out if out else None
 
-    # case 3: list of dicts
     if isinstance(payload, list):
         out = []
         for x in payload:
@@ -438,13 +462,11 @@ def find_bbox_by_label(parsed_items, target_label):
 
     target_label = normalize_object_name(target_label)
 
-    # exact normalized match first
     for item in parsed_items:
         label = normalize_object_name(item.get("label", ""))
         if label == target_label:
             return item.get("bbox_2d", None)
 
-    # loose contains match
     for item in parsed_items:
         label = normalize_object_name(item.get("label", ""))
         if target_label in label or label in target_label:
@@ -532,7 +554,12 @@ def main():
         base_question = strip_legacy_prompt(rec["question"])
         base_question = strip_answer_order_clause(base_question)
 
-        object_names = extract_two_objects_from_question(rec["question"])
+        object_names = get_object_names(rec["question"], image_name)
+
+        if args.debug_print_objects:
+            print(f"[{local_idx}] image={image_name}")
+            print(f"[{local_idx}] question={base_question}")
+            print(f"[{local_idx}] object_names={object_names}")
 
         image_w, image_h = image.size
 
@@ -560,7 +587,7 @@ def main():
         joint_parsed = None
 
         if len(object_names) == 0:
-            sample_record["error"] = "Failed to parse object names from question."
+            sample_record["error"] = "Failed to parse object names from question and image_name."
         else:
             if args.ask_mode == "single":
                 for obj_name in object_names:
@@ -606,7 +633,7 @@ def main():
                         obj2_bbox = bbox
                         obj2_raw = pred_text
 
-            else:  # joint
+            else:
                 prompt_text = build_joint_bbox_prompt(
                     object_names=object_names,
                     image_w=image_w,
