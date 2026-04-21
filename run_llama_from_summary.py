@@ -16,8 +16,8 @@ CHOICES = ["left", "right", "on", "under"]
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--summary-csv", required=True, type=str)
-    p.add_argument("--model-id", default="meta-llama/Llama-3.2-3B-Instruct", type=str)
-    p.add_argument("--out-dir", default="./output_llama_text_from_summary", type=str)
+    p.add_argument("--model-id", default="lmsys/vicuna-7b-v1.5", type=str)
+    p.add_argument("--out-dir", default="./output_vicuna_text_from_summary", type=str)
     p.add_argument("--max-new-tokens", default=16, type=int)
     p.add_argument("--sample-index", default=0, type=int)
     p.add_argument("--limit", default=-1, type=int)
@@ -140,7 +140,7 @@ def load_unique_examples_from_summary(summary_csv):
 
 
 def load_model_and_tokenizer(model_id, requested_device="cuda"):
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -161,11 +161,11 @@ def load_model_and_tokenizer(model_id, requested_device="cuda"):
 
 
 def run_one_generation(model, tokenizer, prompt_text, max_new_tokens=16, do_sample=False, temperature=0.0):
-    messages = [{"role": "user", "content": prompt_text}]
-    input_text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
+    input_text = (
+        "A chat between a curious user and an assistant. "
+        "The assistant gives helpful, detailed, and polite answers.\n"
+        f"USER: {prompt_text}\n"
+        "ASSISTANT:"
     )
 
     inputs = tokenizer(input_text, return_tensors="pt")
@@ -227,7 +227,7 @@ def main():
     fieldnames = build_summary_fieldnames()
 
     summary_name = os.path.splitext(os.path.basename(args.summary_csv))[0]
-    out_csv = os.path.join(args.out_dir, f"llama_text_only_from_{summary_name}.csv")
+    out_csv = os.path.join(args.out_dir, f"vicuna_text_only_from_{summary_name}.csv")
 
     for ex in tqdm(examples, desc="Examples"):
         permuted_prompts = build_q0_permuted_prompts(
