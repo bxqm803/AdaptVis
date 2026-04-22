@@ -21,10 +21,11 @@ def parse_args():
     p.add_argument("--seed", default=1, type=int)
     p.add_argument("--download", action="store_true")
     p.add_argument("--cache-dir", default=None, type=str)
-    p.add_argument("--out-dir", default="output_llava_manual_bbox_image_compare_repo", type=str)
+    p.add_argument("--out-dir", default="output_llava_manual_bbox_image_label_compare_repo", type=str)
     p.add_argument("--sample-index", default=0, type=int)
     p.add_argument("--limit", default=-1, type=int)
     p.add_argument("--line-width", default=6, type=int)
+    p.add_argument("--font-size", default=22, type=int)
     p.add_argument("--print-prompts", action="store_true")
     return p.parse_args()
 
@@ -175,16 +176,64 @@ def run_repo_llava_once(wrapper, image, prompt: str) -> str:
     return str(out)
 
 
-def draw_bbox_on_image(image, bbox1: Optional[List[int]], bbox2: Optional[List[int]], line_width: int = 6):
-    from PIL import ImageDraw
+def draw_bbox_on_image_with_labels(
+    image,
+    bbox1: Optional[List[int]],
+    bbox2: Optional[List[int]],
+    obj1_name: str,
+    obj2_name: str,
+    line_width: int = 6,
+    font_size: int = 22,
+):
+    from PIL import ImageDraw, ImageFont
 
     img = image.copy().convert("RGB")
     draw = ImageDraw.Draw(img)
 
-    if bbox1 is not None:
-        draw.rectangle(bbox1, outline="red", width=line_width)
-    if bbox2 is not None:
-        draw.rectangle(bbox2, outline="blue", width=line_width)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", font_size)
+    except Exception:
+        font = ImageFont.load_default()
+
+    def draw_one_box(bbox, label, color):
+        if bbox is None:
+            return
+
+        x1, y1, x2, y2 = bbox
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=line_width)
+
+        try:
+            tb = draw.textbbox((0, 0), label, font=font)
+            text_w = tb[2] - tb[0]
+            text_h = tb[3] - tb[1]
+        except Exception:
+            text_w, text_h = draw.textsize(label, font=font)
+
+        pad = 4
+
+        label_x1 = x1
+        label_y1 = y1 - text_h - 2 * pad - 2
+        if label_y1 < 0:
+            label_y1 = y1 + 2
+
+        label_x2 = label_x1 + text_w + 2 * pad
+        label_y2 = label_y1 + text_h + 2 * pad
+
+        draw.rectangle(
+            [label_x1, label_y1, label_x2, label_y2],
+            fill="white",
+            outline=color,
+            width=2,
+        )
+        draw.text(
+            (label_x1 + pad, label_y1 + pad),
+            label,
+            fill=color,
+            font=font,
+        )
+
+    draw_one_box(bbox1, obj1_name, "red")
+    draw_one_box(bbox2, obj2_name, "blue")
 
     return img
 
@@ -192,17 +241,17 @@ def draw_bbox_on_image(image, bbox1: Optional[List[int]], bbox2: Optional[List[i
 def build_report(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     total = len(rows)
     baseline_correct = sum(1 for r in rows if bool(r["baseline_correct"]))
-    bbox_image_correct = sum(1 for r in rows if bool(r["bbox_image_correct"]))
-    improved = sum(1 for r in rows if (not bool(r["baseline_correct"])) and bool(r["bbox_image_correct"]))
-    worsened = sum(1 for r in rows if bool(r["baseline_correct"]) and (not bool(r["bbox_image_correct"])))
+    bbox_image_label_correct = sum(1 for r in rows if bool(r["bbox_image_label_correct"]))
+    improved = sum(1 for r in rows if (not bool(r["baseline_correct"])) and bool(r["bbox_image_label_correct"]))
+    worsened = sum(1 for r in rows if bool(r["baseline_correct"]) and (not bool(r["bbox_image_label_correct"])))
     same = total - improved - worsened
 
     return {
         "num_images": total,
         "baseline_accuracy": 0.0 if total == 0 else baseline_correct / total,
-        "bbox_image_accuracy": 0.0 if total == 0 else bbox_image_correct / total,
+        "bbox_image_label_accuracy": 0.0 if total == 0 else bbox_image_label_correct / total,
         "baseline_correct": baseline_correct,
-        "bbox_image_correct": bbox_image_correct,
+        "bbox_image_label_correct": bbox_image_label_correct,
         "improved": improved,
         "worsened": worsened,
         "same": same,
@@ -240,11 +289,11 @@ def main():
     start = args.sample_index
     end = len(prompt_records) if args.limit < 0 else min(len(prompt_records), start + args.limit)
 
-    model_name = f"{args.model_name}_repo_bbox_image"
+    model_name = f"{args.model_name}_repo_bbox_image_label"
     out_root = os.path.join(args.out_dir, args.dataset, model_name)
     os.makedirs(out_root, exist_ok=True)
 
-    summary_csv = os.path.join(out_root, "summary_manual_bbox_image_compare.csv")
+    summary_csv = os.path.join(out_root, "summary_manual_bbox_image_label_compare.csv")
     report_json = os.path.join(out_root, "report.json")
 
     rows: List[Dict[str, Any]] = []
@@ -272,34 +321,41 @@ def main():
             continue
 
         baseline_prompt = raw_question
-        bbox_image_prompt = raw_question
+        bbox_image_label_prompt = raw_question
 
-        image_with_boxes = draw_bbox_on_image(
+        image_with_boxes_and_labels = draw_bbox_on_image_with_labels(
             image=image,
             bbox1=obj1_bbox,
             bbox2=obj2_bbox,
+            obj1_name=obj1_name,
+            obj2_name=obj2_name,
             line_width=args.line_width,
+            font_size=args.font_size,
         )
 
         baseline_gen = run_repo_llava_once(wrapper, image, baseline_prompt)
-        bbox_image_gen = run_repo_llava_once(wrapper, image_with_boxes, bbox_image_prompt)
+        bbox_image_label_gen = run_repo_llava_once(wrapper, image_with_boxes_and_labels, bbox_image_label_prompt)
 
         baseline_pred = parse_prediction(baseline_gen)
-        bbox_image_pred = parse_prediction(bbox_image_gen)
+        bbox_image_label_pred = parse_prediction(bbox_image_label_gen)
         baseline_correct = baseline_pred == gold
-        bbox_image_correct = bbox_image_pred == gold
+        bbox_image_label_correct = bbox_image_label_pred == gold
 
         print("=" * 100)
         print(f"image_name: {image_name}")
         print("[BASELINE PROMPT]")
         print(baseline_prompt)
-        print("[BBOX-IMAGE PROMPT]")
-        print(bbox_image_prompt)
-        print(f"gold={gold} | baseline_pred={baseline_pred} | bbox_image_pred={bbox_image_pred}")
+        print("[BBOX-IMAGE-LABEL PROMPT]")
+        print(bbox_image_label_prompt)
+        print(
+            f"gold={gold} | "
+            f"baseline_pred={baseline_pred} | "
+            f"bbox_image_label_pred={bbox_image_label_pred}"
+        )
 
         if args.print_prompts:
             print(f"[BASELINE GEN] {baseline_gen}")
-            print(f"[BBOX-IMAGE GEN] {bbox_image_gen}")
+            print(f"[BBOX-IMAGE-LABEL GEN] {bbox_image_label_gen}")
 
         sample_dir = os.path.join(out_root, os.path.splitext(image_name)[0])
         os.makedirs(sample_dir, exist_ok=True)
@@ -315,13 +371,13 @@ def main():
             "object_1_bbox": obj1_bbox,
             "object_2_bbox": obj2_bbox,
             "baseline_prompt": baseline_prompt,
-            "bbox_image_prompt": bbox_image_prompt,
+            "bbox_image_label_prompt": bbox_image_label_prompt,
             "baseline_generation": baseline_gen,
-            "bbox_image_generation": bbox_image_gen,
+            "bbox_image_label_generation": bbox_image_label_gen,
             "baseline_pred": baseline_pred,
-            "bbox_image_pred": bbox_image_pred,
+            "bbox_image_label_pred": bbox_image_label_pred,
             "baseline_correct": baseline_correct,
-            "bbox_image_correct": bbox_image_correct,
+            "bbox_image_label_correct": bbox_image_label_correct,
         }
         with open(sample_json, "w", encoding="utf-8") as f:
             json.dump(sample_payload, f, ensure_ascii=False, indent=2)
@@ -336,14 +392,14 @@ def main():
             "object_1_bbox": bbox_to_json(obj1_bbox),
             "object_2_bbox": bbox_to_json(obj2_bbox),
             "baseline_prompt": baseline_prompt,
-            "bbox_image_prompt": bbox_image_prompt,
+            "bbox_image_label_prompt": bbox_image_label_prompt,
             "baseline_generation": baseline_gen,
-            "bbox_image_generation": bbox_image_gen,
+            "bbox_image_label_generation": bbox_image_label_gen,
             "baseline_pred": baseline_pred,
-            "bbox_image_pred": bbox_image_pred,
+            "bbox_image_label_pred": bbox_image_label_pred,
             "baseline_correct": baseline_correct,
-            "bbox_image_correct": bbox_image_correct,
-            "delta": int(bbox_image_correct) - int(baseline_correct),
+            "bbox_image_label_correct": bbox_image_label_correct,
+            "delta": int(bbox_image_label_correct) - int(baseline_correct),
             "sample_json": os.path.relpath(sample_json, out_root),
         })
 
@@ -357,13 +413,13 @@ def main():
             "object_1_bbox",
             "object_2_bbox",
             "baseline_prompt",
-            "bbox_image_prompt",
+            "bbox_image_label_prompt",
             "baseline_generation",
-            "bbox_image_generation",
+            "bbox_image_label_generation",
             "baseline_pred",
-            "bbox_image_pred",
+            "bbox_image_label_pred",
             "baseline_correct",
-            "bbox_image_correct",
+            "bbox_image_label_correct",
             "delta",
             "sample_json",
         ]
