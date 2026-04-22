@@ -21,11 +21,9 @@ def parse_args():
     p.add_argument("--seed", default=1, type=int)
     p.add_argument("--download", action="store_true")
     p.add_argument("--cache-dir", default=None, type=str)
-    p.add_argument("--out-dir", default="output_llava_manual_bbox_image_label_compare_repo", type=str)
+    p.add_argument("--out-dir", default="output_llava_manual_relation_hint_compare_repo", type=str)
     p.add_argument("--sample-index", default=0, type=int)
     p.add_argument("--limit", default=-1, type=int)
-    p.add_argument("--line-width", default=6, type=int)
-    p.add_argument("--font-size", default=22, type=int)
     p.add_argument("--print-prompts", action="store_true")
     return p.parse_args()
 
@@ -84,6 +82,7 @@ def normalize_rel(answer: Any) -> str:
         answer = answer[0]
     if answer is None:
         return "UNK"
+
     rel = str(answer).strip().lower()
     mapping = {
         "left": "left",
@@ -157,6 +156,111 @@ def load_manual_bbox_rows(csv_path: str) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def _get_shortest_edge(feature_extractor) -> Optional[int]:
+    size = getattr(feature_extractor, "size", None)
+    if isinstance(size, dict):
+        if "shortest_edge" in size:
+            return int(size["shortest_edge"])
+        if "height" in size and "width" in size and int(size["height"]) == int(size["width"]):
+            return int(size["height"])
+    elif isinstance(size, int):
+        return int(size)
+    return None
+
+
+def _get_crop_hw(feature_extractor) -> Tuple[Optional[int], Optional[int]]:
+    crop = getattr(feature_extractor, "crop_size", None)
+    if isinstance(crop, dict):
+        h = crop.get("height", crop.get("shortest_edge", None))
+        w = crop.get("width", crop.get("shortest_edge", None))
+        return (int(h) if h is not None else None, int(w) if w is not None else None)
+    if isinstance(crop, int):
+        return int(crop), int(crop)
+    return None, None
+
+
+def clip_bbox(bbox: Optional[List[int]], width: int, height: int) -> Optional[List[int]]:
+    if bbox is None:
+        return None
+    x1, y1, x2, y2 = bbox
+    x1 = max(0, min(int(x1), width - 1))
+    y1 = max(0, min(int(y1), height - 1))
+    x2 = max(0, min(int(x2), width - 1))
+    y2 = max(0, min(int(y2), height - 1))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return [x1, y1, x2, y2]
+
+
+def map_bbox_to_repo_processor_coords(
+    bbox: Optional[List[int]],
+    image_w: int,
+    image_h: int,
+    feature_extractor,
+) -> Optional[List[int]]:
+    if bbox is None:
+        return None
+
+    do_resize = bool(getattr(feature_extractor, "do_resize", True))
+    do_center_crop = bool(getattr(feature_extractor, "do_center_crop", False))
+    shortest_edge = _get_shortest_edge(feature_extractor)
+    crop_h, crop_w = _get_crop_hw(feature_extractor)
+
+    x1, y1, x2, y2 = bbox
+    rw, rh = image_w, image_h
+
+    if do_resize and shortest_edge is not None:
+        scale = float(shortest_edge) / float(min(image_w, image_h))
+        x1 = int(round(x1 * scale))
+        y1 = int(round(y1 * scale))
+        x2 = int(round(x2 * scale))
+        y2 = int(round(y2 * scale))
+        rw = int(round(image_w * scale))
+        rh = int(round(image_h * scale))
+
+    if do_center_crop and crop_h is not None and crop_w is not None:
+        left = max(0, int(round((rw - crop_w) / 2.0)))
+        top = max(0, int(round((rh - crop_h) / 2.0)))
+        x1 -= left
+        x2 -= left
+        y1 -= top
+        y2 -= top
+        return clip_bbox([x1, y1, x2, y2], crop_w, crop_h)
+
+    return clip_bbox([x1, y1, x2, y2], rw, rh)
+
+
+def infer_bbox_relation(obj1_bbox: Optional[List[int]], obj2_bbox: Optional[List[int]]) -> str:
+    if obj1_bbox is None or obj2_bbox is None:
+        return "UNK"
+
+    x1a, y1a, x2a, y2a = obj1_bbox
+    x1b, y1b, x2b, y2b = obj2_bbox
+
+    cxa = (x1a + x2a) / 2.0
+    cya = (y1a + y2a) / 2.0
+    cxb = (x1b + x2b) / 2.0
+    cyb = (y1b + y2b) / 2.0
+
+    dx = cxa - cxb
+    dy = cya - cyb
+
+    if abs(dx) >= abs(dy):
+        return "right" if dx > 0 else "left"
+    return "under" if dy > 0 else "on"
+
+
+def build_relation_only_prompt(raw_question: str, obj1_name: str, obj2_name: str, relation_hint: str) -> str:
+    stem = strip_answer_order_clause(raw_question)
+    hint_text = f"Relation hint: {obj1_name} is {relation_hint} of {obj2_name}."
+    return (
+        f"<image>\n"
+        f"USER: {hint_text}\n"
+        f"Question: {stem} Answer with left, right, on or under only.\n"
+        f"ASSISTANT:"
+    )
+
+
 def run_repo_llava_once(wrapper, image, prompt: str) -> str:
     out = wrapper.run_single_prompt(
         image=image,
@@ -176,82 +280,20 @@ def run_repo_llava_once(wrapper, image, prompt: str) -> str:
     return str(out)
 
 
-def draw_bbox_on_image_with_labels(
-    image,
-    bbox1: Optional[List[int]],
-    bbox2: Optional[List[int]],
-    obj1_name: str,
-    obj2_name: str,
-    line_width: int = 6,
-    font_size: int = 22,
-):
-    from PIL import ImageDraw, ImageFont
-
-    img = image.copy().convert("RGB")
-    draw = ImageDraw.Draw(img)
-
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", font_size)
-    except Exception:
-        font = ImageFont.load_default()
-
-    def draw_one_box(bbox, label, color):
-        if bbox is None:
-            return
-
-        x1, y1, x2, y2 = bbox
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=line_width)
-
-        try:
-            tb = draw.textbbox((0, 0), label, font=font)
-            text_w = tb[2] - tb[0]
-            text_h = tb[3] - tb[1]
-        except Exception:
-            text_w, text_h = draw.textsize(label, font=font)
-
-        pad = 4
-
-        label_x1 = x1
-        label_y1 = y1 - text_h - 2 * pad - 2
-        if label_y1 < 0:
-            label_y1 = y1 + 2
-
-        label_x2 = label_x1 + text_w + 2 * pad
-        label_y2 = label_y1 + text_h + 2 * pad
-
-        draw.rectangle(
-            [label_x1, label_y1, label_x2, label_y2],
-            fill="white",
-            outline=color,
-            width=2,
-        )
-        draw.text(
-            (label_x1 + pad, label_y1 + pad),
-            label,
-            fill=color,
-            font=font,
-        )
-
-    draw_one_box(bbox1, obj1_name, "red")
-    draw_one_box(bbox2, obj2_name, "blue")
-
-    return img
-
-
 def build_report(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     total = len(rows)
     baseline_correct = sum(1 for r in rows if bool(r["baseline_correct"]))
-    bbox_image_label_correct = sum(1 for r in rows if bool(r["bbox_image_label_correct"]))
-    improved = sum(1 for r in rows if (not bool(r["baseline_correct"])) and bool(r["bbox_image_label_correct"]))
-    worsened = sum(1 for r in rows if bool(r["baseline_correct"]) and (not bool(r["bbox_image_label_correct"])))
+    relation_hint_correct = sum(1 for r in rows if bool(r["relation_hint_correct"]))
+    improved = sum(1 for r in rows if (not bool(r["baseline_correct"])) and bool(r["relation_hint_correct"]))
+    worsened = sum(1 for r in rows if bool(r["baseline_correct"]) and (not bool(r["relation_hint_correct"])))
     same = total - improved - worsened
 
     return {
         "num_images": total,
         "baseline_accuracy": 0.0 if total == 0 else baseline_correct / total,
-        "bbox_image_label_accuracy": 0.0 if total == 0 else bbox_image_label_correct / total,
+        "relation_hint_accuracy": 0.0 if total == 0 else relation_hint_correct / total,
         "baseline_correct": baseline_correct,
-        "bbox_image_label_correct": bbox_image_label_correct,
+        "relation_hint_correct": relation_hint_correct,
         "improved": improved,
         "worsened": worsened,
         "same": same,
@@ -281,7 +323,6 @@ def main():
 
     # 严格走仓库自己的 prompt-record 路径
     prompt_records, sampled_indices = wrapper.load_prompt_records_with_sampling(args.dataset, args.option)
-
     if sampled_indices is not None:
         import torch
         dataset = torch.utils.data.Subset(dataset, sampled_indices)
@@ -289,11 +330,11 @@ def main():
     start = args.sample_index
     end = len(prompt_records) if args.limit < 0 else min(len(prompt_records), start + args.limit)
 
-    model_name = f"{args.model_name}_repo_bbox_image_label"
+    model_name = f"{args.model_name}_repo_relation_hint"
     out_root = os.path.join(args.out_dir, args.dataset, model_name)
     os.makedirs(out_root, exist_ok=True)
 
-    summary_csv = os.path.join(out_root, "summary_manual_bbox_image_label_compare.csv")
+    summary_csv = os.path.join(out_root, "summary_manual_relation_hint_compare.csv")
     report_json = os.path.join(out_root, "report.json")
 
     rows: List[Dict[str, Any]] = []
@@ -314,48 +355,54 @@ def main():
         bbox_row = manual_bbox[image_name]
         obj1_name = bbox_row["object_1_name"]
         obj2_name = bbox_row["object_2_name"]
-        obj1_bbox = bbox_row["object_1_bbox"]
-        obj2_bbox = bbox_row["object_2_bbox"]
+        obj1_bbox_orig = bbox_row["object_1_bbox"]
+        obj2_bbox_orig = bbox_row["object_2_bbox"]
 
-        if obj1_bbox is None or obj2_bbox is None:
+        if obj1_bbox_orig is None or obj2_bbox_orig is None:
             continue
 
-        baseline_prompt = raw_question
-        bbox_image_label_prompt = raw_question
+        image_w, image_h = image.size
+        obj1_bbox_proc = map_bbox_to_repo_processor_coords(
+            obj1_bbox_orig, image_w, image_h, wrapper.feature_extractor
+        )
+        obj2_bbox_proc = map_bbox_to_repo_processor_coords(
+            obj2_bbox_orig, image_w, image_h, wrapper.feature_extractor
+        )
 
-        image_with_boxes_and_labels = draw_bbox_on_image_with_labels(
-            image=image,
-            bbox1=obj1_bbox,
-            bbox2=obj2_bbox,
+        relation_hint = infer_bbox_relation(obj1_bbox_proc, obj2_bbox_proc)
+
+        baseline_prompt = raw_question
+        relation_hint_prompt = build_relation_only_prompt(
+            raw_question=raw_question,
             obj1_name=obj1_name,
             obj2_name=obj2_name,
-            line_width=args.line_width,
-            font_size=args.font_size,
+            relation_hint=relation_hint,
         )
 
         baseline_gen = run_repo_llava_once(wrapper, image, baseline_prompt)
-        bbox_image_label_gen = run_repo_llava_once(wrapper, image_with_boxes_and_labels, bbox_image_label_prompt)
+        relation_hint_gen = run_repo_llava_once(wrapper, image, relation_hint_prompt)
 
         baseline_pred = parse_prediction(baseline_gen)
-        bbox_image_label_pred = parse_prediction(bbox_image_label_gen)
+        relation_hint_pred = parse_prediction(relation_hint_gen)
+
         baseline_correct = baseline_pred == gold
-        bbox_image_label_correct = bbox_image_label_pred == gold
+        relation_hint_correct = relation_hint_pred == gold
 
         print("=" * 100)
         print(f"image_name: {image_name}")
         print("[BASELINE PROMPT]")
         print(baseline_prompt)
-        print("[BBOX-IMAGE-LABEL PROMPT]")
-        print(bbox_image_label_prompt)
+        print("[RELATION-HINT PROMPT]")
+        print(relation_hint_prompt)
         print(
             f"gold={gold} | "
             f"baseline_pred={baseline_pred} | "
-            f"bbox_image_label_pred={bbox_image_label_pred}"
+            f"relation_hint_pred={relation_hint_pred}"
         )
 
         if args.print_prompts:
             print(f"[BASELINE GEN] {baseline_gen}")
-            print(f"[BBOX-IMAGE-LABEL GEN] {bbox_image_label_gen}")
+            print(f"[RELATION-HINT GEN] {relation_hint_gen}")
 
         sample_dir = os.path.join(out_root, os.path.splitext(image_name)[0])
         os.makedirs(sample_dir, exist_ok=True)
@@ -368,16 +415,19 @@ def main():
             "gold": gold,
             "object_1_name": obj1_name,
             "object_2_name": obj2_name,
-            "object_1_bbox": obj1_bbox,
-            "object_2_bbox": obj2_bbox,
+            "object_1_bbox_orig": obj1_bbox_orig,
+            "object_2_bbox_orig": obj2_bbox_orig,
+            "object_1_bbox_repo_proc": obj1_bbox_proc,
+            "object_2_bbox_repo_proc": obj2_bbox_proc,
+            "relation_hint": relation_hint,
             "baseline_prompt": baseline_prompt,
-            "bbox_image_label_prompt": bbox_image_label_prompt,
+            "relation_hint_prompt": relation_hint_prompt,
             "baseline_generation": baseline_gen,
-            "bbox_image_label_generation": bbox_image_label_gen,
+            "relation_hint_generation": relation_hint_gen,
             "baseline_pred": baseline_pred,
-            "bbox_image_label_pred": bbox_image_label_pred,
+            "relation_hint_pred": relation_hint_pred,
             "baseline_correct": baseline_correct,
-            "bbox_image_label_correct": bbox_image_label_correct,
+            "relation_hint_correct": relation_hint_correct,
         }
         with open(sample_json, "w", encoding="utf-8") as f:
             json.dump(sample_payload, f, ensure_ascii=False, indent=2)
@@ -389,17 +439,20 @@ def main():
             "gold": gold,
             "object_1_name": obj1_name,
             "object_2_name": obj2_name,
-            "object_1_bbox": bbox_to_json(obj1_bbox),
-            "object_2_bbox": bbox_to_json(obj2_bbox),
+            "object_1_bbox_orig": bbox_to_json(obj1_bbox_orig),
+            "object_2_bbox_orig": bbox_to_json(obj2_bbox_orig),
+            "object_1_bbox_repo_proc": bbox_to_json(obj1_bbox_proc),
+            "object_2_bbox_repo_proc": bbox_to_json(obj2_bbox_proc),
+            "relation_hint": relation_hint,
             "baseline_prompt": baseline_prompt,
-            "bbox_image_label_prompt": bbox_image_label_prompt,
+            "relation_hint_prompt": relation_hint_prompt,
             "baseline_generation": baseline_gen,
-            "bbox_image_label_generation": bbox_image_label_gen,
+            "relation_hint_generation": relation_hint_gen,
             "baseline_pred": baseline_pred,
-            "bbox_image_label_pred": bbox_image_label_pred,
+            "relation_hint_pred": relation_hint_pred,
             "baseline_correct": baseline_correct,
-            "bbox_image_label_correct": bbox_image_label_correct,
-            "delta": int(bbox_image_label_correct) - int(baseline_correct),
+            "relation_hint_correct": relation_hint_correct,
+            "delta": int(relation_hint_correct) - int(baseline_correct),
             "sample_json": os.path.relpath(sample_json, out_root),
         })
 
@@ -410,20 +463,22 @@ def main():
             "gold",
             "object_1_name",
             "object_2_name",
-            "object_1_bbox",
-            "object_2_bbox",
+            "object_1_bbox_orig",
+            "object_2_bbox_orig",
+            "object_1_bbox_repo_proc",
+            "object_2_bbox_repo_proc",
+            "relation_hint",
             "baseline_prompt",
-            "bbox_image_label_prompt",
+            "relation_hint_prompt",
             "baseline_generation",
-            "bbox_image_label_generation",
+            "relation_hint_generation",
             "baseline_pred",
-            "bbox_image_label_pred",
+            "relation_hint_pred",
             "baseline_correct",
-            "bbox_image_label_correct",
+            "relation_hint_correct",
             "delta",
             "sample_json",
         ]
-
         with open(summary_csv, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
