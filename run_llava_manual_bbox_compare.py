@@ -257,15 +257,17 @@ def build_bbox_prompt(raw_question: str,
     proc_desc = ", then ".join(proc_desc_parts) if proc_desc_parts else "the repo image processor"
 
     bbox_info = (
-        f"Auxiliary bounding-box hints in the repo processor coordinate system "
-        f"(after {proc_desc}): "
-        f"{obj1_name}: {bbox_to_json(obj1_bbox_proc)}; "
-        f"{obj2_name}: {bbox_to_json(obj2_bbox_proc)}. "
-        f"BBox-derived coarse hint for {obj1_name} relative to {obj2_name}: {relation_hint}. "
-        f"Use the image as primary evidence if the boxes look imperfect."
+        f"Bounding boxes in {proc_desc} image space: "
+        f"{obj1_name}={bbox_to_json(obj1_bbox_proc)}, "
+        f"{obj2_name}={bbox_to_json(obj2_bbox_proc)}."
     )
 
-    return f"<image>\nUSER: {bbox_info}\nQuestion: {stem} Answer with left, right, on or under only.\nASSISTANT:"
+    return (
+        f"<image>\n"
+        f"USER: {bbox_info}\n"
+        f"Question: {stem} Answer with left, right, on or under only.\n"
+        f"ASSISTANT:"
+    )
 
 
 def run_repo_llava_once(wrapper, image, prompt: str) -> str:
