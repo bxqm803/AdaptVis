@@ -5,6 +5,7 @@ import json
 import argparse
 from typing import Any, Dict, List, Optional, Tuple
 
+import torch
 from PIL import Image, ImageDraw
 
 from misc import seed_all
@@ -17,7 +18,8 @@ from dataset_zoo import get_dataset
 # -------------------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Ask LLaVA for object bboxes derived from the dataset relation question, save JSON, and overlay predicted boxes on images."
+        description="Ask LLaVA for object bboxes derived from the dataset relation question, "
+                    "save JSON, and overlay predicted boxes on images."
     )
     p.add_argument("--dataset", default="Controlled_Images_A", type=str)
     p.add_argument("--option", default="four", type=str)
@@ -29,7 +31,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cache-dir", default=None, type=str)
     p.add_argument("--out-dir", default="output_llava_relation_bbox_json_overlay", type=str)
     p.add_argument("--sample-index", default=0, type=int)
-    p.add_argument("--limit", default=10, type=int, help="Default 10, set to -1 for all.")
+    p.add_argument("--limit", default=10, type=int, help="Default 10, set -1 for all.")
+    p.add_argument("--max-new-tokens", default=192, type=int)
     p.add_argument("--skip-existing", action="store_true")
     p.add_argument("--print-prompts", action="store_true")
     p.add_argument("--print-raw", action="store_true")
@@ -62,8 +65,7 @@ def strip_answer_order_clause(q: str) -> str:
     q = re.sub(r"\s*Your answer should be.*$", "", q, flags=re.IGNORECASE)
     q = re.sub(r"\s*Answer with.*$", "", q, flags=re.IGNORECASE)
     q = re.sub(r"\s*Choose from.*$", "", q, flags=re.IGNORECASE)
-    q = re.sub(r"<image>", " ", q, flags=re.IGNORECASE)
-    q = q.strip()
+    q = re.sub(r"\s+", " ", q).strip()
     if q and q[-1] not in "?.!":
         q += "?"
     return q
@@ -80,6 +82,7 @@ def normalize_object_name(name: str) -> str:
 
 def extract_objects_from_question(question: str) -> Tuple[Optional[str], Optional[str], str]:
     q = strip_answer_order_clause(question)
+    q_lower = q.lower()
 
     patterns = [
         r"where\s+is\s+(?:the\s+)?(.+?)\s+in\s+relation\s+to\s+(?:the\s+)?(.+?)\?",
@@ -87,8 +90,6 @@ def extract_objects_from_question(question: str) -> Tuple[Optional[str], Optiona
         r"where\s+is\s+(?:the\s+)?(.+?)\s+with\s+respect\s+to\s+(?:the\s+)?(.+?)\?",
         r"what\s+is\s+the\s+position\s+of\s+(?:the\s+)?(.+?)\s+relative\s+to\s+(?:the\s+)?(.+?)\?",
     ]
-
-    q_lower = q.lower()
     for pat in patterns:
         m = re.search(pat, q_lower, flags=re.IGNORECASE)
         if m:
@@ -96,7 +97,10 @@ def extract_objects_from_question(question: str) -> Tuple[Optional[str], Optiona
             obj2 = normalize_object_name(m.group(2))
             return obj1 or None, obj2 or None, q
 
-    rel_words = ["left of", "right of", "in front of", "behind", "above", "below", "under", "on"]
+    rel_words = [
+        "left of", "right of", "in front of", "behind",
+        "above", "below", "under", "on", "over"
+    ]
     for rel in rel_words:
         pat = rf"(?:the\s+)?(.+?)\s+{re.escape(rel)}\s+(?:the\s+)?(.+?)$"
         m = re.search(pat, q_lower.rstrip("?"), flags=re.IGNORECASE)
@@ -109,17 +113,17 @@ def extract_objects_from_question(question: str) -> Tuple[Optional[str], Optiona
 
 
 # -------------------------
-# JSON parsing helpers
+# JSON helpers
 # -------------------------
-def _strip_code_fences(text: str) -> str:
-    text = clean_text(text)
+def strip_code_fences(text: str) -> str:
+    text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text)
     return text.strip()
 
 
 def try_parse_json_object(text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    raw = _strip_code_fences(text)
+    raw = strip_code_fences(text)
     decoder = json.JSONDecoder()
 
     try:
@@ -143,7 +147,7 @@ def try_parse_json_object(text: str) -> Tuple[Optional[Dict[str, Any]], Optional
 
 
 # -------------------------
-# Box conversion helpers
+# Box helpers
 # -------------------------
 def _to_float(v: Any) -> Optional[float]:
     try:
@@ -210,12 +214,12 @@ def coerce_box(value: Any) -> Optional[Tuple[float, float, float, float]]:
 
 BOX_KEY_CANDIDATES = {
     "target": [
-        "target_bbox", "object_1_bbox", "obj1_bbox", "bbox", "box",
-        "target_box", "subject_bbox", "subject_box"
+        "target_bbox", "object_1_bbox", "obj1_bbox", "bbox",
+        "box", "target_box", "subject_bbox", "subject_box"
     ],
     "reference": [
         "reference_bbox", "object_2_bbox", "obj2_bbox", "ref_bbox",
-        "reference_box", "context_bbox", "other_bbox", "other_box"
+        "reference_box", "other_bbox", "other_box", "context_bbox"
     ],
 }
 
@@ -243,11 +247,12 @@ def extract_named_box(payload: Dict[str, Any], role: str) -> Tuple[Optional[str]
         nested_keys = ["target", "object_1", "obj1", "subject"] if role == "target" else ["reference", "object_2", "obj2", "other"]
         for nk in nested_keys:
             if isinstance(payload.get(nk), dict):
-                box = coerce_box(payload[nk])
+                nested = payload[nk]
+                box = coerce_box(nested)
                 if name is None:
                     for kk in ["name", "label", "object"]:
-                        if kk in payload[nk] and clean_text(payload[nk][kk]):
-                            name = normalize_object_name(payload[nk][kk])
+                        if kk in nested and clean_text(nested[kk]):
+                            name = normalize_object_name(nested[kk])
                             break
                 if box is not None:
                     break
@@ -264,6 +269,7 @@ def normalize_box_to_pixels(
     vals = [x1, y1, x2, y2]
     max_abs = max(abs(v) for v in vals)
 
+    # 允许 [0,1] 或 [0,1000] 两种输出
     if max_abs <= 1.5:
         x1, x2 = x1 * width, x2 * width
         y1, y2 = y1 * height, y2 * height
@@ -288,45 +294,90 @@ def normalize_box_to_pixels(
 # Prompt + generation
 # -------------------------
 def build_bbox_json_prompt(obj1: str, obj2: str, original_question: str) -> str:
-    relation_q = f"Where is the {obj1} in relation to the {obj2}?"
     original_q = strip_answer_order_clause(original_question)
+    relation_q = f"Where is the {obj1} in relation to the {obj2}?"
 
+    # 注意：必须恰好只有一个 <image>
     prompt = (
-        "USER: Identify the two objects in the image and return their bounding boxes only.\n"
+        "USER: <image>\n"
+        "Identify the two queried objects in the image and return bounding boxes only.\n"
         f"Original dataset question: {original_q}\n"
-        f"Use this object query: {relation_q}\n"
-        "Return ONLY one valid JSON object. Do not output markdown fences. Do not output explanations.\n"
-        "Use integer coordinates on a 0-1000 scale relative to the full image.\n"
+        f"Use this query: {relation_q}\n"
+        "Return ONLY one valid JSON object. No markdown fences. No explanation.\n"
+        "Coordinates must be integers on a 0-1000 scale relative to the full image.\n"
         "Use exactly this schema:\n"
         '{"target_object":"%s","reference_object":"%s","target_bbox":{"x1":0,"y1":0,"x2":0,"y2":0},"reference_bbox":{"x1":0,"y1":0,"x2":0,"y2":0}}\n'
         "Rules:\n"
         "- x1 < x2 and y1 < y2\n"
         "- if an object is not visible, set its bbox to null\n"
         "- object names should match the queried objects\n"
-        "ASSISTANT:" % (obj1, obj2)
-    )
+        "ASSISTANT:"
+    ) % (obj1, obj2)
 
-    prompt = re.sub(r"<image>", " ", prompt, flags=re.IGNORECASE)
-    prompt = re.sub(r"\n{3,}", "\n\n", prompt)
+    prompt = re.sub(r"\n{3,}", "\n\n", prompt).strip()
     return prompt
 
 
-def run_llava_once(wrapper, image: Image.Image, prompt: str) -> str:
-    out = wrapper.run_single_prompt(
-        image=image,
-        prompt=prompt,
-        method="base",
-        weight=None,
+@torch.no_grad()
+def run_llava_once(wrapper, image: Image.Image, prompt: str, max_new_tokens: int = 192) -> str:
+    processor = wrapper.processor
+    model = wrapper.model
+
+    single_input = processor(
+        images=image,
+        text=prompt,
+        padding=True,
+        return_tensors="pt",
     )
-    if isinstance(out, str):
-        return out
-    if isinstance(out, dict):
-        for k in ["response", "text", "pred_text", "output", "answer"]:
-            if k in out:
-                return str(out[k])
-    if isinstance(out, (list, tuple)) and len(out) > 0:
-        return str(out[0])
-    return str(out)
+
+    single_input = {
+        k: (v.to(wrapper.device) if torch.is_tensor(v) else v)
+        for k, v in single_input.items()
+        if v is not None
+    }
+
+    image_id = (single_input["input_ids"] == model.config.image_token_index)
+    num_image_tokens = int(image_id.sum().item())
+
+    if num_image_tokens != 1:
+        decoded_prompt = processor.decode(
+            single_input["input_ids"][0],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        raise ValueError(
+            f"Prompt must contain exactly 1 image token, but got {num_image_tokens}.\n"
+            f"Original prompt:\n{prompt}\n\n"
+            f"Decoded processor prompt:\n{decoded_prompt}"
+        )
+
+    prompt_len = int(single_input["input_ids"].shape[1])
+
+    gen_kwargs = dict(
+        input_ids=single_input["input_ids"],
+        pixel_values=single_input["pixel_values"],
+        attention_mask=single_input.get("attention_mask", None),
+        max_new_tokens=max_new_tokens,
+        output_scores=False,
+        return_dict_in_generate=True,
+        use_cache=True,
+        output_attentions=False,
+        keys=image_id,
+        weight=1.0,
+        adjust_method="none",
+        do_sample=False,
+    )
+
+    output = model.generate(**gen_kwargs)
+    gen_ids = output.sequences[0][prompt_len:]
+
+    gen_text = processor.decode(
+        gen_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    ).strip()
+
+    return gen_text
 
 
 # -------------------------
@@ -341,12 +392,11 @@ def draw_label_box(
     x1, y1, x2, y2 = box
     draw.rectangle([x1, y1, x2, y2], outline=color, width=4)
     try:
-        bbox = draw.textbbox((x1, y1), label)
-        tx1, ty1, tx2, ty2 = bbox
-        text_h = ty2 - ty1
-        bg = [x1, max(0, y1 - text_h - 8), x1 + (tx2 - tx1) + 8, max(0, y1 - 2)]
+        tb = draw.textbbox((x1, y1), label)
+        tx1, ty1, tx2, ty2 = tb
+        bg = [x1, max(0, y1 - (ty2 - ty1) - 8), x1 + (tx2 - tx1) + 8, max(0, y1 - 2)]
         draw.rectangle(bg, fill=color)
-        draw.text((x1 + 4, max(0, y1 - text_h - 6)), label, fill=(255, 255, 255))
+        draw.text((x1 + 4, max(0, y1 - (ty2 - ty1) - 6)), label, fill=(255, 255, 255))
     except Exception:
         draw.text((x1, max(0, y1 - 12)), label, fill=color)
 
@@ -377,7 +427,6 @@ def main() -> None:
 
     cache_dir = args.cache_dir or f"/ddnB/work/{os.environ.get('USER', 'user')}/hf_cache"
     os.makedirs(cache_dir, exist_ok=True)
-    os.makedirs(args.out_dir, exist_ok=True)
     os.environ.setdefault("HF_HOME", cache_dir)
     os.environ.setdefault("HF_HUB_CACHE", os.path.join(cache_dir, "hub"))
     os.environ.setdefault("TRANSFORMERS_CACHE", os.path.join(cache_dir, "transformers"))
@@ -388,7 +437,6 @@ def main() -> None:
 
     prompt_records, sampled_indices = wrapper.load_prompt_records_with_sampling(args.dataset, args.option)
     if sampled_indices is not None:
-        import torch
         dataset = torch.utils.data.Subset(dataset, sampled_indices)
 
     start = args.sample_index
@@ -401,7 +449,8 @@ def main() -> None:
     summary_csv = os.path.join(out_root, "summary_relation_bbox_json.csv")
     report_json = os.path.join(out_root, "report.json")
 
-    rows: List[Dict[str, Any]] = []
+    csv_rows: List[Dict[str, Any]] = []
+    json_rows: List[Dict[str, Any]] = []
 
     for local_idx in range(start, end):
         rec = prompt_records[local_idx]
@@ -426,12 +475,13 @@ def main() -> None:
 
         raw_question = rec["question"]
         gold_relation = clean_text(rec.get("answer", ""))
+
         obj1, obj2, stripped_q = extract_objects_from_question(raw_question)
 
-        parse_error = None
         prompt = None
         raw_output = ""
         parsed_payload = None
+        parse_error = None
         target_name = None
         ref_name = None
         target_box_px = None
@@ -447,9 +497,15 @@ def main() -> None:
                 print("=" * 100)
                 print(f"[{local_idx}] PROMPT")
                 print(prompt)
-                print(f"num_<image>_tokens = {prompt.count('<image>')}")
+                print("raw_prompt_<image>_count =", prompt.count("<image>"))
 
-            raw_output = run_llava_once(wrapper, image, prompt)
+            raw_output = run_llava_once(
+                wrapper=wrapper,
+                image=image,
+                prompt=prompt,
+                max_new_tokens=args.max_new_tokens,
+            )
+
             parsed_payload, json_error = try_parse_json_object(raw_output)
             parse_error = json_error
 
@@ -494,14 +550,16 @@ def main() -> None:
         with open(sample_json, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
 
-        rows.append({
+        json_rows.append(payload)
+
+        csv_rows.append({
             "image_name": image_name,
             "image_path": image_path,
             "local_index": local_idx,
             "gold_relation": gold_relation,
             "original_question": raw_question,
-            "object_1_name": obj1,
-            "object_2_name": obj2,
+            "object_1_name": obj1 or "",
+            "object_2_name": obj2 or "",
             "prompt": prompt or "",
             "raw_model_output": raw_output,
             "target_name_final": target_name or "",
@@ -532,15 +590,15 @@ def main() -> None:
     with open(summary_csv, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(csv_rows)
 
     report = {
         "dataset": args.dataset,
         "model_name": args.model_name,
-        "num_rows": len(rows),
-        "num_json_parsed": sum(1 for r in rows if not r["parse_error"]),
-        "num_target_bbox": sum(1 for r in rows if r["target_bbox_px"] not in ("null", "", "None")),
-        "num_reference_bbox": sum(1 for r in rows if r["reference_bbox_px"] not in ("null", "", "None")),
+        "num_rows": len(csv_rows),
+        "num_json_parsed": sum(1 for r in json_rows if r["parsed_json"] is not None),
+        "num_target_bbox": sum(1 for r in json_rows if r["target_bbox_px"] is not None),
+        "num_reference_bbox": sum(1 for r in json_rows if r["reference_bbox_px"] is not None),
         "summary_csv": summary_csv,
     }
 
