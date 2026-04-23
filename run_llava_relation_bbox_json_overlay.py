@@ -362,9 +362,6 @@ def run_llava_once(wrapper, image: Image.Image, prompt: str, max_new_tokens: int
         return_dict_in_generate=True,
         use_cache=True,
         output_attentions=False,
-        keys=image_id,
-        weight=1.0,
-        adjust_method="none",
         do_sample=False,
     )
 
