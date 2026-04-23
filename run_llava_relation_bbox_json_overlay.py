@@ -3,24 +3,18 @@ import re
 import csv
 import json
 import argparse
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional, Tuple, List, Dict
 
 import torch
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from misc import seed_all
 from model_zoo import get_model
 from dataset_zoo import get_dataset
 
 
-# -------------------------
-# Args
-# -------------------------
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Ask LLaVA for object bboxes derived from the dataset relation question, "
-                    "save JSON, and overlay predicted boxes on images."
-    )
+def parse_args():
+    p = argparse.ArgumentParser()
     p.add_argument("--dataset", default="Controlled_Images_A", type=str)
     p.add_argument("--option", default="four", type=str)
     p.add_argument("--device", default="cuda", type=str)
@@ -29,23 +23,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", default=1, type=int)
     p.add_argument("--download", action="store_true")
     p.add_argument("--cache-dir", default=None, type=str)
-    p.add_argument("--out-dir", default="output_llava_relation_bbox_json_overlay", type=str)
+    p.add_argument("--out-dir", default="output_llava_relation_bbox_raw", type=str)
     p.add_argument("--sample-index", default=0, type=int)
-    p.add_argument("--limit", default=10, type=int, help="Default 10, set -1 for all.")
+    p.add_argument("--limit", default=10, type=int)
     p.add_argument("--max-new-tokens", default=192, type=int)
-    p.add_argument("--skip-existing", action="store_true")
     p.add_argument("--print-prompts", action="store_true")
-    p.add_argument("--print-raw", action="store_true")
     return p.parse_args()
 
 
-# -------------------------
-# Text helpers
-# -------------------------
 def clean_text(x: Any) -> str:
     x = "" if x is None else str(x)
-    x = re.sub(r"\s+", " ", x).strip()
-    return x
+    return re.sub(r"\s+", " ", x).strip()
 
 
 def clean_question_text(question: str) -> str:
@@ -55,8 +43,7 @@ def clean_question_text(question: str) -> str:
         q = q.split("USER:", 1)[1].strip()
     if "ASSISTANT:" in q:
         q = q.split("ASSISTANT:", 1)[0].strip()
-    q = re.sub(r"\s+", " ", q).strip()
-    return q
+    return re.sub(r"\s+", " ", q).strip()
 
 
 def strip_answer_order_clause(q: str) -> str:
@@ -76,8 +63,7 @@ def normalize_object_name(name: str) -> str:
     name = name.replace("_", " ").replace("-", " ")
     name = re.sub(r"^(a|an|the)\s+", "", name)
     name = re.sub(r"[?.!,;:]+$", "", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name
+    return re.sub(r"\s+", " ", name).strip()
 
 
 def extract_objects_from_question(question: str) -> Tuple[Optional[str], Optional[str], str]:
@@ -85,25 +71,14 @@ def extract_objects_from_question(question: str) -> Tuple[Optional[str], Optiona
     q_lower = q.lower()
 
     patterns = [
-        r"where\s+is\s+(?:the\s+)?(.+?)\s+in\s+relation\s+to\s+(?:the\s+)?(.+?)\?",
-        r"where\s+is\s+(?:the\s+)?(.+?)\s+relative\s+to\s+(?:the\s+)?(.+?)\?",
-        r"where\s+is\s+(?:the\s+)?(.+?)\s+with\s+respect\s+to\s+(?:the\s+)?(.+?)\?",
+        r"where\s+(?:is|are)\s+(?:the\s+)?(.+?)\s+in\s+relation\s+to\s+(?:the\s+)?(.+?)\?",
+        r"where\s+(?:is|are)\s+(?:the\s+)?(.+?)\s+relative\s+to\s+(?:the\s+)?(.+?)\?",
+        r"where\s+(?:is|are)\s+(?:the\s+)?(.+?)\s+with\s+respect\s+to\s+(?:the\s+)?(.+?)\?",
         r"what\s+is\s+the\s+position\s+of\s+(?:the\s+)?(.+?)\s+relative\s+to\s+(?:the\s+)?(.+?)\?",
     ]
+
     for pat in patterns:
         m = re.search(pat, q_lower, flags=re.IGNORECASE)
-        if m:
-            obj1 = normalize_object_name(m.group(1))
-            obj2 = normalize_object_name(m.group(2))
-            return obj1 or None, obj2 or None, q
-
-    rel_words = [
-        "left of", "right of", "in front of", "behind",
-        "above", "below", "under", "on", "over"
-    ]
-    for rel in rel_words:
-        pat = rf"(?:the\s+)?(.+?)\s+{re.escape(rel)}\s+(?:the\s+)?(.+?)$"
-        m = re.search(pat, q_lower.rstrip("?"), flags=re.IGNORECASE)
         if m:
             obj1 = normalize_object_name(m.group(1))
             obj2 = normalize_object_name(m.group(2))
@@ -112,210 +87,21 @@ def extract_objects_from_question(question: str) -> Tuple[Optional[str], Optiona
     return None, None, q
 
 
-# -------------------------
-# JSON helpers
-# -------------------------
-def strip_code_fences(text: str) -> str:
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*```$", "", text)
-    return text.strip()
-
-
-def try_parse_json_object(text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    raw = strip_code_fences(text)
-    decoder = json.JSONDecoder()
-
-    try:
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            return obj, None
-    except Exception:
-        pass
-
-    for i, ch in enumerate(raw):
-        if ch != "{":
-            continue
-        try:
-            obj, _ = decoder.raw_decode(raw[i:])
-            if isinstance(obj, dict):
-                return obj, None
-        except Exception:
-            continue
-
-    return None, "Could not parse a JSON object from model output."
-
-
-# -------------------------
-# Box helpers
-# -------------------------
-def _to_float(v: Any) -> Optional[float]:
-    try:
-        if v is None:
-            return None
-        return float(v)
-    except Exception:
-        return None
-
-
-def _clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-
-def _convert_box_dict(box: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
-    if all(k in box for k in ["x1", "y1", "x2", "y2"]):
-        vals = [_to_float(box.get(k)) for k in ["x1", "y1", "x2", "y2"]]
-        if all(v is not None for v in vals):
-            return vals[0], vals[1], vals[2], vals[3]
-
-    if all(k in box for k in ["xmin", "ymin", "xmax", "ymax"]):
-        vals = [_to_float(box.get(k)) for k in ["xmin", "ymin", "xmax", "ymax"]]
-        if all(v is not None for v in vals):
-            return vals[0], vals[1], vals[2], vals[3]
-
-    if all(k in box for k in ["x", "y", "w", "h"]):
-        x, y, w, h = [_to_float(box.get(k)) for k in ["x", "y", "w", "h"]]
-        if None not in (x, y, w, h):
-            return x, y, x + w, y + h
-
-    if all(k in box for k in ["left", "top", "right", "bottom"]):
-        vals = [_to_float(box.get(k)) for k in ["left", "top", "right", "bottom"]]
-        if all(v is not None for v in vals):
-            return vals[0], vals[1], vals[2], vals[3]
-
-    if all(k in box for k in ["cx", "cy", "w", "h"]):
-        cx, cy, w, h = [_to_float(box.get(k)) for k in ["cx", "cy", "w", "h"]]
-        if None not in (cx, cy, w, h):
-            return cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0
-
-    return None
-
-
-def coerce_box(value: Any) -> Optional[Tuple[float, float, float, float]]:
-    if value is None:
-        return None
-
-    if isinstance(value, dict):
-        return _convert_box_dict(value)
-
-    if isinstance(value, (list, tuple)) and len(value) == 4:
-        vals = [_to_float(x) for x in value]
-        if all(v is not None for v in vals):
-            return vals[0], vals[1], vals[2], vals[3]
-
-    if isinstance(value, str):
-        nums = re.findall(r"-?\d+(?:\.\d+)?", value)
-        if len(nums) >= 4:
-            vals = [float(x) for x in nums[:4]]
-            return vals[0], vals[1], vals[2], vals[3]
-
-    return None
-
-
-BOX_KEY_CANDIDATES = {
-    "target": [
-        "target_bbox", "object_1_bbox", "obj1_bbox", "bbox",
-        "box", "target_box", "subject_bbox", "subject_box"
-    ],
-    "reference": [
-        "reference_bbox", "object_2_bbox", "obj2_bbox", "ref_bbox",
-        "reference_box", "other_bbox", "other_box", "context_bbox"
-    ],
-}
-
-NAME_KEY_CANDIDATES = {
-    "target": ["target_object", "object_1_name", "obj1_name", "subject", "object"],
-    "reference": ["reference_object", "object_2_name", "obj2_name", "reference", "other_object"],
-}
-
-
-def extract_named_box(payload: Dict[str, Any], role: str) -> Tuple[Optional[str], Optional[Tuple[float, float, float, float]]]:
-    name = None
-    for k in NAME_KEY_CANDIDATES[role]:
-        if k in payload and clean_text(payload[k]):
-            name = normalize_object_name(payload[k])
-            break
-
-    box = None
-    for k in BOX_KEY_CANDIDATES[role]:
-        if k in payload:
-            box = coerce_box(payload[k])
-            if box is not None:
-                break
-
-    if box is None:
-        nested_keys = ["target", "object_1", "obj1", "subject"] if role == "target" else ["reference", "object_2", "obj2", "other"]
-        for nk in nested_keys:
-            if isinstance(payload.get(nk), dict):
-                nested = payload[nk]
-                box = coerce_box(nested)
-                if name is None:
-                    for kk in ["name", "label", "object"]:
-                        if kk in nested and clean_text(nested[kk]):
-                            name = normalize_object_name(nested[kk])
-                            break
-                if box is not None:
-                    break
-
-    return name, box
-
-
-def normalize_box_to_pixels(
-    box: Tuple[float, float, float, float],
-    width: int,
-    height: int,
-) -> Optional[Tuple[int, int, int, int]]:
-    x1, y1, x2, y2 = box
-    vals = [x1, y1, x2, y2]
-    max_abs = max(abs(v) for v in vals)
-
-    # 允许 [0,1] 或 [0,1000] 两种输出
-    if max_abs <= 1.5:
-        x1, x2 = x1 * width, x2 * width
-        y1, y2 = y1 * height, y2 * height
-    elif max_abs <= 1001:
-        x1, x2 = x1 / 1000.0 * width, x2 / 1000.0 * width
-        y1, y2 = y1 / 1000.0 * height, y2 / 1000.0 * height
-
-    x1, x2 = sorted([x1, x2])
-    y1, y2 = sorted([y1, y2])
-
-    x1 = int(round(_clamp(x1, 0, width - 1)))
-    y1 = int(round(_clamp(y1, 0, height - 1)))
-    x2 = int(round(_clamp(x2, 0, width - 1)))
-    y2 = int(round(_clamp(y2, 0, height - 1)))
-
-    if x2 <= x1 or y2 <= y1:
-        return None
-    return x1, y1, x2, y2
-
-
-# -------------------------
-# Prompt + generation
-# -------------------------
-def build_bbox_json_prompt(obj1: str, obj2: str, original_question: str) -> str:
+def build_prompt(obj1: str, obj2: str, original_question: str) -> str:
     original_q = strip_answer_order_clause(original_question)
     relation_q = f"Where is the {obj1} in relation to the {obj2}?"
 
-    # 注意：必须恰好只有一个 <image>
     prompt = (
         "USER: <image>\n"
-        "Identify the two queried objects in the image and return bounding boxes only.\n"
+        f"Question: {relation_q}\n"
         f"Original dataset question: {original_q}\n"
-        f"Use this query: {relation_q}\n"
-        "Return ONLY one valid JSON object. No markdown fences. No explanation.\n"
-        "Coordinates must be integers on a 0-1000 scale relative to the full image.\n"
-        "Use exactly this schema:\n"
-        '{"target_object":"%s","reference_object":"%s","target_bbox":{"x1":0,"y1":0,"x2":0,"y2":0},"reference_bbox":{"x1":0,"y1":0,"x2":0,"y2":0}}\n'
-        "Rules:\n"
-        "- x1 < x2 and y1 < y2\n"
-        "- if an object is not visible, set its bbox to null\n"
-        "- object names should match the queried objects\n"
+        "Please locate both queried objects in the image.\n"
+        "Answer with bounding boxes for both objects.\n"
+        "Use normalized coordinates from 0 to 1000 for the full image.\n"
+        "You may answer in any clear format.\n"
         "ASSISTANT:"
-    ) % (obj1, obj2)
-
-    prompt = re.sub(r"\n{3,}", "\n\n", prompt).strip()
-    return prompt
+    )
+    return re.sub(r"\n{3,}", "\n\n", prompt).strip()
 
 
 @torch.no_grad()
@@ -336,7 +122,7 @@ def run_llava_once(wrapper, image: Image.Image, prompt: str, max_new_tokens: int
         if v is not None
     }
 
-    image_id = (single_input["input_ids"] == model.config.image_token_index)
+    image_id = single_input["input_ids"] == model.config.image_token_index
     num_image_tokens = int(image_id.sum().item())
 
     if num_image_tokens != 1:
@@ -346,79 +132,31 @@ def run_llava_once(wrapper, image: Image.Image, prompt: str, max_new_tokens: int
             clean_up_tokenization_spaces=False,
         )
         raise ValueError(
-            f"Prompt must contain exactly 1 image token, but got {num_image_tokens}.\n"
-            f"Original prompt:\n{prompt}\n\n"
-            f"Decoded processor prompt:\n{decoded_prompt}"
+            f"Prompt must contain exactly 1 image token, got {num_image_tokens}.\n"
+            f"Prompt:\n{prompt}\n\nDecoded:\n{decoded_prompt}"
         )
 
     prompt_len = int(single_input["input_ids"].shape[1])
 
-    gen_kwargs = dict(
+    output = model.generate(
         input_ids=single_input["input_ids"],
         pixel_values=single_input["pixel_values"],
         attention_mask=single_input.get("attention_mask", None),
         max_new_tokens=max_new_tokens,
-        output_scores=False,
         return_dict_in_generate=True,
-        use_cache=True,
-        output_attentions=False,
         do_sample=False,
+        use_cache=True,
     )
 
-    output = model.generate(**gen_kwargs)
     gen_ids = output.sequences[0][prompt_len:]
-
-    gen_text = processor.decode(
+    return processor.decode(
         gen_ids,
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     ).strip()
 
-    return gen_text
 
-
-# -------------------------
-# Overlay helpers
-# -------------------------
-def draw_label_box(
-    draw: ImageDraw.ImageDraw,
-    box: Tuple[int, int, int, int],
-    label: str,
-    color: Tuple[int, int, int],
-) -> None:
-    x1, y1, x2, y2 = box
-    draw.rectangle([x1, y1, x2, y2], outline=color, width=4)
-    try:
-        tb = draw.textbbox((x1, y1), label)
-        tx1, ty1, tx2, ty2 = tb
-        bg = [x1, max(0, y1 - (ty2 - ty1) - 8), x1 + (tx2 - tx1) + 8, max(0, y1 - 2)]
-        draw.rectangle(bg, fill=color)
-        draw.text((x1 + 4, max(0, y1 - (ty2 - ty1) - 6)), label, fill=(255, 255, 255))
-    except Exception:
-        draw.text((x1, max(0, y1 - 12)), label, fill=color)
-
-
-def save_overlay(
-    image: Image.Image,
-    target_box: Optional[Tuple[int, int, int, int]],
-    target_name: str,
-    ref_box: Optional[Tuple[int, int, int, int]],
-    ref_name: str,
-    out_path: str,
-) -> None:
-    vis = image.convert("RGB").copy()
-    draw = ImageDraw.Draw(vis)
-    if target_box is not None:
-        draw_label_box(draw, target_box, f"target: {target_name}", (255, 0, 0))
-    if ref_box is not None:
-        draw_label_box(draw, ref_box, f"ref: {ref_name}", (0, 128, 255))
-    vis.save(out_path)
-
-
-# -------------------------
-# Main
-# -------------------------
-def main() -> None:
+def main():
     args = parse_args()
     seed_all(args.seed)
 
@@ -433,21 +171,20 @@ def main() -> None:
     dataset = get_dataset(args.dataset, image_preprocess=image_preprocess, download=args.download)
 
     prompt_records, sampled_indices = wrapper.load_prompt_records_with_sampling(args.dataset, args.option)
+
     if sampled_indices is not None:
         dataset = torch.utils.data.Subset(dataset, sampled_indices)
 
     start = args.sample_index
     end = len(prompt_records) if args.limit < 0 else min(len(prompt_records), start + args.limit)
 
-    model_tag = f"{args.model_name}_relation_bbox_json"
-    out_root = os.path.join(args.out_dir, args.dataset, model_tag)
+    out_root = os.path.join(args.out_dir, args.dataset, f"{args.model_name}_raw_bbox_outputs")
     os.makedirs(out_root, exist_ok=True)
 
-    summary_csv = os.path.join(out_root, "summary_relation_bbox_json.csv")
-    report_json = os.path.join(out_root, "report.json")
+    summary_csv = os.path.join(out_root, "summary_raw_outputs.csv")
+    summary_json = os.path.join(out_root, "summary_raw_outputs.json")
 
-    csv_rows: List[Dict[str, Any]] = []
-    json_rows: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = []
 
     for local_idx in range(start, end):
         rec = prompt_records[local_idx]
@@ -458,43 +195,32 @@ def main() -> None:
         image = item["image_options"][0]
 
         if not isinstance(image, Image.Image):
-            raise TypeError(
-                f"Expected PIL.Image from dataset[local_idx]['image_options'][0], got {type(image)}"
-            )
-
-        sample_dir = os.path.join(out_root, os.path.splitext(image_name)[0])
-        os.makedirs(sample_dir, exist_ok=True)
-        sample_json = os.path.join(sample_dir, "result.json")
-        overlay_png = os.path.join(sample_dir, "overlay_pred.png")
-
-        if args.skip_existing and os.path.exists(sample_json) and os.path.exists(overlay_png):
-            continue
+            raise TypeError(f"Expected PIL.Image, got {type(image)}")
 
         raw_question = rec["question"]
         gold_relation = clean_text(rec.get("answer", ""))
 
         obj1, obj2, stripped_q = extract_objects_from_question(raw_question)
 
-        prompt = None
-        raw_output = ""
-        parsed_payload = None
-        parse_error = None
-        target_name = None
-        ref_name = None
-        target_box_px = None
-        ref_box_px = None
-        overlay_saved = False
+        sample_dir = os.path.join(out_root, os.path.splitext(image_name)[0])
+        os.makedirs(sample_dir, exist_ok=True)
 
-        if not obj1 or not obj2:
-            parse_error = "Could not reliably extract the two objects from the original question."
+        prompt_path = os.path.join(sample_dir, "prompt.txt")
+        raw_output_path = os.path.join(sample_dir, "raw_output.txt")
+        result_json_path = os.path.join(sample_dir, "result.json")
+
+        if obj1 is None or obj2 is None:
+            prompt = ""
+            raw_output = ""
+            error = "Could not extract objects from question."
         else:
-            prompt = build_bbox_json_prompt(obj1, obj2, raw_question)
+            prompt = build_prompt(obj1, obj2, raw_question)
 
             if args.print_prompts:
                 print("=" * 100)
-                print(f"[{local_idx}] PROMPT")
+                print("[PROMPT]")
                 print(prompt)
-                print("raw_prompt_<image>_count =", prompt.count("<image>"))
+                print("num_<image> =", prompt.count("<image>"))
 
             raw_output = run_llava_once(
                 wrapper=wrapper,
@@ -502,110 +228,71 @@ def main() -> None:
                 prompt=prompt,
                 max_new_tokens=args.max_new_tokens,
             )
+            error = ""
 
-            parsed_payload, json_error = try_parse_json_object(raw_output)
-            parse_error = json_error
+        with open(prompt_path, "w", encoding="utf-8") as f:
+            f.write(prompt)
 
-            if parsed_payload is None:
-                target_name = obj1
-                ref_name = obj2
-            else:
-                target_name_pred, target_box = extract_named_box(parsed_payload, "target")
-                ref_name_pred, ref_box = extract_named_box(parsed_payload, "reference")
+        with open(raw_output_path, "w", encoding="utf-8") as f:
+            f.write(raw_output)
 
-                target_name = target_name_pred or obj1
-                ref_name = ref_name_pred or obj2
-
-                w, h = image.size
-                target_box_px = normalize_box_to_pixels(target_box, w, h) if target_box is not None else None
-                ref_box_px = normalize_box_to_pixels(ref_box, w, h) if ref_box is not None else None
-
-                if target_box_px is not None or ref_box_px is not None:
-                    save_overlay(image, target_box_px, target_name, ref_box_px, ref_name, overlay_png)
-                    overlay_saved = True
-
-        payload = {
+        result = {
+            "local_index": local_idx,
             "image_name": image_name,
             "image_path": image_path,
-            "local_index": local_idx,
             "original_question": raw_question,
-            "parsed_relation_question": stripped_q,
+            "clean_question": stripped_q,
             "gold_relation": gold_relation,
-            "object_1_name": obj1,
-            "object_2_name": obj2,
+            "object_1": obj1,
+            "object_2": obj2,
             "prompt": prompt,
-            "raw_model_output": raw_output,
-            "parsed_json": parsed_payload,
-            "target_name_final": target_name,
-            "reference_name_final": ref_name,
-            "target_bbox_px": list(target_box_px) if target_box_px is not None else None,
-            "reference_bbox_px": list(ref_box_px) if ref_box_px is not None else None,
-            "parse_error": parse_error,
-            "overlay_png": os.path.relpath(overlay_png, out_root) if overlay_saved else None,
+            "raw_output": raw_output,
+            "error": error,
+            "prompt_path": prompt_path,
+            "raw_output_path": raw_output_path,
         }
 
-        with open(sample_json, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        with open(result_json_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
 
-        json_rows.append(payload)
-
-        csv_rows.append({
-            "image_name": image_name,
-            "image_path": image_path,
-            "local_index": local_idx,
-            "gold_relation": gold_relation,
-            "original_question": raw_question,
-            "object_1_name": obj1 or "",
-            "object_2_name": obj2 or "",
-            "prompt": prompt or "",
-            "raw_model_output": raw_output,
-            "target_name_final": target_name or "",
-            "reference_name_final": ref_name or "",
-            "target_bbox_px": json.dumps(list(target_box_px) if target_box_px is not None else None, ensure_ascii=False),
-            "reference_bbox_px": json.dumps(list(ref_box_px) if ref_box_px is not None else None, ensure_ascii=False),
-            "parse_error": parse_error or "",
-            "overlay_png": os.path.relpath(overlay_png, out_root) if overlay_saved else "",
-            "sample_json": os.path.relpath(sample_json, out_root),
-        })
+        rows.append(result)
 
         print("=" * 100)
         print(f"[{local_idx}] {image_name}")
-        print(f"question: {strip_answer_order_clause(raw_question)}")
+        print(f"question: {stripped_q}")
         print(f"objects: {obj1} | {obj2}")
-        if args.print_raw:
-            print("[RAW OUTPUT]")
-            print(raw_output)
-        print(f"target_bbox_px={target_box_px} | reference_bbox_px={ref_box_px} | parse_error={parse_error}")
-
-    fieldnames = [
-        "image_name", "image_path", "local_index", "gold_relation", "original_question",
-        "object_1_name", "object_2_name", "prompt", "raw_model_output",
-        "target_name_final", "reference_name_final", "target_bbox_px", "reference_bbox_px",
-        "parse_error", "overlay_png", "sample_json",
-    ]
+        if error:
+            print(f"[ERROR] {error}")
+        print("[RAW OUTPUT]")
+        print(raw_output)
+        print(f"saved raw_output: {raw_output_path}")
 
     with open(summary_csv, "w", encoding="utf-8-sig", newline="") as f:
+        fieldnames = [
+            "local_index",
+            "image_name",
+            "image_path",
+            "original_question",
+            "clean_question",
+            "gold_relation",
+            "object_1",
+            "object_2",
+            "prompt",
+            "raw_output",
+            "error",
+            "prompt_path",
+            "raw_output_path",
+        ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(csv_rows)
+        writer.writerows(rows)
 
-    report = {
-        "dataset": args.dataset,
-        "model_name": args.model_name,
-        "num_rows": len(csv_rows),
-        "num_json_parsed": sum(1 for r in json_rows if r["parsed_json"] is not None),
-        "num_target_bbox": sum(1 for r in json_rows if r["target_bbox_px"] is not None),
-        "num_reference_bbox": sum(1 for r in json_rows if r["reference_bbox_px"] is not None),
-        "summary_csv": summary_csv,
-    }
-
-    with open(report_json, "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
+    with open(summary_json, "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
 
     print("=" * 100)
-    print(f"Saved summary to: {summary_csv}")
-    print(f"Saved report to: {report_json}")
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    print(f"Saved CSV: {summary_csv}")
+    print(f"Saved JSON: {summary_json}")
 
 
 if __name__ == "__main__":
