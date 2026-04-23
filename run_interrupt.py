@@ -1,398 +1,335 @@
 import os
+import re
 import csv
 import json
-import math
 import argparse
-from typing import List, Optional, Set
-
-import numpy as np
-from PIL import Image
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from tqdm import tqdm
+from PIL import Image, ImageDraw
 
 from misc import seed_all
 from model_zoo import get_model
 from dataset_zoo import get_dataset
-#from multiq_utils import build_object_pool, build_questions, parse_prediction
-from multiq_utils_order import (
-    build_object_pool,
-    build_questions,
-    parse_prediction,
-    clean_question_text,
-)
 
 
-VALID_PERTURB_MODES = {"none", "uniform", "random", "reverse"}
-STRUCTURED_PERTURB_MODES = {"uniform", "random", "reverse"}
-VALID_IMAGE_MODES = {"original", "black"}
-
-
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--device", default="cuda", type=str)
-    p.add_argument("--model-name", default="llava1.5", type=str)
+# -------------------------
+# Args
+# -------------------------
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Ask LLaVA for object bboxes derived from the dataset relation question, "
+                    "save JSON, and overlay predicted boxes on images."
+    )
     p.add_argument("--dataset", default="Controlled_Images_A", type=str)
     p.add_argument("--option", default="four", type=str)
-    p.add_argument("--download", action="store_true")
+    p.add_argument("--device", default="cuda", type=str)
+    p.add_argument("--model-name", default="llava1.5", type=str)
+    p.add_argument("--method", default="base", type=str)
     p.add_argument("--seed", default=1, type=int)
+    p.add_argument("--download", action="store_true")
+    p.add_argument("--cache-dir", default=None, type=str)
+    p.add_argument("--out-dir", default="output_llava_relation_bbox_json_overlay", type=str)
     p.add_argument("--sample-index", default=0, type=int)
-    p.add_argument("--limit", default=-1, type=int)
-    p.add_argument(
-        "--method",
-        default="scaling_vis",
-        type=str,
-        choices=["scaling_vis"],
-        help="Use the Scal LLaVA path so custom kwargs reach decoder attention.",
-    )
-    p.add_argument(
-        "--weight",
-        default=1.0,
-        type=float,
-        help="Kept for compatibility. Structure perturbation itself preserves image-block mass.",
-    )
-    p.add_argument(
-        "--perturb-modes",
-        default="none,uniform,random,reverse",
-        type=str,
-        help="Comma-separated list from {none,uniform,random,reverse}.",
-    )
-    p.add_argument(
-        "--target-layers",
-        default="all",
-        type=str,
-        help='"all" or comma-separated decoder layer indices, e.g. "16" or "8,16,24".',
-    )
-    p.add_argument(
-        "--image-mode",
-        default="original",
-        type=str,
-        choices=["original", "black"],
-        help='Input image mode: "original" or "black".',
-    )
-    p.add_argument("--max-new-tokens", default=20, type=int)
-    p.add_argument("--trace-topk", default=10, type=int)
-    p.add_argument("--out-dir", default="./output_multiq_perturb", type=str)
+    p.add_argument("--limit", default=10, type=int, help="Default 10, set -1 for all.")
+    p.add_argument("--max-new-tokens", default=192, type=int)
+    p.add_argument("--skip-existing", action="store_true")
+    p.add_argument("--print-prompts", action="store_true")
+    p.add_argument("--print-raw", action="store_true")
     return p.parse_args()
 
 
-def parse_mode_list(text: str) -> List[str]:
-    modes = [x.strip().lower() for x in text.split(",") if x.strip()]
-    if not modes:
-        raise ValueError("No perturb modes provided.")
-    bad = [m for m in modes if m not in VALID_PERTURB_MODES]
-    if bad:
-        raise ValueError(f"Unsupported perturb modes: {bad}")
-    return modes
+# -------------------------
+# Text helpers
+# -------------------------
+def clean_text(x: Any) -> str:
+    x = "" if x is None else str(x)
+    x = re.sub(r"\s+", " ", x).strip()
+    return x
 
 
-def parse_target_layers(text: str) -> Optional[Set[int]]:
-    if text.strip().lower() == "all":
-        return None
-    layers: Set[int] = set()
-    for x in text.split(","):
-        x = x.strip()
-        if not x:
+def clean_question_text(question: str) -> str:
+    q = clean_text(question)
+    q = q.replace("<image>", " ")
+    if "USER:" in q:
+        q = q.split("USER:", 1)[1].strip()
+    if "ASSISTANT:" in q:
+        q = q.split("ASSISTANT:", 1)[0].strip()
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+
+def strip_answer_order_clause(q: str) -> str:
+    q = clean_question_text(q)
+    q = re.sub(r"\s*(?:Please\s+)?(?:answer|respond).*$", "", q, flags=re.IGNORECASE)
+    q = re.sub(r"\s*Your answer should be.*$", "", q, flags=re.IGNORECASE)
+    q = re.sub(r"\s*Answer with.*$", "", q, flags=re.IGNORECASE)
+    q = re.sub(r"\s*Choose from.*$", "", q, flags=re.IGNORECASE)
+    q = re.sub(r"\s+", " ", q).strip()
+    if q and q[-1] not in "?.!":
+        q += "?"
+    return q
+
+
+def normalize_object_name(name: str) -> str:
+    name = clean_text(name).lower()
+    name = name.replace("_", " ").replace("-", " ")
+    name = re.sub(r"^(a|an|the)\s+", "", name)
+    name = re.sub(r"[?.!,;:]+$", "", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
+
+
+def extract_objects_from_question(question: str) -> Tuple[Optional[str], Optional[str], str]:
+    q = strip_answer_order_clause(question)
+    q_lower = q.lower()
+
+    patterns = [
+        r"where\s+is\s+(?:the\s+)?(.+?)\s+in\s+relation\s+to\s+(?:the\s+)?(.+?)\?",
+        r"where\s+is\s+(?:the\s+)?(.+?)\s+relative\s+to\s+(?:the\s+)?(.+?)\?",
+        r"where\s+is\s+(?:the\s+)?(.+?)\s+with\s+respect\s+to\s+(?:the\s+)?(.+?)\?",
+        r"what\s+is\s+the\s+position\s+of\s+(?:the\s+)?(.+?)\s+relative\s+to\s+(?:the\s+)?(.+?)\?",
+    ]
+    for pat in patterns:
+        m = re.search(pat, q_lower, flags=re.IGNORECASE)
+        if m:
+            obj1 = normalize_object_name(m.group(1))
+            obj2 = normalize_object_name(m.group(2))
+            return obj1 or None, obj2 or None, q
+
+    rel_words = [
+        "left of", "right of", "in front of", "behind",
+        "above", "below", "under", "on", "over"
+    ]
+    for rel in rel_words:
+        pat = rf"(?:the\s+)?(.+?)\s+{re.escape(rel)}\s+(?:the\s+)?(.+?)$"
+        m = re.search(pat, q_lower.rstrip("?"), flags=re.IGNORECASE)
+        if m:
+            obj1 = normalize_object_name(m.group(1))
+            obj2 = normalize_object_name(m.group(2))
+            return obj1 or None, obj2 or None, q
+
+    return None, None, q
+
+
+# -------------------------
+# JSON helpers
+# -------------------------
+def strip_code_fences(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def try_parse_json_object(text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    raw = strip_code_fences(text)
+    decoder = json.JSONDecoder()
+
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return obj, None
+    except Exception:
+        pass
+
+    for i, ch in enumerate(raw):
+        if ch != "{":
             continue
-        layers.add(int(x))
-    if not layers:
-        raise ValueError("target-layers must be 'all' or a non-empty comma-separated list of ints.")
-    return layers
+        try:
+            obj, _ = decoder.raw_decode(raw[i:])
+            if isinstance(obj, dict):
+                return obj, None
+        except Exception:
+            continue
+
+    return None, "Could not parse a JSON object from model output."
 
 
-def make_black_image_like(image):
-    """
-    Return a pure black RGB image with the same spatial size as the input image.
-    Works for PIL.Image, numpy arrays, and torch tensors.
-    """
-    if isinstance(image, Image.Image):
-        w, h = image.size
-        return Image.new("RGB", (w, h), color=(0, 0, 0))
-
-    if isinstance(image, torch.Tensor):
-        arr = image.detach().cpu().numpy()
-    else:
-        arr = np.array(image)
-
-    if arr.ndim == 2:
-        h, w = arr.shape
-        black = np.zeros((h, w, 3), dtype=np.uint8)
-        return Image.fromarray(black)
-
-    if arr.ndim == 3:
-        # Handle CHW or HWC
-        if arr.shape[0] in (1, 3) and arr.shape[1] > 4 and arr.shape[2] > 4:
-            # CHW -> HWC
-            _, h, w = arr.shape
-        else:
-            # HWC
-            h, w = arr.shape[:2]
-        black = np.zeros((h, w, 3), dtype=np.uint8)
-        return Image.fromarray(black)
-
-    raise ValueError(f"Unsupported image type/shape for black-image conversion: {type(image)}")
+# -------------------------
+# Box helpers
+# -------------------------
+def _to_float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
 
 
-class _PerturbConfig:
-    target_layers: Optional[Set[int]] = None
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
 
 
-def install_attention_perturbation(target_layers: Optional[Set[int]]) -> None:
-    import model_zoo.llama.modeling_llama_add_attn as mla
+def _convert_box_dict(box: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
+    if all(k in box for k in ["x1", "y1", "x2", "y2"]):
+        vals = [_to_float(box.get(k)) for k in ["x1", "y1", "x2", "y2"]]
+        if all(v is not None for v in vals):
+            return vals[0], vals[1], vals[2], vals[3]
 
-    _PerturbConfig.target_layers = target_layers
-    mla.SAVE_ATTN = False
-    mla.SAVE_LAYER_ONLY = True
+    if all(k in box for k in ["xmin", "ymin", "xmax", "ymax"]):
+        vals = [_to_float(box.get(k)) for k in ["xmin", "ymin", "xmax", "ymax"]]
+        if all(v is not None for v in vals):
+            return vals[0], vals[1], vals[2], vals[3]
 
-    if getattr(mla.LLaMAAttention, "_perturb_patch_installed", False):
-        return
+    if all(k in box for k in ["x", "y", "w", "h"]):
+        x, y, w, h = [_to_float(box.get(k)) for k in ["x", "y", "w", "h"]]
+        if None not in (x, y, w, h):
+            return x, y, x + w, y + h
 
-    apply_rotary_pos_emb = mla.apply_rotary_pos_emb
-    nn = mla.nn
-    torch_mod = mla.torch
-    math_mod = mla.math
+    if all(k in box for k in ["left", "top", "right", "bottom"]):
+        vals = [_to_float(box.get(k)) for k in ["left", "top", "right", "bottom"]]
+        if all(v is not None for v in vals):
+            return vals[0], vals[1], vals[2], vals[3]
 
-    def _apply_image_block_perturbation(
-        attn_probs: torch.Tensor,
-        keys: Optional[torch.Tensor],
-        mode: Optional[str],
-    ) -> torch.Tensor:
-        if mode not in STRUCTURED_PERTURB_MODES or keys is None:
-            return attn_probs
+    if all(k in box for k in ["cx", "cy", "w", "h"]):
+        cx, cy, w, h = [_to_float(box.get(k)) for k in ["cx", "cy", "w", "h"]]
+        if None not in (cx, cy, w, h):
+            return cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0
 
-        # Only perturb prefill step where q_len == kv_len and the image block is explicit.
-        if attn_probs.size(-2) != attn_probs.size(-1):
-            return attn_probs
-
-        true_idx = torch_mod.where(keys)[1] if keys.ndim == 2 else torch_mod.where(keys)[0]
-        if true_idx.numel() == 0:
-            return attn_probs
-
-        start_idx = int(true_idx[0].item())
-        end_idx = int(true_idx[-1].item())
-
-        img = attn_probs[..., start_idx:end_idx + 1]
-        if img.numel() == 0:
-            return attn_probs
-
-        mass = img.sum(dim=-1, keepdim=True)
-        M = img.shape[-1]
-        eps = torch_mod.finfo(img.dtype).eps if img.is_floating_point() else 1e-12
-
-        if mode == "uniform":
-            new_img = torch_mod.full_like(img, 1.0 / float(M))
-            new_img = new_img * mass
-
-        elif mode == "random":
-            rand = torch_mod.rand_like(img)
-            rand = rand / rand.sum(dim=-1, keepdim=True).clamp_min(eps)
-            new_img = rand * mass
-
-        elif mode == "reverse":
-            rev = img.max(dim=-1, keepdim=True).values - img
-            rev_sum = rev.sum(dim=-1, keepdim=True)
-            uniform = torch_mod.full_like(img, 1.0 / float(M))
-            rev_norm = rev / rev_sum.clamp_min(eps)
-            use_uniform = rev_sum <= eps
-            rev_norm = torch_mod.where(use_uniform.expand_as(rev_norm), uniform, rev_norm)
-            new_img = rev_norm * mass
-
-        else:
-            return attn_probs
-
-        out = attn_probs.clone()
-        out[..., start_idx:end_idx + 1] = new_img
-        return out
-
-    def patched_forward(
-        self,
-        hidden_states: torch.Tensor,
-        past_key_value=None,
-        attention_mask=None,
-        position_ids=None,
-        use_cache: bool = False,
-        output_attentions: bool = False,
-        output_head_hidden_states: bool = False,
-        keys: Optional[torch.Tensor] = None,
-        weight: Optional[float] = None,
-        pos: Optional[torch.Tensor] = None,
-        idx: Optional[int] = None,
-        caption_length: Optional[list] = None,
-        adjust_method: Optional[str] = None,
-    ):
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states).view(
-            bsz, q_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(
-            bsz, q_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(
-            bsz, q_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-
-        kv_seq_len = key_states.shape[-2]
-        offset = 0
-        if past_key_value is not None:
-            offset = past_key_value[0].shape[-2]
-            kv_seq_len += offset
-
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin, offset=offset
-        )
-
-        if past_key_value is not None:
-            key_states = torch_mod.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch_mod.cat([past_key_value[1], value_states], dim=2)
-
-        past_key_value = (key_states, value_states)
-
-        attn_weights = torch_mod.matmul(
-            query_states, key_states.transpose(2, 3)
-        ) / math_mod.sqrt(self.head_dim)
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, "
-                f"but is {attn_weights.size()}"
-            )
-
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, "
-                    f"but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
-            attn_weights = torch_mod.max(
-                attn_weights,
-                torch_mod.tensor(
-                    torch_mod.finfo(attn_weights.dtype).min,
-                    device=attn_weights.device,
-                ),
-            )
-
-        attn_probs = nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch_mod.float32
-        ).to(query_states.dtype)
-
-        should_perturb = (
-            adjust_method in STRUCTURED_PERTURB_MODES
-            and idx is not None
-            and (_PerturbConfig.target_layers is None or idx in _PerturbConfig.target_layers)
-        )
-        if should_perturb:
-            attn_probs = _apply_image_block_perturbation(
-                attn_probs,
-                keys=keys,
-                mode=adjust_method,
-            )
-
-        attn_probs = self.att_out(attn_probs)
-        value_states = self.value_out(value_states)
-        attn_output = torch_mod.matmul(attn_probs, value_states)
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, "
-                f"but is {attn_output.size()}"
-            )
-
-        attn_output = attn_output.transpose(1, 2)
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-        attn_output = self.head_out(attn_output)
-        attn_output = self.o_proj(attn_output)
-
-        return attn_output, (attn_probs if output_attentions else None), past_key_value
-
-    mla.LLaMAAttention.forward = patched_forward
-    mla.LLaMAAttention._perturb_patch_installed = True
+    return None
 
 
-def get_change_greedy_fn(model_name: str):
-    if model_name == "llava1.5":
-        from model_zoo.llava15 import change_greedy_to_add_weight
-        return change_greedy_to_add_weight
-    if model_name == "llava1.6":
-        from model_zoo.llava16 import change_greedy_to_add_weight
-        return change_greedy_to_add_weight
-    raise ValueError(f"Unsupported model for this script: {model_name}")
+def coerce_box(value: Any) -> Optional[Tuple[float, float, float, float]]:
+    if value is None:
+        return None
+
+    if isinstance(value, dict):
+        return _convert_box_dict(value)
+
+    if isinstance(value, (list, tuple)) and len(value) == 4:
+        vals = [_to_float(x) for x in value]
+        if all(v is not None for v in vals):
+            return vals[0], vals[1], vals[2], vals[3]
+
+    if isinstance(value, str):
+        nums = re.findall(r"-?\d+(?:\.\d+)?", value)
+        if len(nums) >= 4:
+            vals = [float(x) for x in nums[:4]]
+            return vals[0], vals[1], vals[2], vals[3]
+
+    return None
+
+
+BOX_KEY_CANDIDATES = {
+    "target": [
+        "target_bbox", "object_1_bbox", "obj1_bbox", "bbox",
+        "box", "target_box", "subject_bbox", "subject_box"
+    ],
+    "reference": [
+        "reference_bbox", "object_2_bbox", "obj2_bbox", "ref_bbox",
+        "reference_box", "other_bbox", "other_box", "context_bbox"
+    ],
+}
+
+NAME_KEY_CANDIDATES = {
+    "target": ["target_object", "object_1_name", "obj1_name", "subject", "object"],
+    "reference": ["reference_object", "object_2_name", "obj2_name", "reference", "other_object"],
+}
+
+
+def extract_named_box(payload: Dict[str, Any], role: str) -> Tuple[Optional[str], Optional[Tuple[float, float, float, float]]]:
+    name = None
+    for k in NAME_KEY_CANDIDATES[role]:
+        if k in payload and clean_text(payload[k]):
+            name = normalize_object_name(payload[k])
+            break
+
+    box = None
+    for k in BOX_KEY_CANDIDATES[role]:
+        if k in payload:
+            box = coerce_box(payload[k])
+            if box is not None:
+                break
+
+    if box is None:
+        nested_keys = ["target", "object_1", "obj1", "subject"] if role == "target" else ["reference", "object_2", "obj2", "other"]
+        for nk in nested_keys:
+            if isinstance(payload.get(nk), dict):
+                nested = payload[nk]
+                box = coerce_box(nested)
+                if name is None:
+                    for kk in ["name", "label", "object"]:
+                        if kk in nested and clean_text(nested[kk]):
+                            name = normalize_object_name(nested[kk])
+                            break
+                if box is not None:
+                    break
+
+    return name, box
+
+
+def normalize_box_to_pixels(
+    box: Tuple[float, float, float, float],
+    width: int,
+    height: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    x1, y1, x2, y2 = box
+    vals = [x1, y1, x2, y2]
+    max_abs = max(abs(v) for v in vals)
+
+    # 允许 [0,1] 或 [0,1000] 两种输出
+    if max_abs <= 1.5:
+        x1, x2 = x1 * width, x2 * width
+        y1, y2 = y1 * height, y2 * height
+    elif max_abs <= 1001:
+        x1, x2 = x1 / 1000.0 * width, x2 / 1000.0 * width
+        y1, y2 = y1 / 1000.0 * height, y2 / 1000.0 * height
+
+    x1, x2 = sorted([x1, x2])
+    y1, y2 = sorted([y1, y2])
+
+    x1 = int(round(_clamp(x1, 0, width - 1)))
+    y1 = int(round(_clamp(y1, 0, height - 1)))
+    x2 = int(round(_clamp(x2, 0, width - 1)))
+    y2 = int(round(_clamp(y2, 0, height - 1)))
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
+# -------------------------
+# Prompt + generation
+# -------------------------
+def build_bbox_json_prompt(obj1: str, obj2: str, original_question: str) -> str:
+    original_q = strip_answer_order_clause(original_question)
+    relation_q = f"Where is the {obj1} in relation to the {obj2}?"
+
+    # 注意：必须恰好只有一个 <image>
+    prompt = (
+        "USER: <image>\n"
+        "Identify the two queried objects in the image and return bounding boxes only.\n"
+        f"Original dataset question: {original_q}\n"
+        f"Use this query: {relation_q}\n"
+        "Return ONLY one valid JSON object. No markdown fences. No explanation.\n"
+        "Coordinates must be integers on a 0-1000 scale relative to the full image.\n"
+        "Use exactly this schema:\n"
+        '{"target_object":"%s","reference_object":"%s","target_bbox":{"x1":0,"y1":0,"x2":0,"y2":0},"reference_bbox":{"x1":0,"y1":0,"x2":0,"y2":0}}\n'
+        "Rules:\n"
+        "- x1 < x2 and y1 < y2\n"
+        "- if an object is not visible, set its bbox to null\n"
+        "- object names should match the queried objects\n"
+        "ASSISTANT:"
+    ) % (obj1, obj2)
+
+    prompt = re.sub(r"\n{3,}", "\n\n", prompt).strip()
+    return prompt
 
 
 @torch.no_grad()
-def build_generation_trace(processor, generation_output, prompt_len: int, topk: int = 10):
-    tokenizer = processor.tokenizer
-    sequences = generation_output.sequences
-    gen_ids = sequences[0][prompt_len:]
-
-    step_scores = generation_output.scores or []
-    step_logits = getattr(generation_output, "logits", None)
-
-    trace = []
-    for step_idx, token_id in enumerate(gen_ids.tolist()):
-        step_score = step_scores[step_idx][0].detach().float().cpu()
-
-        if step_logits is not None:
-            step_raw = step_logits[step_idx][0].detach().float().cpu()
-        else:
-            step_raw = step_score
-
-        step_prob = torch.softmax(step_score, dim=-1)
-
-        chosen = {
-            "step": step_idx,
-            "token_id": int(token_id),
-            "token_text": tokenizer.decode(
-                [token_id],
-                skip_special_tokens=False,
-                clean_up_tokenization_spaces=False,
-            ),
-            "score": float(step_score[token_id].item()),
-            "probability": float(step_prob[token_id].item()),
-            "raw_logit": float(step_raw[token_id].item()),
-            "top10": [],
-        }
-
-        k = min(topk, step_prob.numel())
-        topk_prob, topk_ids = torch.topk(step_prob, k=k)
-        topk_score = step_score[topk_ids]
-        topk_raw = step_raw[topk_ids]
-
-        for rank in range(k):
-            cand_id = int(topk_ids[rank].item())
-            chosen["top10"].append({
-                "rank": rank + 1,
-                "token_id": cand_id,
-                "token_text": tokenizer.decode(
-                    [cand_id],
-                    skip_special_tokens=False,
-                    clean_up_tokenization_spaces=False,
-                ),
-                "score": float(topk_score[rank].item()),
-                "probability": float(topk_prob[rank].item()),
-                "raw_logit": float(topk_raw[rank].item()),
-            })
-
-        trace.append(chosen)
-
-    return trace
-
-
-@torch.no_grad()
-def run_one_generation(
-    wrapper,
-    model_name: str,
-    image,
-    prompt: str,
-    perturb_mode: str,
-    max_new_tokens: int,
-):
+def run_llava_once(wrapper, image: Image.Image, prompt: str, max_new_tokens: int = 192) -> str:
     processor = wrapper.processor
     model = wrapper.model
 
-    single_input = processor(images=image, text=prompt, padding=True, return_tensors="pt")
+    single_input = processor(
+        images=image,
+        text=prompt,
+        padding=True,
+        return_tensors="pt",
+    )
+
     single_input = {
         k: (v.to(wrapper.device) if torch.is_tensor(v) else v)
         for k, v in single_input.items()
@@ -400,204 +337,278 @@ def run_one_generation(
     }
 
     image_id = (single_input["input_ids"] == model.config.image_token_index)
-    prompt_len = int(single_input["input_ids"].shape[1])
+    num_image_tokens = int(image_id.sum().item())
 
-    change_greedy = get_change_greedy_fn(model_name)
-    change_greedy()
+    if num_image_tokens != 1:
+        decoded_prompt = processor.decode(
+            single_input["input_ids"][0],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        raise ValueError(
+            f"Prompt must contain exactly 1 image token, but got {num_image_tokens}.\n"
+            f"Original prompt:\n{prompt}\n\n"
+            f"Decoded processor prompt:\n{decoded_prompt}"
+        )
+
+    prompt_len = int(single_input["input_ids"].shape[1])
 
     gen_kwargs = dict(
         input_ids=single_input["input_ids"],
         pixel_values=single_input["pixel_values"],
         attention_mask=single_input.get("attention_mask", None),
         max_new_tokens=max_new_tokens,
-        output_scores=True,
-        output_logits=True,
+        output_scores=False,
         return_dict_in_generate=True,
         use_cache=True,
         output_attentions=False,
         keys=image_id,
         weight=1.0,
-        adjust_method=perturb_mode,
+        adjust_method="none",
+        do_sample=False,
     )
 
     output = model.generate(**gen_kwargs)
     gen_ids = output.sequences[0][prompt_len:]
+
     gen_text = processor.decode(
         gen_ids,
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     ).strip()
 
-    return output, gen_text, prompt_len
+    return gen_text
 
 
-def write_json(path: str, obj) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+# -------------------------
+# Overlay helpers
+# -------------------------
+def draw_label_box(
+    draw: ImageDraw.ImageDraw,
+    box: Tuple[int, int, int, int],
+    label: str,
+    color: Tuple[int, int, int],
+) -> None:
+    x1, y1, x2, y2 = box
+    draw.rectangle([x1, y1, x2, y2], outline=color, width=4)
+    try:
+        tb = draw.textbbox((x1, y1), label)
+        tx1, ty1, tx2, ty2 = tb
+        bg = [x1, max(0, y1 - (ty2 - ty1) - 8), x1 + (tx2 - tx1) + 8, max(0, y1 - 2)]
+        draw.rectangle(bg, fill=color)
+        draw.text((x1 + 4, max(0, y1 - (ty2 - ty1) - 6)), label, fill=(255, 255, 255))
+    except Exception:
+        draw.text((x1, max(0, y1 - 12)), label, fill=color)
 
 
-def main():
+def save_overlay(
+    image: Image.Image,
+    target_box: Optional[Tuple[int, int, int, int]],
+    target_name: str,
+    ref_box: Optional[Tuple[int, int, int, int]],
+    ref_name: str,
+    out_path: str,
+) -> None:
+    vis = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(vis)
+    if target_box is not None:
+        draw_label_box(draw, target_box, f"target: {target_name}", (255, 0, 0))
+    if ref_box is not None:
+        draw_label_box(draw, ref_box, f"ref: {ref_name}", (0, 128, 255))
+    vis.save(out_path)
+
+
+# -------------------------
+# Main
+# -------------------------
+def main() -> None:
     args = parse_args()
     seed_all(args.seed)
 
-    perturb_modes = parse_mode_list(args.perturb_modes)
-    target_layers = parse_target_layers(args.target_layers)
-    install_attention_perturbation(target_layers)
+    cache_dir = args.cache_dir or f"/ddnB/work/{os.environ.get('USER', 'user')}/hf_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ.setdefault("HF_HOME", cache_dir)
+    os.environ.setdefault("HF_HUB_CACHE", os.path.join(cache_dir, "hub"))
+    os.environ.setdefault("TRANSFORMERS_CACHE", os.path.join(cache_dir, "transformers"))
+    os.environ.setdefault("XDG_CACHE_HOME", cache_dir)
 
     wrapper, image_preprocess = get_model(args.model_name, args.device, args.method)
     dataset = get_dataset(args.dataset, image_preprocess=image_preprocess, download=args.download)
-    prompt_records, sampled_indices = wrapper.load_prompt_records_with_sampling(args.dataset, args.option)
-    object_pool = build_object_pool(prompt_records)
 
+    prompt_records, sampled_indices = wrapper.load_prompt_records_with_sampling(args.dataset, args.option)
     if sampled_indices is not None:
-        sub_dataset = torch.utils.data.Subset(dataset, sampled_indices)
-    else:
-        sub_dataset = dataset
+        dataset = torch.utils.data.Subset(dataset, sampled_indices)
 
     start = args.sample_index
     end = len(prompt_records) if args.limit < 0 else min(len(prompt_records), start + args.limit)
 
-    # 按 image_mode 分目录，避免 original / black 覆盖
-    base_dir = os.path.join(args.out_dir, args.dataset, args.image_mode)
-    os.makedirs(base_dir, exist_ok=True)
-    summary_csv = os.path.join(base_dir, f"summary_{args.image_mode}.csv")
-    summary_rows = []
+    model_tag = f"{args.model_name}_relation_bbox_json"
+    out_root = os.path.join(args.out_dir, args.dataset, model_tag)
+    os.makedirs(out_root, exist_ok=True)
 
-    for local_idx in tqdm(range(start, end), desc="Samples"):
+    summary_csv = os.path.join(out_root, "summary_relation_bbox_json.csv")
+    report_json = os.path.join(out_root, "report.json")
+
+    csv_rows: List[Dict[str, Any]] = []
+    json_rows: List[Dict[str, Any]] = []
+
+    for local_idx in range(start, end):
         rec = prompt_records[local_idx]
-        item = sub_dataset[local_idx]
+        item = dataset[local_idx]
 
+        image_name = clean_text(item.get("image_name", f"sample_{local_idx:04d}"))
+        image_path = clean_text(item.get("image_path", ""))
         image = item["image_options"][0]
-        if args.image_mode == "black":
-            image = make_black_image_like(image)
 
-        questions, meta = build_questions(
-            base_prompt=rec["question"],
-            base_answer=rec["answer"][0] if isinstance(rec["answer"], list) else rec["answer"],
-            sample_idx=local_idx,
-            object_pool=object_pool,
-        )
+        if not isinstance(image, Image.Image):
+            raise TypeError(
+                f"Expected PIL.Image from dataset[local_idx]['image_options'][0], got {type(image)}"
+            )
 
-        image_name = item.get("image_name", f"sample_{local_idx:04d}")
-        image_path = item.get("image_path", "")
-        image_stem = os.path.splitext(image_name)[0]
-        sample_dir = os.path.join(base_dir, image_stem)
+        sample_dir = os.path.join(out_root, os.path.splitext(image_name)[0])
         os.makedirs(sample_dir, exist_ok=True)
+        sample_json = os.path.join(sample_dir, "result.json")
+        overlay_png = os.path.join(sample_dir, "overlay_pred.png")
 
-        meta_path = os.path.join(sample_dir, "meta.json")
-        if not os.path.exists(meta_path):
-            write_json(meta_path, {
-                "local_index": local_idx,
-                "image_name": image_name,
-                "image_path": image_path,
-                "image_mode": args.image_mode,
-                **meta,
-            })
+        if args.skip_existing and os.path.exists(sample_json) and os.path.exists(overlay_png):
+            continue
 
-        for perturb_mode in perturb_modes:
-            for q in questions:
-                output, gen_text, prompt_len = run_one_generation(
-                    wrapper=wrapper,
-                    model_name=args.model_name,
-                    image=image,
-                    prompt=q["prompt"],
-                    perturb_mode=perturb_mode,
-                    max_new_tokens=args.max_new_tokens,
-                )
+        raw_question = rec["question"]
+        gold_relation = clean_text(rec.get("answer", ""))
 
-                trace = build_generation_trace(
-                    wrapper.processor,
-                    output,
-                    prompt_len,
-                    topk=args.trace_topk,
-                )
-                pred = parse_prediction(gen_text, q["mode"])
-                correct = (pred == q["gold"])
+        obj1, obj2, stripped_q = extract_objects_from_question(raw_question)
 
-                trace_rel_path = os.path.join(
-                    image_stem,
-                    f"{q['qid']}_{args.image_mode}_{perturb_mode}_trace.json",
-                )
-                trace_path = os.path.join(base_dir, trace_rel_path)
+        prompt = None
+        raw_output = ""
+        parsed_payload = None
+        parse_error = None
+        target_name = None
+        ref_name = None
+        target_box_px = None
+        ref_box_px = None
+        overlay_saved = False
 
-                write_json(trace_path, {
-                    "image_name": image_name,
-                    "image_path": image_path,
-                    "local_index": local_idx,
-                    "qid": q["qid"],
-                    "mode": q["mode"],
-                    "gold": q["gold"],
-                    "prompt": q["prompt"],
-                    "image_mode": args.image_mode,
-                    "perturb_mode": perturb_mode,
-                    "target_layers": "all" if target_layers is None else sorted(target_layers),
-                    "generated_text": gen_text,
-                    "pred": pred,
-                    "correct": correct,
-                    "token_trace": trace,
-                })
+        if not obj1 or not obj2:
+            parse_error = "Could not reliably extract the two objects from the original question."
+        else:
+            prompt = build_bbox_json_prompt(obj1, obj2, raw_question)
 
-                first = trace[0] if trace else {}
-                last = trace[-1] if trace else {}
+            if args.print_prompts:
+                print("=" * 100)
+                print(f"[{local_idx}] PROMPT")
+                print(prompt)
+                print("raw_prompt_<image>_count =", prompt.count("<image>"))
 
-                summary_rows.append({
-                    "image_name": image_name,
-                    "image_path": image_path,
-                    "local_index": local_idx,
-                    "qid": q["qid"],
-                    "question_mode": q["mode"],
-                    "gold": q["gold"],
-                    "pred": pred,
-                    "correct": correct,
-                    "image_mode": args.image_mode,
-                    "perturb_mode": perturb_mode,
-                    "target_layers": "all" if target_layers is None else ",".join(str(x) for x in sorted(target_layers)),
-                    "generated_text": gen_text,
-                    "num_generated_tokens": len(trace),
-                    "first_token": first.get("token_text", ""),
-                    "first_raw_logit": first.get("raw_logit", None),
-                    "first_score": first.get("score", None),
-                    "first_probability": first.get("probability", None),
-                    "final_token": last.get("token_text", ""),
-                    "final_raw_logit": last.get("raw_logit", None),
-                    "final_score": last.get("score", None),
-                    "final_probability": last.get("probability", None),
-                    "trace_json": trace_rel_path,
-                })
+            raw_output = run_llava_once(
+                wrapper=wrapper,
+                image=image,
+                prompt=prompt,
+                max_new_tokens=args.max_new_tokens,
+            )
 
-    with open(summary_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "image_name",
-                "image_path",
-                "local_index",
-                "qid",
-                "question_mode",
-                "gold",
-                "pred",
-                "correct",
-                "image_mode",
-                "perturb_mode",
-                "target_layers",
-                "generated_text",
-                "num_generated_tokens",
-                "first_token",
-                "first_raw_logit",
-                "first_score",
-                "first_probability",
-                "final_token",
-                "final_raw_logit",
-                "final_score",
-                "final_probability",
-                "trace_json",
-            ],
-        )
+            parsed_payload, json_error = try_parse_json_object(raw_output)
+            parse_error = json_error
+
+            if parsed_payload is None:
+                target_name = obj1
+                ref_name = obj2
+            else:
+                target_name_pred, target_box = extract_named_box(parsed_payload, "target")
+                ref_name_pred, ref_box = extract_named_box(parsed_payload, "reference")
+
+                target_name = target_name_pred or obj1
+                ref_name = ref_name_pred or obj2
+
+                w, h = image.size
+                target_box_px = normalize_box_to_pixels(target_box, w, h) if target_box is not None else None
+                ref_box_px = normalize_box_to_pixels(ref_box, w, h) if ref_box is not None else None
+
+                if target_box_px is not None or ref_box_px is not None:
+                    save_overlay(image, target_box_px, target_name, ref_box_px, ref_name, overlay_png)
+                    overlay_saved = True
+
+        payload = {
+            "image_name": image_name,
+            "image_path": image_path,
+            "local_index": local_idx,
+            "original_question": raw_question,
+            "parsed_relation_question": stripped_q,
+            "gold_relation": gold_relation,
+            "object_1_name": obj1,
+            "object_2_name": obj2,
+            "prompt": prompt,
+            "raw_model_output": raw_output,
+            "parsed_json": parsed_payload,
+            "target_name_final": target_name,
+            "reference_name_final": ref_name,
+            "target_bbox_px": list(target_box_px) if target_box_px is not None else None,
+            "reference_bbox_px": list(ref_box_px) if ref_box_px is not None else None,
+            "parse_error": parse_error,
+            "overlay_png": os.path.relpath(overlay_png, out_root) if overlay_saved else None,
+        }
+
+        with open(sample_json, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+        json_rows.append(payload)
+
+        csv_rows.append({
+            "image_name": image_name,
+            "image_path": image_path,
+            "local_index": local_idx,
+            "gold_relation": gold_relation,
+            "original_question": raw_question,
+            "object_1_name": obj1 or "",
+            "object_2_name": obj2 or "",
+            "prompt": prompt or "",
+            "raw_model_output": raw_output,
+            "target_name_final": target_name or "",
+            "reference_name_final": ref_name or "",
+            "target_bbox_px": json.dumps(list(target_box_px) if target_box_px is not None else None, ensure_ascii=False),
+            "reference_bbox_px": json.dumps(list(ref_box_px) if ref_box_px is not None else None, ensure_ascii=False),
+            "parse_error": parse_error or "",
+            "overlay_png": os.path.relpath(overlay_png, out_root) if overlay_saved else "",
+            "sample_json": os.path.relpath(sample_json, out_root),
+        })
+
+        print("=" * 100)
+        print(f"[{local_idx}] {image_name}")
+        print(f"question: {strip_answer_order_clause(raw_question)}")
+        print(f"objects: {obj1} | {obj2}")
+        if args.print_raw:
+            print("[RAW OUTPUT]")
+            print(raw_output)
+        print(f"target_bbox_px={target_box_px} | reference_bbox_px={ref_box_px} | parse_error={parse_error}")
+
+    fieldnames = [
+        "image_name", "image_path", "local_index", "gold_relation", "original_question",
+        "object_1_name", "object_2_name", "prompt", "raw_model_output",
+        "target_name_final", "reference_name_final", "target_bbox_px", "reference_bbox_px",
+        "parse_error", "overlay_png", "sample_json",
+    ]
+
+    with open(summary_csv, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(summary_rows)
+        writer.writerows(csv_rows)
 
+    report = {
+        "dataset": args.dataset,
+        "model_name": args.model_name,
+        "num_rows": len(csv_rows),
+        "num_json_parsed": sum(1 for r in json_rows if r["parsed_json"] is not None),
+        "num_target_bbox": sum(1 for r in json_rows if r["target_bbox_px"] is not None),
+        "num_reference_bbox": sum(1 for r in json_rows if r["reference_bbox_px"] is not None),
+        "summary_csv": summary_csv,
+    }
+
+    with open(report_json, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+    print("=" * 100)
     print(f"Saved summary to: {summary_csv}")
+    print(f"Saved report to: {report_json}")
+    print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
