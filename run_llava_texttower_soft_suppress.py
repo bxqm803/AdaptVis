@@ -3,6 +3,8 @@ import re
 import json
 import math
 import random
+from collections import defaultdict
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -30,12 +32,11 @@ PRINT_FIRST_N = 10
 MAX_EXAMPLES = None   # None = 全部；想先少跑点就改成 20 / 50
 
 # soft background suppression
-BG_RATIO = 0.20       # 背景保底比例，gate=0 时仍保留 20% token 强度
-BOOST = 1.00          # 如需强调前景，可试 1.2 / 1.5
-USE_DILATE = True
+BG_RATIO = 0.10       # 背景保底比例
+BOOST = 1.00
+USE_DILATE = False
 DILATE_KERNEL = 3
 
-# CLIP 模型 dtype
 CLIP_DTYPE = torch.float16 if DEVICE.startswith("cuda") else torch.float32
 
 
@@ -76,7 +77,6 @@ def infer_names_from_filename(image_name):
 def parse_objects_from_question(question):
     q = clean_text(question)
 
-    # 去掉可能的包装
     if "USER:" in q:
         q = q.split("USER:", 1)[1].strip()
     if "ASSISTANT:" in q:
@@ -135,14 +135,6 @@ def relation_from_image_name(image_name):
     return None
 
 
-def parse_prediction(text):
-    text = clean_text(text).lower()
-    for cand in ["left", "right", "on", "under"]:
-        if re.search(rf"\b{cand}\b", text):
-            return cand
-    return None
-
-
 def extract_raw_text(output):
     if isinstance(output, str):
         return output
@@ -154,6 +146,52 @@ def extract_raw_text(output):
     if isinstance(output, (list, tuple)) and len(output) > 0:
         return str(output[0])
     return str(output)
+
+
+def parse_prediction(text):
+    """
+    修正版：
+    - 先找更明确的关系短语
+    - 如果有多个，取最后一个关系表达
+      因为模型常写成：
+      "on the floor, under the chair"
+      真正关系通常在后面
+    """
+    text = clean_text(text).lower()
+
+    phrase_patterns = [
+        (r"\bto the left of\b", "left"),
+        (r"\bto the right of\b", "right"),
+        (r"\bunder\b", "under"),
+        (r"\bon top of\b", "on"),
+        (r"\bon the\b", "on"),
+    ]
+
+    found = []
+    for pat, label in phrase_patterns:
+        for m in re.finditer(pat, text):
+            found.append((m.start(), label, m.group(0)))
+
+    if found:
+        found.sort(key=lambda x: x[0])
+        return found[-1][1]
+
+    single_patterns = [
+        (r"\bleft\b", "left"),
+        (r"\bright\b", "right"),
+        (r"\bunder\b", "under"),
+        (r"\bon\b", "on"),
+    ]
+    found = []
+    for pat, label in single_patterns:
+        for m in re.finditer(pat, text):
+            found.append((m.start(), label))
+
+    if found:
+        found.sort(key=lambda x: x[0])
+        return found[-1][1]
+
+    return None
 
 
 def infer_patch_grid(num_patches):
@@ -173,7 +211,6 @@ def normalize_1d_torch(x, eps=1e-6):
 
 
 def dilate_patch_mask(mask, gh, gw, kernel_size=3):
-    # mask: [B, N]
     b, n = mask.shape
     x = mask.view(b, 1, gh, gw)
     x = F.max_pool2d(x, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
@@ -181,9 +218,6 @@ def dilate_patch_mask(mask, gh, gw, kernel_size=3):
 
 
 def resize_gate_to_num_patches(gate, target_num_patches):
-    """
-    gate: [B, N]
-    """
     src_h, src_w = infer_patch_grid(gate.shape[1])
     tgt_h, tgt_w = infer_patch_grid(target_num_patches)
 
@@ -206,7 +240,6 @@ def get_clip_patch_features(clip_model, clip_processor, image_pil, device):
     vision_outputs = clip_model.vision_model(pixel_values=pixel_values, return_dict=True)
     last_hidden = vision_outputs.last_hidden_state  # [1, 1+N, H]
 
-    # 和你之前那版一致：给 vision token 过 post_layernorm
     if hasattr(clip_model.vision_model, "vision_model") and hasattr(clip_model.vision_model.vision_model, "post_layernorm"):
         last_hidden = clip_model.vision_model.vision_model.post_layernorm(last_hidden)
     elif hasattr(clip_model.vision_model, "post_layernorm"):
@@ -215,7 +248,6 @@ def get_clip_patch_features(clip_model, clip_processor, image_pil, device):
     patch_tokens = last_hidden[:, 1:, :]  # [1, N, H]
     patch_proj = clip_model.visual_projection(patch_tokens)  # [1, N, D]
     patch_proj = patch_proj / (patch_proj.norm(dim=-1, keepdim=True) + 1e-6)
-
     return patch_proj
 
 
@@ -242,19 +274,19 @@ def build_union_gate_from_text_tower(
     """
     你前面已经验证过：
     raw similarity 的 low-score valley 对应目标物体
-    所以这里 objectness = normalize(-raw_sims)
+    所以这里用 normalize(-raw_sims)
     """
-    patch_proj = get_clip_patch_features(clip_model, clip_processor, image_pil, device)   # [1, N, D]
-    text1 = get_clip_text_feature(clip_model, clip_processor, obj1_name, device)          # [1, D]
-    text2 = get_clip_text_feature(clip_model, clip_processor, obj2_name, device)          # [1, D]
+    patch_proj = get_clip_patch_features(clip_model, clip_processor, image_pil, device)
+    text1 = get_clip_text_feature(clip_model, clip_processor, obj1_name, device)
+    text2 = get_clip_text_feature(clip_model, clip_processor, obj2_name, device)
 
     sims1 = torch.matmul(patch_proj[0], text1[0]).unsqueeze(0)   # [1, N]
     sims2 = torch.matmul(patch_proj[0], text2[0]).unsqueeze(0)   # [1, N]
 
-    gate1 = normalize_1d_torch(-sims1)   # low raw score -> high objectness
+    gate1 = normalize_1d_torch(-sims1)
     gate2 = normalize_1d_torch(-sims2)
 
-    union_gate = torch.maximum(gate1, gate2)   # [1, N]
+    union_gate = torch.maximum(gate1, gate2)
 
     gh, gw = infer_patch_grid(union_gate.shape[1])
     if use_dilate:
@@ -265,13 +297,9 @@ def build_union_gate_from_text_tower(
 
 
 # =========================================================
-# patch llava model: only change image features internally
+# patch repo llava: suppress background inside visual stream
 # =========================================================
 def install_soft_gate_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
-    """
-    直接 patch repo 自定义 LLaVA 的 multi_modal_projector.forward
-    位置：vision_tower -> selected_image_feature -> multi_modal_projector -> image_features
-    """
     llava_model = llava_wrapper.model
 
     if not hasattr(llava_model, "multi_modal_projector"):
@@ -282,8 +310,7 @@ def install_soft_gate_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
     original_projector_forward = llava_model.multi_modal_projector.forward
 
     def patched_projector_forward(image_features):
-        # image_features: [B, N, Dv]  (vision tower 输出选中的 patch features)
-        feats = original_projector_forward(image_features)  # [B, N, Dt]
+        feats = original_projector_forward(image_features)  # [B, N, D]
 
         gate = getattr(llava_model, "_current_soft_gate", None)
         if gate is None:
@@ -309,8 +336,7 @@ def install_soft_gate_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
 
         gate_local = gate_local.to(device=feats.device, dtype=feats.dtype).clamp(0, 1)
 
-        # soft background suppression
-        scale = bg_ratio + (1.0 - bg_ratio) * gate_local  # [B, N]
+        scale = bg_ratio + (1.0 - bg_ratio) * gate_local
         if boost != 1.0:
             scale = scale * (1.0 + (boost - 1.0) * gate_local)
 
@@ -365,8 +391,11 @@ def main():
 
     total = 0
     correct = 0
-    shown = 0
 
+    per_gold_total = defaultdict(int)
+    per_gold_correct = defaultdict(int)
+
+    shown = 0
     num_examples = len(dataset) if MAX_EXAMPLES is None else min(MAX_EXAMPLES, len(dataset))
 
     for idx in tqdm(range(num_examples), desc="examples"):
@@ -387,7 +416,6 @@ def main():
         if not obj1 or not obj2:
             obj1, obj2 = infer_names_from_filename(image_name)
 
-        # 1) text tower -> inverse soft mask
         union_gate = build_union_gate_from_text_tower(
             clip_model=clip_model,
             clip_processor=clip_processor,
@@ -399,10 +427,8 @@ def main():
             dilate_kernel=DILATE_KERNEL,
         )
 
-        # 2) 把 gate 塞给 llava，内部改视觉 token
         llava_model._current_soft_gate = union_gate
 
-        # 3) 跑原始问题（保持仓库原生方式）
         try:
             out = llava_wrapper.run_single_prompt(
                 image=image,
@@ -417,8 +443,11 @@ def main():
         pred = parse_prediction(raw_output)
 
         total += 1
+        per_gold_total[gold] += 1
+
         if pred == gold:
             correct += 1
+            per_gold_correct[gold] += 1
 
         if shown < PRINT_FIRST_N:
             print("=" * 120)
@@ -435,7 +464,13 @@ def main():
     print("=" * 120)
     print(f"total = {total}")
     print(f"correct = {correct}")
-    print(f"acc = {correct / total:.4f}" if total > 0 else "acc = N/A")
+    print(f"overall_acc = {correct / total:.4f}" if total > 0 else "overall_acc = N/A")
+
+    for rel in ["left", "right", "under", "on"]:
+        n = per_gold_total[rel]
+        c = per_gold_correct[rel]
+        acc = (c / n) if n > 0 else 0.0
+        print(f"{rel}_acc = {acc:.4f} ({c}/{n})")
 
 
 if __name__ == "__main__":
