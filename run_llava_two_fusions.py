@@ -31,8 +31,9 @@ SEED = 1
 PRINT_FIRST_N = 10
 MAX_EXAMPLES = None
 
-# 只对前 N 个样本做 token-prob 分析
+# analysis
 ANALYZE_FIRST_N = 10
+MAX_NEW_TOKENS_ANALYSIS = 32
 TOPK = 5
 
 # fused on full vocab
@@ -188,7 +189,7 @@ def parse_prediction(text):
     found = []
     for pat, label in single_patterns:
         for m in re.finditer(pat, text):
-            found.append((m.start(), m.end(), label))
+            found.append((m.start(), m.end(), label, m.group(0)))
 
     if found:
         found.sort(key=lambda x: (x[0], x[1]))
@@ -197,13 +198,21 @@ def parse_prediction(text):
     return None
 
 
-def find_analysis_anchor_span(text):
+def find_last_anchor_from_generated(tokenizer, generated_ids):
     """
-    next to 和 left/right/under/on 同一层级，
-    统一取最后一个关系表达作为分析锚点。
+    在真实生成 token 序列里，逐步 decode 前缀，
+    找最后一个关系表达。
+
+    next to 和 left/right/under/on 同层级。
+    返回:
+        {
+            "label": "left/right/under/on/next_to",
+            "matched_text": "...",
+            "anchor_word": "left/right/under/on/next",
+        }
     """
-    raw = str(text)
-    lower = raw.lower()
+    best = None
+    prefix = []
 
     phrase_patterns = [
         (r"\bto the left of\b", "left", "left"),
@@ -214,39 +223,42 @@ def find_analysis_anchor_span(text):
         (r"\bon the\b", "on", "on"),
     ]
 
-    found = []
-    for pat, label, anchor_word in phrase_patterns:
-        for m in re.finditer(pat, lower):
-            found.append({
-                "start": m.start(),
-                "end": m.end(),
-                "label": label,
-                "matched_text": raw[m.start():m.end()],
-                "anchor_word": anchor_word,
-            })
+    single_patterns = [
+        (r"\bleft\b", "left", "left"),
+        (r"\bright\b", "right", "right"),
+        (r"\bunder\b", "under", "under"),
+        (r"\bon\b", "on", "on"),
+    ]
 
-    if not found:
-        single_patterns = [
-            (r"\bleft\b", "left", "left"),
-            (r"\bright\b", "right", "right"),
-            (r"\bunder\b", "under", "under"),
-            (r"\bon\b", "on", "on"),
-        ]
-        for pat, label, anchor_word in single_patterns:
+    for step_idx, tid in enumerate(generated_ids):
+        prefix.append(int(tid))
+        text = tokenizer.decode(prefix, skip_special_tokens=True)
+        lower = text.lower()
+
+        found = []
+        for pat, label, anchor_word in phrase_patterns:
             for m in re.finditer(pat, lower):
-                found.append({
-                    "start": m.start(),
-                    "end": m.end(),
-                    "label": label,
-                    "matched_text": raw[m.start():m.end()],
-                    "anchor_word": anchor_word,
-                })
+                found.append((m.start(), m.end(), step_idx, label, anchor_word, text[m.start():m.end()]))
 
-    if not found:
+        if not found:
+            for pat, label, anchor_word in single_patterns:
+                for m in re.finditer(pat, lower):
+                    found.append((m.start(), m.end(), step_idx, label, anchor_word, text[m.start():m.end()]))
+
+        if found:
+            found.sort(key=lambda x: (x[0], x[1]))
+            cand = found[-1]
+            if best is None or (cand[0], cand[1]) >= (best[0], best[1]):
+                best = cand
+
+    if best is None:
         return None
 
-    found.sort(key=lambda x: (x["start"], x["end"]))
-    return found[-1]
+    return {
+        "label": best[3],
+        "anchor_word": best[4],
+        "matched_text": best[5],
+    }
 
 
 def infer_patch_grid(num_patches):
@@ -436,7 +448,7 @@ def run_one_mode(llava_wrapper, llava_model, image, prompt, gate=None):
 
 
 # =========================================================
-# token-step analysis only
+# token-step analysis using TRUE generation scores
 # =========================================================
 def get_relation_token_id_sets(tokenizer):
     vocab_words = ["left", "right", "under", "on", "next"]
@@ -456,47 +468,49 @@ def get_relation_token_id_sets(tokenizer):
     return out
 
 
+def find_last_anchor_token_step(generated_ids, token_id_sets, anchor_word):
+    """
+    在真实生成 token 序列里，找最后一个 anchor_word 对应 token 的 step。
+    next_to -> anchor_word='next'
+    """
+    if anchor_word not in token_id_sets:
+        return None, None
+
+    target_ids = token_id_sets[anchor_word]
+    best = None
+    for step_idx, tid in enumerate(generated_ids):
+        tid = int(tid)
+        if tid in target_ids:
+            best = (step_idx, tid)
+
+    if best is None:
+        return None, None
+    return best
+
+
 @torch.no_grad()
-def analyze_anchor_next_token_topk(
+def analyze_true_generation_anchor_topk(
     llava_wrapper,
     image,
     prompt,
-    raw_output,
     gate=None,
+    max_new_tokens=32,
     topk=5,
 ):
     """
-    - 找最后一个关系表达 anchor
-    - prefix 截到 anchor 开始之前
-    - 直接看 prefix 后“下一个 token”的完整词表分布
-
-    如果最后关系表达是 next to，
-    那么看的就是生成 next 那一步的词表分布。
+    用真实 generate 过程分析：
+    - generate 一次，拿到真实 generated_ids 和每步 scores
+    - 找最后一个关系表达（next to 和 left/right/under/on 同层级）
+    - 取该关系表达对应 anchor token 的真实生成 step
+    - 直接读 gen_out.scores[step_idx] 的完整词表概率
     """
     llava_model = llava_wrapper.model
     processor = llava_wrapper.processor
     tokenizer = processor.tokenizer
 
-    relation_token_id_sets = get_relation_token_id_sets(tokenizer)
+    token_id_sets = get_relation_token_id_sets(tokenizer)
 
-    anchor = find_analysis_anchor_span(raw_output)
-    if anchor is None:
-        return {
-            "analysis_raw_output": raw_output,
-            "anchor_label": None,
-            "anchor_text": None,
-            "anchor_word": None,
-            "prefix_text": None,
-            "matched_token_ids": [],
-            "matched_prob": None,
-            "topk": [],
-            "full_vocab_probs": None,
-        }
-
-    prefix_before_anchor = raw_output[:anchor["start"]]
-    prefix_text = prompt + prefix_before_anchor
-
-    inputs = processor(images=image, text=prefix_text, padding=True, return_tensors="pt")
+    inputs = processor(images=image, text=prompt, padding=True, return_tensors="pt")
     inputs = {
         k: (v.to(DEVICE) if torch.is_tensor(v) else v)
         for k, v in inputs.items()
@@ -505,24 +519,63 @@ def analyze_anchor_next_token_topk(
 
     llava_model._current_soft_gate = gate
     try:
-        outputs = llava_model(**inputs)
+        gen_out = llava_model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            return_dict_in_generate=True,
+            output_scores=True,
+            use_cache=True,
+        )
     finally:
         llava_model._current_soft_gate = None
 
-    next_logits = outputs.logits[0, -1].float()
-    next_probs = F.softmax(next_logits, dim=-1)
+    full_seq = gen_out.sequences[0]
+    prompt_len = inputs["input_ids"].shape[1]
+    generated_ids = full_seq[prompt_len:]
+    raw_output = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
-    matched_token_ids = sorted(relation_token_id_sets.get(anchor["anchor_word"], set()))
-    if len(matched_token_ids) == 0:
-        pieces = tokenizer.encode(anchor["anchor_word"], add_special_tokens=False)
-        if len(pieces) > 0:
-            matched_token_ids = [int(pieces[-1])]
+    anchor = find_last_anchor_from_generated(tokenizer, generated_ids.tolist())
+    if anchor is None:
+        return {
+            "analysis_raw_output": raw_output,
+            "anchor_label": None,
+            "anchor_text": None,
+            "anchor_word": None,
+            "matched_step": None,
+            "matched_token_id": None,
+            "matched_token_text": None,
+            "matched_prob": None,
+            "topk": [],
+            "full_vocab_probs": None,
+        }
 
-    matched_prob = 0.0
-    for tid in matched_token_ids:
-        matched_prob += float(next_probs[int(tid)].item())
+    step_idx, matched_token_id = find_last_anchor_token_step(
+        generated_ids.tolist(),
+        token_id_sets,
+        anchor["anchor_word"],
+    )
 
-    top_vals, top_ids = torch.topk(next_probs, k=min(topk, next_probs.shape[0]))
+    if step_idx is None or step_idx >= len(gen_out.scores):
+        return {
+            "analysis_raw_output": raw_output,
+            "anchor_label": anchor["label"],
+            "anchor_text": anchor["matched_text"],
+            "anchor_word": anchor["anchor_word"],
+            "matched_step": None,
+            "matched_token_id": None,
+            "matched_token_text": None,
+            "matched_prob": None,
+            "topk": [],
+            "full_vocab_probs": None,
+        }
+
+    step_logits = gen_out.scores[step_idx][0].float()
+    step_probs = F.softmax(step_logits, dim=-1)
+
+    matched_prob = float(step_probs[int(matched_token_id)].item())
+
+    top_vals, top_ids = torch.topk(step_probs, k=min(topk, step_probs.shape[0]))
     topk_list = []
     for p, tid in zip(top_vals.tolist(), top_ids.tolist()):
         token_piece = tokenizer.convert_ids_to_tokens(int(tid))
@@ -539,11 +592,12 @@ def analyze_anchor_next_token_topk(
         "anchor_label": anchor["label"],
         "anchor_text": anchor["matched_text"],
         "anchor_word": anchor["anchor_word"],
-        "prefix_text": prefix_text,
-        "matched_token_ids": matched_token_ids,
+        "matched_step": int(step_idx),
+        "matched_token_id": int(matched_token_id),
+        "matched_token_text": tokenizer.decode([int(matched_token_id)], skip_special_tokens=False),
         "matched_prob": matched_prob,
         "topk": topk_list,
-        "full_vocab_probs": next_probs.detach().cpu().numpy(),
+        "full_vocab_probs": step_probs.detach().cpu().numpy(),
     }
 
 
@@ -725,21 +779,21 @@ def main():
 
         # analysis for first few samples
         if idx < ANALYZE_FIRST_N:
-            base_analysis = analyze_anchor_next_token_topk(
+            base_analysis = analyze_true_generation_anchor_topk(
                 llava_wrapper=llava_wrapper,
                 image=image,
                 prompt=raw_question,
-                raw_output=raw_output_base,
                 gate=None,
+                max_new_tokens=MAX_NEW_TOKENS_ANALYSIS,
                 topk=TOPK,
             )
 
-            gate_analysis = analyze_anchor_next_token_topk(
+            gate_analysis = analyze_true_generation_anchor_topk(
                 llava_wrapper=llava_wrapper,
                 image=image,
                 prompt=raw_question,
-                raw_output=raw_output_gate,
                 gate=union_gate,
+                max_new_tokens=MAX_NEW_TOKENS_ANALYSIS,
                 topk=TOPK,
             )
 
@@ -770,7 +824,9 @@ def main():
             print(f"[BASELINE ANCHOR LABEL] {base_analysis['anchor_label']}")
             print(f"[BASELINE ANCHOR TEXT] {base_analysis['anchor_text']}")
             print(f"[BASELINE ANCHOR WORD] {base_analysis['anchor_word']}")
-            print(f"[BASELINE MATCHED TOKEN IDS] {base_analysis['matched_token_ids']}")
+            print(f"[BASELINE MATCHED STEP] {base_analysis['matched_step']}")
+            print(f"[BASELINE MATCHED TOKEN ID] {base_analysis['matched_token_id']}")
+            print(f"[BASELINE MATCHED TOKEN TEXT] {repr(base_analysis['matched_token_text'])}")
             print(f"[BASELINE MATCHED TOKEN PROB] {base_analysis['matched_prob']}")
             print("[BASELINE TOP-5 TOKENS]")
             for j, item_top in enumerate(base_analysis["topk"], 1):
@@ -786,7 +842,9 @@ def main():
             print(f"[SOFT-MASK ANCHOR LABEL] {gate_analysis['anchor_label']}")
             print(f"[SOFT-MASK ANCHOR TEXT] {gate_analysis['anchor_text']}")
             print(f"[SOFT-MASK ANCHOR WORD] {gate_analysis['anchor_word']}")
-            print(f"[SOFT-MASK MATCHED TOKEN IDS] {gate_analysis['matched_token_ids']}")
+            print(f"[SOFT-MASK MATCHED STEP] {gate_analysis['matched_step']}")
+            print(f"[SOFT-MASK MATCHED TOKEN ID] {gate_analysis['matched_token_id']}")
+            print(f"[SOFT-MASK MATCHED TOKEN TEXT] {repr(gate_analysis['matched_token_text'])}")
             print(f"[SOFT-MASK MATCHED TOKEN PROB] {gate_analysis['matched_prob']}")
             print("[SOFT-MASK TOP-5 TOKENS]")
             for j, item_top in enumerate(gate_analysis["topk"], 1):
