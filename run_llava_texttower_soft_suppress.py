@@ -269,24 +269,21 @@ def build_union_gate_from_text_tower(
 # =========================================================
 def install_soft_gate_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
     """
-    直接按仓库里的路径 patch：
-        llava_wrapper.model.llava.get_image_features
+    直接 patch repo 自定义 LLaVA 的 multi_modal_projector.forward
+    位置：vision_tower -> selected_image_feature -> multi_modal_projector -> image_features
     """
     llava_model = llava_wrapper.model
 
-    if not hasattr(llava_model, "llava"):
+    if not hasattr(llava_model, "multi_modal_projector"):
         raise RuntimeError(
-            f"repo-loaded model has no .llava attribute, type={type(llava_model)}"
-        )
-    if not hasattr(llava_model.llava, "get_image_features"):
-        raise RuntimeError(
-            f"repo-loaded model.llava has no get_image_features, type={type(llava_model.llava)}"
+            f"repo-loaded model has no .multi_modal_projector, type={type(llava_model)}"
         )
 
-    original_get_image_features = llava_model.llava.get_image_features
+    original_projector_forward = llava_model.multi_modal_projector.forward
 
-    def patched_get_image_features(*args, **kwargs):
-        feats = original_get_image_features(*args, **kwargs)
+    def patched_projector_forward(image_features):
+        # image_features: [B, N, Dv]  (vision tower 输出选中的 patch features)
+        feats = original_projector_forward(image_features)  # [B, N, Dt]
 
         gate = getattr(llava_model, "_current_soft_gate", None)
         if gate is None:
@@ -312,27 +309,15 @@ def install_soft_gate_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
 
         gate_local = gate_local.to(device=feats.device, dtype=feats.dtype).clamp(0, 1)
 
-        scale = bg_ratio + (1.0 - bg_ratio) * gate_local
+        # soft background suppression
+        scale = bg_ratio + (1.0 - bg_ratio) * gate_local  # [B, N]
         if boost != 1.0:
             scale = scale * (1.0 + (boost - 1.0) * gate_local)
 
         feats = feats * scale.unsqueeze(-1)
         return feats
 
-    llava_model.llava.get_image_features = patched_get_image_features
-    return llava_model
-
-    if hasattr(llava_model, "get_image_features"):
-        llava_model.get_image_features = make_patched_method(llava_model)
-        patched = True
-
-    if hasattr(llava_model, "llava") and hasattr(llava_model.llava, "get_image_features"):
-        llava_model.llava.get_image_features = make_patched_method(llava_model.llava)
-        patched = True
-
-    if not patched:
-        raise RuntimeError("Could not find get_image_features on repo-loaded llava model.")
-
+    llava_model.multi_modal_projector.forward = patched_projector_forward
     return llava_model
 
 
