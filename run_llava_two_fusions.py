@@ -28,8 +28,9 @@ CLIP_MODEL_ID = "openai/clip-vit-large-patch14-336"
 CLIP_DTYPE = torch.float16 if DEVICE.startswith("cuda") else torch.float32
 
 SEED = 1
-MAX_EXAMPLES = None       # None = 全部；想先少跑点就改成 20 / 50
+MAX_EXAMPLES = None
 PRINT_FIRST_N = 10
+MAX_NEW_TOKENS = 24
 
 # local branch: soft background suppression
 BG_RATIO = 0.10
@@ -38,8 +39,6 @@ USE_DILATE = False
 DILATE_KERNEL = 3
 
 LABELS = ["left", "right", "under", "on"]
-LABEL2ID = {x: i for i, x in enumerate(LABELS)}
-ID2LABEL = {i: x for x, i in LABEL2ID.items()}
 
 # 概率级融合：
 # fused_prob[c] = alpha[c] * global_prob[c] + (1 - alpha[c]) * local_prob[c]
@@ -189,15 +188,42 @@ def resize_gate_to_num_patches(gate, target_num_patches):
     return x.view(gate.shape[0], tgt_h * tgt_w)
 
 
-def softmax_np(x):
-    x = np.asarray(x, dtype=np.float32)
-    x = x - np.max(x)
-    ex = np.exp(x)
-    return ex / (np.sum(ex) + 1e-12)
+def parse_prediction(text):
+    text = clean_text(text).lower()
 
+    phrase_patterns = [
+        (r"\bto the left of\b", "left"),
+        (r"\bto the right of\b", "right"),
+        (r"\bunder\b", "under"),
+        (r"\bon top of\b", "on"),
+        (r"\bon the\b", "on"),
+    ]
 
-def probs_to_pred(probs):
-    return LABELS[int(np.argmax(probs))]
+    found = []
+    for pat, label in phrase_patterns:
+        for m in re.finditer(pat, text):
+            found.append((m.start(), label, m.group(0)))
+
+    if found:
+        found.sort(key=lambda x: x[0])
+        return found[-1][1]
+
+    single_patterns = [
+        (r"\bleft\b", "left"),
+        (r"\bright\b", "right"),
+        (r"\bunder\b", "under"),
+        (r"\bon\b", "on"),
+    ]
+    found = []
+    for pat, label in single_patterns:
+        for m in re.finditer(pat, text):
+            found.append((m.start(), label))
+
+    if found:
+        found.sort(key=lambda x: x[0])
+        return found[-1][1]
+
+    return None
 
 
 def print_stats(name, total, correct, per_gold_total, per_gold_correct):
@@ -211,6 +237,10 @@ def print_stats(name, total, correct, per_gold_total, per_gold_correct):
         c = per_gold_correct[rel]
         acc = (c / n) if n > 0 else 0.0
         print(f"{rel}_acc = {acc:.4f} ({c}/{n})")
+
+
+def probs_dict_to_pred(prob_dict):
+    return max(prob_dict.items(), key=lambda x: x[1])[0]
 
 
 # =========================================================
@@ -324,75 +354,128 @@ def install_projector_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
 
 
 # =========================================================
-# scoring
+# generation + relation-step probability extraction
 # =========================================================
-@torch.no_grad()
-def score_candidate(llava_wrapper, image, prompt, candidate, gate=None):
+def get_relation_token_ids(tokenizer):
+    rel_token_ids = {}
+    for lab in LABELS:
+        pieces = tokenizer.encode(" " + lab, add_special_tokens=False)
+        if len(pieces) != 1:
+            raise ValueError(f"Relation label '{lab}' is not a single token: {pieces}")
+        rel_token_ids[lab] = pieces[0]
+    return rel_token_ids
+
+
+def decode_generated_prefix(tokenizer, gen_ids):
+    return tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+
+def find_first_relation_step(tokenizer, generated_ids):
     """
-    teacher-forcing score for one candidate answer
+    在自由生成序列里，找到第一次出现 left/right/under/on 的那一步
+    返回:
+        step_idx: 第几个生成 step
+        matched_label: 匹配到的关系词
+    """
+    patterns = [
+        (r"\bto the left of\b", "left"),
+        (r"\bto the right of\b", "right"),
+        (r"\bunder\b", "under"),
+        (r"\bon top of\b", "on"),
+        (r"\bon\b", "on"),
+    ]
+
+    prefix = []
+    for step_idx, tok in enumerate(generated_ids):
+        prefix.append(int(tok))
+        text = decode_generated_prefix(tokenizer, prefix).lower()
+
+        found = []
+        for pat, lab in patterns:
+            for m in re.finditer(pat, text):
+                found.append((m.start(), lab))
+
+        if found:
+            found.sort(key=lambda x: x[0])
+            return step_idx, found[-1][1]
+
+    return None, None
+
+
+@torch.no_grad()
+def run_generate_and_get_relation_probs(llava_wrapper, image, prompt, gate=None, max_new_tokens=24):
+    """
+    仍然自由生成整句，但提取第一次生成出关系词那一步的四类概率
+    返回:
+        raw_output: 最终生成文本
+        relation_probs: dict(left/right/under/on -> prob) 或 None
+        step_idx: 命中关系词的 step 或 None
+        matched_label: 首次匹配到的关系词或 None
     """
     llava_model = llava_wrapper.model
     processor = llava_wrapper.processor
+    tokenizer = processor.tokenizer
 
-    full_text = prompt + " " + candidate
+    rel_token_ids = get_relation_token_ids(tokenizer)
+
+    inputs = processor(images=image, text=prompt, padding=True, return_tensors="pt")
+    inputs = {
+        k: (v.to(DEVICE) if torch.is_tensor(v) else v)
+        for k, v in inputs.items()
+        if v is not None
+    }
 
     llava_model._current_soft_gate = gate
     try:
-        prompt_inputs = processor(images=image, text=prompt, padding=True, return_tensors="pt")
-        prompt_inputs = {
-            k: (v.to(llava_wrapper.device) if torch.is_tensor(v) else v)
-            for k, v in prompt_inputs.items()
-            if v is not None
-        }
-        prompt_len = prompt_inputs["input_ids"].shape[1]
-
-        full_inputs = processor(images=image, text=full_text, padding=True, return_tensors="pt")
-        full_inputs = {
-            k: (v.to(llava_wrapper.device) if torch.is_tensor(v) else v)
-            for k, v in full_inputs.items()
-            if v is not None
-        }
-
-        outputs = llava_model(**full_inputs)
-        logits = outputs.logits  # [1, T, V]
-        input_ids = full_inputs["input_ids"]  # [1, T]
-
-        target_ids = input_ids[:, prompt_len:]                # [1, L]
-        pred_logits = logits[:, prompt_len - 1:-1, :]         # [1, L, V]
-
-        log_probs = F.log_softmax(pred_logits, dim=-1)
-        gathered = torch.gather(log_probs, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
-
-        # sum log-prob
-        return float(gathered.sum().item())
+        gen_out = llava_model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            return_dict_in_generate=True,
+            output_scores=True,
+            use_cache=True,
+        )
     finally:
         llava_model._current_soft_gate = None
 
+    full_seq = gen_out.sequences[0]
+    prompt_len = inputs["input_ids"].shape[1]
+    generated_ids = full_seq[prompt_len:]
 
-@torch.no_grad()
-def score_branch_4way(llava_wrapper, image, prompt, gate=None):
-    scores = []
-    for label in LABELS:
-        scores.append(score_candidate(llava_wrapper, image, prompt, label, gate=gate))
-    return np.array(scores, dtype=np.float32)
+    raw_output = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+    step_idx, matched_label = find_first_relation_step(tokenizer, generated_ids.tolist())
+
+    if step_idx is None:
+        return raw_output, None, None, None
+
+    step_logits = gen_out.scores[step_idx][0]
+    step_probs = F.softmax(step_logits.float(), dim=-1)
+
+    rel_probs = {}
+    total = 0.0
+    for lab, tok_id in rel_token_ids.items():
+        p = float(step_probs[tok_id].item())
+        rel_probs[lab] = p
+        total += p
+
+    total = max(total, 1e-12)
+    for lab in rel_probs:
+        rel_probs[lab] /= total
+
+    return raw_output, rel_probs, step_idx, matched_label
 
 
-def fuse_probs(global_scores, local_scores):
-    """
-    方案1：
-    先把每个分支自己的 4 类 raw score -> softmax 概率
-    再按类别做加权融合
-    """
-    global_probs = softmax_np(global_scores)
-    local_probs = softmax_np(local_scores)
+def fuse_relation_probs(global_probs, local_probs, alpha_by_class):
+    fused = {}
+    for lab in LABELS:
+        a = alpha_by_class[lab]
+        fused[lab] = a * global_probs[lab] + (1.0 - a) * local_probs[lab]
 
-    fused_probs = np.zeros_like(global_probs, dtype=np.float32)
-    for i, label in enumerate(LABELS):
-        alpha = ALPHA_BY_CLASS[label]
-        fused_probs[i] = alpha * global_probs[i] + (1.0 - alpha) * local_probs[i]
-
-    fused_probs = fused_probs / (np.sum(fused_probs) + 1e-12)
-    return global_probs, local_probs, fused_probs
+    total = sum(fused.values()) + 1e-12
+    for lab in fused:
+        fused[lab] /= total
+    return fused
 
 
 # =========================================================
@@ -483,14 +566,42 @@ def main():
             dilate_kernel=DILATE_KERNEL,
         )
 
-        global_scores = score_branch_4way(llava_wrapper, image, prompt, gate=None)
-        local_scores = score_branch_4way(llava_wrapper, image, prompt, gate=union_gate)
+        global_raw, global_probs, global_step, global_match = run_generate_and_get_relation_probs(
+            llava_wrapper=llava_wrapper,
+            image=image,
+            prompt=prompt,
+            gate=None,
+            max_new_tokens=MAX_NEW_TOKENS,
+        )
 
-        global_probs, local_probs, fused_probs = fuse_probs(global_scores, local_scores)
+        local_raw, local_probs, local_step, local_match = run_generate_and_get_relation_probs(
+            llava_wrapper=llava_wrapper,
+            image=image,
+            prompt=prompt,
+            gate=union_gate,
+            max_new_tokens=MAX_NEW_TOKENS,
+        )
 
-        pred_g = probs_to_pred(global_probs)
-        pred_l = probs_to_pred(local_probs)
-        pred_f = probs_to_pred(fused_probs)
+        pred_g = parse_prediction(global_raw)
+        pred_l = parse_prediction(local_raw)
+        pred_f = pred_g
+        fused_probs = None
+
+        if global_probs is not None:
+            pred_g = probs_dict_to_pred(global_probs)
+
+        if local_probs is not None:
+            pred_l = probs_dict_to_pred(local_probs)
+
+        if global_probs is not None and local_probs is not None:
+            fused_probs = fuse_relation_probs(global_probs, local_probs, ALPHA_BY_CLASS)
+            pred_f = probs_dict_to_pred(fused_probs)
+        else:
+            # 如果有一路拿不到关系词概率，就退回生成后的 parse
+            if pred_g is not None:
+                pred_f = pred_g
+            elif pred_l is not None:
+                pred_f = pred_l
 
         total_g += 1
         per_gold_total_g[gold] += 1
@@ -516,35 +627,39 @@ def main():
             print(f"image_name: {image_name}")
             print(f"obj1={obj1} | obj2={obj2}")
             print(f"gold={gold}")
+
             print("[PROMPT]")
             print(prompt)
 
-            print("[GLOBAL RAW SCORES]")
-            for lab, s in zip(LABELS, global_scores):
-                print(f"  {lab:>5}: {s:.4f}")
-            print("[GLOBAL PROBS]")
-            for lab, p in zip(LABELS, global_probs):
-                print(f"  {lab:>5}: {p:.4f}")
+            print("[GLOBAL RAW OUTPUT]")
+            print(global_raw)
+            print(f"[GLOBAL STEP] {global_step} | [MATCHED] {global_match}")
+            if global_probs is not None:
+                print("[GLOBAL RELATION PROBS]")
+                for lab in LABELS:
+                    print(f"  {lab:>5}: {global_probs[lab]:.4f}")
             print(f"[GLOBAL PRED] {pred_g}")
 
-            print("[LOCAL RAW SCORES]")
-            for lab, s in zip(LABELS, local_scores):
-                print(f"  {lab:>5}: {s:.4f}")
-            print("[LOCAL PROBS]")
-            for lab, p in zip(LABELS, local_probs):
-                print(f"  {lab:>5}: {p:.4f}")
+            print("[LOCAL RAW OUTPUT]")
+            print(local_raw)
+            print(f"[LOCAL STEP] {local_step} | [MATCHED] {local_match}")
+            if local_probs is not None:
+                print("[LOCAL RELATION PROBS]")
+                for lab in LABELS:
+                    print(f"  {lab:>5}: {local_probs[lab]:.4f}")
             print(f"[LOCAL PRED] {pred_l}")
 
-            print("[FUSED PROBS]")
-            for lab, p in zip(LABELS, fused_probs):
-                print(f"  {lab:>5}: {p:.4f}")
+            if fused_probs is not None:
+                print("[FUSED RELATION PROBS]")
+                for lab in LABELS:
+                    print(f"  {lab:>5}: {fused_probs[lab]:.4f}")
             print(f"[FUSED PRED] {pred_f}")
 
             shown += 1
 
     print_stats("GLOBAL_ONLY", total_g, correct_g, per_gold_total_g, per_gold_correct_g)
     print_stats("LOCAL_ONLY", total_l, correct_l, per_gold_total_l, per_gold_correct_l)
-    print_stats("FUSED_PROB_LEVEL", total_f, correct_f, per_gold_total_f, per_gold_correct_f)
+    print_stats("FUSED_PROB_STEP", total_f, correct_f, per_gold_total_f, per_gold_correct_f)
 
 
 if __name__ == "__main__":
