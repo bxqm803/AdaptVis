@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 from PIL import Image
+from tqdm import tqdm
 
 from misc import seed_all
 from model_zoo import get_model
@@ -68,14 +69,22 @@ def normalize_relation_answer(text: str) -> str:
 
 def normalize_gold_relation(x: Any) -> str:
     t = clean_text(x).lower()
-    for label in ["left", "right", "under", "on"]:
-        if label in t:
-            return label
+
+    if "left" in t:
+        return "left"
+    if "right" in t:
+        return "right"
+    if "under" in t or "below" in t or "beneath" in t:
+        return "under"
+    if "on" in t:
+        return "on"
+
     return t
 
 
 def build_prompt(question: str) -> str:
     q = clean_question(question)
+
     return (
         "USER: <image>\n"
         f"{q}\n\n"
@@ -167,19 +176,12 @@ def main():
 
     total = 0
     correct = 0
+    invalid = 0
 
-    print(f"dataset = {args.dataset}")
-    print(f"option = {args.option}")
-    print(f"model = {args.model_name}")
-    print(f"running samples [{start}, {end})")
-    print("=" * 100)
-
-    for local_idx in range(start, end):
+    for local_idx in tqdm(range(start, end), desc="Running LLaVA"):
         rec = prompt_records[local_idx]
         item = dataset[local_idx]
 
-        image_name = clean_text(item.get("image_name", f"sample_{local_idx:04d}"))
-        image_path = clean_text(item.get("image_path", ""))
         image = item["image_options"][0]
 
         if not isinstance(image, Image.Image):
@@ -189,6 +191,7 @@ def main():
         gold_relation = rec.get("answer", "")
 
         prompt = build_prompt(raw_question)
+
         raw_output = run_llava_once(
             wrapper=wrapper,
             image=image,
@@ -199,27 +202,24 @@ def main():
         pred_norm = normalize_relation_answer(raw_output)
         gold_norm = normalize_gold_relation(gold_relation)
 
+        if pred_norm not in {"left", "right", "on", "under"}:
+            invalid += 1
+
         is_correct = pred_norm == gold_norm
         total += 1
         correct += int(is_correct)
 
-        print("=" * 100)
-        print(f"[{local_idx}] {image_name}")
-        print(f"image_path: {image_path}")
-        print(f"question: {clean_question(raw_question)}")
-        print(f"gold_relation: {gold_relation}")
-        print(f"gold_norm: {gold_norm}")
-        print("[PROMPT]")
-        print(prompt)
-        print("[RAW OUTPUT]")
-        print(raw_output)
-        print(f"[NORMALIZED] {pred_norm}")
-        print(f"[CORRECT] {is_correct}")
-
     acc = correct / total if total > 0 else 0.0
+
     print("=" * 100)
+    print(f"DATASET = {args.dataset}")
+    print(f"OPTION = {args.option}")
+    print(f"MODEL = {args.model_name}")
+    print(f"START = {start}")
+    print(f"END = {end}")
     print(f"TOTAL = {total}")
     print(f"CORRECT = {correct}")
+    print(f"INVALID = {invalid}")
     print(f"ACC = {acc:.4f}")
 
 
