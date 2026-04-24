@@ -23,7 +23,7 @@ def parse_args():
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", default=1, type=int)
     p.add_argument("--limit", default=10, type=int)
-    p.add_argument("--max-new-tokens", default=16, type=int)
+    p.add_argument("--max-new-tokens", default=24, type=int)
     p.add_argument("--image-mode", default="original", choices=["original", "overlay"])
     return p.parse_args()
 
@@ -52,13 +52,31 @@ def clean_question(question: str) -> str:
     return q
 
 
+def normalize_relation_answer(text: str) -> str:
+    t = clean_text(text).lower()
+
+    # 先处理常见短语
+    if re.search(r"\bleft\b", t):
+        return "left"
+    if re.search(r"\bright\b", t):
+        return "right"
+    if re.search(r"\bunder\b|\bbelow\b|beneath", t):
+        return "under"
+    if re.search(r"\bon\b|\bon top of\b|atop", t):
+        return "on"
+
+    return t
+
+
 def build_baseline_prompt(question: str) -> str:
     q = clean_question(question)
 
     return (
         "USER: <image>\n"
-        f"{q}\n"
-        "Answer with left, right, on or under.\n"
+        f"{q}\n\n"
+        "Choose the best spatial relation between the first object and the second object.\n"
+        "Allowed labels: left, right, on, under.\n"
+        "Return only the final label.\n"
         "ASSISTANT:"
     )
 
@@ -70,17 +88,20 @@ def build_bbox_assisted_prompt(result: Dict[str, Any]) -> str:
 
     return (
         "USER: <image>\n"
-        f"Question: {q}\n"
-        "Use the following bounding boxes to answer the spatial relation.\n"
-        f"{obj1} bbox normalized [x1, y1, x2, y2]: {result.get('bbox1_norm')}\n"
-        f"{obj2} bbox normalized [x1, y1, x2, y2]: {result.get('bbox2_norm')}\n"
-        "Answer with left, right, on or under.\n"
+        f"{q}\n\n"
+        "Detected bounding boxes are provided below.\n"
+        f"{obj1}: {result.get('bbox1_norm')}\n"
+        f"{obj2}: {result.get('bbox2_norm')}\n\n"
+        "Use the image first. Use the boxes only as extra evidence.\n"
+        "Choose the best spatial relation between the first object and the second object.\n"
+        "Allowed labels: left, right, on, under.\n"
+        "Return only the final label.\n"
         "ASSISTANT:"
     )
 
 
 @torch.no_grad()
-def run_llava_once(wrapper, image: Image.Image, prompt: str, max_new_tokens: int = 16) -> str:
+def run_llava_once(wrapper, image: Image.Image, prompt: str, max_new_tokens: int = 24) -> str:
     processor = wrapper.processor
     model = wrapper.model
 
@@ -198,6 +219,9 @@ def main():
             max_new_tokens=args.max_new_tokens,
         )
 
+        baseline_norm = normalize_relation_answer(baseline_output)
+        assisted_norm = normalize_relation_answer(assisted_output)
+
         print("=" * 100)
         print(f"[{idx}] {result.get('image_name', os.path.basename(sample_dir))}")
         print(f"image_path: {image_path}")
@@ -207,14 +231,18 @@ def main():
         print(f"bbox1_norm: {result.get('bbox1_norm')}")
         print(f"object_2: {result.get('object_2')}")
         print(f"bbox2_norm: {result.get('bbox2_norm')}")
+
         print("[BASELINE PROMPT]")
         print(baseline_prompt)
         print("[BASELINE OUTPUT]")
         print(baseline_output)
+        print(f"[BASELINE NORMALIZED] {baseline_norm}")
+
         print("[BBOX-ASSISTED PROMPT]")
         print(assisted_prompt)
         print("[BBOX-ASSISTED OUTPUT]")
         print(assisted_output)
+        print(f"[BBOX-ASSISTED NORMALIZED] {assisted_norm}")
 
 
 if __name__ == "__main__":
