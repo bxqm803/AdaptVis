@@ -32,21 +32,13 @@ MAX_EXAMPLES = None
 PRINT_FIRST_N = 10
 MAX_NEW_TOKENS = 24
 
-# local branch: soft background suppression
+# soft-mask branch
 BG_RATIO = 0.10
 BOOST = 1.00
 USE_DILATE = False
 DILATE_KERNEL = 3
 
 LABELS = ["left", "right", "under", "on"]
-
-# fused_prob[c] = alpha[c] * global_prob[c] + (1 - alpha[c]) * local_prob[c]
-ALPHA_BY_CLASS = {
-    "left": 0.90,
-    "right": 0.90,
-    "under": 0.50,
-    "on": 0.10,
-}
 
 
 # =========================================================
@@ -225,13 +217,6 @@ def parse_prediction(text):
     return None
 
 
-def softmax_np(x):
-    x = np.asarray(x, dtype=np.float32)
-    x = x - np.max(x)
-    ex = np.exp(x)
-    return ex / (np.sum(ex) + 1e-12)
-
-
 def probs_dict_to_pred(prob_dict):
     return max(prob_dict.items(), key=lambda x: x[1])[0]
 
@@ -298,6 +283,7 @@ def build_union_gate_from_text_tower(
     sims1 = torch.matmul(patch_proj[0], text1[0]).unsqueeze(0)
     sims2 = torch.matmul(patch_proj[0], text2[0]).unsqueeze(0)
 
+    # 你前面验证过：目标区域更偏“低值”，所以这里取反后再归一化
     gate1 = normalize_1d_torch(-sims1)
     gate2 = normalize_1d_torch(-sims2)
 
@@ -359,13 +345,13 @@ def install_projector_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
 
 
 # =========================================================
-# generation + last-word probability extraction
+# generation helpers
 # =========================================================
 def get_relation_lexical_token_ids(tokenizer):
     """
-    对每个关系词，收集可能对应的 lexical token ids。
-    使用裸词、带空格、首字母大写、带空格首字母大写四种形式，
-    取各自编码结果的最后一个 token id。
+    为每个关系词收集若干可能的 lexical token id。
+    用法比较保守：裸词 / 前导空格 / 首字母大写 / 前导空格+首字母大写。
+    最后只取每种形式编码后的最后一个 token id。
     """
     rel_ids = {}
     for lab in LABELS:
@@ -382,15 +368,18 @@ def get_relation_lexical_token_ids(tokenizer):
     return rel_ids
 
 
-def find_last_relation_word_step(tokenizer, generated_ids):
+def find_last_specific_relation_word_step(tokenizer, generated_ids, target_label):
     """
-    找最终输出里最后一次出现的单独关系词 left/right/under/on，
-    并返回对应的生成 step。
-    返回:
-        step_idx, matched_label, matched_text
+    在生成文本里，找 target_label 最后一次出现对应的生成 step。
+    比如 target_label='under'，输出
+    'The scarf is on the floor, under the armchair.'
+    就会定位到 under 那一步。
     """
+    if target_label is None:
+        return None, None
+
     prefix = []
-    best = None  # (start, end, step_idx, label, matched_text)
+    best = None  # (start, end, step_idx, matched_text)
 
     for step_idx, tok in enumerate(generated_ids):
         prefix.append(int(tok))
@@ -398,41 +387,63 @@ def find_last_relation_word_step(tokenizer, generated_ids):
         lower = text.lower()
 
         found = []
-        for lab in LABELS:
-            for m in re.finditer(rf"\b{lab}\b", lower):
-                found.append((m.start(), m.end(), lab, text[m.start():m.end()]))
+        for m in re.finditer(rf"\b{re.escape(target_label)}\b", lower):
+            found.append((m.start(), m.end(), text[m.start():m.end()]))
 
         if not found:
             continue
 
         found.sort(key=lambda x: (x[0], x[1]))
-        s, e, lab, matched = found[-1]
+        s, e, matched = found[-1]
 
         if best is None or (s, e) >= (best[0], best[1]):
-            best = (s, e, step_idx, lab, matched)
+            best = (s, e, step_idx, matched)
 
     if best is None:
-        return None, None, None
+        return None, None
 
-    return best[2], best[3], best[4]
+    return best[2], best[3]
+
+
+def extract_4way_probs_from_step(step_logits, relation_token_ids):
+    """
+    从某个 step 的全词表 logits 中，提取 left/right/under/on 这四类的概率，
+    再在这四类内部重新归一化。
+    """
+    step_probs = F.softmax(step_logits.float(), dim=-1)
+
+    rel_probs = {}
+    total = 0.0
+    for lab in LABELS:
+        p = 0.0
+        for tid in relation_token_ids[lab]:
+            p += float(step_probs[tid].item())
+        rel_probs[lab] = p
+        total += p
+
+    total = max(total, 1e-12)
+    for lab in rel_probs:
+        rel_probs[lab] /= total
+
+    arr = np.array([rel_probs[lab] for lab in LABELS], dtype=np.float32)
+    if not np.isfinite(arr).all():
+        return None
+
+    return rel_probs
 
 
 @torch.no_grad()
-def run_generate_and_get_relation_probs(llava_wrapper, image, prompt, gate=None, max_new_tokens=24):
+def run_generate_branch(llava_wrapper, image, prompt, relation_token_ids, gate=None, max_new_tokens=24):
     """
-    自由生成整句，但提取最终输出里最后一个 left/right/under/on
-    对应那一步的四类概率。
-    返回:
-        raw_output
-        relation_probs(dict) 或 None
-        matched_label
-        matched_text
+    一个分支完整跑法：
+    1. 自由生成整句
+    2. 用 parse_prediction(raw_output) 得到最终关系
+    3. 找这个最终关系在生成中的对应 step
+    4. 读那个 step 的 left/right/under/on 四类概率
     """
     llava_model = llava_wrapper.model
     processor = llava_wrapper.processor
     tokenizer = processor.tokenizer
-
-    rel_token_ids = get_relation_lexical_token_ids(tokenizer)
 
     inputs = processor(images=image, text=prompt, padding=True, return_tensors="pt")
     inputs = {
@@ -459,45 +470,44 @@ def run_generate_and_get_relation_probs(llava_wrapper, image, prompt, gate=None,
     generated_ids = full_seq[prompt_len:]
     raw_output = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
-    step_idx, matched_label, matched_text = find_last_relation_word_step(
-        tokenizer, generated_ids.tolist()
-    )
+    parsed_pred = parse_prediction(raw_output)
 
-    if step_idx is None:
-        return raw_output, None, None, None
+    matched_step = None
+    matched_text = None
+    relation_probs = None
 
-    step_logits = gen_out.scores[step_idx][0]
-    step_probs = F.softmax(step_logits.float(), dim=-1)
+    if parsed_pred is not None:
+        matched_step, matched_text = find_last_specific_relation_word_step(
+            tokenizer=tokenizer,
+            generated_ids=generated_ids.tolist(),
+            target_label=parsed_pred,
+        )
 
-    rel_probs = {}
-    total = 0.0
-    for lab in LABELS:
-        tok_ids = rel_token_ids[lab]
-        p = 0.0
-        for tid in tok_ids:
-            p += float(step_probs[tid].item())
-        rel_probs[lab] = p
-        total += p
+        if matched_step is not None and matched_step < len(gen_out.scores):
+            step_logits = gen_out.scores[matched_step][0]
+            relation_probs = extract_4way_probs_from_step(step_logits, relation_token_ids)
 
-    total = max(total, 1e-12)
-    for lab in rel_probs:
-        rel_probs[lab] /= total
-
-    if not np.isfinite(np.array(list(rel_probs.values()), dtype=np.float32)).all():
-        return raw_output, None, matched_label, matched_text
-
-    return raw_output, rel_probs, matched_label, matched_text
+    return {
+        "raw_output": raw_output,
+        "parsed_pred": parsed_pred,
+        "matched_step": matched_step,
+        "matched_text": matched_text,
+        "relation_probs": relation_probs,
+    }
 
 
-def fuse_relation_probs(global_probs, local_probs, alpha_by_class):
+def fuse_two_prob_dicts(prob_a, prob_b):
+    """
+    直接把 baseline 和 local 的四类概率相加，再在四类内部重新归一化。
+    """
     fused = {}
     for lab in LABELS:
-        a = alpha_by_class[lab]
-        fused[lab] = a * global_probs[lab] + (1.0 - a) * local_probs[lab]
+        fused[lab] = prob_a[lab] + prob_b[lab]
 
     total = sum(fused.values()) + 1e-12
     for lab in fused:
         fused[lab] /= total
+
     return fused
 
 
@@ -541,16 +551,21 @@ def main():
         cache_dir=CACHE_DIR,
     ).to(DEVICE).eval()
 
-    total_g = 0
-    correct_g = 0
-    per_gold_total_g = defaultdict(int)
-    per_gold_correct_g = defaultdict(int)
+    relation_token_ids = get_relation_lexical_token_ids(llava_wrapper.processor.tokenizer)
 
+    # baseline stats
+    total_b = 0
+    correct_b = 0
+    per_gold_total_b = defaultdict(int)
+    per_gold_correct_b = defaultdict(int)
+
+    # local stats
     total_l = 0
     correct_l = 0
     per_gold_total_l = defaultdict(int)
     per_gold_correct_l = defaultdict(int)
 
+    # fused stats
     total_f = 0
     correct_f = 0
     per_gold_total_f = defaultdict(int)
@@ -589,54 +604,71 @@ def main():
             dilate_kernel=DILATE_KERNEL,
         )
 
-        global_raw, global_probs, global_match, global_text = run_generate_and_get_relation_probs(
+        # -------------------------------------------------
+        # baseline branch: original generation + parse
+        # -------------------------------------------------
+        baseline_res = run_generate_branch(
             llava_wrapper=llava_wrapper,
             image=image,
             prompt=prompt,
+            relation_token_ids=relation_token_ids,
             gate=None,
             max_new_tokens=MAX_NEW_TOKENS,
         )
 
-        local_raw, local_probs, local_match, local_text = run_generate_and_get_relation_probs(
+        # -------------------------------------------------
+        # local branch: soft-mask generation + parse
+        # -------------------------------------------------
+        local_res = run_generate_branch(
             llava_wrapper=llava_wrapper,
             image=image,
             prompt=prompt,
+            relation_token_ids=relation_token_ids,
             gate=union_gate,
             max_new_tokens=MAX_NEW_TOKENS,
         )
 
-        pred_g = parse_prediction(global_raw)
-        pred_l = parse_prediction(local_raw)
-        pred_f = pred_g
+        pred_b = baseline_res["parsed_pred"]
+        pred_l = local_res["parsed_pred"]
+
+        # -------------------------------------------------
+        # fused branch:
+        # use baseline/local decision-step 4-way probs
+        # -------------------------------------------------
         fused_probs = None
+        pred_f = None
 
-        if global_probs is not None:
-            pred_g = probs_dict_to_pred(global_probs)
-
-        if local_probs is not None:
-            pred_l = probs_dict_to_pred(local_probs)
-
-        if global_probs is not None and local_probs is not None:
-            fused_probs = fuse_relation_probs(global_probs, local_probs, ALPHA_BY_CLASS)
+        if baseline_res["relation_probs"] is not None and local_res["relation_probs"] is not None:
+            fused_probs = fuse_two_prob_dicts(
+                baseline_res["relation_probs"],
+                local_res["relation_probs"],
+            )
             pred_f = probs_dict_to_pred(fused_probs)
         else:
-            if pred_g is not None:
-                pred_f = pred_g
-            elif pred_l is not None:
-                pred_f = pred_l
+            # fallback
+            pred_f = pred_b if pred_b is not None else pred_l
 
-        total_g += 1
-        per_gold_total_g[gold] += 1
-        if pred_g == gold:
-            correct_g += 1
-            per_gold_correct_g[gold] += 1
+        # -------------------------------------------------
+        # stats: baseline
+        # -------------------------------------------------
+        total_b += 1
+        per_gold_total_b[gold] += 1
+        if pred_b == gold:
+            correct_b += 1
+            per_gold_correct_b[gold] += 1
 
+        # -------------------------------------------------
+        # stats: local
+        # -------------------------------------------------
         total_l += 1
         per_gold_total_l[gold] += 1
         if pred_l == gold:
             correct_l += 1
             per_gold_correct_l[gold] += 1
 
+        # -------------------------------------------------
+        # stats: fused
+        # -------------------------------------------------
         total_f += 1
         per_gold_total_f[gold] += 1
         if pred_f == gold:
@@ -653,35 +685,37 @@ def main():
             print("[PROMPT]")
             print(prompt)
 
-            print("[GLOBAL RAW OUTPUT]")
-            print(global_raw)
-            print(f"[GLOBAL MATCHED LAST LABEL] {global_match} | [MATCHED TEXT] {global_text}")
-            if global_probs is not None:
-                print("[GLOBAL RELATION PROBS]")
+            print("[BASELINE RAW OUTPUT]")
+            print(baseline_res["raw_output"])
+            print(f"[BASELINE PARSED PRED] {baseline_res['parsed_pred']}")
+            print(f"[BASELINE MATCHED STEP] {baseline_res['matched_step']}")
+            print(f"[BASELINE MATCHED TEXT] {baseline_res['matched_text']}")
+            if baseline_res["relation_probs"] is not None:
+                print("[BASELINE STEP RELATION PROBS]")
                 for lab in LABELS:
-                    print(f"  {lab:>5}: {global_probs[lab]:.4f}")
-            print(f"[GLOBAL PRED] {pred_g}")
+                    print(f"  {lab:>5}: {baseline_res['relation_probs'][lab]:.4f}")
 
             print("[LOCAL RAW OUTPUT]")
-            print(local_raw)
-            print(f"[LOCAL MATCHED LAST LABEL] {local_match} | [MATCHED TEXT] {local_text}")
-            if local_probs is not None:
-                print("[LOCAL RELATION PROBS]")
+            print(local_res["raw_output"])
+            print(f"[LOCAL PARSED PRED] {local_res['parsed_pred']}")
+            print(f"[LOCAL MATCHED STEP] {local_res['matched_step']}")
+            print(f"[LOCAL MATCHED TEXT] {local_res['matched_text']}")
+            if local_res["relation_probs"] is not None:
+                print("[LOCAL STEP RELATION PROBS]")
                 for lab in LABELS:
-                    print(f"  {lab:>5}: {local_probs[lab]:.4f}")
-            print(f"[LOCAL PRED] {pred_l}")
+                    print(f"  {lab:>5}: {local_res['relation_probs'][lab]:.4f}")
 
             if fused_probs is not None:
-                print("[FUSED RELATION PROBS]")
+                print("[FUSED STEP PROBS = BASELINE + LOCAL]")
                 for lab in LABELS:
                     print(f"  {lab:>5}: {fused_probs[lab]:.4f}")
-            print(f"[FUSED PRED] {pred_f}")
 
+            print(f"[FUSED PRED] {pred_f}")
             shown += 1
 
-    print_stats("GLOBAL_ONLY", total_g, correct_g, per_gold_total_g, per_gold_correct_g)
-    print_stats("LOCAL_ONLY", total_l, correct_l, per_gold_total_l, per_gold_correct_l)
-    print_stats("FUSED_PROB_LASTWORD", total_f, correct_f, per_gold_total_f, per_gold_correct_f)
+    print_stats("BASELINE_GENERATION_PARSE", total_b, correct_b, per_gold_total_b, per_gold_correct_b)
+    print_stats("SOFT_MASK_GENERATION_PARSE", total_l, correct_l, per_gold_total_l, per_gold_correct_l)
+    print_stats("FUSED_STEP_PROBS_SUM", total_f, correct_f, per_gold_total_f, per_gold_correct_f)
 
 
 if __name__ == "__main__":
