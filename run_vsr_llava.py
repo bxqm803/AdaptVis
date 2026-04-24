@@ -1,58 +1,88 @@
 import argparse
+import os
+
 import pandas as pd
+import torch
 from tqdm import tqdm
 from datasets import load_dataset
 
-from model_zoo.llava15 import LLaVA15Model
+from model_zoo.llava15 import LlavaWrapper
 
 
-def normalize_pred(text):
-    t = text.lower()
+def build_prompt(caption: str) -> str:
+    return (
+        "USER: <image>\n"
+        "Determine whether the following caption correctly describes the image. "
+        "Answer only True or False.\n\n"
+        f"Caption: {caption}\n"
+        "ASSISTANT:"
+    )
+
+
+def normalize_pred(text: str) -> int:
+    t = str(text).strip().lower()
+
     if "true" in t and "false" not in t:
         return 1
     if "false" in t and "true" not in t:
         return 0
-    if t.strip().startswith("yes"):
+
+    if t.startswith("yes"):
         return 1
-    if t.strip().startswith("no"):
+    if t.startswith("no"):
         return 0
+
     return -1
-
-
-def build_prompt(caption):
-    return (
-        "Determine whether the following caption correctly describes the image. "
-        "Answer only True or False.\n\n"
-        f"Caption: {caption}\n"
-        "Answer:"
-    )
 
 
 def main():
     parser = argparse.ArgumentParser()
+
     parser.add_argument("--config", default="random", choices=["random", "zeroshot"])
     parser.add_argument("--split", default="test", choices=["train", "validation", "test"])
-    parser.add_argument("--model-path", default="liuhaotian/llava-v1.5-7b")
+
+    parser.add_argument("--cache-dir", default="/ddnB/work/mwang32/hf_cache")
+    parser.add_argument("--method", default="default", choices=["default", "scaling_vis", "adapt_vis"])
+
+    parser.add_argument("--weight", type=float, default=1.0)
+    parser.add_argument("--threshold", type=float, default=1.0)
+    parser.add_argument("--weight1", type=float, default=1.0)
+    parser.add_argument("--weight2", type=float, default=1.0)
+
     parser.add_argument("--max-samples", type=int, default=-1)
     parser.add_argument("--out", default="vsr_llava_results.csv")
+
     args = parser.parse_args()
 
+    os.makedirs(args.cache_dir, exist_ok=True)
+
+    print(f"Loading VSR dataset: config={args.config}, split={args.split}")
     ds = load_dataset(
         "juletxara/visual-spatial-reasoning",
         args.config,
         split=args.split,
         trust_remote_code=True,
+        cache_dir=args.cache_dir,
     )
 
     if args.max_samples > 0:
-        ds = ds.select(range(min(args.max_samples, len(ds))))
+        n = min(args.max_samples, len(ds))
+        ds = ds.select(range(n))
 
-    model = LLaVA15Model(args.model_path)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Loading LLaVA on {device}")
+
+    model = LlavaWrapper(
+        root_dir=args.cache_dir,
+        device=device,
+        method=args.method,
+    )
 
     rows = []
     correct = 0
+    valid_pred = 0
 
-    for i, ex in enumerate(tqdm(ds)):
+    for idx, ex in enumerate(tqdm(ds)):
         image = ex["image"].convert("RGB")
         caption = ex["caption"]
         label = int(ex["label"])
@@ -62,19 +92,23 @@ def main():
         pred_text = model.run_single_prompt(
             image=image,
             prompt=prompt,
-            method="default",
-            weight=1.0,
-            threshold=0.0,
-            weight1=1.0,
-            weight2=1.0,
+            method=args.method,
+            weight=args.weight,
+            threshold=args.threshold,
+            weight1=args.weight1,
+            weight2=args.weight2,
         )
 
         pred = normalize_pred(pred_text)
+
+        if pred != -1:
+            valid_pred += 1
+
         is_correct = int(pred == label)
         correct += is_correct
 
         rows.append({
-            "idx": i,
+            "idx": idx,
             "caption": caption,
             "relation": ex.get("relation", ""),
             "label": label,
@@ -88,9 +122,16 @@ def main():
     df = pd.DataFrame(rows)
     df.to_csv(args.out, index=False)
 
-    acc = correct / len(ds)
+    total = len(df)
+    acc = correct / total if total > 0 else 0.0
+    valid_rate = valid_pred / total if total > 0 else 0.0
+
+    print("=" * 60)
+    print(f"Total samples: {total}")
     print(f"Accuracy: {acc:.4f}")
-    print(f"Saved to {args.out}")
+    print(f"Valid prediction rate: {valid_rate:.4f}")
+    print(f"Saved to: {args.out}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
