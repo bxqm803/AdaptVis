@@ -28,11 +28,10 @@ CLIP_MODEL_ID = "openai/clip-vit-large-patch14-336"
 CLIP_DTYPE = torch.float16 if DEVICE.startswith("cuda") else torch.float32
 
 SEED = 1
-MAX_EXAMPLES = None
 PRINT_FIRST_N = 10
-MAX_NEW_TOKENS = 24
+MAX_EXAMPLES = None
 
-# soft-mask branch
+# soft-mask suppression params
 BG_RATIO = 0.10
 BOOST = 1.00
 USE_DILATE = False
@@ -99,13 +98,6 @@ def parse_objects_from_question(question):
     return None, None
 
 
-def prepare_repo_prompt(question):
-    q = clean_text(question)
-    if "<image>" in q and "USER:" in q and "ASSISTANT:" in q:
-        return q
-    return f"<image> USER: {q} Answer with left, right, on or under. ASSISTANT:"
-
-
 def normalize_rel(answer):
     if isinstance(answer, (list, tuple)):
         if len(answer) == 0:
@@ -144,42 +136,24 @@ def relation_from_image_name(image_name):
     return None
 
 
-def infer_patch_grid(num_patches):
-    side = int(round(math.sqrt(num_patches)))
-    if side * side == num_patches:
-        return side, side
-    for h in range(int(math.sqrt(num_patches)), 0, -1):
-        if num_patches % h == 0:
-            return h, num_patches // h
-    return 1, num_patches
-
-
-def normalize_1d_torch(x, eps=1e-6):
-    x_min = x.min(dim=1, keepdim=True).values
-    x_max = x.max(dim=1, keepdim=True).values
-    return (x - x_min) / (x_max - x_min + eps)
-
-
-def dilate_patch_mask(mask, gh, gw, kernel_size=3):
-    b, n = mask.shape
-    x = mask.view(b, 1, gh, gw)
-    x = F.max_pool2d(x, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
-    return x.view(b, n)
-
-
-def resize_gate_to_num_patches(gate, target_num_patches):
-    src_h, src_w = infer_patch_grid(gate.shape[1])
-    tgt_h, tgt_w = infer_patch_grid(target_num_patches)
-
-    if src_h == tgt_h and src_w == tgt_w:
-        return gate
-
-    x = gate.view(gate.shape[0], 1, src_h, src_w)
-    x = F.interpolate(x, size=(tgt_h, tgt_w), mode="bilinear", align_corners=False)
-    return x.view(gate.shape[0], tgt_h * tgt_w)
+def extract_raw_text(output):
+    if isinstance(output, str):
+        return output
+    if isinstance(output, dict):
+        for k in ["response", "text", "pred_text", "output", "answer"]:
+            if k in output:
+                return str(output[k])
+        return str(output)
+    if isinstance(output, (list, tuple)) and len(output) > 0:
+        return str(output[0])
+    return str(output)
 
 
 def parse_prediction(text):
+    """
+    和你原来脚本一致的口径：
+    取最后一个有效关系表达。
+    """
     text = clean_text(text).lower()
 
     phrase_patterns = [
@@ -217,8 +191,112 @@ def parse_prediction(text):
     return None
 
 
+def find_selected_relation_span(text):
+    """
+    和 parse_prediction 同口径：
+    返回最后一个有效关系表达的 span 和标签。
+    """
+    raw = str(text)
+    lower = raw.lower()
+
+    phrase_patterns = [
+        (r"\bto the left of\b", "left"),
+        (r"\bto the right of\b", "right"),
+        (r"\bunder\b", "under"),
+        (r"\bon top of\b", "on"),
+        (r"\bon the\b", "on"),
+    ]
+
+    found = []
+    for pat, label in phrase_patterns:
+        for m in re.finditer(pat, lower):
+            found.append((m.start(), m.end(), label, raw[m.start():m.end()]))
+
+    if found:
+        found.sort(key=lambda x: (x[0], x[1]))
+        return found[-1]
+
+    single_patterns = [
+        (r"\bleft\b", "left"),
+        (r"\bright\b", "right"),
+        (r"\bunder\b", "under"),
+        (r"\bon\b", "on"),
+    ]
+    found = []
+    for pat, label in single_patterns:
+        for m in re.finditer(pat, lower):
+            found.append((m.start(), m.end(), label, raw[m.start():m.end()]))
+
+    if found:
+        found.sort(key=lambda x: (x[0], x[1]))
+        return found[-1]
+
+    return None
+
+
+def infer_patch_grid(num_patches):
+    side = int(round(math.sqrt(num_patches)))
+    if side * side == num_patches:
+        return side, side
+    for h in range(int(math.sqrt(num_patches)), 0, -1):
+        if num_patches % h == 0:
+            return h, num_patches // h
+    return 1, num_patches
+
+
+def normalize_1d_torch(x, eps=1e-6):
+    x_min = x.min(dim=1, keepdim=True).values
+    x_max = x.max(dim=1, keepdim=True).values
+    return (x - x_min) / (x_max - x_min + eps)
+
+
+def dilate_patch_mask(mask, gh, gw, kernel_size=3):
+    b, n = mask.shape
+    x = mask.view(b, 1, gh, gw)
+    x = F.max_pool2d(x, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+    return x.view(b, n)
+
+
+def resize_gate_to_num_patches(gate, target_num_patches):
+    src_h, src_w = infer_patch_grid(gate.shape[1])
+    tgt_h, tgt_w = infer_patch_grid(target_num_patches)
+
+    if src_h == tgt_h and src_w == tgt_w:
+        return gate
+
+    x = gate.view(gate.shape[0], 1, src_h, src_w)
+    x = F.interpolate(x, size=(tgt_h, tgt_w), mode="bilinear", align_corners=False)
+    return x.view(gate.shape[0], tgt_h * tgt_w)
+
+
+def softmax_np(x):
+    x = np.asarray(x, dtype=np.float32)
+    x = x - np.max(x)
+    ex = np.exp(x)
+    return ex / (np.sum(ex) + 1e-12)
+
+
 def probs_dict_to_pred(prob_dict):
     return max(prob_dict.items(), key=lambda x: x[1])[0]
+
+
+def concat_text(a, b):
+    if len(a) == 0:
+        return b
+    if len(b) == 0:
+        return a
+    if a[-1].isspace() or b[0].isspace():
+        return a + b
+    return a + " " + b
+
+
+def continuation_phrases():
+    return {
+        "left": "to the left of",
+        "right": "to the right of",
+        "under": "under",
+        "on": "on the",
+    }
 
 
 def print_stats(name, total, correct, per_gold_total, per_gold_correct):
@@ -283,7 +361,7 @@ def build_union_gate_from_text_tower(
     sims1 = torch.matmul(patch_proj[0], text1[0]).unsqueeze(0)
     sims2 = torch.matmul(patch_proj[0], text2[0]).unsqueeze(0)
 
-    # 你前面验证过：目标区域更偏“低值”，所以这里取反后再归一化
+    # 你前面验证过：目标区域更偏低值，所以这里取反
     gate1 = normalize_1d_torch(-sims1)
     gate2 = normalize_1d_torch(-sims2)
 
@@ -300,7 +378,7 @@ def build_union_gate_from_text_tower(
 # =========================================================
 # patch repo llava projector
 # =========================================================
-def install_projector_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
+def install_soft_gate_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
     llava_model = llava_wrapper.model
 
     if not hasattr(llava_model, "multi_modal_projector"):
@@ -314,30 +392,34 @@ def install_projector_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
         feats = original_projector_forward(image_features)
 
         gate = getattr(llava_model, "_current_soft_gate", None)
-        if gate is not None:
-            gate_local = gate
-            if gate_local.ndim == 1:
-                gate_local = gate_local.unsqueeze(0)
+        if gate is None:
+            return feats
 
-            if gate_local.shape[0] != feats.shape[0]:
-                if gate_local.shape[0] == 1 and feats.shape[0] > 1:
-                    gate_local = gate_local.expand(feats.shape[0], -1)
-                else:
-                    raise ValueError(
-                        f"gate batch {gate_local.shape[0]} != feats batch {feats.shape[0]}"
-                    )
+        if feats is None or not torch.is_tensor(feats):
+            return feats
 
-            if gate_local.shape[1] != feats.shape[1]:
-                gate_local = resize_gate_to_num_patches(gate_local, feats.shape[1])
+        gate_local = gate
+        if gate_local.ndim == 1:
+            gate_local = gate_local.unsqueeze(0)
 
-            gate_local = gate_local.to(device=feats.device, dtype=feats.dtype).clamp(0, 1)
+        if gate_local.shape[0] != feats.shape[0]:
+            if gate_local.shape[0] == 1 and feats.shape[0] > 1:
+                gate_local = gate_local.expand(feats.shape[0], -1)
+            else:
+                raise ValueError(
+                    f"gate batch {gate_local.shape[0]} != feats batch {feats.shape[0]}"
+                )
 
-            scale = bg_ratio + (1.0 - bg_ratio) * gate_local
-            if boost != 1.0:
-                scale = scale * (1.0 + (boost - 1.0) * gate_local)
+        if gate_local.shape[1] != feats.shape[1]:
+            gate_local = resize_gate_to_num_patches(gate_local, feats.shape[1])
 
-            feats = feats * scale.unsqueeze(-1)
+        gate_local = gate_local.to(device=feats.device, dtype=feats.dtype).clamp(0, 1)
 
+        scale = bg_ratio + (1.0 - bg_ratio) * gate_local
+        if boost != 1.0:
+            scale = scale * (1.0 + (boost - 1.0) * gate_local)
+
+        feats = feats * scale.unsqueeze(-1)
         return feats
 
     llava_model.multi_modal_projector.forward = patched_projector_forward
@@ -345,160 +427,133 @@ def install_projector_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
 
 
 # =========================================================
-# generation helpers
+# branch run (keep original prediction definition)
 # =========================================================
-def get_relation_lexical_token_ids(tokenizer):
+def run_one_mode(llava_wrapper, llava_model, image, prompt, gate=None):
     """
-    为每个关系词收集若干可能的 lexical token id。
-    用法比较保守：裸词 / 前导空格 / 首字母大写 / 前导空格+首字母大写。
-    最后只取每种形式编码后的最后一个 token id。
+    和你原来脚本一致：
+    自由生成 -> parse_prediction
     """
-    rel_ids = {}
-    for lab in LABELS:
-        cand_forms = [lab, " " + lab, lab.capitalize(), " " + lab.capitalize()]
-        ids = []
-        for form in cand_forms:
-            pieces = tokenizer.encode(form, add_special_tokens=False)
-            if len(pieces) > 0:
-                ids.append(pieces[-1])
-        ids = sorted(set(ids))
-        if len(ids) == 0:
-            raise ValueError(f"Cannot get lexical token ids for label: {lab}")
-        rel_ids[lab] = ids
-    return rel_ids
+    llava_model._current_soft_gate = gate
+    try:
+        out = llava_wrapper.run_single_prompt(
+            image=image,
+            prompt=prompt,
+            method="base",
+            weight=None,
+        )
+        raw_output = extract_raw_text(out).strip()
+    finally:
+        llava_model._current_soft_gate = None
+
+    pred = parse_prediction(raw_output)
+    return raw_output, pred
 
 
-def find_last_specific_relation_word_step(tokenizer, generated_ids, target_label):
-    """
-    在生成文本里，找 target_label 最后一次出现对应的生成 step。
-    比如 target_label='under'，输出
-    'The scarf is on the floor, under the armchair.'
-    就会定位到 under 那一步。
-    """
-    if target_label is None:
-        return None, None
-
-    prefix = []
-    best = None  # (start, end, step_idx, matched_text)
-
-    for step_idx, tok in enumerate(generated_ids):
-        prefix.append(int(tok))
-        text = tokenizer.decode(prefix, skip_special_tokens=True)
-        lower = text.lower()
-
-        found = []
-        for m in re.finditer(rf"\b{re.escape(target_label)}\b", lower):
-            found.append((m.start(), m.end(), text[m.start():m.end()]))
-
-        if not found:
-            continue
-
-        found.sort(key=lambda x: (x[0], x[1]))
-        s, e, matched = found[-1]
-
-        if best is None or (s, e) >= (best[0], best[1]):
-            best = (s, e, step_idx, matched)
-
-    if best is None:
-        return None, None
-
-    return best[2], best[3]
-
-
-def extract_4way_probs_from_step(step_logits, relation_token_ids):
-    """
-    从某个 step 的全词表 logits 中，提取 left/right/under/on 这四类的概率，
-    再在这四类内部重新归一化。
-    """
-    step_probs = F.softmax(step_logits.float(), dim=-1)
-
-    rel_probs = {}
-    total = 0.0
-    for lab in LABELS:
-        p = 0.0
-        for tid in relation_token_ids[lab]:
-            p += float(step_probs[tid].item())
-        rel_probs[lab] = p
-        total += p
-
-    total = max(total, 1e-12)
-    for lab in rel_probs:
-        rel_probs[lab] /= total
-
-    arr = np.array([rel_probs[lab] for lab in LABELS], dtype=np.float32)
-    if not np.isfinite(arr).all():
-        return None
-
-    return rel_probs
-
-
+# =========================================================
+# sequence-level continuation scoring for fusion
+# =========================================================
 @torch.no_grad()
-def run_generate_branch(llava_wrapper, image, prompt, relation_token_ids, gate=None, max_new_tokens=24):
+def score_text_continuation(llava_wrapper, image, prefix_text, continuation_text, gate=None):
     """
-    一个分支完整跑法：
-    1. 自由生成整句
-    2. 用 parse_prediction(raw_output) 得到最终关系
-    3. 找这个最终关系在生成中的对应 step
-    4. 读那个 step 的 left/right/under/on 四类概率
+    对 continuation_text 做 teacher-forcing continuation 打分
+    返回平均 log-prob（避免长度偏置）
+
+    关键点：
+    - 不再用 prefix/full 长度差去切 continuation
+    - 先单独 tokenize continuation，再直接取 full sequence 的最后 k 个 token
     """
     llava_model = llava_wrapper.model
     processor = llava_wrapper.processor
     tokenizer = processor.tokenizer
 
-    inputs = processor(images=image, text=prompt, padding=True, return_tensors="pt")
-    inputs = {
+    if len(prefix_text) > 0 and prefix_text[-1].isspace():
+        suffix_text = continuation_text
+    else:
+        suffix_text = " " + continuation_text
+
+    cont_ids = tokenizer.encode(suffix_text, add_special_tokens=False)
+    if len(cont_ids) == 0:
+        return float("-1e9")
+
+    full_text = prefix_text + suffix_text
+
+    full_inputs = processor(images=image, text=full_text, padding=True, return_tensors="pt")
+    full_inputs = {
         k: (v.to(DEVICE) if torch.is_tensor(v) else v)
-        for k, v in inputs.items()
+        for k, v in full_inputs.items()
         if v is not None
     }
 
     llava_model._current_soft_gate = gate
     try:
-        gen_out = llava_model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            return_dict_in_generate=True,
-            output_scores=True,
-            use_cache=True,
-        )
+        outputs = llava_model(**full_inputs)
     finally:
         llava_model._current_soft_gate = None
 
-    full_seq = gen_out.sequences[0]
-    prompt_len = inputs["input_ids"].shape[1]
-    generated_ids = full_seq[prompt_len:]
-    raw_output = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+    logits = outputs.logits                # [1, T, V]
+    input_ids = full_inputs["input_ids"]   # [1, T]
 
-    parsed_pred = parse_prediction(raw_output)
+    k = len(cont_ids)
+    target_ids = input_ids[:, -k:]         # [1, k]
+    pred_logits = logits[:, -k-1:-1, :]    # [1, k, V]
 
-    matched_step = None
-    matched_text = None
-    relation_probs = None
+    if target_ids.numel() == 0 or pred_logits.numel() == 0 or pred_logits.shape[1] != k:
+        return float("-1e9")
 
-    if parsed_pred is not None:
-        matched_step, matched_text = find_last_specific_relation_word_step(
-            tokenizer=tokenizer,
-            generated_ids=generated_ids.tolist(),
-            target_label=parsed_pred,
+    log_probs = F.log_softmax(pred_logits, dim=-1)
+    gathered = torch.gather(log_probs, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+
+    if gathered.numel() == 0:
+        return float("-1e9")
+
+    score = gathered.mean()
+    if not torch.isfinite(score):
+        return float("-1e9")
+
+    return float(score.item())
+
+
+@torch.no_grad()
+def extract_relation_probs_from_output(llava_wrapper, image, prompt, raw_output, gate=None):
+    """
+    从最终自由生成文本里，找到最后一个有效关系表达，
+    然后从它前面的 prefix 出发，对四个关系短语做 continuation sequence scoring。
+    """
+    span = find_selected_relation_span(raw_output)
+    if span is None:
+        return None, None, None
+
+    start, end, matched_label, matched_text = span
+    prefix_before_relation = raw_output[:start]
+    prefix_text = prompt + prefix_before_relation
+
+    rel_scores = {}
+    cand_map = continuation_phrases()
+    for lab in LABELS:
+        rel_scores[lab] = score_text_continuation(
+            llava_wrapper=llava_wrapper,
+            image=image,
+            prefix_text=prefix_text,
+            continuation_text=cand_map[lab],
+            gate=gate,
         )
 
-        if matched_step is not None and matched_step < len(gen_out.scores):
-            step_logits = gen_out.scores[matched_step][0]
-            relation_probs = extract_4way_probs_from_step(step_logits, relation_token_ids)
+    score_vec = np.array([rel_scores[lab] for lab in LABELS], dtype=np.float32)
+    if not np.isfinite(score_vec).all():
+        return None, matched_label, matched_text
 
-    return {
-        "raw_output": raw_output,
-        "parsed_pred": parsed_pred,
-        "matched_step": matched_step,
-        "matched_text": matched_text,
-        "relation_probs": relation_probs,
-    }
+    prob_vec = softmax_np(score_vec)
+    if not np.isfinite(prob_vec).all():
+        return None, matched_label, matched_text
+
+    relation_probs = {lab: float(prob_vec[i]) for i, lab in enumerate(LABELS)}
+    return relation_probs, matched_label, matched_text
 
 
 def fuse_two_prob_dicts(prob_a, prob_b):
     """
-    直接把 baseline 和 local 的四类概率相加，再在四类内部重新归一化。
+    直接把 baseline 和 local 的四类概率相加，再归一化。
     """
     fused = {}
     for lab in LABELS:
@@ -530,7 +585,9 @@ def main():
         method="base",
         root_dir=CACHE_DIR,
     )
-    install_projector_patch(llava_wrapper, bg_ratio=BG_RATIO, boost=BOOST)
+
+    llava_model = llava_wrapper.model
+    install_soft_gate_patch(llava_wrapper, bg_ratio=BG_RATIO, boost=BOOST)
 
     dataset = get_dataset(DATASET, image_preprocess=image_preprocess, download=False)
 
@@ -551,25 +608,23 @@ def main():
         cache_dir=CACHE_DIR,
     ).to(DEVICE).eval()
 
-    relation_token_ids = get_relation_lexical_token_ids(llava_wrapper.processor.tokenizer)
-
     # baseline stats
-    total_b = 0
-    correct_b = 0
-    per_gold_total_b = defaultdict(int)
-    per_gold_correct_b = defaultdict(int)
+    total_base = 0
+    correct_base = 0
+    per_gold_total_base = defaultdict(int)
+    per_gold_correct_base = defaultdict(int)
 
     # local stats
-    total_l = 0
-    correct_l = 0
-    per_gold_total_l = defaultdict(int)
-    per_gold_correct_l = defaultdict(int)
+    total_local = 0
+    correct_local = 0
+    per_gold_total_local = defaultdict(int)
+    per_gold_correct_local = defaultdict(int)
 
     # fused stats
-    total_f = 0
-    correct_f = 0
-    per_gold_total_f = defaultdict(int)
-    per_gold_correct_f = defaultdict(int)
+    total_fused = 0
+    correct_fused = 0
+    per_gold_total_fused = defaultdict(int)
+    per_gold_correct_fused = defaultdict(int)
 
     shown = 0
     num_examples = len(dataset) if MAX_EXAMPLES is None else min(MAX_EXAMPLES, len(dataset))
@@ -581,7 +636,6 @@ def main():
         image = item["image_options"][0].convert("RGB")
         image_name = clean_text(item.get("image_name", f"sample_{idx:04d}"))
         raw_question = clean_text(rec.get("question", ""))
-        prompt = prepare_repo_prompt(raw_question)
 
         gold = normalize_rel(rec.get("answer", None))
         if gold is None:
@@ -589,10 +643,27 @@ def main():
         if gold is None:
             continue
 
-        obj1, obj2 = parse_objects_from_question(prompt)
+        obj1, obj2 = parse_objects_from_question(raw_question)
         if not obj1 or not obj2:
             obj1, obj2 = infer_names_from_filename(image_name)
 
+        # 这里继续沿用你原来脚本的 prompt 传法
+        prompt = raw_question
+
+        # -------------------------------------------------
+        # baseline: original generation + parse
+        # -------------------------------------------------
+        raw_output_base, pred_base = run_one_mode(
+            llava_wrapper=llava_wrapper,
+            llava_model=llava_model,
+            image=image,
+            prompt=prompt,
+            gate=None,
+        )
+
+        # -------------------------------------------------
+        # local: soft-mask generation + parse
+        # -------------------------------------------------
         union_gate = build_union_gate_from_text_tower(
             clip_model=clip_model,
             clip_processor=clip_processor,
@@ -604,76 +675,68 @@ def main():
             dilate_kernel=DILATE_KERNEL,
         )
 
-        # -------------------------------------------------
-        # baseline branch: original generation + parse
-        # -------------------------------------------------
-        baseline_res = run_generate_branch(
+        raw_output_local, pred_local = run_one_mode(
             llava_wrapper=llava_wrapper,
+            llava_model=llava_model,
             image=image,
             prompt=prompt,
-            relation_token_ids=relation_token_ids,
-            gate=None,
-            max_new_tokens=MAX_NEW_TOKENS,
-        )
-
-        # -------------------------------------------------
-        # local branch: soft-mask generation + parse
-        # -------------------------------------------------
-        local_res = run_generate_branch(
-            llava_wrapper=llava_wrapper,
-            image=image,
-            prompt=prompt,
-            relation_token_ids=relation_token_ids,
             gate=union_gate,
-            max_new_tokens=MAX_NEW_TOKENS,
         )
 
-        pred_b = baseline_res["parsed_pred"]
-        pred_l = local_res["parsed_pred"]
+        # -------------------------------------------------
+        # fused:
+        # use sequence-level continuation probabilities
+        # around the final parsed relation of each branch
+        # -------------------------------------------------
+        base_probs, base_match_label, base_match_text = extract_relation_probs_from_output(
+            llava_wrapper=llava_wrapper,
+            image=image,
+            prompt=prompt,
+            raw_output=raw_output_base,
+            gate=None,
+        )
 
-        # -------------------------------------------------
-        # fused branch:
-        # use baseline/local decision-step 4-way probs
-        # -------------------------------------------------
+        local_probs, local_match_label, local_match_text = extract_relation_probs_from_output(
+            llava_wrapper=llava_wrapper,
+            image=image,
+            prompt=prompt,
+            raw_output=raw_output_local,
+            gate=union_gate,
+        )
+
         fused_probs = None
-        pred_f = None
+        pred_fused = pred_base if pred_base is not None else pred_local
 
-        if baseline_res["relation_probs"] is not None and local_res["relation_probs"] is not None:
-            fused_probs = fuse_two_prob_dicts(
-                baseline_res["relation_probs"],
-                local_res["relation_probs"],
-            )
-            pred_f = probs_dict_to_pred(fused_probs)
-        else:
-            # fallback
-            pred_f = pred_b if pred_b is not None else pred_l
+        if base_probs is not None and local_probs is not None:
+            fused_probs = fuse_two_prob_dicts(base_probs, local_probs)
+            pred_fused = probs_dict_to_pred(fused_probs)
 
         # -------------------------------------------------
         # stats: baseline
         # -------------------------------------------------
-        total_b += 1
-        per_gold_total_b[gold] += 1
-        if pred_b == gold:
-            correct_b += 1
-            per_gold_correct_b[gold] += 1
+        total_base += 1
+        per_gold_total_base[gold] += 1
+        if pred_base == gold:
+            correct_base += 1
+            per_gold_correct_base[gold] += 1
 
         # -------------------------------------------------
         # stats: local
         # -------------------------------------------------
-        total_l += 1
-        per_gold_total_l[gold] += 1
-        if pred_l == gold:
-            correct_l += 1
-            per_gold_correct_l[gold] += 1
+        total_local += 1
+        per_gold_total_local[gold] += 1
+        if pred_local == gold:
+            correct_local += 1
+            per_gold_correct_local[gold] += 1
 
         # -------------------------------------------------
         # stats: fused
         # -------------------------------------------------
-        total_f += 1
-        per_gold_total_f[gold] += 1
-        if pred_f == gold:
-            correct_f += 1
-            per_gold_correct_f[gold] += 1
+        total_fused += 1
+        per_gold_total_fused[gold] += 1
+        if pred_fused == gold:
+            correct_fused += 1
+            per_gold_correct_fused[gold] += 1
 
         if shown < PRINT_FIRST_N:
             print("=" * 120)
@@ -686,36 +749,56 @@ def main():
             print(prompt)
 
             print("[BASELINE RAW OUTPUT]")
-            print(baseline_res["raw_output"])
-            print(f"[BASELINE PARSED PRED] {baseline_res['parsed_pred']}")
-            print(f"[BASELINE MATCHED STEP] {baseline_res['matched_step']}")
-            print(f"[BASELINE MATCHED TEXT] {baseline_res['matched_text']}")
-            if baseline_res["relation_probs"] is not None:
-                print("[BASELINE STEP RELATION PROBS]")
+            print(raw_output_base)
+            print(f"[BASELINE PARSED PRED] {pred_base}")
+            print(f"[BASELINE MATCHED LABEL] {base_match_label}")
+            print(f"[BASELINE MATCHED TEXT] {base_match_text}")
+            if base_probs is not None:
+                print("[BASELINE SEQ RELATION PROBS]")
                 for lab in LABELS:
-                    print(f"  {lab:>5}: {baseline_res['relation_probs'][lab]:.4f}")
+                    print(f"  {lab:>5}: {base_probs[lab]:.4f}")
 
             print("[LOCAL RAW OUTPUT]")
-            print(local_res["raw_output"])
-            print(f"[LOCAL PARSED PRED] {local_res['parsed_pred']}")
-            print(f"[LOCAL MATCHED STEP] {local_res['matched_step']}")
-            print(f"[LOCAL MATCHED TEXT] {local_res['matched_text']}")
-            if local_res["relation_probs"] is not None:
-                print("[LOCAL STEP RELATION PROBS]")
+            print(raw_output_local)
+            print(f"[LOCAL PARSED PRED] {pred_local}")
+            print(f"[LOCAL MATCHED LABEL] {local_match_label}")
+            print(f"[LOCAL MATCHED TEXT] {local_match_text}")
+            if local_probs is not None:
+                print("[LOCAL SEQ RELATION PROBS]")
                 for lab in LABELS:
-                    print(f"  {lab:>5}: {local_res['relation_probs'][lab]:.4f}")
+                    print(f"  {lab:>5}: {local_probs[lab]:.4f}")
 
             if fused_probs is not None:
-                print("[FUSED STEP PROBS = BASELINE + LOCAL]")
+                print("[FUSED SEQ PROBS = BASELINE + LOCAL]")
                 for lab in LABELS:
                     print(f"  {lab:>5}: {fused_probs[lab]:.4f}")
 
-            print(f"[FUSED PRED] {pred_f}")
+            print(f"[FUSED PRED] {pred_fused}")
             shown += 1
 
-    print_stats("BASELINE_GENERATION_PARSE", total_b, correct_b, per_gold_total_b, per_gold_correct_b)
-    print_stats("SOFT_MASK_GENERATION_PARSE", total_l, correct_l, per_gold_total_l, per_gold_correct_l)
-    print_stats("FUSED_STEP_PROBS_SUM", total_f, correct_f, per_gold_total_f, per_gold_correct_f)
+    print_stats(
+        "BASELINE_GENERATION_PARSE",
+        total_base,
+        correct_base,
+        per_gold_total_base,
+        per_gold_correct_base,
+    )
+
+    print_stats(
+        "SOFT_MASK_GENERATION_PARSE",
+        total_local,
+        correct_local,
+        per_gold_total_local,
+        per_gold_correct_local,
+    )
+
+    print_stats(
+        "FUSED_SEQUENCE_PROBS_SUM",
+        total_fused,
+        correct_fused,
+        per_gold_total_fused,
+        per_gold_correct_fused,
+    )
 
 
 if __name__ == "__main__":
