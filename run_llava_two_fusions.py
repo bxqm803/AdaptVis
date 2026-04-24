@@ -155,12 +155,8 @@ def extract_raw_text(output):
 
 def parse_prediction(text):
     """
-    修正版：
-    - 先找更明确的关系短语
-    - 如果有多个，取最后一个关系表达
-      因为模型常写成：
-      "on the floor, under the chair"
-      真正关系通常在后面
+    取最后一个有效关系表达，并返回标签字符串:
+    left / right / under / on
     """
     text = clean_text(text).lower()
 
@@ -179,7 +175,7 @@ def parse_prediction(text):
 
     if found:
         found.sort(key=lambda x: (x[0], x[1]))
-        return found[-1][1]
+        return found[-1][2]   # 注意这里是 label，不是 end 位置
 
     single_patterns = [
         (r"\bleft\b", "left"),
@@ -190,14 +186,13 @@ def parse_prediction(text):
     found = []
     for pat, label in single_patterns:
         for m in re.finditer(pat, text):
-            found.append((m.start(), m.end(), label))
+            found.append((m.start(), m.end(), label, m.group(0)))
 
     if found:
         found.sort(key=lambda x: (x[0], x[1]))
-        return found[-1][1]
+        return found[-1][2]   # 同样这里也要返回 label
 
     return None
-
 
 def infer_patch_grid(num_patches):
     side = int(round(math.sqrt(num_patches)))
