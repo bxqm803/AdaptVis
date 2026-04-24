@@ -204,7 +204,7 @@ def parse_prediction(text):
             found.append((m.start(), m.end(), label, m.group(0)))
 
     if found:
-        found.sort(key=lambda x: x[0])
+        found.sort(key=lambda x: (x[0], x[1]))
         return found[-1][2]
 
     single_patterns = [
@@ -219,7 +219,7 @@ def parse_prediction(text):
             found.append((m.start(), m.end(), label, m.group(0)))
 
     if found:
-        found.sort(key=lambda x: x[0])
+        found.sort(key=lambda x: (x[0], x[1]))
         return found[-1][2]
 
     return None
@@ -359,7 +359,7 @@ def install_projector_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
 
 
 # =========================================================
-# generation + single-word probability extraction
+# generation + last-word probability extraction
 # =========================================================
 def get_relation_lexical_token_ids(tokenizer):
     """
@@ -382,13 +382,16 @@ def get_relation_lexical_token_ids(tokenizer):
     return rel_ids
 
 
-def find_first_relation_word_step(tokenizer, generated_ids):
+def find_last_relation_word_step(tokenizer, generated_ids):
     """
-    在自由生成序列里，找到第一次出现单独关系词 left/right/under/on 的那一步。
+    找最终输出里最后一次出现的单独关系词 left/right/under/on，
+    并返回对应的生成 step。
     返回:
         step_idx, matched_label, matched_text
     """
     prefix = []
+    best = None  # (start, end, step_idx, label, matched_text)
+
     for step_idx, tok in enumerate(generated_ids):
         prefix.append(int(tok))
         text = tokenizer.decode(prefix, skip_special_tokens=True)
@@ -399,18 +402,26 @@ def find_first_relation_word_step(tokenizer, generated_ids):
             for m in re.finditer(rf"\b{lab}\b", lower):
                 found.append((m.start(), m.end(), lab, text[m.start():m.end()]))
 
-        if found:
-            found.sort(key=lambda x: x[0])
-            _, _, lab, matched = found[-1]
-            return step_idx, lab, matched
+        if not found:
+            continue
 
-    return None, None, None
+        found.sort(key=lambda x: (x[0], x[1]))
+        s, e, lab, matched = found[-1]
+
+        if best is None or (s, e) >= (best[0], best[1]):
+            best = (s, e, step_idx, lab, matched)
+
+    if best is None:
+        return None, None, None
+
+    return best[2], best[3], best[4]
 
 
 @torch.no_grad()
 def run_generate_and_get_relation_probs(llava_wrapper, image, prompt, gate=None, max_new_tokens=24):
     """
-    自由生成整句，但提取第一次生成出 left/right/under/on 这个词本身那一步的四类概率。
+    自由生成整句，但提取最终输出里最后一个 left/right/under/on
+    对应那一步的四类概率。
     返回:
         raw_output
         relation_probs(dict) 或 None
@@ -448,7 +459,7 @@ def run_generate_and_get_relation_probs(llava_wrapper, image, prompt, gate=None,
     generated_ids = full_seq[prompt_len:]
     raw_output = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
-    step_idx, matched_label, matched_text = find_first_relation_word_step(
+    step_idx, matched_label, matched_text = find_last_relation_word_step(
         tokenizer, generated_ids.tolist()
     )
 
@@ -644,7 +655,7 @@ def main():
 
             print("[GLOBAL RAW OUTPUT]")
             print(global_raw)
-            print(f"[GLOBAL MATCHED LABEL] {global_match} | [MATCHED TEXT] {global_text}")
+            print(f"[GLOBAL MATCHED LAST LABEL] {global_match} | [MATCHED TEXT] {global_text}")
             if global_probs is not None:
                 print("[GLOBAL RELATION PROBS]")
                 for lab in LABELS:
@@ -653,7 +664,7 @@ def main():
 
             print("[LOCAL RAW OUTPUT]")
             print(local_raw)
-            print(f"[LOCAL MATCHED LABEL] {local_match} | [MATCHED TEXT] {local_text}")
+            print(f"[LOCAL MATCHED LAST LABEL] {local_match} | [MATCHED TEXT] {local_text}")
             if local_probs is not None:
                 print("[LOCAL RELATION PROBS]")
                 for lab in LABELS:
@@ -670,7 +681,7 @@ def main():
 
     print_stats("GLOBAL_ONLY", total_g, correct_g, per_gold_total_g, per_gold_correct_g)
     print_stats("LOCAL_ONLY", total_l, correct_l, per_gold_total_l, per_gold_correct_l)
-    print_stats("FUSED_PROB_WORDSTEP", total_f, correct_f, per_gold_total_f, per_gold_correct_f)
+    print_stats("FUSED_PROB_LASTWORD", total_f, correct_f, per_gold_total_f, per_gold_correct_f)
 
 
 if __name__ == "__main__":
