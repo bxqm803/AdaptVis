@@ -1,12 +1,17 @@
 import argparse
 import os
-
+import json
 import pandas as pd
 import torch
+import requests
+from PIL import Image
+from io import BytesIO
 from tqdm import tqdm
-from datasets import load_dataset
 
 from model_zoo.llava15 import LlavaWrapper
+
+
+SPLIT_URL = "https://github.com/cambridgeltl/visual-spatial-reasoning/raw/master/data/splits"
 
 
 def build_prompt(caption: str) -> str:
@@ -26,13 +31,57 @@ def normalize_pred(text: str) -> int:
         return 1
     if "false" in t and "true" not in t:
         return 0
-
     if t.startswith("yes"):
         return 1
     if t.startswith("no"):
         return 0
 
     return -1
+
+
+def split_filename(split: str) -> str:
+    if split == "validation":
+        return "dev.jsonl"
+    return f"{split}.jsonl"
+
+
+def download_jsonl(config: str, split: str, cache_dir: str):
+    os.makedirs(cache_dir, exist_ok=True)
+
+    fname = split_filename(split)
+    local_path = os.path.join(cache_dir, f"vsr_{config}_{fname}")
+
+    if os.path.exists(local_path):
+        return local_path
+
+    url = f"{SPLIT_URL}/{config}/{fname}"
+    print(f"Downloading split file: {url}")
+
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+
+    with open(local_path, "wb") as f:
+        f.write(r.content)
+
+    return local_path
+
+
+def load_vsr_jsonl(config: str, split: str, cache_dir: str):
+    path = download_jsonl(config, split, cache_dir)
+
+    data = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                data.append(json.loads(line))
+
+    return data
+
+
+def load_image_from_url(url: str):
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    return Image.open(BytesIO(r.content)).convert("RGB")
 
 
 def main():
@@ -54,20 +103,11 @@ def main():
 
     args = parser.parse_args()
 
-    os.makedirs(args.cache_dir, exist_ok=True)
-
-    print(f"Loading VSR dataset: config={args.config}, split={args.split}")
-    ds = load_dataset(
-        "juletxara/visual-spatial-reasoning",
-        args.config,
-        split=args.split,
-        trust_remote_code=True,
-        cache_dir=args.cache_dir,
-    )
+    print(f"Loading VSR jsonl: config={args.config}, split={args.split}")
+    data = load_vsr_jsonl(args.config, args.split, args.cache_dir)
 
     if args.max_samples > 0:
-        n = min(args.max_samples, len(ds))
-        ds = ds.select(range(n))
+        data = data[:args.max_samples]
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Loading LLaVA on {device}")
@@ -82,10 +122,16 @@ def main():
     correct = 0
     valid_pred = 0
 
-    for idx, ex in enumerate(tqdm(ds)):
-        image = ex["image"].convert("RGB")
+    for idx, ex in enumerate(tqdm(data)):
+        try:
+            image = load_image_from_url(ex["image_link"])
+        except Exception as e:
+            print(f"[WARN] Failed to load image idx={idx}: {e}")
+            continue
+
         caption = ex["caption"]
         label = int(ex["label"])
+        relation = ex.get("relation", "")
 
         prompt = build_prompt(caption)
 
@@ -110,7 +156,7 @@ def main():
         rows.append({
             "idx": idx,
             "caption": caption,
-            "relation": ex.get("relation", ""),
+            "relation": relation,
             "label": label,
             "label_text": "True" if label == 1 else "False",
             "pred": pred,
@@ -127,7 +173,7 @@ def main():
     valid_rate = valid_pred / total if total > 0 else 0.0
 
     print("=" * 60)
-    print(f"Total samples: {total}")
+    print(f"Total evaluated samples: {total}")
     print(f"Accuracy: {acc:.4f}")
     print(f"Valid prediction rate: {valid_rate:.4f}")
     print(f"Saved to: {args.out}")
