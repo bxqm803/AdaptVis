@@ -267,57 +267,60 @@ def build_union_gate_from_text_tower(
 # =========================================================
 # patch llava model: only change image features internally
 # =========================================================
-def install_soft_gate_patch(llava_model, bg_ratio=0.2, boost=1.0):
+def install_soft_gate_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
     """
-    尝试 patch:
-    1) model.get_image_features
-    2) model.llava.get_image_features
-    哪个存在就 patch 哪个
+    直接按仓库里的路径 patch：
+        llava_wrapper.model.llava.get_image_features
     """
-    patched = False
+    llava_model = llava_wrapper.model
 
-    def make_patched_method(target_module):
-        original_fn = target_module.get_image_features
+    if not hasattr(llava_model, "llava"):
+        raise RuntimeError(
+            f"repo-loaded model has no .llava attribute, type={type(llava_model)}"
+        )
+    if not hasattr(llava_model.llava, "get_image_features"):
+        raise RuntimeError(
+            f"repo-loaded model.llava has no get_image_features, type={type(llava_model.llava)}"
+        )
 
-        def patched_get_image_features(*args, **kwargs):
-            feats = original_fn(*args, **kwargs)  # expected [B, N, D]
-            gate = getattr(llava_model, "_current_soft_gate", None)
+    original_get_image_features = llava_model.llava.get_image_features
 
-            if gate is None:
-                return feats
+    def patched_get_image_features(*args, **kwargs):
+        feats = original_get_image_features(*args, **kwargs)
 
-            if feats is None:
-                return feats
-
-            if not torch.is_tensor(feats):
-                return feats
-
-            gate_local = gate
-            if gate_local.ndim == 1:
-                gate_local = gate_local.unsqueeze(0)
-
-            if gate_local.shape[0] != feats.shape[0]:
-                if gate_local.shape[0] == 1 and feats.shape[0] > 1:
-                    gate_local = gate_local.expand(feats.shape[0], -1)
-                else:
-                    raise ValueError(
-                        f"gate batch {gate_local.shape[0]} != feats batch {feats.shape[0]}"
-                    )
-
-            if gate_local.shape[1] != feats.shape[1]:
-                gate_local = resize_gate_to_num_patches(gate_local, feats.shape[1])
-
-            gate_local = gate_local.to(device=feats.device, dtype=feats.dtype).clamp(0, 1)
-
-            # 背景抑制，不删除 token
-            scale = bg_ratio + (1.0 - bg_ratio) * gate_local   # [B, N]
-            if boost != 1.0:
-                scale = scale * (1.0 + (boost - 1.0) * gate_local)
-
-            feats = feats * scale.unsqueeze(-1)
+        gate = getattr(llava_model, "_current_soft_gate", None)
+        if gate is None:
             return feats
 
-        return patched_get_image_features
+        if feats is None or not torch.is_tensor(feats):
+            return feats
+
+        gate_local = gate
+        if gate_local.ndim == 1:
+            gate_local = gate_local.unsqueeze(0)
+
+        if gate_local.shape[0] != feats.shape[0]:
+            if gate_local.shape[0] == 1 and feats.shape[0] > 1:
+                gate_local = gate_local.expand(feats.shape[0], -1)
+            else:
+                raise ValueError(
+                    f"gate batch {gate_local.shape[0]} != feats batch {feats.shape[0]}"
+                )
+
+        if gate_local.shape[1] != feats.shape[1]:
+            gate_local = resize_gate_to_num_patches(gate_local, feats.shape[1])
+
+        gate_local = gate_local.to(device=feats.device, dtype=feats.dtype).clamp(0, 1)
+
+        scale = bg_ratio + (1.0 - bg_ratio) * gate_local
+        if boost != 1.0:
+            scale = scale * (1.0 + (boost - 1.0) * gate_local)
+
+        feats = feats * scale.unsqueeze(-1)
+        return feats
+
+    llava_model.llava.get_image_features = patched_get_image_features
+    return llava_model
 
     if hasattr(llava_model, "get_image_features"):
         llava_model.get_image_features = make_patched_method(llava_model)
@@ -354,7 +357,7 @@ def main():
     )
 
     llava_model = llava_wrapper.model
-    install_soft_gate_patch(llava_model, bg_ratio=BG_RATIO, boost=BOOST)
+    install_soft_gate_patch(llava_wrapper, bg_ratio=BG_RATIO, boost=BOOST)
 
     dataset = get_dataset(DATASET, image_preprocess=image_preprocess, download=False)
 
