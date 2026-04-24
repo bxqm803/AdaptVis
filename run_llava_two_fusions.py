@@ -29,7 +29,12 @@ CLIP_DTYPE = torch.float16 if DEVICE.startswith("cuda") else torch.float32
 
 SEED = 1
 PRINT_FIRST_N = 10
-MAX_EXAMPLES = None
+MAX_EXAMPLES = None   # None = 全部；想先少跑一点就改成 20 / 50
+
+# 只对前 N 个样本做 token-prob 分析，避免太慢
+ANALYZE_FIRST_N = 10
+MAX_NEW_TOKENS_ANALYSIS = 32
+TOPK = 5
 
 # soft-mask suppression params
 BG_RATIO = 0.10
@@ -76,7 +81,6 @@ def infer_names_from_filename(image_name):
 
 def parse_objects_from_question(question):
     q = clean_text(question)
-    q = q.replace("<image>", " ").strip()
 
     if "USER:" in q:
         q = q.split("USER:", 1)[1].strip()
@@ -151,8 +155,12 @@ def extract_raw_text(output):
 
 def parse_prediction(text):
     """
-    和你原来脚本一致的口径：
-    取最后一个有效关系表达。
+    修正版：
+    - 先找更明确的关系短语
+    - 如果有多个，取最后一个关系表达
+      因为模型常写成：
+      "on the floor, under the chair"
+      真正关系通常在后面
     """
     text = clean_text(text).lower()
 
@@ -171,7 +179,7 @@ def parse_prediction(text):
 
     if found:
         found.sort(key=lambda x: (x[0], x[1]))
-        return found[-1][2]
+        return found[-1][1]
 
     single_patterns = [
         (r"\bleft\b", "left"),
@@ -182,54 +190,11 @@ def parse_prediction(text):
     found = []
     for pat, label in single_patterns:
         for m in re.finditer(pat, text):
-            found.append((m.start(), m.end(), label, m.group(0)))
+            found.append((m.start(), m.end(), label))
 
     if found:
         found.sort(key=lambda x: (x[0], x[1]))
-        return found[-1][2]
-
-    return None
-
-
-def find_selected_relation_span(text):
-    """
-    和 parse_prediction 同口径：
-    返回最后一个有效关系表达的 span 和标签。
-    """
-    raw = str(text)
-    lower = raw.lower()
-
-    phrase_patterns = [
-        (r"\bto the left of\b", "left"),
-        (r"\bto the right of\b", "right"),
-        (r"\bunder\b", "under"),
-        (r"\bon top of\b", "on"),
-        (r"\bon the\b", "on"),
-    ]
-
-    found = []
-    for pat, label in phrase_patterns:
-        for m in re.finditer(pat, lower):
-            found.append((m.start(), m.end(), label, raw[m.start():m.end()]))
-
-    if found:
-        found.sort(key=lambda x: (x[0], x[1]))
-        return found[-1]
-
-    single_patterns = [
-        (r"\bleft\b", "left"),
-        (r"\bright\b", "right"),
-        (r"\bunder\b", "under"),
-        (r"\bon\b", "on"),
-    ]
-    found = []
-    for pat, label in single_patterns:
-        for m in re.finditer(pat, lower):
-            found.append((m.start(), m.end(), label, raw[m.start():m.end()]))
-
-    if found:
-        found.sort(key=lambda x: (x[0], x[1]))
-        return found[-1]
+        return found[-1][1]
 
     return None
 
@@ -269,36 +234,6 @@ def resize_gate_to_num_patches(gate, target_num_patches):
     return x.view(gate.shape[0], tgt_h * tgt_w)
 
 
-def softmax_np(x):
-    x = np.asarray(x, dtype=np.float32)
-    x = x - np.max(x)
-    ex = np.exp(x)
-    return ex / (np.sum(ex) + 1e-12)
-
-
-def probs_dict_to_pred(prob_dict):
-    return max(prob_dict.items(), key=lambda x: x[1])[0]
-
-
-def concat_text(a, b):
-    if len(a) == 0:
-        return b
-    if len(b) == 0:
-        return a
-    if a[-1].isspace() or b[0].isspace():
-        return a + b
-    return a + " " + b
-
-
-def continuation_phrases():
-    return {
-        "left": "to the left of",
-        "right": "to the right of",
-        "under": "under",
-        "on": "on the",
-    }
-
-
 def print_stats(name, total, correct, per_gold_total, per_gold_correct):
     print("=" * 120)
     print(f"[{name}]")
@@ -321,15 +256,15 @@ def get_clip_patch_features(clip_model, clip_processor, image_pil, device):
     pixel_values = image_inputs["pixel_values"].to(device=device, dtype=CLIP_DTYPE)
 
     vision_outputs = clip_model.vision_model(pixel_values=pixel_values, return_dict=True)
-    last_hidden = vision_outputs.last_hidden_state
+    last_hidden = vision_outputs.last_hidden_state  # [1, 1+N, H]
 
     if hasattr(clip_model.vision_model, "vision_model") and hasattr(clip_model.vision_model.vision_model, "post_layernorm"):
         last_hidden = clip_model.vision_model.vision_model.post_layernorm(last_hidden)
     elif hasattr(clip_model.vision_model, "post_layernorm"):
         last_hidden = clip_model.vision_model.post_layernorm(last_hidden)
 
-    patch_tokens = last_hidden[:, 1:, :]
-    patch_proj = clip_model.visual_projection(patch_tokens)
+    patch_tokens = last_hidden[:, 1:, :]  # [1, N, H]
+    patch_proj = clip_model.visual_projection(patch_tokens)  # [1, N, D]
     patch_proj = patch_proj / (patch_proj.norm(dim=-1, keepdim=True) + 1e-6)
     return patch_proj
 
@@ -338,7 +273,7 @@ def get_clip_patch_features(clip_model, clip_processor, image_pil, device):
 def get_clip_text_feature(clip_model, clip_processor, text_phrase, device):
     text_inputs = clip_processor(text=[text_phrase], return_tensors="pt", padding=True)
     text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
-    text_features = clip_model.get_text_features(**text_inputs)
+    text_features = clip_model.get_text_features(**text_inputs)  # [1, D]
     text_features = text_features / (text_features.norm(dim=-1, keepdim=True) + 1e-6)
     return text_features
 
@@ -354,14 +289,18 @@ def build_union_gate_from_text_tower(
     use_dilate=True,
     dilate_kernel=3,
 ):
+    """
+    你前面已经验证过：
+    raw similarity 的 low-score valley 对应目标物体
+    所以这里用 normalize(-raw_sims)
+    """
     patch_proj = get_clip_patch_features(clip_model, clip_processor, image_pil, device)
     text1 = get_clip_text_feature(clip_model, clip_processor, obj1_name, device)
     text2 = get_clip_text_feature(clip_model, clip_processor, obj2_name, device)
 
-    sims1 = torch.matmul(patch_proj[0], text1[0]).unsqueeze(0)
-    sims2 = torch.matmul(patch_proj[0], text2[0]).unsqueeze(0)
+    sims1 = torch.matmul(patch_proj[0], text1[0]).unsqueeze(0)   # [1, N]
+    sims2 = torch.matmul(patch_proj[0], text2[0]).unsqueeze(0)   # [1, N]
 
-    # 你前面验证过：目标区域更偏低值，所以这里取反
     gate1 = normalize_1d_torch(-sims1)
     gate2 = normalize_1d_torch(-sims2)
 
@@ -376,7 +315,7 @@ def build_union_gate_from_text_tower(
 
 
 # =========================================================
-# patch repo llava projector
+# patch repo llava: suppress background inside visual stream
 # =========================================================
 def install_soft_gate_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
     llava_model = llava_wrapper.model
@@ -389,7 +328,7 @@ def install_soft_gate_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
     original_projector_forward = llava_model.multi_modal_projector.forward
 
     def patched_projector_forward(image_features):
-        feats = original_projector_forward(image_features)
+        feats = original_projector_forward(image_features)  # [B, N, D]
 
         gate = getattr(llava_model, "_current_soft_gate", None)
         if gate is None:
@@ -427,13 +366,9 @@ def install_soft_gate_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
 
 
 # =========================================================
-# branch run (keep original prediction definition)
+# original generation path (keep predictions identical to original compare)
 # =========================================================
 def run_one_mode(llava_wrapper, llava_model, image, prompt, gate=None):
-    """
-    和你原来脚本一致：
-    自由生成 -> parse_prediction
-    """
     llava_model._current_soft_gate = gate
     try:
         out = llava_wrapper.run_single_prompt(
@@ -451,119 +386,170 @@ def run_one_mode(llava_wrapper, llava_model, image, prompt, gate=None):
 
 
 # =========================================================
-# sequence-level continuation scoring for fusion
+# token-step analysis only
 # =========================================================
-@torch.no_grad()
-def score_text_continuation(llava_wrapper, image, prefix_text, continuation_text, gate=None):
+def get_relation_token_id_sets(tokenizer):
     """
-    对 continuation_text 做 teacher-forcing continuation 打分
-    返回平均 log-prob（避免长度偏置）
+    为每个关系词收集若干可能的单-token形式。
+    如果某个形式 encode 后长度为1，就加入集合。
+    这样可以同时兼容:
+      left / Left / " left" / " Left"
+    """
+    out = {}
+    for lab in LABELS:
+        forms = [lab, lab.capitalize(), " " + lab, " " + lab.capitalize()]
+        ids = set()
+        for form in forms:
+            pieces = tokenizer.encode(form, add_special_tokens=False)
+            if len(pieces) == 1:
+                ids.add(int(pieces[0]))
 
-    关键点：
-    - 不再用 prefix/full 长度差去切 continuation
-    - 先单独 tokenize continuation，再直接取 full sequence 的最后 k 个 token
+        # 如果一个都没收集到，退化到裸词的最后一个 token
+        if len(ids) == 0:
+            pieces = tokenizer.encode(lab, add_special_tokens=False)
+            if len(pieces) == 0:
+                raise ValueError(f"Cannot encode label: {lab}")
+            ids.add(int(pieces[-1]))
+
+        out[lab] = ids
+    return out
+
+
+def find_last_relation_token_step(generated_ids, relation_token_id_sets, target_label=None):
     """
+    在真实生成 token 序列里，找最后一个 relation token 的 step。
+    如果给了 target_label，就只在那个 label 的 token 集合里找。
+    """
+    best = None
+
+    if target_label is not None:
+        target_ids = relation_token_id_sets[target_label]
+        for step_idx, tid in enumerate(generated_ids):
+            tid = int(tid)
+            if tid in target_ids:
+                best = (step_idx, target_label, tid)
+        return best
+
+    id2label = {}
+    for lab, idset in relation_token_id_sets.items():
+        for tid in idset:
+            id2label[int(tid)] = lab
+
+    for step_idx, tid in enumerate(generated_ids):
+        tid = int(tid)
+        if tid in id2label:
+            best = (step_idx, id2label[tid], tid)
+
+    return best
+
+
+@torch.no_grad()
+def analyze_last_relation_step_topk(
+    llava_wrapper,
+    image,
+    prompt,
+    parsed_label,
+    gate=None,
+    max_new_tokens=32,
+    topk=5,
+):
+    """
+    单纯做分析，不改变原始预测定义。
+    - 先重新 generate 一次（deterministic）
+    - 在真实生成 token 里，找到最后一个 relation token step
+    - 取该 step 的完整词表概率
+    - 打印 top-k token
+    """
+    if parsed_label is None:
+        return None
+
     llava_model = llava_wrapper.model
     processor = llava_wrapper.processor
     tokenizer = processor.tokenizer
 
-    if len(prefix_text) > 0 and prefix_text[-1].isspace():
-        suffix_text = continuation_text
-    else:
-        suffix_text = " " + continuation_text
+    relation_token_id_sets = get_relation_token_id_sets(tokenizer)
 
-    cont_ids = tokenizer.encode(suffix_text, add_special_tokens=False)
-    if len(cont_ids) == 0:
-        return float("-1e9")
-
-    full_text = prefix_text + suffix_text
-
-    full_inputs = processor(images=image, text=full_text, padding=True, return_tensors="pt")
-    full_inputs = {
+    inputs = processor(images=image, text=prompt, padding=True, return_tensors="pt")
+    inputs = {
         k: (v.to(DEVICE) if torch.is_tensor(v) else v)
-        for k, v in full_inputs.items()
+        for k, v in inputs.items()
         if v is not None
     }
 
     llava_model._current_soft_gate = gate
     try:
-        outputs = llava_model(**full_inputs)
+        gen_out = llava_model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            return_dict_in_generate=True,
+            output_scores=True,
+            use_cache=True,
+        )
     finally:
         llava_model._current_soft_gate = None
 
-    logits = outputs.logits                # [1, T, V]
-    input_ids = full_inputs["input_ids"]   # [1, T]
+    full_seq = gen_out.sequences[0]
+    prompt_len = inputs["input_ids"].shape[1]
+    generated_ids = full_seq[prompt_len:]
+    analysis_raw_output = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
-    k = len(cont_ids)
-    target_ids = input_ids[:, -k:]         # [1, k]
-    pred_logits = logits[:, -k-1:-1, :]    # [1, k, V]
+    found = find_last_relation_token_step(
+        generated_ids=generated_ids.tolist(),
+        relation_token_id_sets=relation_token_id_sets,
+        target_label=parsed_label,
+    )
 
-    if target_ids.numel() == 0 or pred_logits.numel() == 0 or pred_logits.shape[1] != k:
-        return float("-1e9")
+    if found is None:
+        return {
+            "analysis_raw_output": analysis_raw_output,
+            "matched_step": None,
+            "matched_label": None,
+            "matched_token_id": None,
+            "matched_token_text": None,
+            "matched_prob": None,
+            "topk": [],
+        }
 
-    log_probs = F.log_softmax(pred_logits, dim=-1)
-    gathered = torch.gather(log_probs, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+    step_idx, matched_label, matched_token_id = found
 
-    if gathered.numel() == 0:
-        return float("-1e9")
+    if step_idx >= len(gen_out.scores):
+        return {
+            "analysis_raw_output": analysis_raw_output,
+            "matched_step": step_idx,
+            "matched_label": matched_label,
+            "matched_token_id": matched_token_id,
+            "matched_token_text": tokenizer.decode([matched_token_id], skip_special_tokens=False),
+            "matched_prob": None,
+            "topk": [],
+        }
 
-    score = gathered.mean()
-    if not torch.isfinite(score):
-        return float("-1e9")
+    step_logits = gen_out.scores[step_idx][0].float()
+    step_probs = F.softmax(step_logits, dim=-1)
 
-    return float(score.item())
+    matched_prob = float(step_probs[int(matched_token_id)].item())
 
+    top_vals, top_ids = torch.topk(step_probs, k=min(topk, step_probs.shape[0]))
+    topk_list = []
+    for p, tid in zip(top_vals.tolist(), top_ids.tolist()):
+        token_piece = tokenizer.convert_ids_to_tokens(int(tid))
+        token_text = tokenizer.decode([int(tid)], skip_special_tokens=False)
+        topk_list.append({
+            "token_id": int(tid),
+            "token_piece": str(token_piece),
+            "token_text": str(token_text),
+            "prob": float(p),
+        })
 
-@torch.no_grad()
-def extract_relation_probs_from_output(llava_wrapper, image, prompt, raw_output, gate=None):
-    """
-    从最终自由生成文本里，找到最后一个有效关系表达，
-    然后从它前面的 prefix 出发，对四个关系短语做 continuation sequence scoring。
-    """
-    span = find_selected_relation_span(raw_output)
-    if span is None:
-        return None, None, None
-
-    start, end, matched_label, matched_text = span
-    prefix_before_relation = raw_output[:start]
-    prefix_text = prompt + prefix_before_relation
-
-    rel_scores = {}
-    cand_map = continuation_phrases()
-    for lab in LABELS:
-        rel_scores[lab] = score_text_continuation(
-            llava_wrapper=llava_wrapper,
-            image=image,
-            prefix_text=prefix_text,
-            continuation_text=cand_map[lab],
-            gate=gate,
-        )
-
-    score_vec = np.array([rel_scores[lab] for lab in LABELS], dtype=np.float32)
-    if not np.isfinite(score_vec).all():
-        return None, matched_label, matched_text
-
-    prob_vec = softmax_np(score_vec)
-    if not np.isfinite(prob_vec).all():
-        return None, matched_label, matched_text
-
-    relation_probs = {lab: float(prob_vec[i]) for i, lab in enumerate(LABELS)}
-    return relation_probs, matched_label, matched_text
-
-
-def fuse_two_prob_dicts(prob_a, prob_b):
-    """
-    直接把 baseline 和 local 的四类概率相加，再归一化。
-    """
-    fused = {}
-    for lab in LABELS:
-        fused[lab] = prob_a[lab] + prob_b[lab]
-
-    total = sum(fused.values()) + 1e-12
-    for lab in fused:
-        fused[lab] /= total
-
-    return fused
+    return {
+        "analysis_raw_output": analysis_raw_output,
+        "matched_step": int(step_idx),
+        "matched_label": str(matched_label),
+        "matched_token_id": int(matched_token_id),
+        "matched_token_text": tokenizer.decode([int(matched_token_id)], skip_special_tokens=False),
+        "matched_prob": matched_prob,
+        "topk": topk_list,
+    }
 
 
 # =========================================================
@@ -614,17 +600,11 @@ def main():
     per_gold_total_base = defaultdict(int)
     per_gold_correct_base = defaultdict(int)
 
-    # local stats
-    total_local = 0
-    correct_local = 0
-    per_gold_total_local = defaultdict(int)
-    per_gold_correct_local = defaultdict(int)
-
-    # fused stats
-    total_fused = 0
-    correct_fused = 0
-    per_gold_total_fused = defaultdict(int)
-    per_gold_correct_fused = defaultdict(int)
+    # gated stats
+    total_gate = 0
+    correct_gate = 0
+    per_gold_total_gate = defaultdict(int)
+    per_gold_correct_gate = defaultdict(int)
 
     shown = 0
     num_examples = len(dataset) if MAX_EXAMPLES is None else min(MAX_EXAMPLES, len(dataset))
@@ -647,22 +627,25 @@ def main():
         if not obj1 or not obj2:
             obj1, obj2 = infer_names_from_filename(image_name)
 
-        # 这里继续沿用你原来脚本的 prompt 传法
-        prompt = raw_question
-
         # -------------------------------------------------
-        # baseline: original generation + parse
+        # baseline
         # -------------------------------------------------
         raw_output_base, pred_base = run_one_mode(
             llava_wrapper=llava_wrapper,
             llava_model=llava_model,
             image=image,
-            prompt=prompt,
+            prompt=raw_question,
             gate=None,
         )
 
+        total_base += 1
+        per_gold_total_base[gold] += 1
+        if pred_base == gold:
+            correct_base += 1
+            per_gold_correct_base[gold] += 1
+
         # -------------------------------------------------
-        # local: soft-mask generation + parse
+        # soft-mask suppression
         # -------------------------------------------------
         union_gate = build_union_gate_from_text_tower(
             clip_model=clip_model,
@@ -675,68 +658,19 @@ def main():
             dilate_kernel=DILATE_KERNEL,
         )
 
-        raw_output_local, pred_local = run_one_mode(
+        raw_output_gate, pred_gate = run_one_mode(
             llava_wrapper=llava_wrapper,
             llava_model=llava_model,
             image=image,
-            prompt=prompt,
+            prompt=raw_question,
             gate=union_gate,
         )
 
-        # -------------------------------------------------
-        # fused:
-        # use sequence-level continuation probabilities
-        # around the final parsed relation of each branch
-        # -------------------------------------------------
-        base_probs, base_match_label, base_match_text = extract_relation_probs_from_output(
-            llava_wrapper=llava_wrapper,
-            image=image,
-            prompt=prompt,
-            raw_output=raw_output_base,
-            gate=None,
-        )
-
-        local_probs, local_match_label, local_match_text = extract_relation_probs_from_output(
-            llava_wrapper=llava_wrapper,
-            image=image,
-            prompt=prompt,
-            raw_output=raw_output_local,
-            gate=union_gate,
-        )
-
-        fused_probs = None
-        pred_fused = pred_base if pred_base is not None else pred_local
-
-        if base_probs is not None and local_probs is not None:
-            fused_probs = fuse_two_prob_dicts(base_probs, local_probs)
-            pred_fused = probs_dict_to_pred(fused_probs)
-
-        # -------------------------------------------------
-        # stats: baseline
-        # -------------------------------------------------
-        total_base += 1
-        per_gold_total_base[gold] += 1
-        if pred_base == gold:
-            correct_base += 1
-            per_gold_correct_base[gold] += 1
-
-        # -------------------------------------------------
-        # stats: local
-        # -------------------------------------------------
-        total_local += 1
-        per_gold_total_local[gold] += 1
-        if pred_local == gold:
-            correct_local += 1
-            per_gold_correct_local[gold] += 1
-
-        # -------------------------------------------------
-        # stats: fused
-        # -------------------------------------------------
-        total_fused += 1
-        per_gold_total_fused[gold] += 1
-        if pred_fused == gold:
-            correct_fused += 1
-            per_gold_correct_fused[gold] += 1
+        total_gate += 1
+        per_gold_total_gate[gold] += 1
+        if pred_gate == gold:
+            correct_gate += 1
+            per_gold_correct_gate[gold] += 1
 
         if shown < PRINT_FIRST_N:
             print("=" * 120)
@@ -746,38 +680,79 @@ def main():
             print(f"gold={gold}")
 
             print("[PROMPT]")
-            print(prompt)
+            print(raw_question)
 
             print("[BASELINE RAW OUTPUT]")
             print(raw_output_base)
-            print(f"[BASELINE PARSED PRED] {pred_base}")
-            print(f"[BASELINE MATCHED LABEL] {base_match_label}")
-            print(f"[BASELINE MATCHED TEXT] {base_match_text}")
-            if base_probs is not None:
-                print("[BASELINE SEQ RELATION PROBS]")
-                for lab in LABELS:
-                    print(f"  {lab:>5}: {base_probs[lab]:.4f}")
+            print(f"[BASELINE PRED] {pred_base}")
 
-            print("[LOCAL RAW OUTPUT]")
-            print(raw_output_local)
-            print(f"[LOCAL PARSED PRED] {pred_local}")
-            print(f"[LOCAL MATCHED LABEL] {local_match_label}")
-            print(f"[LOCAL MATCHED TEXT] {local_match_text}")
-            if local_probs is not None:
-                print("[LOCAL SEQ RELATION PROBS]")
-                for lab in LABELS:
-                    print(f"  {lab:>5}: {local_probs[lab]:.4f}")
+            print("[SOFT-MASK RAW OUTPUT]")
+            print(raw_output_gate)
+            print(f"[SOFT-MASK PRED] {pred_gate}")
 
-            if fused_probs is not None:
-                print("[FUSED SEQ PROBS = BASELINE + LOCAL]")
-                for lab in LABELS:
-                    print(f"  {lab:>5}: {fused_probs[lab]:.4f}")
-
-            print(f"[FUSED PRED] {pred_fused}")
             shown += 1
 
+        # -------------------------------------------------
+        # token-prob analysis only for first few samples
+        # -------------------------------------------------
+        if idx < ANALYZE_FIRST_N:
+            base_analysis = analyze_last_relation_step_topk(
+                llava_wrapper=llava_wrapper,
+                image=image,
+                prompt=raw_question,
+                parsed_label=pred_base,
+                gate=None,
+                max_new_tokens=MAX_NEW_TOKENS_ANALYSIS,
+                topk=TOPK,
+            )
+
+            gate_analysis = analyze_last_relation_step_topk(
+                llava_wrapper=llava_wrapper,
+                image=image,
+                prompt=raw_question,
+                parsed_label=pred_gate,
+                gate=union_gate,
+                max_new_tokens=MAX_NEW_TOKENS_ANALYSIS,
+                topk=TOPK,
+            )
+
+            print("-" * 120)
+            print(f"[ANALYSIS idx={idx}] image_name={image_name}")
+
+            print("[BASELINE ANALYSIS RAW OUTPUT]")
+            print(base_analysis["analysis_raw_output"])
+            print(f"[BASELINE MATCHED LABEL] {base_analysis['matched_label']}")
+            print(f"[BASELINE MATCHED STEP] {base_analysis['matched_step']}")
+            print(f"[BASELINE MATCHED TOKEN ID] {base_analysis['matched_token_id']}")
+            print(f"[BASELINE MATCHED TOKEN TEXT] {repr(base_analysis['matched_token_text'])}")
+            print(f"[BASELINE MATCHED TOKEN PROB] {base_analysis['matched_prob']}")
+            print("[BASELINE TOP-5 TOKENS]")
+            for j, item_top in enumerate(base_analysis["topk"], 1):
+                print(
+                    f"  {j}. id={item_top['token_id']:<6d} "
+                    f"piece={repr(item_top['token_piece'])} "
+                    f"text={repr(item_top['token_text'])} "
+                    f"prob={item_top['prob']:.6f}"
+                )
+
+            print("[SOFT-MASK ANALYSIS RAW OUTPUT]")
+            print(gate_analysis["analysis_raw_output"])
+            print(f"[SOFT-MASK MATCHED LABEL] {gate_analysis['matched_label']}")
+            print(f"[SOFT-MASK MATCHED STEP] {gate_analysis['matched_step']}")
+            print(f"[SOFT-MASK MATCHED TOKEN ID] {gate_analysis['matched_token_id']}")
+            print(f"[SOFT-MASK MATCHED TOKEN TEXT] {repr(gate_analysis['matched_token_text'])}")
+            print(f"[SOFT-MASK MATCHED TOKEN PROB] {gate_analysis['matched_prob']}")
+            print("[SOFT-MASK TOP-5 TOKENS]")
+            for j, item_top in enumerate(gate_analysis["topk"], 1):
+                print(
+                    f"  {j}. id={item_top['token_id']:<6d} "
+                    f"piece={repr(item_top['token_piece'])} "
+                    f"text={repr(item_top['token_text'])} "
+                    f"prob={item_top['prob']:.6f}"
+                )
+
     print_stats(
-        "BASELINE_GENERATION_PARSE",
+        "BASELINE",
         total_base,
         correct_base,
         per_gold_total_base,
@@ -785,19 +760,11 @@ def main():
     )
 
     print_stats(
-        "SOFT_MASK_GENERATION_PARSE",
-        total_local,
-        correct_local,
-        per_gold_total_local,
-        per_gold_correct_local,
-    )
-
-    print_stats(
-        "FUSED_SEQUENCE_PROBS_SUM",
-        total_fused,
-        correct_fused,
-        per_gold_total_fused,
-        per_gold_correct_fused,
+        "SOFT_MASK_SUPPRESSION",
+        total_gate,
+        correct_gate,
+        per_gold_total_gate,
+        per_gold_correct_gate,
     )
 
 
