@@ -306,7 +306,11 @@ def main():
         raise ValueError(f"Prompt count ({len(prompt_records)}) != dataset size ({len(dataset)}).")
 
     print(f"Loading LLaVA: {LLAVA_MODEL_ID}")
-    llava_processor = AutoProcessor.from_pretrained(LLAVA_MODEL_ID, cache_dir=CACHE_DIR)
+    llava_processor = AutoProcessor.from_pretrained(
+        LLAVA_MODEL_ID,
+        cache_dir=CACHE_DIR,
+        use_fast=False,
+    )
     llava_model = LlavaForConditionalGeneration.from_pretrained(
         LLAVA_MODEL_ID,
         torch_dtype=DTYPE,
