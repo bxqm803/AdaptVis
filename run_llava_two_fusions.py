@@ -41,8 +41,8 @@ LABELS = ["left", "right", "under", "on"]
 LABEL2ID = {x: i for i, x in enumerate(LABELS)}
 ID2LABEL = {i: x for x, i in LABEL2ID.items()}
 
-# 分数级融合：每个类别单独设 alpha
-# fused_score[c] = alpha[c] * global_score[c] + (1 - alpha[c]) * local_score[c]
+# 概率级融合：
+# fused_prob[c] = alpha[c] * global_prob[c] + (1 - alpha[c]) * local_prob[c]
 ALPHA_BY_CLASS = {
     "left": 0.90,
     "right": 0.90,
@@ -87,6 +87,7 @@ def infer_names_from_filename(image_name):
 
 def parse_objects_from_question(question):
     q = clean_text(question)
+    q = q.replace("<image>", " ").strip()
 
     if "USER:" in q:
         q = q.split("USER:", 1)[1].strip()
@@ -108,9 +109,11 @@ def parse_objects_from_question(question):
     return None, None
 
 
-def build_prompt(question):
-    question = clean_text(question)
-    return f"<image> USER: {question} Answer with left, right, on or under. ASSISTANT:"
+def prepare_repo_prompt(question):
+    q = clean_text(question)
+    if "<image>" in q and "USER:" in q and "ASSISTANT:" in q:
+        return q
+    return f"<image> USER: {q} Answer with left, right, on or under. ASSISTANT:"
 
 
 def normalize_rel(answer):
@@ -184,6 +187,17 @@ def resize_gate_to_num_patches(gate, target_num_patches):
     x = gate.view(gate.shape[0], 1, src_h, src_w)
     x = F.interpolate(x, size=(tgt_h, tgt_w), mode="bilinear", align_corners=False)
     return x.view(gate.shape[0], tgt_h * tgt_w)
+
+
+def softmax_np(x):
+    x = np.asarray(x, dtype=np.float32)
+    x = x - np.max(x)
+    ex = np.exp(x)
+    return ex / (np.sum(ex) + 1e-12)
+
+
+def probs_to_pred(probs):
+    return LABELS[int(np.argmax(probs))]
 
 
 def print_stats(name, total, correct, per_gold_total, per_gold_correct):
@@ -310,7 +324,7 @@ def install_projector_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
 
 
 # =========================================================
-# score helper
+# scoring
 # =========================================================
 @torch.no_grad()
 def score_candidate(llava_wrapper, image, prompt, candidate, gate=None):
@@ -348,6 +362,8 @@ def score_candidate(llava_wrapper, image, prompt, candidate, gate=None):
 
         log_probs = F.log_softmax(pred_logits, dim=-1)
         gathered = torch.gather(log_probs, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+
+        # sum log-prob
         return float(gathered.sum().item())
     finally:
         llava_model._current_soft_gate = None
@@ -361,16 +377,22 @@ def score_branch_4way(llava_wrapper, image, prompt, gate=None):
     return np.array(scores, dtype=np.float32)
 
 
-def fuse_scores(global_scores, local_scores):
-    fused = np.zeros_like(global_scores, dtype=np.float32)
+def fuse_probs(global_scores, local_scores):
+    """
+    方案1：
+    先把每个分支自己的 4 类 raw score -> softmax 概率
+    再按类别做加权融合
+    """
+    global_probs = softmax_np(global_scores)
+    local_probs = softmax_np(local_scores)
+
+    fused_probs = np.zeros_like(global_probs, dtype=np.float32)
     for i, label in enumerate(LABELS):
         alpha = ALPHA_BY_CLASS[label]
-        fused[i] = alpha * global_scores[i] + (1.0 - alpha) * local_scores[i]
-    return fused
+        fused_probs[i] = alpha * global_probs[i] + (1.0 - alpha) * local_probs[i]
 
-
-def scores_to_pred(scores):
-    return LABELS[int(np.argmax(scores))]
+    fused_probs = fused_probs / (np.sum(fused_probs) + 1e-12)
+    return global_probs, local_probs, fused_probs
 
 
 # =========================================================
@@ -438,8 +460,7 @@ def main():
         image = item["image_options"][0].convert("RGB")
         image_name = clean_text(item.get("image_name", f"sample_{idx:04d}"))
         raw_question = clean_text(rec.get("question", ""))
-
-        prompt = raw_question
+        prompt = prepare_repo_prompt(raw_question)
 
         gold = normalize_rel(rec.get("answer", None))
         if gold is None:
@@ -464,11 +485,12 @@ def main():
 
         global_scores = score_branch_4way(llava_wrapper, image, prompt, gate=None)
         local_scores = score_branch_4way(llava_wrapper, image, prompt, gate=union_gate)
-        fused_scores = fuse_scores(global_scores, local_scores)
 
-        pred_g = scores_to_pred(global_scores)
-        pred_l = scores_to_pred(local_scores)
-        pred_f = scores_to_pred(fused_scores)
+        global_probs, local_probs, fused_probs = fuse_probs(global_scores, local_scores)
+
+        pred_g = probs_to_pred(global_probs)
+        pred_l = probs_to_pred(local_probs)
+        pred_f = probs_to_pred(fused_probs)
 
         total_g += 1
         per_gold_total_g[gold] += 1
@@ -497,26 +519,32 @@ def main():
             print("[PROMPT]")
             print(prompt)
 
-            print("[GLOBAL SCORES]")
+            print("[GLOBAL RAW SCORES]")
             for lab, s in zip(LABELS, global_scores):
                 print(f"  {lab:>5}: {s:.4f}")
+            print("[GLOBAL PROBS]")
+            for lab, p in zip(LABELS, global_probs):
+                print(f"  {lab:>5}: {p:.4f}")
             print(f"[GLOBAL PRED] {pred_g}")
 
-            print("[LOCAL SCORES]")
+            print("[LOCAL RAW SCORES]")
             for lab, s in zip(LABELS, local_scores):
                 print(f"  {lab:>5}: {s:.4f}")
+            print("[LOCAL PROBS]")
+            for lab, p in zip(LABELS, local_probs):
+                print(f"  {lab:>5}: {p:.4f}")
             print(f"[LOCAL PRED] {pred_l}")
 
-            print("[FUSED SCORES]")
-            for lab, s in zip(LABELS, fused_scores):
-                print(f"  {lab:>5}: {s:.4f}")
+            print("[FUSED PROBS]")
+            for lab, p in zip(LABELS, fused_probs):
+                print(f"  {lab:>5}: {p:.4f}")
             print(f"[FUSED PRED] {pred_f}")
 
             shown += 1
 
     print_stats("GLOBAL_ONLY", total_g, correct_g, per_gold_total_g, per_gold_correct_g)
     print_stats("LOCAL_ONLY", total_l, correct_l, per_gold_total_l, per_gold_correct_l)
-    print_stats("FUSED_SCORE_LEVEL", total_f, correct_f, per_gold_total_f, per_gold_correct_f)
+    print_stats("FUSED_PROB_LEVEL", total_f, correct_f, per_gold_total_f, per_gold_correct_f)
 
 
 if __name__ == "__main__":
