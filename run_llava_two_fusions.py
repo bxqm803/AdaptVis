@@ -158,7 +158,7 @@ def extract_raw_text(output):
 
 def parse_prediction(text):
     """
-    和你原来 compare 脚本同口径：
+    和原 compare 脚本同口径：
     取最后一个有效关系表达。
     """
     text = clean_text(text).lower()
@@ -695,6 +695,12 @@ def main():
     per_gold_total_gate = defaultdict(int)
     per_gold_correct_gate = defaultdict(int)
 
+    # fused stats
+    total_fused = 0
+    correct_fused = 0
+    per_gold_total_fused = defaultdict(int)
+    per_gold_correct_fused = defaultdict(int)
+
     shown = 0
     num_examples = len(dataset) if MAX_EXAMPLES is None else min(MAX_EXAMPLES, len(dataset))
 
@@ -757,6 +763,52 @@ def main():
             correct_gate += 1
             per_gold_correct_gate[gold] += 1
 
+        # analysis for ALL samples, needed for fused acc
+        base_analysis = analyze_true_generation_anchor_topk(
+            llava_wrapper=llava_wrapper,
+            image=image,
+            prompt=raw_question,
+            gate=None,
+            max_new_tokens=MAX_NEW_TOKENS_ANALYSIS,
+            topk=TOPK,
+        )
+
+        gate_analysis = analyze_true_generation_anchor_topk(
+            llava_wrapper=llava_wrapper,
+            image=image,
+            prompt=raw_question,
+            gate=union_gate,
+            max_new_tokens=MAX_NEW_TOKENS_ANALYSIS,
+            topk=TOPK,
+        )
+
+        fused_analysis = None
+        pred_fused = pred_base if pred_base is not None else pred_gate
+
+        if base_analysis["full_vocab_probs"] is not None and gate_analysis["full_vocab_probs"] is not None:
+            fused_full = fuse_full_vocab_probs(
+                base_analysis["full_vocab_probs"],
+                gate_analysis["full_vocab_probs"],
+                alpha=FUSED_ALPHA,
+            )
+            fused_label_probs = extract_label_probs_from_full_vocab(
+                fused_full, relation_token_id_sets
+            )
+            pred_fused = probs_dict_to_pred(fused_label_probs)
+            fused_topk = topk_from_full_vocab(fused_full, tokenizer, topk=TOPK)
+
+            fused_analysis = {
+                "fused_label_probs": fused_label_probs,
+                "fused_pred": pred_fused,
+                "fused_topk": fused_topk,
+            }
+
+        total_fused += 1
+        per_gold_total_fused[gold] += 1
+        if pred_fused == gold:
+            correct_fused += 1
+            per_gold_correct_fused[gold] += 1
+
         if shown < PRINT_FIRST_N:
             print("=" * 120)
             print(f"idx={idx}")
@@ -777,45 +829,7 @@ def main():
 
             shown += 1
 
-        # analysis for first few samples
         if idx < ANALYZE_FIRST_N:
-            base_analysis = analyze_true_generation_anchor_topk(
-                llava_wrapper=llava_wrapper,
-                image=image,
-                prompt=raw_question,
-                gate=None,
-                max_new_tokens=MAX_NEW_TOKENS_ANALYSIS,
-                topk=TOPK,
-            )
-
-            gate_analysis = analyze_true_generation_anchor_topk(
-                llava_wrapper=llava_wrapper,
-                image=image,
-                prompt=raw_question,
-                gate=union_gate,
-                max_new_tokens=MAX_NEW_TOKENS_ANALYSIS,
-                topk=TOPK,
-            )
-
-            fused_analysis = None
-            if base_analysis["full_vocab_probs"] is not None and gate_analysis["full_vocab_probs"] is not None:
-                fused_full = fuse_full_vocab_probs(
-                    base_analysis["full_vocab_probs"],
-                    gate_analysis["full_vocab_probs"],
-                    alpha=FUSED_ALPHA,
-                )
-                fused_label_probs = extract_label_probs_from_full_vocab(
-                    fused_full, relation_token_id_sets
-                )
-                fused_pred = probs_dict_to_pred(fused_label_probs)
-                fused_topk = topk_from_full_vocab(fused_full, tokenizer, topk=TOPK)
-
-                fused_analysis = {
-                    "fused_label_probs": fused_label_probs,
-                    "fused_pred": fused_pred,
-                    "fused_topk": fused_topk,
-                }
-
             print("-" * 120)
             print(f"[ANALYSIS idx={idx}] image_name={image_name}")
 
@@ -868,6 +882,8 @@ def main():
                         f"text={repr(item_top['token_text'])} "
                         f"prob={item_top['prob']:.6f}"
                     )
+            else:
+                print(f"[FUSED PRED] {pred_fused} (fallback)")
 
     print_stats(
         "BASELINE",
@@ -883,6 +899,14 @@ def main():
         correct_gate,
         per_gold_total_gate,
         per_gold_correct_gate,
+    )
+
+    print_stats(
+        "FUSED_FULLVOCAB",
+        total_fused,
+        correct_fused,
+        per_gold_total_fused,
+        per_gold_correct_fused,
     )
 
 
