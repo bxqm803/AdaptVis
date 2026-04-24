@@ -40,7 +40,6 @@ DILATE_KERNEL = 3
 
 LABELS = ["left", "right", "under", "on"]
 
-# 概率级融合：
 # fused_prob[c] = alpha[c] * global_prob[c] + (1 - alpha[c]) * local_prob[c]
 ALPHA_BY_CLASS = {
     "left": 0.90,
@@ -226,70 +225,6 @@ def parse_prediction(text):
     return None
 
 
-def find_selected_relation_span(text):
-    """
-    和 parse_prediction 同口径：
-    取最后一个有效关系表达
-    返回:
-      (start, end, label, matched_text) or None
-    """
-    raw = str(text)
-    lower = raw.lower()
-
-    phrase_patterns = [
-        (r"\bto the left of\b", "left"),
-        (r"\bto the right of\b", "right"),
-        (r"\bunder\b", "under"),
-        (r"\bon top of\b", "on"),
-        (r"\bon the\b", "on"),
-    ]
-
-    found = []
-    for pat, label in phrase_patterns:
-        for m in re.finditer(pat, lower):
-            found.append((m.start(), m.end(), label, raw[m.start():m.end()]))
-
-    if found:
-        found.sort(key=lambda x: x[0])
-        return found[-1]
-
-    single_patterns = [
-        (r"\bleft\b", "left"),
-        (r"\bright\b", "right"),
-        (r"\bunder\b", "under"),
-        (r"\bon\b", "on"),
-    ]
-    found = []
-    for pat, label in single_patterns:
-        for m in re.finditer(pat, lower):
-            found.append((m.start(), m.end(), label, raw[m.start():m.end()]))
-
-    if found:
-        found.sort(key=lambda x: x[0])
-        return found[-1]
-
-    return None
-
-
-def concat_text(a, b):
-    if len(a) == 0:
-        return b
-    if len(b) == 0:
-        return a
-    if a[-1].isspace() or b[0].isspace():
-        return a + b
-    return a + " " + b
-
-
-def continuation_phrases():
-    return {
-        "left": "to the left of",
-        "right": "to the right of",
-        "under": "under",
-        "on": "on",
-    }
-
-
 def softmax_np(x):
     x = np.asarray(x, dtype=np.float32)
     x = x - np.max(x)
@@ -323,15 +258,15 @@ def get_clip_patch_features(clip_model, clip_processor, image_pil, device):
     pixel_values = image_inputs["pixel_values"].to(device=device, dtype=CLIP_DTYPE)
 
     vision_outputs = clip_model.vision_model(pixel_values=pixel_values, return_dict=True)
-    last_hidden = vision_outputs.last_hidden_state  # [1, 1+N, H]
+    last_hidden = vision_outputs.last_hidden_state
 
     if hasattr(clip_model.vision_model, "vision_model") and hasattr(clip_model.vision_model.vision_model, "post_layernorm"):
         last_hidden = clip_model.vision_model.vision_model.post_layernorm(last_hidden)
     elif hasattr(clip_model.vision_model, "post_layernorm"):
         last_hidden = clip_model.vision_model.post_layernorm(last_hidden)
 
-    patch_tokens = last_hidden[:, 1:, :]  # [1, N, H]
-    patch_proj = clip_model.visual_projection(patch_tokens)  # [1, N, D]
+    patch_tokens = last_hidden[:, 1:, :]
+    patch_proj = clip_model.visual_projection(patch_tokens)
     patch_proj = patch_proj / (patch_proj.norm(dim=-1, keepdim=True) + 1e-6)
     return patch_proj
 
@@ -340,7 +275,7 @@ def get_clip_patch_features(clip_model, clip_processor, image_pil, device):
 def get_clip_text_feature(clip_model, clip_processor, text_phrase, device):
     text_inputs = clip_processor(text=[text_phrase], return_tensors="pt", padding=True)
     text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
-    text_features = clip_model.get_text_features(**text_inputs)  # [1, D]
+    text_features = clip_model.get_text_features(**text_inputs)
     text_features = text_features / (text_features.norm(dim=-1, keepdim=True) + 1e-6)
     return text_features
 
@@ -360,8 +295,8 @@ def build_union_gate_from_text_tower(
     text1 = get_clip_text_feature(clip_model, clip_processor, obj1_name, device)
     text2 = get_clip_text_feature(clip_model, clip_processor, obj2_name, device)
 
-    sims1 = torch.matmul(patch_proj[0], text1[0]).unsqueeze(0)   # [1, N]
-    sims2 = torch.matmul(patch_proj[0], text2[0]).unsqueeze(0)   # [1, N]
+    sims1 = torch.matmul(patch_proj[0], text1[0]).unsqueeze(0)
+    sims2 = torch.matmul(patch_proj[0], text2[0]).unsqueeze(0)
 
     gate1 = normalize_1d_torch(-sims1)
     gate2 = normalize_1d_torch(-sims2)
@@ -390,7 +325,7 @@ def install_projector_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
     original_projector_forward = llava_model.multi_modal_projector.forward
 
     def patched_projector_forward(image_features):
-        feats = original_projector_forward(image_features)  # [B, N, D]
+        feats = original_projector_forward(image_features)
 
         gate = getattr(llava_model, "_current_soft_gate", None)
         if gate is not None:
@@ -424,13 +359,69 @@ def install_projector_patch(llava_wrapper, bg_ratio=0.2, boost=1.0):
 
 
 # =========================================================
-# generation + continuation scoring from selected relation prefix
+# generation + single-word probability extraction
 # =========================================================
+def get_relation_lexical_token_ids(tokenizer):
+    """
+    对每个关系词，收集可能对应的 lexical token ids。
+    使用裸词、带空格、首字母大写、带空格首字母大写四种形式，
+    取各自编码结果的最后一个 token id。
+    """
+    rel_ids = {}
+    for lab in LABELS:
+        cand_forms = [lab, " " + lab, lab.capitalize(), " " + lab.capitalize()]
+        ids = []
+        for form in cand_forms:
+            pieces = tokenizer.encode(form, add_special_tokens=False)
+            if len(pieces) > 0:
+                ids.append(pieces[-1])
+        ids = sorted(set(ids))
+        if len(ids) == 0:
+            raise ValueError(f"Cannot get lexical token ids for label: {lab}")
+        rel_ids[lab] = ids
+    return rel_ids
+
+
+def find_first_relation_word_step(tokenizer, generated_ids):
+    """
+    在自由生成序列里，找到第一次出现单独关系词 left/right/under/on 的那一步。
+    返回:
+        step_idx, matched_label, matched_text
+    """
+    prefix = []
+    for step_idx, tok in enumerate(generated_ids):
+        prefix.append(int(tok))
+        text = tokenizer.decode(prefix, skip_special_tokens=True)
+        lower = text.lower()
+
+        found = []
+        for lab in LABELS:
+            for m in re.finditer(rf"\b{lab}\b", lower):
+                found.append((m.start(), m.end(), lab, text[m.start():m.end()]))
+
+        if found:
+            found.sort(key=lambda x: x[0])
+            _, _, lab, matched = found[-1]
+            return step_idx, lab, matched
+
+    return None, None, None
+
+
 @torch.no_grad()
-def run_free_generation(llava_wrapper, image, prompt, gate=None, max_new_tokens=24):
+def run_generate_and_get_relation_probs(llava_wrapper, image, prompt, gate=None, max_new_tokens=24):
+    """
+    自由生成整句，但提取第一次生成出 left/right/under/on 这个词本身那一步的四类概率。
+    返回:
+        raw_output
+        relation_probs(dict) 或 None
+        matched_label
+        matched_text
+    """
     llava_model = llava_wrapper.model
     processor = llava_wrapper.processor
     tokenizer = processor.tokenizer
+
+    rel_token_ids = get_relation_lexical_token_ids(tokenizer)
 
     inputs = processor(images=image, text=prompt, padding=True, return_tensors="pt")
     inputs = {
@@ -441,110 +432,50 @@ def run_free_generation(llava_wrapper, image, prompt, gate=None, max_new_tokens=
 
     llava_model._current_soft_gate = gate
     try:
-        generated_ids = llava_model.generate(
+        gen_out = llava_model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
+            return_dict_in_generate=True,
+            output_scores=True,
             use_cache=True,
-        )[0]
+        )
     finally:
         llava_model._current_soft_gate = None
 
+    full_seq = gen_out.sequences[0]
     prompt_len = inputs["input_ids"].shape[1]
-    gen_only = generated_ids[prompt_len:]
-    raw_output = tokenizer.decode(gen_only, skip_special_tokens=True).strip()
-    return raw_output
+    generated_ids = full_seq[prompt_len:]
+    raw_output = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
-
-@torch.no_grad()
-def score_text_continuation(llava_wrapper, image, prefix_text, continuation_text, gate=None):
-    """
-    对 continuation_text 做 teacher-forcing continuation 打分
-    返回平均 log-prob（避免长度偏置）
-    """
-    llava_model = llava_wrapper.model
-    processor = llava_wrapper.processor
-
-    full_text = concat_text(prefix_text, continuation_text)
-
-    prefix_inputs = processor(images=image, text=prefix_text, padding=True, return_tensors="pt")
-    prefix_inputs = {
-        k: (v.to(DEVICE) if torch.is_tensor(v) else v)
-        for k, v in prefix_inputs.items()
-        if v is not None
-    }
-    prefix_len = prefix_inputs["input_ids"].shape[1]
-
-    full_inputs = processor(images=image, text=full_text, padding=True, return_tensors="pt")
-    full_inputs = {
-        k: (v.to(DEVICE) if torch.is_tensor(v) else v)
-        for k, v in full_inputs.items()
-        if v is not None
-    }
-
-    llava_model._current_soft_gate = gate
-    try:
-        outputs = llava_model(**full_inputs)
-    finally:
-        llava_model._current_soft_gate = None
-
-    logits = outputs.logits                # [1, T, V]
-    input_ids = full_inputs["input_ids"]   # [1, T]
-
-    target_ids = input_ids[:, prefix_len:]            # continuation token ids
-    pred_logits = logits[:, prefix_len - 1:-1, :]     # aligned next-token logits
-
-    log_probs = F.log_softmax(pred_logits, dim=-1)
-    gathered = torch.gather(log_probs, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
-
-    # 用平均 log-prob，减少长度偏置
-    return float(gathered.mean().item())
-
-
-@torch.no_grad()
-def run_generate_and_get_relation_probs(llava_wrapper, image, prompt, gate=None, max_new_tokens=24):
-    """
-    先自由生成整句，再找到最终选中的关系短语位置，
-    从“关系短语前缀”出发，对四个关系短语做 continuation 打分。
-    返回:
-        raw_output
-        relation_probs(dict) 或 None
-        matched_label
-        matched_text
-    """
-    raw_output = run_free_generation(
-        llava_wrapper=llava_wrapper,
-        image=image,
-        prompt=prompt,
-        gate=gate,
-        max_new_tokens=max_new_tokens,
+    step_idx, matched_label, matched_text = find_first_relation_word_step(
+        tokenizer, generated_ids.tolist()
     )
 
-    span = find_selected_relation_span(raw_output)
-    if span is None:
+    if step_idx is None:
         return raw_output, None, None, None
 
-    start, end, matched_label, matched_text = span
-    prefix_before_relation = raw_output[:start]
+    step_logits = gen_out.scores[step_idx][0]
+    step_probs = F.softmax(step_logits.float(), dim=-1)
 
-    prefix_text = prompt + prefix_before_relation
-
-    rel_scores = {}
-    cand_map = continuation_phrases()
+    rel_probs = {}
+    total = 0.0
     for lab in LABELS:
-        rel_scores[lab] = score_text_continuation(
-            llava_wrapper=llava_wrapper,
-            image=image,
-            prefix_text=prefix_text,
-            continuation_text=cand_map[lab],
-            gate=gate,
-        )
+        tok_ids = rel_token_ids[lab]
+        p = 0.0
+        for tid in tok_ids:
+            p += float(step_probs[tid].item())
+        rel_probs[lab] = p
+        total += p
 
-    score_vec = np.array([rel_scores[lab] for lab in LABELS], dtype=np.float32)
-    prob_vec = softmax_np(score_vec)
+    total = max(total, 1e-12)
+    for lab in rel_probs:
+        rel_probs[lab] /= total
 
-    relation_probs = {lab: float(prob_vec[i]) for i, lab in enumerate(LABELS)}
-    return raw_output, relation_probs, matched_label, matched_text
+    if not np.isfinite(np.array(list(rel_probs.values()), dtype=np.float32)).all():
+        return raw_output, None, matched_label, matched_text
+
+    return raw_output, rel_probs, matched_label, matched_text
 
 
 def fuse_relation_probs(global_probs, local_probs, alpha_by_class):
@@ -739,7 +670,7 @@ def main():
 
     print_stats("GLOBAL_ONLY", total_g, correct_g, per_gold_total_g, per_gold_correct_g)
     print_stats("LOCAL_ONLY", total_l, correct_l, per_gold_total_l, per_gold_correct_l)
-    print_stats("FUSED_PROB_STEP", total_f, correct_f, per_gold_total_f, per_gold_correct_f)
+    print_stats("FUSED_PROB_WORDSTEP", total_f, correct_f, per_gold_total_f, per_gold_correct_f)
 
 
 if __name__ == "__main__":
