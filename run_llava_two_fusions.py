@@ -439,7 +439,7 @@ def main():
         image_name = clean_text(item.get("image_name", f"sample_{idx:04d}"))
         raw_question = clean_text(rec.get("question", ""))
 
-        prompt = build_prompt(raw_question)
+        prompt = raw_question
 
         gold = normalize_rel(rec.get("answer", None))
         if gold is None:
