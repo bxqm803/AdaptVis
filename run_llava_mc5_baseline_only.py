@@ -4,7 +4,7 @@ import csv
 import json
 import argparse
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from tqdm import tqdm
 
@@ -29,7 +29,7 @@ def parse_args():
     p.add_argument("--sample-index", default=0, type=int)
     p.add_argument("--limit", default=-1, type=int)
     p.add_argument("--cache-dir", default=None, type=str)
-    p.add_argument("--out-dir", default="./output_llava_mc5_baseline_only", type=str)
+    p.add_argument("--out-dir", default="./output_llava_mc5_on_only", type=str)
     p.add_argument("--model-name", default="llava1.5", type=str)
     p.add_argument("--method", default="base", type=str)
     p.add_argument("--print-first-n", default=10, type=int)
@@ -165,11 +165,11 @@ def parse_prediction_generic(text: str) -> str:
     return "UNK"
 
 
-def parse_prediction_mc(raw_output: str, prompt_id: int) -> str:
+def parse_prediction_mc(raw_output: str, template_id: int) -> str:
     t = clean_text(raw_output)
 
-    # Prompt 3: A/B/C/D format
-    if prompt_id == 3:
+    # A/B/C/D format
+    if template_id == 3:
         m = re.search(r"\b([ABCD])\b", t, flags=re.IGNORECASE)
         if m:
             ch = m.group(1).upper()
@@ -180,14 +180,10 @@ def parse_prediction_mc(raw_output: str, prompt_id: int) -> str:
                 "D": "on",
             }[ch]
 
-    # fallback: parse natural-language output or direct label word
     return parse_prediction_generic(t)
 
 
 def build_mc_prompts(base_question: str) -> Dict[int, str]:
-    """
-    Uses only the 5 multiple-choice / closed-answer variants.
-    """
     stem = strip_existing_answer_clause(base_question)
     if not stem.endswith("?"):
         stem = stem.rstrip(".") + "?"
@@ -196,7 +192,7 @@ def build_mc_prompts(base_question: str) -> Dict[int, str]:
         1: f"<image> USER: {stem} Answer with only one word: left, right, under, or on. ASSISTANT:",
         2: f"<image> USER: {stem} Output exactly one label from: left, right, under, on. Do not output anything else. ASSISTANT:",
         3: f"<image> USER: {stem} Choose one option only. A. left B. right C. under D. on. Answer with only A, B, C, or D. ASSISTANT:",
-        4: f"<image> USER: Which of the following best describes the relation asked in this question? {stem} Options: left, right, under, on. Answer with only one word. ASSISTANT:",
+        4: f"<image> USER: Which of the following best describes the relation of the first object to the second? {stem} Options: left, right, under, on. Answer with only one word. ASSISTANT:",
         5: f"<image> USER: Select the correct relation for this question: {stem} Choices: left, right, under, on. Respond with only the chosen word. ASSISTANT:",
     }
     return prompts
@@ -233,19 +229,20 @@ def build_summary_fieldnames() -> List[str]:
     ]
 
 
-def print_stats(name: str, total: int, correct: int,
-                per_gold_total: Dict[str, int],
-                per_gold_correct: Dict[str, int]):
+def print_stats_on_subset(
+    name: str,
+    total: int,
+    correct: int,
+    pred_counter: Dict[str, int],
+):
     print("=" * 120)
     print(f"[{name}]")
     print(f"total = {total}")
     print(f"correct = {correct}")
     print(f"overall_acc = {correct / total:.4f}" if total > 0 else "overall_acc = N/A")
-    for rel in ["left", "right", "under", "on"]:
-        n = per_gold_total[rel]
-        c = per_gold_correct[rel]
-        acc = 0.0 if n == 0 else c / n
-        print(f"{rel}_acc = {acc:.4f} ({c}/{n})")
+    print("prediction_count:")
+    for lab in ["left", "right", "under", "on", "UNK"]:
+        print(f"  {lab}: {pred_counter[lab]}")
 
 
 def write_summary_txt(
@@ -255,7 +252,7 @@ def write_summary_txt(
     reports: Dict[int, Dict[str, Any]],
 ):
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write("LLaVA multiple-choice baseline summary\n")
+        f.write("LLaVA multiple-choice baseline summary (gold=on only)\n")
         f.write("=" * 100 + "\n\n")
 
         f.write("Prompt templates\n")
@@ -263,7 +260,7 @@ def write_summary_txt(
         for pid in sorted(prompt_templates):
             f.write(f"[Template {pid}]\n{prompt_templates[pid]}\n\n")
 
-        f.write("\nFirst 10 examples x 5 prompts\n")
+        f.write("\nFirst printed examples\n")
         f.write("-" * 100 + "\n")
         for row in first10_rows:
             f.write(f"local_index: {row['local_index']}\n")
@@ -275,7 +272,7 @@ def write_summary_txt(
             f.write(f"raw_output: {row['raw_output']}\n")
             f.write("-" * 100 + "\n")
 
-        f.write("\nPer-template metrics\n")
+        f.write("\nPer-template metrics (gold=on only)\n")
         f.write("-" * 100 + "\n")
         for pid in sorted(reports):
             r = reports[pid]
@@ -283,11 +280,9 @@ def write_summary_txt(
             f.write(f"total = {r['total']}\n")
             f.write(f"correct = {r['correct']}\n")
             f.write(f"overall_acc = {r['overall_acc']:.4f}\n")
-            for rel in ["left", "right", "under", "on"]:
-                f.write(
-                    f"{rel}_acc = {r[f'{rel}_acc']:.4f} "
-                    f"({r[f'{rel}_correct']}/{r[f'{rel}_total']})\n"
-                )
+            f.write("prediction_count:\n")
+            for lab in ["left", "right", "under", "on", "UNK"]:
+                f.write(f"  {lab}: {r['pred_counter'][lab]}\n")
             f.write("\n")
 
 
@@ -317,7 +312,6 @@ def main():
 
     dataset = get_dataset(args.dataset, image_preprocess=image_preprocess, download=args.download)
 
-    # Strictly use repo's prompt-record loading path
     prompt_records, sampled_indices = wrapper.load_prompt_records_with_sampling(args.dataset, args.option)
     if sampled_indices is not None:
         import torch
@@ -329,23 +323,22 @@ def main():
     start = args.sample_index
     end = len(prompt_records) if args.limit < 0 else min(len(prompt_records), start + args.limit)
 
-    out_root = os.path.join(args.out_dir, args.dataset, "llava1.5_repo_mc5_baseline")
+    out_root = os.path.join(args.out_dir, args.dataset, "llava1.5_repo_mc5_on_only")
     ensure_dir(out_root)
 
-    summary_csv = os.path.join(out_root, "summary_mc5_baseline.csv")
-    summary_txt = os.path.join(out_root, "summary_mc5_baseline.txt")
-    report_json = os.path.join(out_root, "report_mc5_baseline.json")
+    summary_csv = os.path.join(out_root, "summary_mc5_on_only.csv")
+    summary_txt = os.path.join(out_root, "summary_mc5_on_only.txt")
+    report_json = os.path.join(out_root, "report_mc5_on_only.json")
 
     rows: List[Dict[str, Any]] = []
     first10_rows: List[Dict[str, Any]] = []
 
-    # stats per template
+    # stats per template, but only for gold=on subset
     total_by_template = defaultdict(int)
     correct_by_template = defaultdict(int)
-    per_gold_total = {pid: defaultdict(int) for pid in range(1, 6)}
-    per_gold_correct = {pid: defaultdict(int) for pid in range(1, 6)}
+    pred_counter_by_template = {pid: defaultdict(int) for pid in range(1, 6)}
 
-    shown = 0
+    shown_examples = 0
     prompt_templates_cache = None
 
     for local_idx in tqdm(range(start, end), desc="examples"):
@@ -360,11 +353,15 @@ def main():
         gold = normalize_rel(rec.get("answer", None))
         if gold is None:
             gold = relation_from_image_name(image_name)
-        if gold is None:
+
+        # only keep gold=on
+        if gold != "on":
             continue
 
         prompt_templates = build_mc_prompts(raw_question)
         prompt_templates_cache = prompt_templates
+
+        example_rows = []
 
         for template_id, prompt_text in prompt_templates.items():
             raw_output = run_repo_llava_once(wrapper, image, prompt_text)
@@ -385,26 +382,27 @@ def main():
                 "raw_output": raw_output,
             }
             rows.append(row)
+            example_rows.append(row)
 
             total_by_template[template_id] += 1
-            per_gold_total[template_id][gold] += 1
+            pred_counter_by_template[template_id][pred] += 1
             if correct:
                 correct_by_template[template_id] += 1
-                per_gold_correct[template_id][gold] += 1
 
-            if local_idx < start + args.print_first_n:
-                first10_rows.append(row)
-
-        if shown < args.print_first_n:
+        if shown_examples < args.print_first_n:
             print("=" * 120)
             print(f"idx={local_idx}")
             print(f"image_name: {image_name}")
             print(f"gold={gold}")
-            for template_id in range(1, 6):
-                last_row = rows[-(6 - template_id)]
-                print(f"[TEMPLATE {template_id} PRED] {last_row['pred']}")
-                print(f"[TEMPLATE {template_id} RAW OUTPUT] {last_row['raw_output']}")
-            shown += 1
+            print(f"raw_question: {clean_question_text(raw_question)}")
+            for row in example_rows:
+                print("-" * 80)
+                print(f"[TEMPLATE {row['template_id']}]")
+                print(f"[PROMPT] {row['prompt_text']}")
+                print(f"[RAW OUTPUT] {row['raw_output']}")
+                print(f"[PRED] {row['pred']}")
+                first10_rows.append(row)
+            shown_examples += 1
 
     # save csv
     with open(summary_csv, "w", newline="", encoding="utf-8") as f:
@@ -417,19 +415,15 @@ def main():
     for pid in range(1, 6):
         total = total_by_template[pid]
         correct = correct_by_template[pid]
+        pred_counter = {lab: pred_counter_by_template[pid][lab] for lab in ["left", "right", "under", "on", "UNK"]}
         report = {
             "template_id": pid,
             "template_text": prompt_templates_cache[pid] if prompt_templates_cache is not None else "",
             "total": total,
             "correct": correct,
             "overall_acc": 0.0 if total == 0 else correct / total,
+            "pred_counter": pred_counter,
         }
-        for rel in ["left", "right", "under", "on"]:
-            n = per_gold_total[pid][rel]
-            c = per_gold_correct[pid][rel]
-            report[f"{rel}_total"] = n
-            report[f"{rel}_correct"] = c
-            report[f"{rel}_acc"] = 0.0 if n == 0 else c / n
         reports[pid] = report
 
     with open(report_json, "w", encoding="utf-8") as f:
@@ -446,14 +440,12 @@ def main():
     print(f"Saved summary txt to: {summary_txt}")
     print(f"Saved report json to: {report_json}")
 
-    # print 5 prompts x 4 label acc
     for pid in range(1, 6):
-        print_stats(
-            f"TEMPLATE_{pid}",
+        print_stats_on_subset(
+            f"TEMPLATE_{pid}_GOLD_ON_ONLY",
             reports[pid]["total"],
             reports[pid]["correct"],
-            {k: reports[pid][f"{k}_total"] for k in ["left", "right", "under", "on"]},
-            {k: reports[pid][f"{k}_correct"] for k in ["left", "right", "under", "on"]},
+            reports[pid]["pred_counter"],
         )
 
 
