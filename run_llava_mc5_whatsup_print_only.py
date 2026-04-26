@@ -7,7 +7,7 @@ import argparse
 import tempfile
 from pathlib import Path
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
@@ -29,10 +29,9 @@ def parse_args():
     p.add_argument("--cache-dir", default=None, type=str)
     p.add_argument("--out-dir", default="./output_vlm_mc_open", type=str)
 
-    # llava1.5 / instructblip / qwen-vl-chat
     p.add_argument("--model-name", default="llava1.5", type=str)
     p.add_argument("--model-id", default=None, type=str)
-    p.add_argument("--method", default="base", type=str, help="Only used by repo LLaVA wrapper.")
+    p.add_argument("--method", default="base", type=str)
     p.add_argument("--task", default="both", choices=["mc", "open", "both"], type=str)
 
     p.add_argument("--max-new-tokens", default=64, type=int)
@@ -42,7 +41,7 @@ def parse_args():
 
 
 # =========================================================
-# text / label utils
+# text utils
 # =========================================================
 def clean_text(x: Any) -> str:
     x = "" if x is None else str(x)
@@ -61,9 +60,12 @@ def clean_question_text(question: str) -> str:
 
 def strip_existing_answer_clause(question_text: str) -> str:
     q = clean_question_text(question_text)
+
     patterns = [
         r"Answer with\s+left,\s*right,\s*on\s+or\s+under(?:\s+only)?\.?\s*$",
+        r"Answer with\s+left,\s*right,\s*above\s+or\s+below(?:\s+only)?\.?\s*$",
         r"Answer with\s+left,\s*right,\s*in-front\s+or\s+behind(?:\s+only)?\.?\s*$",
+        r"Answer with\s+left,\s*right,\s*in front\s+or\s+behind(?:\s+only)?\.?\s*$",
         r"Answer with\s+only\s+one\s+word:.*$",
         r"Output exactly one label from:.*$",
         r"Choose one option only\..*$",
@@ -72,9 +74,36 @@ def strip_existing_answer_clause(question_text: str) -> str:
         r"Respond with only.*$",
         r"Do not output anything else\.?\s*$",
     ]
+
     for pat in patterns:
         q = re.sub(pat, "", q, flags=re.IGNORECASE)
+
     return re.sub(r"\s+", " ", q).strip()
+
+
+def normalize_object_name(x: str) -> str:
+    x = clean_text(x)
+    x = re.sub(r"[?.!,;:]+$", "", x)
+    x = re.sub(r"\s+", " ", x).strip()
+    return x
+
+
+def parse_objects_from_question(question: str) -> Tuple[Optional[str], Optional[str]]:
+    q = strip_existing_answer_clause(question)
+
+    patterns = [
+        r"Where is the (.+?) in relation to the (.+?)\?",
+        r"Where are the (.+?) in relation to the (.+?)\?",
+        r"Where is (.+?) in relation to (.+?)\?",
+        r"Where are (.+?) in relation to (.+?)\?",
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, q, flags=re.IGNORECASE)
+        if m:
+            return normalize_object_name(m.group(1)), normalize_object_name(m.group(2))
+
+    return None, None
 
 
 def labels_for_dataset(dataset_name: str) -> List[str]:
@@ -124,6 +153,7 @@ def relation_from_image_name(image_name: str) -> Optional[str]:
         return "on"
     if "_under_" in stem:
         return "under"
+
     return None
 
 
@@ -196,16 +226,23 @@ def build_mc_prompts(base_question: str, valid_labels: List[str]) -> Dict[int, s
 
 
 def build_open_prompts(base_question: str) -> Dict[int, str]:
-    stem = strip_existing_answer_clause(base_question)
-    if not stem.endswith("?"):
-        stem = stem.rstrip(".") + "?"
+    obj1, obj2 = parse_objects_from_question(base_question)
+
+    if obj1 is None or obj2 is None:
+        return {
+            1: "Describe the spatial relation between the two queried objects.",
+            2: "Describe where the first object is located relative to the second object.",
+            3: "In one short sentence, describe the spatial relation between the two objects.",
+            4: "State the relative position of the first object with respect to the second object.",
+            5: "Describe how the first object is positioned relative to the second object.",
+        }
 
     return {
-        1: stem,
-        2: f"Describe the spatial relation in this image in one short sentence. Question: {stem}",
-        3: f"What is the relation between the two queried objects? Answer naturally. Question: {stem}",
-        4: f"State the relation in a short phrase. Question: {stem}",
-        5: f"Describe how the first queried object is positioned relative to the second queried object. Question: {stem}",
+        1: f"Describe the spatial relation between the {obj1} and the {obj2}.",
+        2: f"Describe where the {obj1} is located relative to the {obj2}.",
+        3: f"In one short sentence, describe the spatial relation between the {obj1} and the {obj2}.",
+        4: f"State the relative position of the {obj1} with respect to the {obj2}.",
+        5: f"Describe how the {obj1} is positioned relative to the {obj2}.",
     }
 
 
@@ -218,6 +255,7 @@ def format_prompt_for_llava(prompt_text: str) -> str:
 # =========================================================
 def load_prompt_records(dataset_name: str, option: str) -> List[Dict[str, Any]]:
     prompt_path = Path("prompts") / f"{dataset_name}_with_answer_{option}_options.jsonl"
+
     if not prompt_path.exists():
         raise FileNotFoundError(f"Prompt file not found: {prompt_path}")
 
@@ -226,6 +264,7 @@ def load_prompt_records(dataset_name: str, option: str) -> List[Dict[str, Any]]:
         for line in f:
             if line.strip():
                 records.append(json.loads(line))
+
     return records
 
 
@@ -288,7 +327,15 @@ class InstructBLIPRunner(BaseRunner):
         model_id = args.model_id or "Salesforce/instructblip-vicuna-7b"
         print(f"Loading InstructBLIP: {model_id}")
 
-        self.processor = InstructBlipProcessor.from_pretrained(model_id, cache_dir=args.cache_dir)
+        # Key fix:
+        # use_fast=False avoids:
+        # Exception: data did not match any variant of untagged enum ModelWrapper
+        self.processor = InstructBlipProcessor.from_pretrained(
+            model_id,
+            cache_dir=args.cache_dir,
+            use_fast=False,
+        )
+
         dtype = torch.float16 if args.device.startswith("cuda") else torch.float32
 
         self.model = InstructBlipForConditionalGeneration.from_pretrained(
@@ -304,6 +351,7 @@ class InstructBLIPRunner(BaseRunner):
     @torch.no_grad()
     def generate(self, image: Image.Image, image_path: str, prompt_text: str) -> str:
         inputs = self.processor(images=image, text=prompt_text, return_tensors="pt")
+
         dev = next(self.model.parameters()).device
         inputs = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in inputs.items()}
 
@@ -357,10 +405,12 @@ class QwenVLChatRunner(BaseRunner):
     @torch.no_grad()
     def generate(self, image: Image.Image, image_path: str, prompt_text: str) -> str:
         img_path = self._ensure_image_path(image, image_path)
+
         query = self.tokenizer.from_list_format([
             {"image": img_path},
             {"text": prompt_text},
         ])
+
         response, _ = self.model.chat(self.tokenizer, query=query, history=None)
         return clean_text(response)
 
@@ -448,9 +498,7 @@ def run_task(args, runner: BaseRunner, dataset, prompt_records, start: int, end:
     per_gold_total = {pid: defaultdict(int) for pid in range(1, 6)}
     per_gold_correct = {pid: defaultdict(int) for pid in range(1, 6)}
 
-    # 每个 task 独立打印：4 类 × 每类 3 个 = 12 个 example
     printed_by_gold = defaultdict(int)
-
     rows = []
 
     with open(result_jsonl, "w", encoding="utf-8") as fj:
