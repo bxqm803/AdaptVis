@@ -218,6 +218,16 @@ def write_summary_txt(
                 f"({report[f'{rel}_correct']}/{report[f'{rel}_total']})\n"
             )
 
+def run_repo_llava_once(wrapper, image, prompt: str) -> str:
+    return extract_raw_text(
+        wrapper.run_single_prompt(
+            image=image,
+            prompt=prompt,
+            method="base",
+            weight=None,
+        )
+    ).strip()
+
 
 # =========================================================
 # main
