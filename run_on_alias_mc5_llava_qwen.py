@@ -32,7 +32,6 @@ def parse_args():
     p.add_argument("--seed", default=1, type=int)
     p.add_argument("--sample-index", default=0, type=int)
     p.add_argument("--limit", default=-1, type=int)
-    p.add_argument("--print-first-n", default=5, type=int)
     p.add_argument("--cache-dir", default=None, type=str)
     p.add_argument("--out-dir", default="./output_on_alias_mc5", type=str)
 
