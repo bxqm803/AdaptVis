@@ -32,7 +32,7 @@ def parse_args():
     p.add_argument("--seed", default=1, type=int)
     p.add_argument("--sample-index", default=0, type=int)
     p.add_argument("--limit", default=-1, type=int)
-
+    p.add_argument("--print-first-n", default=5, type=int)
     p.add_argument("--cache-dir", default=None, type=str)
     p.add_argument("--out-dir", default="./output_on_alias_mc5", type=str)
 
@@ -412,7 +412,6 @@ def main():
 
     args.cache_dir = args.cache_dir or f"/ddnB/work/{os.environ.get('USER', 'user')}/hf_cache"
     os.makedirs(args.cache_dir, exist_ok=True)
-    os.makedirs(args.out_dir, exist_ok=True)
 
     os.environ.setdefault("HF_HOME", args.cache_dir)
     os.environ.setdefault("HF_HUB_CACHE", os.path.join(args.cache_dir, "hub"))
@@ -446,156 +445,104 @@ def main():
     start = args.sample_index
     end = len(prompt_records) if args.limit < 0 else min(len(prompt_records), start + args.limit)
 
-    out_root = (
-        Path(args.out_dir)
-        / args.dataset
-        / safe_model_tag(args)
-        / f"mc5_on_only_alias_{safe_alias_tag(args)}"
-    )
-    out_root.mkdir(parents=True, exist_ok=True)
-
-    result_csv = out_root / "results.csv"
-    result_jsonl = out_root / "results.jsonl"
-    summary_json = out_root / "summary.json"
-
     total_by_template = defaultdict(int)
     correct_by_template = defaultdict(int)
     pred_counter_by_template = {pid: defaultdict(int) for pid in range(1, 6)}
 
-    rows = []
-    printed = 0
-    total_on_samples = 0
+    printed_examples = 0
+    max_print_examples = 5
+    total_gold_on_samples = 0
 
-    with open(result_jsonl, "w", encoding="utf-8") as fj:
-        for local_idx in tqdm(range(start, end), desc="on-only mc5 examples"):
-            rec = prompt_records[local_idx]
-            item = dataset[local_idx]
+    print("=" * 120)
+    print(
+        f"RUNNING ON-ONLY MC5 | dataset={args.dataset} | "
+        f"model={args.model_name} | on_alias={alias_text(args)}"
+    )
+    print("=" * 120)
 
-            image_name = clean_text(item.get("image_name", f"sample_{local_idx:04d}"))
-            image_path = clean_text(item.get("image_path", ""))
-            image = item["image_options"][0].convert("RGB")
+    for local_idx in tqdm(range(start, end), desc="on-only mc5 examples"):
+        rec = prompt_records[local_idx]
+        item = dataset[local_idx]
 
-            raw_question = rec["question"]
+        image_name = clean_text(item.get("image_name", f"sample_{local_idx:04d}"))
+        image_path = clean_text(item.get("image_path", ""))
+        image = item["image_options"][0].convert("RGB")
 
-            gold = normalize_rel(rec.get("answer", None))
-            if gold is None:
-                gold = relation_from_image_name(image_name)
+        raw_question = rec["question"]
 
-            # Only evaluate gold=on.
-            if gold != "on":
-                continue
+        gold = normalize_rel(rec.get("answer", None))
+        if gold is None:
+            gold = relation_from_image_name(image_name)
 
-            total_on_samples += 1
-            prompt_templates = build_mc_prompts_on_alias(raw_question, args)
-            example_rows = []
+        if gold != "on":
+            continue
 
-            for template_id, prompt_text in prompt_templates.items():
-                raw_output = runner.generate(image, image_path, prompt_text)
-                pred = parse_prediction_mc(raw_output, template_id, args)
-                correct = pred == "on"
+        total_gold_on_samples += 1
+        prompt_templates = build_mc_prompts_on_alias(raw_question, args)
 
-                row = {
-                    "model_name": args.model_name,
-                    "model_id": args.model_id or "",
-                    "dataset": args.dataset,
-                    "on_alias": alias_text(args),
-                    "template_id": template_id,
-                    "local_index": local_idx,
-                    "image_name": image_name,
-                    "image_path": image_path,
-                    "gold": "on",
-                    "pred": pred,
-                    "correct": correct,
-                    "raw_question": clean_question_text(raw_question),
-                    "prompt_text": prompt_text,
-                    "raw_output": raw_output,
-                }
+        example_rows = []
 
-                rows.append(row)
-                example_rows.append(row)
-                fj.write(json.dumps(row, ensure_ascii=False) + "\n")
+        for template_id, prompt_text in prompt_templates.items():
+            raw_output = runner.generate(image, image_path, prompt_text)
+            pred = parse_prediction_mc(raw_output, template_id, args)
+            correct = pred == "on"
 
-                total_by_template[template_id] += 1
-                pred_counter_by_template[template_id][pred] += 1
-                if correct:
-                    correct_by_template[template_id] += 1
+            total_by_template[template_id] += 1
+            pred_counter_by_template[template_id][pred] += 1
 
-            if printed < args.print_first_n:
-                printed += 1
-                print("=" * 120)
-                print(f"[ON EXAMPLE {printed}/{args.print_first_n}]")
-                print(f"idx={local_idx}")
-                print(f"image_name={image_name}")
-                print(f"gold=on")
-                print(f"on_alias={alias_text(args)}")
-                print(f"[RAW QUESTION] {clean_question_text(raw_question)}")
-                for row in example_rows:
-                    print("-" * 80)
-                    print(f"[TEMPLATE {row['template_id']}]")
-                    print(f"[PROMPT] {row['prompt_text']}")
-                    print(f"[RAW OUTPUT] {row['raw_output']}")
-                    print(f"[PRED] {row['pred']}")
+            if correct:
+                correct_by_template[template_id] += 1
 
-    if rows:
-        with open(result_csv, "w", newline="", encoding="utf-8") as fc:
-            writer = csv.DictWriter(fc, fieldnames=list(rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(rows)
+            example_rows.append({
+                "template_id": template_id,
+                "prompt_text": prompt_text,
+                "raw_output": raw_output,
+                "pred": pred,
+                "correct": correct,
+            })
 
-    reports = {}
-    for pid in range(1, 6):
-        total = total_by_template[pid]
-        correct = correct_by_template[pid]
-        pred_counter = {
-            lab: pred_counter_by_template[pid][lab]
-            for lab in ["left", "right", "under", "on", "UNK"]
-        }
+        if printed_examples < max_print_examples:
+            printed_examples += 1
 
-        reports[str(pid)] = {
-            "template_id": pid,
-            "total_on_examples": total,
-            "correct_as_on": correct,
-            "on_acc": 0.0 if total == 0 else correct / total,
-            "pred_counter": pred_counter,
-        }
+            print("\n" + "=" * 120)
+            print(f"[ON EXAMPLE {printed_examples}/{max_print_examples}]")
+            print(f"idx={local_idx}")
+            print(f"image_name={image_name}")
+            print("gold=on")
+            print(f"on_alias={alias_text(args)}")
+            print(f"[RAW QUESTION] {clean_question_text(raw_question)}")
 
-    with open(summary_json, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "model_name": args.model_name,
-                "model_id": args.model_id,
-                "dataset": args.dataset,
-                "on_alias": alias_text(args),
-                "start": start,
-                "end": end,
-                "total_gold_on_samples": total_on_samples,
-                "result_csv": str(result_csv),
-                "result_jsonl": str(result_jsonl),
-                "reports": reports,
-            },
-            f,
-            indent=2,
-            ensure_ascii=False,
-        )
+            for row in example_rows:
+                print("-" * 80)
+                print(f"[TEMPLATE {row['template_id']}]")
+                print(f"[RAW PROMPT] {row['prompt_text']}")
+                print(f"[RAW OUTPUT] {row['raw_output']}")
+                print(f"[PRED] {row['pred']}")
+                print(f"[CORRECT] {row['correct']}")
 
     print("\n" + "#" * 120)
     print(
-        f"FINAL RESULTS | MC5 ON-ONLY | dataset={args.dataset} "
-        f"| model={args.model_name} | on_alias={alias_text(args)}"
+        f"FINAL RESULTS | MC5 ON-ONLY | dataset={args.dataset} | "
+        f"model={args.model_name} | on_alias={alias_text(args)}"
     )
     print("#" * 120)
 
-    for pid in range(1, 6):
-        print_stats(
-            f"TEMPLATE_{pid}",
-            reports[str(pid)]["total_on_examples"],
-            reports[str(pid)]["correct_as_on"],
-            reports[str(pid)]["pred_counter"],
-        )
+    print(f"total_gold_on_samples = {total_gold_on_samples}")
 
-    print(f"Saved csv to: {result_csv}")
-    print(f"Saved jsonl to: {result_jsonl}")
-    print(f"Saved summary to: {summary_json}")
+    for pid in range(1, 6):
+        total = total_by_template[pid]
+        correct = correct_by_template[pid]
+        acc = 0.0 if total == 0 else correct / total
+
+        print("=" * 120)
+        print(f"[TEMPLATE {pid}]")
+        print(f"total = {total}")
+        print(f"correct = {correct}")
+        print(f"on_acc = {acc:.4f}" if total > 0 else "on_acc = N/A")
+
+        print("prediction_count:")
+        for lab in ["left", "right", "under", "on", "UNK"]:
+            print(f"  {lab}: {pred_counter_by_template[pid][lab]}")
 
 
 if __name__ == "__main__":
