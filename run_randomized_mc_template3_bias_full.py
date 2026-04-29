@@ -219,7 +219,7 @@ def build_random_template3_prompt(
     }
 
     option_text = " ".join(
-        [f"{letter}. {letter_to_label[letter];}" for letter in option_letters]
+        [f"{letter}. {letter_to_label[letter]};" for letter in option_letters]
     )
 
     # Important:
