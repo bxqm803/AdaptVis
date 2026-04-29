@@ -1,4 +1,4 @@
-# run_randomized_mc_template3_bias_full.py
+# run_randomized_mc_template3_first_option_bias.py
 import os
 import re
 import json
@@ -42,7 +42,6 @@ def parse_args():
     p.add_argument("--model-id", default=None, type=str)
     p.add_argument("--method", default="base", type=str)
 
-    # on option alias
     p.add_argument(
         "--on-alias",
         default="on",
@@ -198,18 +197,18 @@ def build_random_template3_prompt(
     base_question: str,
     args,
     rng: random.Random,
-) -> Tuple[str, Dict[str, str], List[str], List[str]]:
+) -> Tuple[str, Dict[str, str], List[str]]:
     stem = strip_existing_answer_clause(base_question)
     if not stem.endswith("?"):
         stem = stem.rstrip(".") + "?"
 
     labels = labels_with_alias(args)
 
-    # 1) Randomize which labels are paired with letters.
+    # 1) Randomize label order.
     shuffled_labels = labels[:]
     rng.shuffle(shuffled_labels)
 
-    # 2) Randomize display order of option letters.
+    # 2) Randomize displayed option-letter order.
     # Example: D. on A. right C. left B. under
     option_letters = ["A", "B", "C", "D"]
     rng.shuffle(option_letters)
@@ -223,20 +222,15 @@ def build_random_template3_prompt(
         [f"{letter}. {letter_to_label[letter]}" for letter in option_letters]
     )
 
-    # 3) Randomize order in final answer instruction.
-    # Example: Answer with only B, D, C, or A.
-    answer_letters = ["A", "B", "C", "D"]
-    rng.shuffle(answer_letters)
-
-    answer_letter_text = ", ".join(answer_letters[:-1]) + f", or {answer_letters[-1]}"
-
+    # Important:
+    # No "Answer with only A, B, C, or D."
+    # This isolates whether the model tends to pick the first displayed option.
     prompt = (
         f"{stem} Choose one option only. "
-        f"{option_text}. "
-        f"Answer with only {answer_letter_text}."
+        f"{option_text}."
     )
 
-    return prompt, letter_to_label, option_letters, answer_letters
+    return prompt, letter_to_label, option_letters
 
 
 def parse_random_template3_output(
@@ -245,12 +239,14 @@ def parse_random_template3_output(
 ) -> Tuple[str, str]:
     t = clean_text(raw_output)
 
+    # Prefer explicit A/B/C/D answer if present.
     m = re.search(r"\b([ABCD])\b", t, flags=re.IGNORECASE)
     if m:
         pred_letter = m.group(1).upper()
         pred_label = canonicalize_label(letter_to_label[pred_letter])
         return pred_letter, pred_label
 
+    # Otherwise parse generated label text.
     pred_label = parse_prediction_generic(t)
     pred_letter = "UNK"
 
@@ -473,30 +469,23 @@ def main():
     gold_label_counter = Counter()
     gold_letter_counter = Counter()
 
-    # Bias-specific counters
     first_option_chosen = 0
-    first_answer_letter_chosen = 0
-
     first_option_letter_counter = Counter()
-    first_answer_letter_counter = Counter()
-
     pred_is_first_option_by_gold = Counter()
     total_by_gold_for_first = Counter()
 
-    # relation -> predicted label
     confusion = defaultdict(Counter)
-
     printed = 0
 
     print("=" * 120)
     print(
-        f"RUNNING RANDOMIZED TEMPLATE-3 BIAS TEST | "
+        f"RUNNING FIRST-DISPLAYED-OPTION BIAS TEST | "
         f"dataset={args.dataset} | model={args.model_name} | "
         f"on_alias={alias_text(args)} | eval_scope={args.eval_scope}"
     )
     print("=" * 120)
 
-    for local_idx in tqdm(range(start, end), desc="randomized-template3"):
+    for local_idx in tqdm(range(start, end), desc="first-option-bias"):
         rec = prompt_records[local_idx]
         item = dataset[local_idx]
 
@@ -516,13 +505,11 @@ def main():
         if args.eval_scope == "only_on" and gold != "on":
             continue
 
-        prompt_text, letter_to_label, option_letters, answer_letters = build_random_template3_prompt(
+        prompt_text, letter_to_label, option_letters = build_random_template3_prompt(
             raw_question, args, rng
         )
 
         first_option_letter = option_letters[0]
-        first_answer_letter = answer_letters[0]
-
         gold_letter = get_gold_letter(gold, letter_to_label)
 
         raw_output = runner.generate(image, image_path, prompt_text)
@@ -530,7 +517,6 @@ def main():
 
         is_correct = pred == gold
         pred_is_first_option = pred_letter == first_option_letter
-        pred_is_first_answer_letter = pred_letter == first_answer_letter
 
         total += 1
         correct += int(is_correct)
@@ -545,10 +531,7 @@ def main():
         pred_letter_counter[pred_letter] += 1
 
         first_option_letter_counter[first_option_letter] += 1
-        first_answer_letter_counter[first_answer_letter] += 1
-
         first_option_chosen += int(pred_is_first_option)
-        first_answer_letter_chosen += int(pred_is_first_answer_letter)
 
         total_by_gold_for_first[gold] += 1
         pred_is_first_option_by_gold[gold] += int(pred_is_first_option)
@@ -565,21 +548,18 @@ def main():
             print(f"gold_letter={gold_letter}")
             print(f"letter_to_label={letter_to_label}")
             print(f"option_letters={option_letters}")
-            print(f"answer_letters={answer_letters}")
             print(f"first_option_letter={first_option_letter}")
-            print(f"first_answer_letter={first_answer_letter}")
             print(f"[RAW QUESTION] {clean_question_text(raw_question)}")
             print(f"[RAW PROMPT] {prompt_text}")
             print(f"[RAW OUTPUT] {raw_output}")
             print(f"[PRED LETTER] {pred_letter}")
             print(f"[PRED] {pred}")
             print(f"[CORRECT] {is_correct}")
-            print(f"[PRED_IS_FIRST_OPTION] {pred_is_first_option}")
-            print(f"[PRED_IS_FIRST_ANSWER_LETTER] {pred_is_first_answer_letter}")
+            print(f"[PRED_IS_FIRST_DISPLAYED_OPTION] {pred_is_first_option}")
 
     print("\n" + "#" * 120)
     print(
-        f"FINAL RESULTS | RANDOMIZED TEMPLATE-3 | "
+        f"FINAL RESULTS | FIRST-DISPLAYED-OPTION BIAS TEST | "
         f"dataset={args.dataset} | model={args.model_name} | "
         f"on_alias={alias_text(args)} | eval_scope={args.eval_scope}"
     )
@@ -593,10 +573,6 @@ def main():
     print(
         f"  chose_first_displayed_option = {first_option_chosen}/{total} "
         f"({safe_rate(first_option_chosen, total):.4f})"
-    )
-    print(
-        f"  chose_first_answer_instruction_letter = {first_answer_letter_chosen}/{total} "
-        f"({safe_rate(first_answer_letter_chosen, total):.4f})"
     )
 
     print("\nfirst displayed option chosen by gold:")
@@ -617,8 +593,6 @@ def main():
     print_counter("gold letter distribution after randomization:", gold_letter_counter, ["A", "B", "C", "D", "UNK"])
     print()
     print_counter("first displayed option letter distribution:", first_option_letter_counter, ["A", "B", "C", "D"])
-    print()
-    print_counter("first answer instruction letter distribution:", first_answer_letter_counter, ["A", "B", "C", "D"])
     print()
     print_counter("pred label distribution:", pred_label_counter, ["left", "right", "under", "on", "UNK"])
     print()
