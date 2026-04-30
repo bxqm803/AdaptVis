@@ -40,7 +40,7 @@ def main(args):
     seed_all(args.seed) 
     model, image_preprocess = get_model(args.model_name, args.device, args.method)
     dataset = get_dataset(args.dataset, image_preprocess=image_preprocess, download=args.download)
-    SAMPLE=True
+    SAMPLE=False
     TEST=os.getenv('TEST_MODE', 'False') == 'True'
     sampled_indices=None
     collate_fn = _default_collate if image_preprocess is None else None
