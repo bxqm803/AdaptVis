@@ -381,6 +381,7 @@ class LlavaWrapper:
 
                     query_pos = None
                     # Generate predictions based on specified method
+                    # Generate predictions based on specified method
                     if method == 'scaling_vis':
                         
                         change_greedy_to_add_weight()
