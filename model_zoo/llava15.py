@@ -339,7 +339,19 @@ class LlavaWrapper:
             answer_list = [answer_list[i] for i in sampled_indices]
 
         # Create directory for saving attention maps
-        save_attn_dir = f"./output/{dataset}_weight{weight:.2f}"
+        attn_run_tag = os.getenv("ATTN_RUN_TAG", "")
+
+        if attn_run_tag:
+            save_attn_dir = f"./output/{attn_run_tag}"
+        elif method == "scaling_vis":
+            save_attn_dir = f"./output/{dataset}_scaling_w{weight:.2f}"
+        elif method == "adapt_vis":
+            save_attn_dir = (
+                f"./output/{dataset}_adapt"
+                f"_th{threshold:.2f}_w1{weight1:.2f}_w2{weight2:.2f}"
+            )
+        else:
+            save_attn_dir = f"./output/{dataset}_{method}"
         os.makedirs(save_attn_dir, exist_ok=True)
 
         results = []  # Store results for each generated sequence
