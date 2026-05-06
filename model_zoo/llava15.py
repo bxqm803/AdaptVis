@@ -380,6 +380,10 @@ class LlavaWrapper:
                     query_pos_env = os.getenv("QUERY_POS", "")
 
                     query_pos = None
+                    if adjust_method_env == "text_offset":
+                        if query_pos_env == "":
+                            raise ValueError("ADJUST_METHOD=text_offset requires QUERY_POS.")
+                        query_pos = torch.tensor(int(query_pos_env), device=self.device)
                     # Generate predictions based on specified method
                     # Generate predictions based on specified method
                     if method == 'scaling_vis':
