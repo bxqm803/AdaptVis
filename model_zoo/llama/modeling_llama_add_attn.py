@@ -349,7 +349,33 @@ class LLaMAAttention(nn.Module):
             # Paper-style default:
             # final / last query -> image tokens
             if adjust_method is None or adjust_method == "last_query":
+                # Paper-style default:
+                # last query -> image tokens
                 mask[-1, start_idx:end_idx + 1] = True
+
+            elif adjust_method == "text_offset":
+                # The k-th text query after image tokens -> image tokens.
+                # QUERY_POS=0 means the first text token after the image block.
+                # If selected text query does not exist, fall back to last query.
+                if pos is None:
+                    raise ValueError("adjust_method='text_offset' requires pos.")
+
+                if torch.is_tensor(pos):
+                    offset = int(pos.item())
+                else:
+                    offset = int(pos)
+
+                q_pos = end_idx + 1 + offset
+
+                # Only meaningful in prefill stage where q_len == kv_seq_len.
+                # If q_pos is out of range, use last query.
+                if q_len == kv_seq_len:
+                    if 0 <= q_pos < q_len:
+                        mask[q_pos, start_idx:end_idx + 1] = True
+                    else:
+                        mask[-1, start_idx:end_idx + 1] = True
+                else:
+                    mask[-1, start_idx:end_idx + 1] = True
 
             elif adjust_method == "caption_query" and caption_length:
                 # Last k caption/query tokens -> image tokens
