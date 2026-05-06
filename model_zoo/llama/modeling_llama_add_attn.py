@@ -222,7 +222,7 @@ class LLaMAAttention(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         use_cache: bool = False,
         output_attentions: bool = False,
-        output_head_hidden_states: bool = False, 
+        output_head_hidden_states: bool = False,
         keys: Optional[torch.Tensor] = None,
         weight: Optional[float] = None,
         pos: Optional[torch.Tensor] = None,
@@ -234,95 +234,201 @@ class LLaMAAttention(nn.Module):
 
         bsz, q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        query_states = self.q_proj(hidden_states).view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+
+        key_states = self.k_proj(hidden_states).view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+
+        value_states = self.v_proj(hidden_states).view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
         offset = 0
+
         if past_key_value is not None:
             offset = past_key_value[0].shape[-2]
             kv_seq_len += offset
+
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, offset=offset)
-        # [bsz, nh, t, hd]
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states,
+            key_states,
+            cos,
+            sin,
+            offset=offset
+        )
 
         if past_key_value is not None:
-            # reuse k, v, self_attention
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
         past_key_value = (key_states, value_states)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        attn_weights = torch.matmul(
+            query_states,
+            key_states.transpose(2, 3)
+        ) / math.sqrt(self.head_dim)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
+                f"Attention weights should be of size "
+                f"{(bsz, self.num_heads, q_len, kv_seq_len)}, "
+                f"but is {attn_weights.size()}"
             )
-        # print("attn_weights size", attn_weights.size())
-        # pdb.set_trace()
+
         unchanged_attn_weights = attn_weights.clone()
 
-        ######ATTENTION#######
-        if idx<32:
-            if attn_weights.size()[2]==attn_weights.size()[3]:
-                true_indices = torch.where(keys)[True]
-                if len(true_indices) == 0:
-                    print("No True values found in index.")
-                else:
-                    # pdb.set_trace()
-                    start_idx = true_indices[0].item()
-                    end_idx = true_indices[-1].item()
-                    square_size = end_idx - start_idx + 1
-                    mask = torch.zeros((attn_weights.size()[2], attn_weights.size()[2]), dtype=torch.bool)
-                    if caption_length:
-                        mask[-len(caption_length[0]):,start_idx:start_idx + square_size+1] = True
-                    else:
-                        mask[-1,start_idx:start_idx + square_size] = True
-                        # mask[start_idx:start_idx + square_size,start_idx:start_idx + square_size] = True
-                    # pdb.set_trace()
-                    # pdb.set_trace()
-                    attn_weights[:, :, mask] *= weight
-                    
-            else:
-                # print("Not a square matrix, skipping. got size", attn_weights.size())
-                start_idx,end_idx,square_size = -1,-1,-1
+        ###### ATTENTION INTERVENTION ######
+        start_idx, end_idx = -1, -1
 
+        if idx is not None and idx < 32 and keys is not None and weight is not None:
+            if keys.dim() == 2:
+                key_mask = keys[0].bool()
+            else:
+                key_mask = keys.bool()
+
+            true_indices = torch.where(key_mask)[0]
+
+            if true_indices.numel() == 0:
+                print("No True values found in keys.")
+            else:
+                start_idx = true_indices[0].item()
+                end_idx = true_indices[-1].item()
+
+                start_idx = max(0, min(start_idx, kv_seq_len - 1))
+                end_idx = max(0, min(end_idx, kv_seq_len - 1))
+
+                mask = torch.zeros(
+                    (q_len, kv_seq_len),
+                    dtype=torch.bool,
+                    device=attn_weights.device
+                )
+
+                if adjust_method == "last_query":
+                    # Paper-style:
+                    # last query -> image tokens
+                    mask[-1, start_idx:end_idx + 1] = True
+
+                elif adjust_method == "caption_query" and caption_length:
+                    # Last several caption tokens -> image tokens
+                    n_caption = len(caption_length[0])
+                    n_caption = min(n_caption, q_len)
+                    mask[-n_caption:, start_idx:end_idx + 1] = True
+
+                elif adjust_method == "full":
+                    # Full attention matrix scaling
+                    mask[:, :] = True
+
+                else:
+                    # Default:
+                    # all current queries -> image tokens
+                    mask[:, start_idx:end_idx + 1] = True
+
+                attn_weights[:, :, mask] *= weight
+
+        ###### CAUSAL / PADDING MASK ######
         if attention_mask is not None:
             if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
                 raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                    f"Attention mask should be of size "
+                    f"{(bsz, 1, q_len, kv_seq_len)}, "
+                    f"but is {attention_mask.size()}"
                 )
-            attn_weights = attn_weights + attention_mask
-            attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        if SAVE_ATTN : # save the change in attention weights for analysis
+            attn_weights = attn_weights + attention_mask
+            attn_weights = torch.max(
+                attn_weights,
+                torch.tensor(
+                    torch.finfo(attn_weights.dtype).min,
+                    device=attn_weights.device,
+                    dtype=attn_weights.dtype
+                )
+            )
+
+        ###### SAVE BEFORE / AFTER LOGITS ######
+        if SAVE_ATTN:
             save_path = os.getenv("SAVE_ATTN_PATH")
             if not save_path:
                 raise ValueError("SAVE_ATTN_PATH not set.")
-            unchanged_attn_weights = unchanged_attn_weights + attention_mask
-            unchanged_attn_weights = torch.max(unchanged_attn_weights, torch.tensor(torch.finfo(unchanged_attn_weights.dtype).min))
+
             if SAVE_ORI:
-                ori=unchanged_attn_weights[:,:,-1,:]
-                # pdb.set_trace()
-                np.save(f"{save_path}diff_{idx}_start{start_idx}_end{end_idx}.npy", ori.cpu().detach().numpy())
+                before_logits = unchanged_attn_weights
 
-            unchanged_attn_weights = nn.functional.softmax(unchanged_attn_weights, dim=-1, dtype=torch.float32).to(
-                query_states.dtype)
+                if attention_mask is not None:
+                    before_logits = before_logits + attention_mask
+                    before_logits = torch.max(
+                        before_logits,
+                        torch.tensor(
+                            torch.finfo(before_logits.dtype).min,
+                            device=before_logits.device,
+                            dtype=before_logits.dtype
+                        )
+                    )
 
-        attn_weights = self.att_out(attn_weights)       
+                after_logits = attn_weights
+
+                np.save(
+                    f"{save_path}before_logits_layer{idx}_start{start_idx}_end{end_idx}.npy",
+                    before_logits[:, :, -1, :].detach().float().cpu().numpy()
+                )
+
+                np.save(
+                    f"{save_path}after_logits_layer{idx}_start{start_idx}_end{end_idx}.npy",
+                    after_logits[:, :, -1, :].detach().float().cpu().numpy()
+                )
+
+        ###### SOFTMAX ######
+        attn_weights = nn.functional.softmax(
+            attn_weights,
+            dim=-1,
+            dtype=torch.float32
+        ).to(query_states.dtype)
+
+        ###### SAVE BEFORE / AFTER PROBS ######
+        if SAVE_ATTN and SAVE_ORI:
+            before_probs = unchanged_attn_weights
+
+            if attention_mask is not None:
+                before_probs = before_probs + attention_mask
+                before_probs = torch.max(
+                    before_probs,
+                    torch.tensor(
+                        torch.finfo(before_probs.dtype).min,
+                        device=before_probs.device,
+                        dtype=before_probs.dtype
+                    )
+                )
+
+            before_probs = nn.functional.softmax(
+                before_probs,
+                dim=-1,
+                dtype=torch.float32
+            ).to(query_states.dtype)
+
+            np.save(
+                f"{save_path}before_probs_layer{idx}_start{start_idx}_end{end_idx}.npy",
+                before_probs[:, :, -1, :].detach().float().cpu().numpy()
+            )
+
+            np.save(
+                f"{save_path}after_probs_layer{idx}_start{start_idx}_end{end_idx}.npy",
+                attn_weights[:, :, -1, :].detach().float().cpu().numpy()
+            )
+
+        attn_weights = self.att_out(attn_weights)
         value_states = self.value_out(value_states)
 
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
+                f"`attn_output` should be of size "
+                f"{(bsz, self.num_heads, q_len, self.head_dim)}, "
+                f"but is {attn_output.size()}"
             )
 
         attn_output = attn_output.transpose(1, 2)
@@ -333,8 +439,10 @@ class LLaMAAttention(nn.Module):
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, unchanged_attn_weights, past_key_value
+        if SAVE_ATTN and SAVE_ORI:
+            return attn_output, before_probs, past_key_value
 
+        return attn_output, None, past_key_value
 
 class LLaMADecoderLayer(nn.Module):
     def __init__(self, config: LLaMAConfig):
