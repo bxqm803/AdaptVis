@@ -382,8 +382,13 @@ class LlavaWrapper:
                         
                         change_greedy_to_add_weight()
                         output = self.model.generate(
-                            **single_input, keys=keys, weight=weight,
-                            max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                            **single_input,
+                            keys=keys,
+                            weight=1.0,
+                            adjust_method="last_query",
+                            max_new_tokens=100,
+                            output_scores=True,
+                            return_dict_in_generate=True
                         )
                         uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
                         gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
@@ -392,7 +397,7 @@ class LlavaWrapper:
                         change_greedy_to_add_weight()
                        
                         output = self.model.generate(
-                            **single_input,weight=1.0,max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                            **single_input,weight=1.0, adjust_method="last_query", max_new_tokens=100, output_scores=True, return_dict_in_generate=True
                         )
                         uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
                         print(uncertainty,threshold)
@@ -400,12 +405,12 @@ class LlavaWrapper:
                         # Adjust attention based on uncertainty
                         if uncertainty < threshold:
                             output = self.model.generate(
-                                **single_input, keys=keys, weight=weight1, 
+                                **single_input, keys=keys, weight=weight1, adjust_method="last_query",
                                 max_new_tokens=100, output_scores=True, return_dict_in_generate=True
                             )
                         else:
                             output = self.model.generate(
-                                **single_input, keys=keys, weight=weight2, 
+                                **single_input, keys=keys, weight=weight2, adjust_method="last_query",
                                 max_new_tokens=100, output_scores=True, return_dict_in_generate=True
                             )
                         gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
@@ -413,7 +418,7 @@ class LlavaWrapper:
                     else:
                         # Default generation method
                         output = self.model.generate(
-                            **single_input, max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                            **single_input, adjust_method="last_query", max_new_tokens=100, output_scores=True, return_dict_in_generate=True
                         )
                         gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
                         uncertainty = np.round(float(max(output['scores'][0][0])), 2)
