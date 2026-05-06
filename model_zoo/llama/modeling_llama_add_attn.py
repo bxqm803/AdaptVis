@@ -280,21 +280,51 @@ class LLaMAAttention(nn.Module):
                 f"but is {attn_weights.size()}"
             )
 
-        unchanged_attn_weights = attn_weights.clone()
+        ######################################################################
+        # 1. Save raw logits before current-layer intervention
+        ######################################################################
 
-        ###### ATTENTION INTERVENTION ######
+        before_logits_raw = attn_weights.clone()
+
         start_idx, end_idx = -1, -1
+        valid_image_tokens = False
+
+        ######################################################################
+        # 2. Decide whether to save this layer
+        #    Example:
+        #    SAVE_LAYERS=17,31
+        ######################################################################
+
+        save_layers_env = os.getenv("SAVE_LAYERS", "")
+
+        if save_layers_env.strip():
+            save_layers = {
+                int(x.strip())
+                for x in save_layers_env.split(",")
+                if x.strip()
+            }
+            should_save_layer = idx in save_layers
+        else:
+            should_save_layer = True
+
+        ######################################################################
+        # 3. Locate image-token range from keys
+        ######################################################################
 
         if idx is not None and idx < 32 and keys is not None and weight is not None:
-            if keys.dim() == 2:
-                key_mask = keys[0].bool()
+            if isinstance(keys, (list, tuple)):
+                key_mask = keys[0]
             else:
-                key_mask = keys.bool()
+                key_mask = keys
 
+            if key_mask.dim() == 2:
+                key_mask = key_mask[0]
+
+            key_mask = key_mask.to(attn_weights.device).bool()
             true_indices = torch.where(key_mask)[0]
 
             if true_indices.numel() == 0:
-                print("No True values found in keys.")
+                print(f"[Layer {idx}] No True values found in keys.")
             else:
                 start_idx = true_indices[0].item()
                 end_idx = true_indices[-1].item()
@@ -302,35 +332,56 @@ class LLaMAAttention(nn.Module):
                 start_idx = max(0, min(start_idx, kv_seq_len - 1))
                 end_idx = max(0, min(end_idx, kv_seq_len - 1))
 
-                mask = torch.zeros(
-                    (q_len, kv_seq_len),
-                    dtype=torch.bool,
-                    device=attn_weights.device
-                )
+                if end_idx >= start_idx:
+                    valid_image_tokens = True
 
-                if adjust_method == "last_query":
-                    # Paper-style:
-                    # last query -> image tokens
-                    mask[-1, start_idx:end_idx + 1] = True
+        ######################################################################
+        # 4. Apply attention intervention
+        ######################################################################
 
-                elif adjust_method == "caption_query" and caption_length:
-                    # Last several caption tokens -> image tokens
-                    n_caption = len(caption_length[0])
-                    n_caption = min(n_caption, q_len)
-                    mask[-n_caption:, start_idx:end_idx + 1] = True
+        if valid_image_tokens:
+            mask = torch.zeros(
+                (q_len, kv_seq_len),
+                dtype=torch.bool,
+                device=attn_weights.device
+            )
 
-                elif adjust_method == "full":
-                    # Full attention matrix scaling
-                    mask[:, :] = True
+            # Paper-style default:
+            # final / last query -> image tokens
+            if adjust_method is None or adjust_method == "last_query":
+                mask[-1, start_idx:end_idx + 1] = True
 
-                else:
-                    # Default:
-                    # all current queries -> image tokens
-                    mask[:, start_idx:end_idx + 1] = True
+            elif adjust_method == "caption_query" and caption_length:
+                # Last k caption/query tokens -> image tokens
+                n_caption = len(caption_length[0])
+                n_caption = min(n_caption, q_len)
+                mask[-n_caption:, start_idx:end_idx + 1] = True
 
-                attn_weights[:, :, mask] *= weight
+            elif adjust_method == "all_query":
+                # All current queries -> image tokens
+                mask[:, start_idx:end_idx + 1] = True
 
-        ###### CAUSAL / PADDING MASK ######
+            elif adjust_method == "full":
+                # Full attention matrix scaling
+                mask[:, :] = True
+
+            else:
+                raise ValueError(f"Unknown adjust_method: {adjust_method}")
+
+            # ScalingVis / AdaptVis:
+            # multiply selected attention logits by weight
+            attn_weights[:, :, mask] *= weight
+
+        ######################################################################
+        # 5. Save raw logits after current-layer intervention
+        ######################################################################
+
+        after_logits_raw = attn_weights.clone()
+
+        ######################################################################
+        # 6. Apply causal / padding attention mask
+        ######################################################################
+
         if attention_mask is not None:
             if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
                 raise ValueError(
@@ -339,75 +390,67 @@ class LLaMAAttention(nn.Module):
                     f"but is {attention_mask.size()}"
                 )
 
-            attn_weights = attn_weights + attention_mask
-            attn_weights = torch.max(
-                attn_weights,
+            before_logits = before_logits_raw + attention_mask
+            after_logits = after_logits_raw + attention_mask
+
+            before_logits = torch.max(
+                before_logits,
                 torch.tensor(
-                    torch.finfo(attn_weights.dtype).min,
-                    device=attn_weights.device,
-                    dtype=attn_weights.dtype
+                    torch.finfo(before_logits.dtype).min,
+                    device=before_logits.device,
+                    dtype=before_logits.dtype
                 )
             )
 
-        ###### SAVE BEFORE / AFTER LOGITS ######
-        if SAVE_ATTN:
-            save_path = os.getenv("SAVE_ATTN_PATH")
-            if not save_path:
-                raise ValueError("SAVE_ATTN_PATH not set.")
-
-            if SAVE_ORI:
-                before_logits = unchanged_attn_weights
-
-                if attention_mask is not None:
-                    before_logits = before_logits + attention_mask
-                    before_logits = torch.max(
-                        before_logits,
-                        torch.tensor(
-                            torch.finfo(before_logits.dtype).min,
-                            device=before_logits.device,
-                            dtype=before_logits.dtype
-                        )
-                    )
-
-                after_logits = attn_weights
-
-                np.save(
-                    f"{save_path}before_logits_layer{idx}_start{start_idx}_end{end_idx}.npy",
-                    before_logits[:, :, -1, :].detach().float().cpu().numpy()
+            after_logits = torch.max(
+                after_logits,
+                torch.tensor(
+                    torch.finfo(after_logits.dtype).min,
+                    device=after_logits.device,
+                    dtype=after_logits.dtype
                 )
+            )
+        else:
+            before_logits = before_logits_raw
+            after_logits = after_logits_raw
 
-                np.save(
-                    f"{save_path}after_logits_layer{idx}_start{start_idx}_end{end_idx}.npy",
-                    after_logits[:, :, -1, :].detach().float().cpu().numpy()
-                )
+        ######################################################################
+        # 7. Softmax: before probs and after probs
+        ######################################################################
 
-        ###### SOFTMAX ######
-        attn_weights = nn.functional.softmax(
-            attn_weights,
+        before_probs = nn.functional.softmax(
+            before_logits,
             dim=-1,
             dtype=torch.float32
         ).to(query_states.dtype)
 
-        ###### SAVE BEFORE / AFTER PROBS ######
-        if SAVE_ATTN and SAVE_ORI:
-            before_probs = unchanged_attn_weights
+        after_probs = nn.functional.softmax(
+            after_logits,
+            dim=-1,
+            dtype=torch.float32
+        ).to(query_states.dtype)
 
-            if attention_mask is not None:
-                before_probs = before_probs + attention_mask
-                before_probs = torch.max(
-                    before_probs,
-                    torch.tensor(
-                        torch.finfo(before_probs.dtype).min,
-                        device=before_probs.device,
-                        dtype=before_probs.dtype
-                    )
-                )
+        ######################################################################
+        # 8. Save before / after logits and probs
+        ######################################################################
 
-            before_probs = nn.functional.softmax(
-                before_probs,
-                dim=-1,
-                dtype=torch.float32
-            ).to(query_states.dtype)
+        if SAVE_ATTN and SAVE_ORI and should_save_layer and valid_image_tokens:
+            save_path = os.getenv("SAVE_ATTN_PATH")
+
+            if not save_path:
+                raise ValueError("SAVE_ATTN_PATH not set.")
+
+            os.makedirs(save_path, exist_ok=True)
+
+            np.save(
+                f"{save_path}before_logits_layer{idx}_start{start_idx}_end{end_idx}.npy",
+                before_logits[:, :, -1, :].detach().float().cpu().numpy()
+            )
+
+            np.save(
+                f"{save_path}after_logits_layer{idx}_start{start_idx}_end{end_idx}.npy",
+                after_logits[:, :, -1, :].detach().float().cpu().numpy()
+            )
 
             np.save(
                 f"{save_path}before_probs_layer{idx}_start{start_idx}_end{end_idx}.npy",
@@ -416,8 +459,14 @@ class LLaMAAttention(nn.Module):
 
             np.save(
                 f"{save_path}after_probs_layer{idx}_start{start_idx}_end{end_idx}.npy",
-                attn_weights[:, :, -1, :].detach().float().cpu().numpy()
+                after_probs[:, :, -1, :].detach().float().cpu().numpy()
             )
+
+        ######################################################################
+        # 9. Use after_probs for the actual forward computation
+        ######################################################################
+
+        attn_weights = after_probs
 
         attn_weights = self.att_out(attn_weights)
         value_states = self.value_out(value_states)
@@ -439,10 +488,7 @@ class LLaMAAttention(nn.Module):
         if not output_attentions:
             attn_weights = None
 
-        if SAVE_ATTN and SAVE_ORI:
-            return attn_output, before_probs, past_key_value
-
-        return attn_output, None, past_key_value
+        return attn_output, attn_weights, past_key_value
 
 class LLaMADecoderLayer(nn.Module):
     def __init__(self, config: LLaMAConfig):
