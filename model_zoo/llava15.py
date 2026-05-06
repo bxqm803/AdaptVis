@@ -384,6 +384,26 @@ class LlavaWrapper:
                         output = self.model.generate(
                             **single_input,
                             keys=keys,
+                            weight=weight,
+                            adjust_method="last_query",
+                            max_new_tokens=100,
+                            output_scores=True,
+                            return_dict_in_generate=True
+                        )
+                        uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
+                        gen = self.processor.decode(
+                            output['sequences'][0][len(single_input['input_ids'][-1]):],
+                            skip_special_tokens=True
+                        )
+                    
+                    elif method == 'adapt_vis':
+                        change_greedy_to_add_weight()
+                       
+                        # First pass: use weight=1.0 only to estimate uncertainty.
+                        # keys must be passed, otherwise attention files may be saved as start-1_end-1.
+                        output = self.model.generate(
+                            **single_input,
+                            keys=keys,
                             weight=1.0,
                             adjust_method="last_query",
                             max_new_tokens=100,
@@ -391,36 +411,47 @@ class LlavaWrapper:
                             return_dict_in_generate=True
                         )
                         uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
-                        gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
-                    
-                    elif method == 'adapt_vis':
-                        change_greedy_to_add_weight()
-                       
-                        output = self.model.generate(
-                            **single_input,weight=1.0, adjust_method="last_query", max_new_tokens=100, output_scores=True, return_dict_in_generate=True
-                        )
-                        uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
-                        print(uncertainty,threshold)
+                        print(uncertainty, threshold)
 
-                        # Adjust attention based on uncertainty
+                        # Second pass: apply adaptive attention scaling.
                         if uncertainty < threshold:
                             output = self.model.generate(
-                                **single_input, keys=keys, weight=weight1, adjust_method="last_query",
-                                max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                                **single_input,
+                                keys=keys,
+                                weight=weight1,
+                                adjust_method="last_query",
+                                max_new_tokens=100,
+                                output_scores=True,
+                                return_dict_in_generate=True
                             )
                         else:
                             output = self.model.generate(
-                                **single_input, keys=keys, weight=weight2, adjust_method="last_query",
-                                max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                                **single_input,
+                                keys=keys,
+                                weight=weight2,
+                                adjust_method="last_query",
+                                max_new_tokens=100,
+                                output_scores=True,
+                                return_dict_in_generate=True
                             )
-                        gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
+
+                        gen = self.processor.decode(
+                            output['sequences'][0][len(single_input['input_ids'][-1]):],
+                            skip_special_tokens=True
+                        )
 
                     else:
                         # Default generation method
                         output = self.model.generate(
-                            **single_input, adjust_method="last_query", max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                            **single_input,
+                            max_new_tokens=100,
+                            output_scores=True,
+                            return_dict_in_generate=True
                         )
-                        gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
+                        gen = self.processor.decode(
+                            output['sequences'][0][len(single_input['input_ids'][-1]):],
+                            skip_special_tokens=True
+                        )
                         uncertainty = np.round(float(max(output['scores'][0][0])), 2)
 
                     # Print prompt, generated text, and expected answer
