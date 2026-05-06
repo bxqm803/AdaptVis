@@ -376,7 +376,10 @@ class LlavaWrapper:
                     
                     # Create key mask for special token
                     keys = [torch.where(input_id == 32001, 1, 0) for input_id in single_input['input_ids']]
+                    adjust_method_env = os.getenv("ADJUST_METHOD", "last_query")
+                    query_pos_env = os.getenv("QUERY_POS", "")
 
+                    query_pos = None
                     # Generate predictions based on specified method
                     if method == 'scaling_vis':
                         
@@ -385,7 +388,8 @@ class LlavaWrapper:
                             **single_input,
                             keys=keys,
                             weight=weight,
-                            adjust_method="last_query",
+                            adjust_method=adjust_method_env,
+                            pos=query_pos,
                             max_new_tokens=100,
                             output_scores=True,
                             return_dict_in_generate=True
@@ -400,12 +404,12 @@ class LlavaWrapper:
                         change_greedy_to_add_weight()
                        
                         # First pass: use weight=1.0 only to estimate uncertainty.
-                        # keys must be passed, otherwise attention files may be saved as start-1_end-1.
                         output = self.model.generate(
                             **single_input,
                             keys=keys,
                             weight=1.0,
-                            adjust_method="last_query",
+                            adjust_method=adjust_method_env,
+                            pos=query_pos,
                             max_new_tokens=100,
                             output_scores=True,
                             return_dict_in_generate=True
@@ -419,7 +423,8 @@ class LlavaWrapper:
                                 **single_input,
                                 keys=keys,
                                 weight=weight1,
-                                adjust_method="last_query",
+                                adjust_method=adjust_method_env,
+                                pos=query_pos,
                                 max_new_tokens=100,
                                 output_scores=True,
                                 return_dict_in_generate=True
@@ -429,7 +434,8 @@ class LlavaWrapper:
                                 **single_input,
                                 keys=keys,
                                 weight=weight2,
-                                adjust_method="last_query",
+                                adjust_method=adjust_method_env,
+                                pos=query_pos,
                                 max_new_tokens=100,
                                 output_scores=True,
                                 return_dict_in_generate=True
