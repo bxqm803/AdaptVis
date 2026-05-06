@@ -16,7 +16,7 @@ mkdir -p "${RESULT_DIR}"
 DEFAULT_RESULT_JSON="output/results1.5_${DATASET}_adapt_vis_1.0_${OPTION}option_False.json"
 DEFAULT_SCORE_JSON="output/results1.5_${DATASET}_adapt_vis_1.0_${OPTION}option_Falsescores.json"
 
-for k in $(seq 0 15); do
+for k in $(seq 16 20); do
     echo "=============================="
     echo "Running text_offset query ${k}"
     echo "=============================="
