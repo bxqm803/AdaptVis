@@ -347,13 +347,13 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
         caption_length: Optional[list] = None,
         object_patch_mask: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, LlavaCausalLMOutputWithPast]:
-        """
-        Main forward pass.
+        r"""
+        Args:
+            object_patch_mask (`torch.Tensor`, *optional*):
+                Binary object patch mask produced by the external CLIP object localizer.
 
-        object_patch_mask:
-            Optional bool tensor of shape [num_image_patches].
-            It is produced outside by the external CLIP object localizer.
-            This function only forwards it into the LLaMA language model.
+        Returns:
+
         """
 
         output_attentions = (
