@@ -78,6 +78,25 @@ def _clean_obj_name(s: str) -> str:
     return s.strip()
 
 
+def is_generation_correct(golden: str, gen: str) -> bool:
+    """
+    Use the same correctness rule as the original AdaptVis evaluation.
+
+    This is saved into each result row so block-level ablations can later
+    compare all-patch baseline vs except-block runs per sample.
+    """
+    golden = str(golden)
+    gen = str(gen)
+
+    ok = (golden in gen) or (golden.lower() in gen.lower())
+
+    # Original special case: avoid counting "front" as "on".
+    if golden.lower() == "on" and "front" in gen.strip().lower():
+        ok = False
+
+    return bool(ok)
+
+
 def extract_objects_from_question(question: str) -> Optional[Tuple[str, str]]:
     """
     Parse:
@@ -913,44 +932,63 @@ class LlavaWrapper:
 
                         uncertainty = np.round(float(max(output["scores"][0][0])), 2)
 
-                    print(f"Prompt: {prompt}\nGeneration: {gen}\nGolden: {answer_list[index_of_total][0]}")
+                    golden = answer_list[index_of_total][0]
+                    is_correct = is_generation_correct(golden, gen)
 
-                    result = {
-                        "Prompt": prompt,
-                        "Generation": gen,
-                        "Golden": answer_list[index_of_total][0],
-                    }
-                    results.append(result)
+                    print(
+                        f"Prompt: {prompt}\n"
+                        f"Generation: {gen}\n"
+                        f"Golden: {golden}\n"
+                        f"Correct: {is_correct}"
+                    )
 
                     c_option = batch["caption_options"]
+                    num_options = len(list(c_option))
 
-                    if len(list(c_option)) == 4:
-                        if (
-                            (answer_list[index_of_total][0] in gen)
-                            or (answer_list[index_of_total][0].lower() in gen.lower())
-                        ) and not (
-                            answer_list[index_of_total][0].lower() == "on"
-                            and "front" in gen.strip().lower()
-                        ):
+                    if num_options == 4:
+                        if is_correct:
                             acc += 1
                             correct_id.append(index_of_total)
                             answers = [1, 0, 0, 0]
                         else:
                             answers = [0, 0, 1, 0]
 
-                    elif len(list(c_option)) == 2:
-                        if (
-                            (answer_list[index_of_total][0] in gen)
-                            or (answer_list[index_of_total][0].lower() in gen.lower())
-                        ) and not (
-                            answer_list[index_of_total][0].lower() == "on"
-                            and "front" in gen.strip().lower()
-                        ):
+                    elif num_options == 2:
+                        if is_correct:
                             acc += 1
                             correct_id.append(index_of_total)
                             answers = [1, 0]
                         else:
                             answers = [0, 1]
+
+                    else:
+                        raise ValueError(f"Unexpected number of caption options: {num_options}")
+
+                    patch_selected = None
+                    if object_patch_mask is not None:
+                        patch_selected = int(object_patch_mask.detach().bool().sum().item())
+
+                    result = {
+                        "sample_id": int(index_of_total),
+                        "Prompt": prompt,
+                        "Generation": gen,
+                        "Golden": golden,
+                        "Correct": bool(is_correct),
+                        "Uncertainty": float(uncertainty) if "uncertainty" in locals() else None,
+
+                        # Mask / block metadata for per-image flip analysis.
+                        "adjust_method": os.getenv("ADJUST_METHOD", "last_query"),
+                        "patch_mask_mode": os.getenv("PATCH_MASK_MODE", ""),
+                        "patch_grid_size": os.getenv("PATCH_GRID_SIZE", ""),
+                        "patch_block_grid": os.getenv("PATCH_BLOCK_GRID", ""),
+                        "patch_block_id": os.getenv("PATCH_BLOCK_ID", ""),
+                        "patch_row_id": os.getenv("PATCH_ROW_ID", ""),
+                        "patch_col_id": os.getenv("PATCH_COL_ID", ""),
+                        "clip_obj_mask": os.getenv("CLIP_OBJ_MASK", "False"),
+                        "clip_obj_threshold": os.getenv("CLIP_OBJ_THRESHOLD", ""),
+                        "selected_patch_count": patch_selected,
+                    }
+                    results.append(result)
 
                     im_scores.append(np.expand_dims(np.array(answers), -1))
                     index_of_total += 1
