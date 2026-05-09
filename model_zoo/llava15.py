@@ -74,7 +74,8 @@ def _normalize_01(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 def _clean_obj_name(s: str) -> str:
     s = s.strip()
     s = re.sub(r"\s+", " ", s)
-    return s
+    s = re.sub(r"^(the|a|an)\s+", "", s, flags=re.IGNORECASE)
+    return s.strip()
 
 
 def extract_objects_from_question(question: str) -> Optional[Tuple[str, str]]:
@@ -290,6 +291,100 @@ def compute_clip_object_mask_binary(
     return object_patch_mask.detach()
 
 
+def build_manual_patch_mask_from_env(device):
+    """
+    Manual patch/block mask for brute-force search.
+
+    Assumes LLaVA-1.5 image tokens are 24x24 = 576.
+
+    Environment variables:
+        PATCH_MASK_MODE:
+            ""             -> disabled
+            "all"          -> select all patches
+            "block"        -> select only one block
+            "except_block" -> select all patches except one block
+            "row"          -> select one row
+            "col"          -> select one column
+
+        PATCH_GRID_SIZE=24
+        PATCH_BLOCK_GRID=4
+        PATCH_BLOCK_ID=0
+        PATCH_ROW_ID=0
+        PATCH_COL_ID=0
+    """
+    mode = os.getenv("PATCH_MASK_MODE", "").strip()
+
+    if mode == "":
+        return None
+
+    grid_size = int(os.getenv("PATCH_GRID_SIZE", "24"))
+    block_grid = int(os.getenv("PATCH_BLOCK_GRID", "4"))
+    block_id = int(os.getenv("PATCH_BLOCK_ID", "0"))
+
+    num_patches = grid_size * grid_size
+    mask_2d = torch.zeros((grid_size, grid_size), dtype=torch.bool)
+
+    if mode == "all":
+        mask_2d[:, :] = True
+
+    elif mode in ["block", "except_block"]:
+        if grid_size % block_grid != 0:
+            raise ValueError(
+                f"PATCH_GRID_SIZE={grid_size} must be divisible by "
+                f"PATCH_BLOCK_GRID={block_grid}"
+            )
+
+        block_h = grid_size // block_grid
+        block_w = grid_size // block_grid
+
+        br = block_id // block_grid
+        bc = block_id % block_grid
+
+        if not (0 <= br < block_grid and 0 <= bc < block_grid):
+            raise ValueError(
+                f"Invalid PATCH_BLOCK_ID={block_id} for "
+                f"PATCH_BLOCK_GRID={block_grid}"
+            )
+
+        r0 = br * block_h
+        r1 = (br + 1) * block_h
+        c0 = bc * block_w
+        c1 = (bc + 1) * block_w
+
+        if mode == "block":
+            mask_2d[r0:r1, c0:c1] = True
+
+        elif mode == "except_block":
+            mask_2d[:, :] = True
+            mask_2d[r0:r1, c0:c1] = False
+
+    elif mode == "row":
+        row_id = int(os.getenv("PATCH_ROW_ID", "0"))
+        if not (0 <= row_id < grid_size):
+            raise ValueError(f"Invalid PATCH_ROW_ID={row_id}")
+        mask_2d[row_id, :] = True
+
+    elif mode == "col":
+        col_id = int(os.getenv("PATCH_COL_ID", "0"))
+        if not (0 <= col_id < grid_size):
+            raise ValueError(f"Invalid PATCH_COL_ID={col_id}")
+        mask_2d[:, col_id] = True
+
+    else:
+        raise ValueError(f"Unknown PATCH_MASK_MODE={mode}")
+
+    patch_mask = mask_2d.reshape(-1).to(device)
+
+    if os.getenv("PATCH_MASK_DEBUG", "False") == "True":
+        print(
+            f"[PATCH_MASK] mode={mode}, grid={grid_size}, "
+            f"block_grid={block_grid}, block_id={block_id}, "
+            f"selected={int(patch_mask.sum().item())}/{num_patches}"
+        )
+
+    return patch_mask
+
+
 # ============================================================
 # Custom greedy search
 # ============================================================
@@ -371,10 +466,11 @@ def _add_weight_greedy_search(
     while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
         model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
-        # Make sure custom mask survives even if prepare_inputs_for_generation
-        # does not explicitly preserve it yet.
-        if "object_patch_mask" not in model_inputs and "object_patch_mask" in model_kwargs:
-            model_inputs["object_patch_mask"] = model_kwargs.get("object_patch_mask", None)
+        # Keep custom kwargs robustly across generation.
+        # Some prepare_inputs_for_generation implementations may drop them.
+        for custom_key in ["keys", "object_patch_mask"]:
+            if custom_key not in model_inputs and custom_key in model_kwargs:
+                model_inputs[custom_key] = model_kwargs.get(custom_key, None)
 
         if "Scal" not in str(type(self)):
             outputs = self(
@@ -437,6 +533,12 @@ def _add_weight_greedy_search(
             model_kwargs,
             is_encoder_decoder=self.config.is_encoder_decoder,
         )
+
+        # Keep custom kwargs after HF updates model_kwargs.
+        # This avoids losing object_patch_mask / keys after the first decode step.
+        for custom_key in ["keys", "object_patch_mask"]:
+            if custom_key in model_inputs and custom_key not in model_kwargs:
+                model_kwargs[custom_key] = model_inputs[custom_key]
 
         if eos_token_id_tensor is not None:
             unfinished_sequences = unfinished_sequences.mul(
@@ -691,7 +793,14 @@ class LlavaWrapper:
 
                     object_patch_mask = None
 
-                    if self.use_clip_obj_mask and adjust_method_env == "object_mask":
+                    # Manual brute-force mask has higher priority than CLIP mask.
+                    # This lets you test which image patch/block is useful without using CLIP.
+                    manual_patch_mask = build_manual_patch_mask_from_env(self.device)
+
+                    if adjust_method_env == "object_mask" and manual_patch_mask is not None:
+                        object_patch_mask = manual_patch_mask
+
+                    elif self.use_clip_obj_mask and adjust_method_env == "object_mask":
                         clip_obj_threshold = float(os.getenv("CLIP_OBJ_THRESHOLD", "0.85"))
                         clip_obj_dilate = int(os.getenv("CLIP_OBJ_DILATE", "1"))
                         clip_obj_invert = os.getenv("CLIP_OBJ_INVERT", "True") == "True"
