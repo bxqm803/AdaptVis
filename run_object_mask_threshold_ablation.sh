@@ -13,9 +13,9 @@ OUT_DIR="output/object_mask_threshold_ablation"
 mkdir -p "${OUT_DIR}"
 
 # 保存中间层 attention；15 是中间层，31 是最后一层
-export SAVE_LAYERS=15
+export SAVE_LAYERS=17
 
-for OBJ_THR in 0.70 0.75 0.80 0.85 0.90 0.95; do
+for OBJ_THR in 0.0 0.2 0.4 0.6 0.7; do
   echo "========================================"
   echo "Running object-mask threshold = ${OBJ_THR}"
   echo "========================================"
