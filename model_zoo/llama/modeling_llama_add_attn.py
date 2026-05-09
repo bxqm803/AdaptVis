@@ -30,7 +30,6 @@ from transformers.utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
     logging,
-    replace_return_docstrings,
 )
 
 from .configuration_llama import LLaMAConfig
@@ -1123,10 +1122,6 @@ class LLaMAForCausalLMScal(LLaMAPreTrainedModel):
     def get_decoder(self):
         return self.model
 
-    @replace_return_docstrings(
-        output_type=CausalLMOutputWithPast,
-        config_class=_CONFIG_FOR_DOC,
-    )
     def forward(
         self,
         input_ids: torch.LongTensor = None,
