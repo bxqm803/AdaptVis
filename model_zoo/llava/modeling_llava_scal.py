@@ -2,23 +2,11 @@
 # Copyright 2023 the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """ PyTorch Llava model. """
 
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
-import pdb
 import torch
 import torch.utils.checkpoint
 from torch import nn
@@ -28,7 +16,6 @@ from model_zoo import llama
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
 )
 from transformers.modeling_utils import PreTrainedModel
 from transformers.cache_utils import Cache
@@ -37,10 +24,9 @@ from transformers.utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
     logging,
-    replace_return_docstrings,
 )
 
-from transformers import AutoModel, AutoModelForCausalLM
+from transformers import AutoModel
 
 from .configuration_llava import LlavaConfig
 from model_zoo.llama.configuration_llama import LLaMAConfig
@@ -229,15 +215,17 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
         num_images, num_image_patches, embed_dim = image_features.shape
         batch_size, sequence_length = input_ids.shape
 
-        left_padding = not torch.sum(
-            input_ids[:, -1] == torch.tensor(self.pad_token_id)
+        pad_token = torch.tensor(
+            self.pad_token_id,
+            device=input_ids.device,
+            dtype=input_ids.dtype,
         )
 
-        # 1. Create a mask to know where special image tokens are.
+        left_padding = not torch.sum(input_ids[:, -1] == pad_token)
+
         special_image_token_mask = input_ids == self.config.image_token_index
         num_special_image_tokens = torch.sum(special_image_token_mask, dim=-1)
 
-        # Compute the maximum embed dimension.
         max_embed_dim = (
             num_special_image_tokens.max() * (num_image_patches - 1)
         ) + sequence_length
@@ -246,7 +234,6 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
             input_ids != self.config.image_token_index
         )
 
-        # 2. Compute the positions where text should be written.
         new_token_positions = (
             torch.cumsum(
                 (special_image_token_mask * (num_image_patches - 1) + 1),
@@ -265,7 +252,6 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
             non_image_indices,
         ]
 
-        # 3. Create the full embedding.
         final_embedding = torch.zeros(
             batch_size,
             max_embed_dim,
@@ -281,7 +267,6 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
             device=inputs_embeds.device,
         )
 
-        # 4. Fill text embeddings.
         final_embedding[batch_indices, text_to_overwrite] = inputs_embeds[
             batch_indices,
             non_image_indices,
@@ -292,7 +277,6 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
             non_image_indices,
         ]
 
-        # 5. Fill image embeddings.
         image_to_overwrite = torch.all(final_embedding == 0, dim=-1)
         image_to_overwrite &= (
             image_to_overwrite.cumsum(-1) - 1 >= nb_image_pad[:, None]
@@ -317,14 +301,9 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
             final_attention_mask.cumsum(-1) - 1
         ).masked_fill_((final_attention_mask == 0), 1)
 
-        # image_to_overwrite is the bool mask for inserted image tokens.
         return final_embedding, final_attention_mask, position_ids, image_to_overwrite
 
     @add_start_docstrings_to_model_forward(LLAVA_INPUTS_DOCSTRING)
-    @replace_return_docstrings(
-        output_type=LlavaCausalLMOutputWithPast,
-        config_class=_CONFIG_FOR_DOC,
-    )
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -349,11 +328,8 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
     ) -> Union[Tuple, LlavaCausalLMOutputWithPast]:
         r"""
         Args:
-            object_patch_mask (`torch.Tensor`, *optional*):
+            object_patch_mask (`torch.Tensor`, optional):
                 Binary object patch mask produced by the external CLIP object localizer.
-
-        Returns:
-
         """
 
         output_attentions = (
@@ -389,10 +365,8 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
         image_id = None
 
         if inputs_embeds is None:
-            # 1. Extract input embeddings.
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-            # 2. Merge text and images.
             if pixel_values is not None and input_ids.shape[1] != 1:
                 image_outputs = self.vision_tower(
                     pixel_values,
@@ -439,13 +413,13 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
                     ).to(torch.long)
 
             else:
-                # Generation with cache.
                 if (
                     past_key_values is not None
                     and pixel_values is not None
                     and input_ids.shape[1] == 1
                 ):
                     first_layer_past_key_value = past_key_values[0][0][:, 0, :, 0]
+
                     batch_index, non_attended_tokens = torch.where(
                         first_layer_past_key_value == 0
                     )
@@ -479,7 +453,6 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
 
         outputs = self.language_model(
             attention_mask=attention_mask,
-            # position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
@@ -549,7 +522,6 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2]
 
-            # Keep only the unprocessed tokens.
             if (
                 attention_mask is not None
                 and attention_mask.shape[1] > input_ids.shape[1]
@@ -589,10 +561,6 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
                 "pixel_values": pixel_values,
-
-                # Keep custom object mask during generation.
-                # This is produced in model_zoo/llava15.py and consumed in
-                # model_zoo/llama/modeling_llama_add_attn.py.
                 "object_patch_mask": kwargs.get("object_patch_mask", None),
             }
         )
