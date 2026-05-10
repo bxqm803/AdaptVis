@@ -20,7 +20,7 @@ export SAVE_LAYERS=-1
 SRC_RESULT="output/results1.5_${DATASET}_adapt_vis_1.0_${OPTION}option_False.json"
 SRC_SCORE="output/results1.5_${DATASET}_adapt_vis_1.0_${OPTION}option_Falsescores.json"
 
-for BLOCK_ID in $(seq 0 15); do
+for BLOCK_ID in $(seq 11 15); do
   echo "========================================"
   echo "Running only block ${BLOCK_ID}"
   echo "========================================"
