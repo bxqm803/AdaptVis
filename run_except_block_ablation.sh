@@ -18,7 +18,7 @@ mkdir -p "${OUT_DIR}"
 # 如果不想保存 attention，可以关掉或设成不存在的层
 export SAVE_LAYERS=-1
 
-for BLOCK_ID in $(seq 0 15); do
+for BLOCK_ID in $(seq 11 15); do
   echo "========================================"
   echo "Running except block ${BLOCK_ID}"
   echo "========================================"
