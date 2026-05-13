@@ -318,16 +318,19 @@ def build_manual_patch_mask_from_env(device):
 
     Environment variables:
         PATCH_MASK_MODE:
-            ""             -> disabled
-            "all"          -> select all patches
-            "block"        -> select only one block
-            "except_block" -> select all patches except one block
-            "row"          -> select one row
-            "col"          -> select one column
+            ""              -> disabled
+            "all"           -> select all patches
+            "block"         -> select only one block by PATCH_BLOCK_ID
+            "blocks"        -> select multiple blocks by PATCH_BLOCK_IDS
+            "except_block"  -> select all patches except one block by PATCH_BLOCK_ID
+            "except_blocks" -> select all patches except multiple blocks by PATCH_BLOCK_IDS
+            "row"           -> select one row
+            "col"           -> select one column
 
         PATCH_GRID_SIZE=24
         PATCH_BLOCK_GRID=4
         PATCH_BLOCK_ID=0
+        PATCH_BLOCK_IDS=12,13,14,15
         PATCH_ROW_ID=0
         PATCH_COL_ID=0
     """
@@ -339,54 +342,96 @@ def build_manual_patch_mask_from_env(device):
     grid_size = int(os.getenv("PATCH_GRID_SIZE", "24"))
     block_grid = int(os.getenv("PATCH_BLOCK_GRID", "4"))
     block_id = int(os.getenv("PATCH_BLOCK_ID", "0"))
+    block_ids_env = os.getenv("PATCH_BLOCK_IDS", "")
 
     num_patches = grid_size * grid_size
     mask_2d = torch.zeros((grid_size, grid_size), dtype=torch.bool)
 
-    if mode == "all":
-        mask_2d[:, :] = True
+    def parse_block_ids():
+        """
+        PATCH_BLOCK_IDS has higher priority when using blocks / except_blocks.
+        Example:
+            PATCH_BLOCK_IDS=12,13,14,15
+        """
+        if block_ids_env.strip() == "":
+            return [block_id]
 
-    elif mode in ["block", "except_block"]:
+        ids = []
+        for x in block_ids_env.split(","):
+            x = x.strip()
+            if x:
+                ids.append(int(x))
+
+        if len(ids) == 0:
+            return [block_id]
+
+        return ids
+
+    def block_slice(bid):
         if grid_size % block_grid != 0:
             raise ValueError(
                 f"PATCH_GRID_SIZE={grid_size} must be divisible by "
                 f"PATCH_BLOCK_GRID={block_grid}"
             )
 
+        total_blocks = block_grid * block_grid
+
+        if not (0 <= bid < total_blocks):
+            raise ValueError(
+                f"Invalid block id={bid} for PATCH_BLOCK_GRID={block_grid}. "
+                f"Valid range: 0..{total_blocks - 1}"
+            )
+
         block_h = grid_size // block_grid
         block_w = grid_size // block_grid
 
-        br = block_id // block_grid
-        bc = block_id % block_grid
-
-        if not (0 <= br < block_grid and 0 <= bc < block_grid):
-            raise ValueError(
-                f"Invalid PATCH_BLOCK_ID={block_id} for "
-                f"PATCH_BLOCK_GRID={block_grid}"
-            )
+        br = bid // block_grid
+        bc = bid % block_grid
 
         r0 = br * block_h
         r1 = (br + 1) * block_h
         c0 = bc * block_w
         c1 = (bc + 1) * block_w
 
-        if mode == "block":
+        return r0, r1, c0, c1
+
+    if mode == "all":
+        mask_2d[:, :] = True
+
+    elif mode == "block":
+        r0, r1, c0, c1 = block_slice(block_id)
+        mask_2d[r0:r1, c0:c1] = True
+
+    elif mode == "blocks":
+        for bid in parse_block_ids():
+            r0, r1, c0, c1 = block_slice(bid)
             mask_2d[r0:r1, c0:c1] = True
 
-        elif mode == "except_block":
-            mask_2d[:, :] = True
+    elif mode == "except_block":
+        mask_2d[:, :] = True
+        r0, r1, c0, c1 = block_slice(block_id)
+        mask_2d[r0:r1, c0:c1] = False
+
+    elif mode == "except_blocks":
+        mask_2d[:, :] = True
+        for bid in parse_block_ids():
+            r0, r1, c0, c1 = block_slice(bid)
             mask_2d[r0:r1, c0:c1] = False
 
     elif mode == "row":
         row_id = int(os.getenv("PATCH_ROW_ID", "0"))
+
         if not (0 <= row_id < grid_size):
             raise ValueError(f"Invalid PATCH_ROW_ID={row_id}")
+
         mask_2d[row_id, :] = True
 
     elif mode == "col":
         col_id = int(os.getenv("PATCH_COL_ID", "0"))
+
         if not (0 <= col_id < grid_size):
             raise ValueError(f"Invalid PATCH_COL_ID={col_id}")
+
         mask_2d[:, col_id] = True
 
     else:
@@ -395,9 +440,14 @@ def build_manual_patch_mask_from_env(device):
     patch_mask = mask_2d.reshape(-1).to(device)
 
     if os.getenv("PATCH_MASK_DEBUG", "False") == "True":
+        if mode in ["blocks", "except_blocks"]:
+            selected_blocks = ",".join(str(x) for x in parse_block_ids())
+        else:
+            selected_blocks = str(block_id)
+
         print(
             f"[PATCH_MASK] mode={mode}, grid={grid_size}, "
-            f"block_grid={block_grid}, block_id={block_id}, "
+            f"block_grid={block_grid}, block_ids={selected_blocks}, "
             f"selected={int(patch_mask.sum().item())}/{num_patches}"
         )
 
@@ -982,6 +1032,7 @@ class LlavaWrapper:
                         "patch_grid_size": os.getenv("PATCH_GRID_SIZE", ""),
                         "patch_block_grid": os.getenv("PATCH_BLOCK_GRID", ""),
                         "patch_block_id": os.getenv("PATCH_BLOCK_ID", ""),
+                        "patch_block_ids": os.getenv("PATCH_BLOCK_IDS", ""),
                         "patch_row_id": os.getenv("PATCH_ROW_ID", ""),
                         "patch_col_id": os.getenv("PATCH_COL_ID", ""),
                         "clip_obj_mask": os.getenv("CLIP_OBJ_MASK", "False"),
