@@ -20,26 +20,26 @@ export SAVE_LAYERS=-1
 SRC_RESULT="output/results1.5_${DATASET}_adapt_vis_1.0_${OPTION}option_False.json"
 SRC_SCORE="output/results1.5_${DATASET}_adapt_vis_1.0_${OPTION}option_Falsescores.json"
 
-declare -A GROUPS
+declare -A BLOCK_GROUPS
 
-GROUPS["row3_bottom"]="12,13,14,15"
-GROUPS["row2_lower_middle"]="8,9,10,11"
-GROUPS["lower_half"]="8,9,10,11,12,13,14,15"
+BLOCK_GROUPS["row3_bottom"]="12,13,14,15"
+BLOCK_GROUPS["row2_lower_middle"]="8,9,10,11"
+BLOCK_GROUPS["lower_half"]="8,9,10,11,12,13,14,15"
 
-GROUPS["center"]="5,6,9,10"
-GROUPS["lower_center"]="9,10,13,14"
+BLOCK_GROUPS["center"]="5,6,9,10"
+BLOCK_GROUPS["lower_center"]="9,10,13,14"
 
-GROUPS["bottom_mid"]="13,14"
-GROUPS["bottom_mid_right"]="13,14,15"
-GROUPS["bottom_left_mid"]="12,13,14"
+BLOCK_GROUPS["bottom_mid"]="13,14"
+BLOCK_GROUPS["bottom_mid_right"]="13,14,15"
+BLOCK_GROUPS["bottom_left_mid"]="12,13,14"
 
-GROUPS["quad_bottom_left"]="8,9,12,13"
-GROUPS["quad_bottom_right"]="10,11,14,15"
+BLOCK_GROUPS["quad_bottom_left"]="8,9,12,13"
+BLOCK_GROUPS["quad_bottom_right"]="10,11,14,15"
 
-GROUPS["contact_band"]="9,10,11,13,14,15"
+BLOCK_GROUPS["contact_band"]="9,10,11,13,14,15"
 
-for NAME in "${!GROUPS[@]}"; do
-  IDS="${GROUPS[$NAME]}"
+for NAME in "${!BLOCK_GROUPS[@]}"; do
+  IDS="${BLOCK_GROUPS[$NAME]}"
 
   echo "========================================"
   echo "Running group: ${NAME} = ${IDS}"
