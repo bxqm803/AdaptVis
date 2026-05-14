@@ -80,18 +80,31 @@ def _clean_obj_name(s: str) -> str:
 
 def is_generation_correct(golden: str, gen: str) -> bool:
     """
-    Use the same correctness rule as the original AdaptVis evaluation.
-
-    This is saved into each result row so block-level ablations can later
-    compare all-patch baseline vs except-block runs per sample.
+    Use the same correctness rule as the original AdaptVis evaluation,
+    with a small normalization for in-front / in front / front.
     """
     golden = str(golden)
     gen = str(gen)
 
-    ok = (golden in gen) or (golden.lower() in gen.lower())
+    golden_l = golden.strip().lower()
+    gen_l = gen.strip().lower()
+
+    # Normalize common variants.
+    golden_norm = golden_l.replace("in front", "in-front").replace("in_front", "in-front")
+    gen_norm = gen_l.replace("in front", "in-front").replace("in_front", "in-front")
+
+    ok = (golden in gen) or (golden_l in gen_l) or (golden_norm in gen_norm)
+
+    # Allow front to match in-front when datasets use the relation name in-front.
+    if golden_norm in ["in-front", "front"]:
+        ok = (
+            ("front" in gen_norm)
+            or ("in-front" in gen_norm)
+            or ("in front" in gen_l)
+        )
 
     # Original special case: avoid counting "front" as "on".
-    if golden.lower() == "on" and "front" in gen.strip().lower():
+    if golden_norm == "on" and "front" in gen_l:
         ok = False
 
     return bool(ok)
@@ -102,25 +115,295 @@ def is_generation_correct(golden: str, gen: str) -> bool:
 RELATION_WORDS = ["left", "right", "on", "under"]
 
 
+def get_probe_relation_set(dataset: Optional[str] = None) -> Tuple[List[str], Dict[str, List[str]]]:
+    """
+    Return canonical relation names and text/token aliases.
+
+    You can override by env:
+        PROBE_RELATION_SET=controlled_a
+        PROBE_RELATION_SET=controlled_b
+        PROBE_RELATION_SET=coco_two_obj
+    """
+    relation_set = os.getenv("PROBE_RELATION_SET", "").strip().lower()
+    dataset_l = str(dataset or "").strip().lower()
+
+    if not relation_set:
+        if "controlled_images_b" in dataset_l:
+            relation_set = "controlled_b"
+        elif "coco_qa_two_obj" in dataset_l or "coco" in dataset_l:
+            relation_set = "coco_two_obj"
+        else:
+            relation_set = "controlled_a"
+
+    if relation_set in ["controlled_b", "b"]:
+        canonical = ["left", "right", "in-front", "behind"]
+        aliases = {
+            "left": ["left"],
+            "right": ["right"],
+            "in-front": ["in-front", "in front", "front"],
+            "behind": ["behind"],
+        }
+    elif relation_set in ["coco_two_obj", "coco", "coco_qa_two_obj"]:
+        canonical = ["left", "right", "above", "below"]
+        aliases = {
+            "left": ["left"],
+            "right": ["right"],
+            "above": ["above"],
+            "below": ["below"],
+        }
+    else:
+        canonical = ["left", "right", "on", "under"]
+        aliases = {
+            "left": ["left"],
+            "right": ["right"],
+            "on": ["on"],
+            "under": ["under"],
+        }
+
+    return canonical, aliases
+
+
 def normalize_relation_token_text(s: str) -> str:
     s = str(s).strip().lower()
     s = s.replace("▁", " ")
     s = s.strip()
     s = re.sub(r"^[\s\.,:;!\?\-\(\)\[\]\{\}'\"]+", "", s)
     s = re.sub(r"[\s\.,:;!\?\-\(\)\[\]\{\}'\"]+$", "", s)
+
+    # Normalize front variants.
+    s = s.replace("in front", "in-front").replace("in_front", "in-front")
     return s
 
 
-def parse_relation_from_text(text: str) -> str:
+def canonicalize_relation_text(text: str, dataset: Optional[str] = None) -> str:
     s = str(text).strip().lower()
+    s_norm = s.replace("in front", "in-front").replace("in_front", "in-front")
 
-    for rel in ["under", "left", "right", "on"]:
-        if re.search(rf"\b{rel}\b", s):
-            if rel == "on" and "front" in s:
+    canonical, aliases = get_probe_relation_set(dataset)
+
+    # For Controlled_Images_B, prefer behind before front to avoid weird strings.
+    if "behind" in canonical and re.search(r"\bbehind\b", s_norm):
+        return "behind"
+
+    if "in-front" in canonical:
+        if (
+            re.search(r"\bin\s*-\s*front\b", s_norm)
+            or re.search(r"\bin\s+front\b", s)
+            or re.search(r"\bfront\b", s_norm)
+        ):
+            return "in-front"
+
+    for rel in canonical:
+        if rel == "in-front":
+            continue
+
+        if re.search(rf"\b{re.escape(rel)}\b", s_norm):
+            # For Controlled_Images_A, avoid counting "front" as "on".
+            if rel == "on" and "front" in s_norm:
                 continue
             return rel
 
     return "unknown"
+
+
+def relation_exists_in_text(text: str, rel: str, dataset: Optional[str] = None) -> bool:
+    s = str(text).strip().lower()
+    s_norm = s.replace("in front", "in-front").replace("in_front", "in-front")
+
+    if rel == "in-front":
+        return bool(
+            re.search(r"\bin\s*-\s*front\b", s_norm)
+            or re.search(r"\bin\s+front\b", s)
+            or re.search(r"\bfront\b", s_norm)
+        )
+
+    if rel == "on" and "front" in s_norm:
+        return False
+
+    return bool(re.search(rf"\b{re.escape(rel)}\b", s_norm))
+
+
+def relations_in_text(text: str, dataset: Optional[str] = None) -> List[str]:
+    canonical, _ = get_probe_relation_set(dataset)
+    out = []
+    for rel in canonical:
+        if relation_exists_in_text(text, rel, dataset=dataset):
+            out.append(rel)
+    return out
+
+
+def parse_relation_from_text(text: str, dataset: Optional[str] = None) -> str:
+    return canonicalize_relation_text(text, dataset=dataset)
+
+
+def _single_token_prob(tokenizer, probs: torch.Tensor, alias: str):
+    """
+    Probability of alias if it is encoded as a single token.
+    Try both raw alias and space-prefixed alias.
+    """
+    candidates = [alias, " " + alias]
+    best = None
+    best_token_id = None
+    best_decoded = None
+
+    for cand in candidates:
+        try:
+            token_ids = tokenizer.encode(cand, add_special_tokens=False)
+        except Exception:
+            token_ids = []
+
+        if len(token_ids) == 1:
+            tid = int(token_ids[0])
+            p = float(probs[tid].item())
+            if best is None or p > best:
+                best = p
+                best_token_id = tid
+                best_decoded = tokenizer.decode(
+                    [tid],
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+
+    return {
+        "prob": best,
+        "token_id": best_token_id,
+        "decoded": best_decoded,
+    }
+
+
+def _generated_phrase_prob_if_matches(
+    tokenizer,
+    generated_ids,
+    scores,
+    end_step: int,
+    phrase: str,
+):
+    """
+    Compute product probability for a phrase only if the generated token window
+    ending at end_step exactly matches one tokenizer encoding of the phrase.
+
+    This is not a counterfactual teacher-forced probability. It is the probability
+    of the actually generated phrase when that phrase appears in the output.
+    """
+    variants = [phrase, " " + phrase]
+    best = None
+    best_ids = None
+    best_decoded = None
+
+    for v in variants:
+        try:
+            ids = tokenizer.encode(v, add_special_tokens=False)
+        except Exception:
+            ids = []
+
+        if not ids:
+            continue
+
+        L = len(ids)
+        start = end_step - L + 1
+        if start < 0:
+            continue
+
+        actual = [int(x.item()) for x in generated_ids[start:end_step + 1]]
+        if actual != [int(x) for x in ids]:
+            continue
+
+        prob = 1.0
+        for off, tid in enumerate(ids):
+            step = start + off
+            logits = scores[step][0].detach().float()
+            step_probs = torch.softmax(logits, dim=-1)
+            prob *= float(step_probs[int(tid)].item())
+
+        decoded = tokenizer.decode(
+            ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+        if best is None or prob > best:
+            best = prob
+            best_ids = [int(x) for x in ids]
+            best_decoded = decoded
+
+    return {
+        "prob": best,
+        "token_ids": best_ids,
+        "decoded": best_decoded,
+    }
+
+
+def build_relation_candidate_probs(
+    tokenizer,
+    scores,
+    generated_ids,
+    step: int,
+    probs: torch.Tensor,
+    dataset: Optional[str] = None,
+):
+    """
+    Save relation-candidate probabilities at the selected relation step.
+
+    For Controlled_Images_B:
+      - in-front may appear as one token, as "front", or as two tokens "in front".
+      - We record single-token probabilities for in/front/in-front/front,
+        and phrase probability if the actually generated tokens match "in front".
+    """
+    canonical, aliases = get_probe_relation_set(dataset)
+    out = {}
+
+    for rel in canonical:
+        rel_info = {
+            "aliases": aliases.get(rel, [rel]),
+            "single_token": {},
+            "generated_phrase": {},
+        }
+
+        for alias in aliases.get(rel, [rel]):
+            alias_norm = alias.strip().lower()
+
+            single = _single_token_prob(tokenizer, probs, alias_norm)
+            rel_info["single_token"][alias_norm] = single
+
+            phrase = _generated_phrase_prob_if_matches(
+                tokenizer=tokenizer,
+                generated_ids=generated_ids,
+                scores=scores,
+                end_step=step,
+                phrase=alias_norm,
+            )
+            rel_info["generated_phrase"][alias_norm] = phrase
+
+        # Special record for in front split into in + front.
+        if rel == "in-front":
+            rel_info["in_front_parts"] = {}
+
+            for part in ["in", "front", "in-front"]:
+                rel_info["in_front_parts"][part] = _single_token_prob(
+                    tokenizer,
+                    probs,
+                    part,
+                )
+
+            # If current selected step is front, also try to record previous "in" probability.
+            if step >= 1:
+                prev_logits = scores[step - 1][0].detach().float()
+                prev_probs = torch.softmax(prev_logits, dim=-1)
+                rel_info["in_front_parts"]["prev_step_in"] = _single_token_prob(
+                    tokenizer,
+                    prev_probs,
+                    "in",
+                )
+            else:
+                rel_info["in_front_parts"]["prev_step_in"] = {
+                    "prob": None,
+                    "token_id": None,
+                    "decoded": None,
+                }
+
+        out[rel] = rel_info
+
+    return out
 
 
 def extract_relation_token_topk_from_generate_output(
@@ -128,24 +411,31 @@ def extract_relation_token_topk_from_generate_output(
     input_len: int,
     tokenizer,
     topk: int = 10,
+    dataset: Optional[str] = None,
 ):
     """
-    Find the LAST generated relation token among:
+    Find the LAST generated relation token for the dataset's relation set.
+
+    Controlled_Images_A:
         left / right / on / under
 
-    This is useful for generations such as:
-        "The cup is on the floor, under the table."
+    Controlled_Images_B:
+        left / right / in-front / behind
+        "in-front" supports "front", "in front", and "in-front".
 
-    In that case, the first relation token is "on", but the final answer
-    relation should be treated as "under". Therefore this function records
-    the last relation token step and saves the top-k vocabulary probabilities
-    at that step.
+    COCO_QA_two_obj:
+        left / right / above / below
+
+    The returned dict also contains relation_candidate_probs so downstream
+    analysis can inspect all relation probabilities, not only the generated one.
     """
     if output is None:
         return None
 
     if "sequences" not in output or "scores" not in output:
         return None
+
+    canonical, _ = get_probe_relation_set(dataset)
 
     seq = output["sequences"][0]
     scores = output["scores"]
@@ -177,31 +467,35 @@ def extract_relation_token_topk_from_generate_output(
 
         relation = None
 
-        # Case 1: the current token itself is a relation word.
-        if token_norm in RELATION_WORDS:
-            relation = token_norm
+        # Single-token direct match.
+        for rel in canonical:
+            if rel == "in-front":
+                if token_norm in ["front", "in-front"]:
+                    relation = "in-front"
+                    break
+            elif token_norm == rel:
+                if not (rel == "on" and "front" in str(curr_text).lower()):
+                    relation = rel
+                    break
 
-        # Case 2: relation appears only after accumulating text.
-        # Record only when a relation newly appears at this step.
+        # Text-level newly-added relation.
         if relation is None:
-            before_relations = []
-            after_relations = []
-
-            before_lower = str(prev_text).lower()
-            after_lower = str(curr_text).lower()
-
-            for rel in RELATION_WORDS:
-                if re.search(rf"\b{rel}\b", before_lower):
-                    if not (rel == "on" and "front" in before_lower):
-                        before_relations.append(rel)
-
-                if re.search(rf"\b{rel}\b", after_lower):
-                    if not (rel == "on" and "front" in after_lower):
-                        after_relations.append(rel)
-
+            before_relations = relations_in_text(prev_text, dataset=dataset)
+            after_relations = relations_in_text(curr_text, dataset=dataset)
             newly_added = [rel for rel in after_relations if rel not in before_relations]
+
             if newly_added:
-                relation = max(newly_added, key=lambda r: after_lower.rfind(r))
+                curr_lower = str(curr_text).lower().replace("in front", "in-front")
+
+                def last_pos(rel):
+                    if rel == "in-front":
+                        return max(
+                            curr_lower.rfind("in-front"),
+                            curr_lower.rfind("front"),
+                        )
+                    return curr_lower.rfind(rel)
+
+                relation = max(newly_added, key=last_pos)
 
         if relation is not None:
             relation_hits.append(
@@ -216,6 +510,12 @@ def extract_relation_token_topk_from_generate_output(
             )
 
         prev_text = curr_text
+
+    full_generated_text = tokenizer.decode(
+        generated_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
 
     if relation_hits:
         hit = relation_hits[-1]
@@ -249,15 +549,19 @@ def extract_relation_token_topk_from_generate_output(
                 }
             )
 
-        full_generated_text = tokenizer.decode(
-            generated_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
+        relation_candidate_probs = build_relation_candidate_probs(
+            tokenizer=tokenizer,
+            scores=scores,
+            generated_ids=generated_ids,
+            step=step,
+            probs=probs,
+            dataset=dataset,
         )
 
         return {
             "found": True,
-            "probe_mode": "last_relation_token",
+            "probe_mode": "last_relation_token_dataset_aware",
+            "relation_set": canonical,
             "relation": relation,
             "step": int(step),
             "generated_token_id": int(token_id),
@@ -268,10 +572,12 @@ def extract_relation_token_topk_from_generate_output(
             "full_generated_text": full_generated_text,
             "num_relation_hits": int(len(relation_hits)),
             "relation_hits": relation_hits,
+            "relation_candidate_probs": relation_candidate_probs,
             "topk": int(topk),
             "top_tokens": top_tokens,
         }
 
+    # Fallback: no explicit relation token found.
     first_logits = scores[0][0].detach().float()
     first_probs = torch.softmax(first_logits, dim=-1)
     top_probs, top_ids = torch.topk(first_probs, k=topk)
@@ -297,15 +603,19 @@ def extract_relation_token_topk_from_generate_output(
             }
         )
 
-    full_generated_text = tokenizer.decode(
-        generated_ids,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
+    relation_candidate_probs = build_relation_candidate_probs(
+        tokenizer=tokenizer,
+        scores=scores,
+        generated_ids=generated_ids,
+        step=0,
+        probs=first_probs,
+        dataset=dataset,
     )
 
     return {
         "found": False,
-        "probe_mode": "last_relation_token",
+        "probe_mode": "last_relation_token_dataset_aware",
+        "relation_set": canonical,
         "relation": "unknown",
         "step": None,
         "generated_token_id": None,
@@ -316,6 +626,7 @@ def extract_relation_token_topk_from_generate_output(
         "full_generated_text": full_generated_text,
         "num_relation_hits": 0,
         "relation_hits": [],
+        "relation_candidate_probs": relation_candidate_probs,
         "topk": int(topk),
         "top_tokens": top_tokens,
     }
@@ -1226,6 +1537,7 @@ class LlavaWrapper:
                             input_len=input_len,
                             tokenizer=self.processor.tokenizer,
                             topk=probe_topk,
+                            dataset=dataset,
                         )
 
                     golden = answer_list[index_of_total][0]
