@@ -130,8 +130,16 @@ def extract_relation_token_topk_from_generate_output(
     topk: int = 10,
 ):
     """
-    Find the first generated token corresponding to left/right/on/under.
-    Save the top-k vocabulary probabilities at that generation step.
+    Find the LAST generated relation token among:
+        left / right / on / under
+
+    This is useful for generations such as:
+        "The cup is on the floor, under the table."
+
+    In that case, the first relation token is "on", but the final answer
+    relation should be treated as "under". Therefore this function records
+    the last relation token step and saves the top-k vocabulary probabilities
+    at that step.
     """
     if output is None:
         return None
@@ -146,9 +154,10 @@ def extract_relation_token_topk_from_generate_output(
         return None
 
     generated_ids = seq[input_len:]
-    prev_text = ""
-
     max_steps = min(len(generated_ids), len(scores))
+
+    relation_hits = []
+    prev_text = ""
 
     for step in range(max_steps):
         token_id = int(generated_ids[step].item())
@@ -160,64 +169,108 @@ def extract_relation_token_topk_from_generate_output(
         )
         token_norm = normalize_relation_token_text(token_text)
 
-        relation = None
-
-        if token_norm in RELATION_WORDS:
-            relation = token_norm
-
         curr_text = tokenizer.decode(
             generated_ids[: step + 1],
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
 
-        if relation is None:
-            before_rel = parse_relation_from_text(prev_text)
-            after_rel = parse_relation_from_text(curr_text)
+        relation = None
 
-            if before_rel == "unknown" and after_rel in RELATION_WORDS:
-                relation = after_rel
+        # Case 1: the current token itself is a relation word.
+        if token_norm in RELATION_WORDS:
+            relation = token_norm
+
+        # Case 2: relation appears only after accumulating text.
+        # Record only when a relation newly appears at this step.
+        if relation is None:
+            before_relations = []
+            after_relations = []
+
+            before_lower = str(prev_text).lower()
+            after_lower = str(curr_text).lower()
+
+            for rel in RELATION_WORDS:
+                if re.search(rf"\b{rel}\b", before_lower):
+                    if not (rel == "on" and "front" in before_lower):
+                        before_relations.append(rel)
+
+                if re.search(rf"\b{rel}\b", after_lower):
+                    if not (rel == "on" and "front" in after_lower):
+                        after_relations.append(rel)
+
+            newly_added = [rel for rel in after_relations if rel not in before_relations]
+            if newly_added:
+                relation = max(newly_added, key=lambda r: after_lower.rfind(r))
 
         if relation is not None:
-            logits = scores[step][0].detach().float()
-            probs = torch.softmax(logits, dim=-1)
-            top_probs, top_ids = torch.topk(probs, k=topk)
-
-            top_tokens = []
-            for rank, (tid, prob) in enumerate(
-                zip(top_ids.tolist(), top_probs.tolist()),
-                start=1,
-            ):
-                decoded = tokenizer.decode(
-                    [int(tid)],
-                    skip_special_tokens=True,
-                    clean_up_tokenization_spaces=False,
-                )
-
-                top_tokens.append(
-                    {
-                        "rank": int(rank),
-                        "token_id": int(tid),
-                        "token": decoded,
-                        "token_clean": normalize_relation_token_text(decoded),
-                        "prob": float(prob),
-                    }
-                )
-
-            return {
-                "found": True,
-                "relation": relation,
-                "step": int(step),
-                "generated_token_id": int(token_id),
-                "generated_token": token_text,
-                "generated_token_clean": token_norm,
-                "generated_token_prob": float(probs[token_id].item()),
-                "generated_text_until_relation": curr_text,
-                "topk": int(topk),
-                "top_tokens": top_tokens,
-            }
+            relation_hits.append(
+                {
+                    "step": int(step),
+                    "relation": relation,
+                    "token_id": int(token_id),
+                    "token_text": token_text,
+                    "token_norm": token_norm,
+                    "text_until_relation": curr_text,
+                }
+            )
 
         prev_text = curr_text
+
+    if relation_hits:
+        hit = relation_hits[-1]
+
+        step = hit["step"]
+        token_id = hit["token_id"]
+        relation = hit["relation"]
+
+        logits = scores[step][0].detach().float()
+        probs = torch.softmax(logits, dim=-1)
+        top_probs, top_ids = torch.topk(probs, k=topk)
+
+        top_tokens = []
+        for rank, (tid, prob) in enumerate(
+            zip(top_ids.tolist(), top_probs.tolist()),
+            start=1,
+        ):
+            decoded = tokenizer.decode(
+                [int(tid)],
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+
+            top_tokens.append(
+                {
+                    "rank": int(rank),
+                    "token_id": int(tid),
+                    "token": decoded,
+                    "token_clean": normalize_relation_token_text(decoded),
+                    "prob": float(prob),
+                }
+            )
+
+        full_generated_text = tokenizer.decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+        return {
+            "found": True,
+            "probe_mode": "last_relation_token",
+            "relation": relation,
+            "step": int(step),
+            "generated_token_id": int(token_id),
+            "generated_token": hit["token_text"],
+            "generated_token_clean": hit["token_norm"],
+            "generated_token_prob": float(probs[token_id].item()),
+            "generated_text_until_relation": hit["text_until_relation"],
+            "full_generated_text": full_generated_text,
+            "num_relation_hits": int(len(relation_hits)),
+            "relation_hits": relation_hits,
+            "topk": int(topk),
+            "top_tokens": top_tokens,
+        }
 
     first_logits = scores[0][0].detach().float()
     first_probs = torch.softmax(first_logits, dim=-1)
@@ -244,19 +297,25 @@ def extract_relation_token_topk_from_generate_output(
             }
         )
 
+    full_generated_text = tokenizer.decode(
+        generated_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+
     return {
         "found": False,
+        "probe_mode": "last_relation_token",
         "relation": "unknown",
         "step": None,
         "generated_token_id": None,
         "generated_token": None,
         "generated_token_clean": None,
         "generated_token_prob": None,
-        "generated_text_until_relation": tokenizer.decode(
-            generated_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        ),
+        "generated_text_until_relation": full_generated_text,
+        "full_generated_text": full_generated_text,
+        "num_relation_hits": 0,
+        "relation_hits": [],
         "topk": int(topk),
         "top_tokens": top_tokens,
     }
