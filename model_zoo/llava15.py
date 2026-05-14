@@ -97,6 +97,171 @@ def is_generation_correct(golden: str, gen: str) -> bool:
     return bool(ok)
 
 
+
+
+RELATION_WORDS = ["left", "right", "on", "under"]
+
+
+def normalize_relation_token_text(s: str) -> str:
+    s = str(s).strip().lower()
+    s = s.replace("▁", " ")
+    s = s.strip()
+    s = re.sub(r"^[\s\.,:;!\?\-\(\)\[\]\{\}'\"]+", "", s)
+    s = re.sub(r"[\s\.,:;!\?\-\(\)\[\]\{\}'\"]+$", "", s)
+    return s
+
+
+def parse_relation_from_text(text: str) -> str:
+    s = str(text).strip().lower()
+
+    for rel in ["under", "left", "right", "on"]:
+        if re.search(rf"\b{rel}\b", s):
+            if rel == "on" and "front" in s:
+                continue
+            return rel
+
+    return "unknown"
+
+
+def extract_relation_token_topk_from_generate_output(
+    output,
+    input_len: int,
+    tokenizer,
+    topk: int = 10,
+):
+    """
+    Find the first generated token corresponding to left/right/on/under.
+    Save the top-k vocabulary probabilities at that generation step.
+    """
+    if output is None:
+        return None
+
+    if "sequences" not in output or "scores" not in output:
+        return None
+
+    seq = output["sequences"][0]
+    scores = output["scores"]
+
+    if scores is None or len(scores) == 0:
+        return None
+
+    generated_ids = seq[input_len:]
+    prev_text = ""
+
+    max_steps = min(len(generated_ids), len(scores))
+
+    for step in range(max_steps):
+        token_id = int(generated_ids[step].item())
+
+        token_text = tokenizer.decode(
+            [token_id],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        token_norm = normalize_relation_token_text(token_text)
+
+        relation = None
+
+        if token_norm in RELATION_WORDS:
+            relation = token_norm
+
+        curr_text = tokenizer.decode(
+            generated_ids[: step + 1],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+        if relation is None:
+            before_rel = parse_relation_from_text(prev_text)
+            after_rel = parse_relation_from_text(curr_text)
+
+            if before_rel == "unknown" and after_rel in RELATION_WORDS:
+                relation = after_rel
+
+        if relation is not None:
+            logits = scores[step][0].detach().float()
+            probs = torch.softmax(logits, dim=-1)
+            top_probs, top_ids = torch.topk(probs, k=topk)
+
+            top_tokens = []
+            for rank, (tid, prob) in enumerate(
+                zip(top_ids.tolist(), top_probs.tolist()),
+                start=1,
+            ):
+                decoded = tokenizer.decode(
+                    [int(tid)],
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+
+                top_tokens.append(
+                    {
+                        "rank": int(rank),
+                        "token_id": int(tid),
+                        "token": decoded,
+                        "token_clean": normalize_relation_token_text(decoded),
+                        "prob": float(prob),
+                    }
+                )
+
+            return {
+                "found": True,
+                "relation": relation,
+                "step": int(step),
+                "generated_token_id": int(token_id),
+                "generated_token": token_text,
+                "generated_token_clean": token_norm,
+                "generated_token_prob": float(probs[token_id].item()),
+                "generated_text_until_relation": curr_text,
+                "topk": int(topk),
+                "top_tokens": top_tokens,
+            }
+
+        prev_text = curr_text
+
+    first_logits = scores[0][0].detach().float()
+    first_probs = torch.softmax(first_logits, dim=-1)
+    top_probs, top_ids = torch.topk(first_probs, k=topk)
+
+    top_tokens = []
+    for rank, (tid, prob) in enumerate(
+        zip(top_ids.tolist(), top_probs.tolist()),
+        start=1,
+    ):
+        decoded = tokenizer.decode(
+            [int(tid)],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+        top_tokens.append(
+            {
+                "rank": int(rank),
+                "token_id": int(tid),
+                "token": decoded,
+                "token_clean": normalize_relation_token_text(decoded),
+                "prob": float(prob),
+            }
+        )
+
+    return {
+        "found": False,
+        "relation": "unknown",
+        "step": None,
+        "generated_token_id": None,
+        "generated_token": None,
+        "generated_token_clean": None,
+        "generated_token_prob": None,
+        "generated_text_until_relation": tokenizer.decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        ),
+        "topk": int(topk),
+        "top_tokens": top_tokens,
+    }
+
+
 def extract_objects_from_question(question: str) -> Optional[Tuple[str, str]]:
     """
     Parse:
@@ -888,8 +1053,11 @@ class LlavaWrapper:
                         if object_patch_mask is not None:
                             object_patch_mask = object_patch_mask.to(self.device)
 
+                    selected_weight = None
+
                     if method == "scaling_vis":
                         change_greedy_to_add_weight()
+                        selected_weight = weight
 
                         output = self.model.generate(
                             **single_input,
@@ -938,6 +1106,8 @@ class LlavaWrapper:
 
                         # Second pass: original AdaptVis confidence rule.
                         if uncertainty < threshold:
+                            selected_weight = weight1
+
                             output = self.model.generate(
                                 **single_input,
                                 keys=keys,
@@ -950,6 +1120,8 @@ class LlavaWrapper:
                                 return_dict_in_generate=True,
                             )
                         else:
+                            selected_weight = weight2
+
                             output = self.model.generate(
                                 **single_input,
                                 keys=keys,
@@ -968,6 +1140,8 @@ class LlavaWrapper:
                         )
 
                     else:
+                        selected_weight = None
+
                         output = self.model.generate(
                             **single_input,
                             max_new_tokens=100,
@@ -981,6 +1155,19 @@ class LlavaWrapper:
                         )
 
                         uncertainty = np.round(float(max(output["scores"][0][0])), 2)
+
+                    relation_probe = None
+
+                    if os.getenv("PROBE_RELATION_PROBS", "False") == "True":
+                        probe_topk = int(os.getenv("PROBE_RELATION_TOPK", "10"))
+                        input_len = len(single_input["input_ids"][-1])
+
+                        relation_probe = extract_relation_token_topk_from_generate_output(
+                            output=output,
+                            input_len=input_len,
+                            tokenizer=self.processor.tokenizer,
+                            topk=probe_topk,
+                        )
 
                     golden = answer_list[index_of_total][0]
                     is_correct = is_generation_correct(golden, gen)
@@ -1025,6 +1212,8 @@ class LlavaWrapper:
                         "Golden": golden,
                         "Correct": bool(is_correct),
                         "Uncertainty": float(uncertainty) if "uncertainty" in locals() else None,
+                        "selected_weight": float(selected_weight) if selected_weight is not None else None,
+                        "relation_probe": relation_probe,
 
                         # Mask / block metadata for per-image flip analysis.
                         "adjust_method": os.getenv("ADJUST_METHOD", "last_query"),
