@@ -34,6 +34,7 @@ from transformers.utils import (
 
 from .configuration_llama import LLaMAConfig
 import numpy as np
+from model_zoo.var_sink_utils import apply_var_sink_attention
 
 
 logger = logging.get_logger(__name__)
@@ -577,12 +578,19 @@ class LLaMAAttention(nn.Module):
                                     f"start={start_idx}, end={end_idx}"
                                 )
 
+            elif adjust_method == "var_sink":
+                # VAR-sink does not multiply attention logits.
+                # It redistributes attention probabilities after softmax.
+                pass
+
             else:
                 raise ValueError(f"Unknown adjust_method: {adjust_method}")
 
             # ScalingVis / AdaptVis:
             # multiply selected attention logits by weight.
-            attn_weights[:, :, mask] *= weight
+            # VAR-sink is handled after softmax, so skip logit scaling here.
+            if adjust_method != "var_sink":
+                attn_weights[:, :, mask] *= weight
 
         ######################################################################
         # 5. Save raw logits after current-layer intervention
@@ -642,6 +650,18 @@ class LLaMAAttention(nn.Module):
             dim=-1,
             dtype=torch.float32,
         ).to(query_states.dtype)
+
+        ######################################################################
+        # 7.5. VAR-sink redistribution after softmax
+        ######################################################################
+
+        if valid_image_tokens and adjust_method == "var_sink":
+            after_probs = apply_var_sink_attention(
+                attn_weights=after_probs,
+                image_token_start=start_idx,
+                image_token_end=end_idx + 1,
+                layer_idx=idx,
+            )
 
         ######################################################################
         # 8. Save before / after logits and probs
