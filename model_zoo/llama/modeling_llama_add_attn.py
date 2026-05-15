@@ -46,6 +46,88 @@ SAVE_ATTN = True
 SAVE_ORI = True
 
 
+
+def _parse_int_list_from_env(name: str):
+    """Parse comma-separated integer list from an environment variable."""
+    s = os.getenv(name, "").strip()
+    if not s:
+        return []
+
+    out = []
+    for x in s.split(","):
+        x = x.strip()
+        if x:
+            out.append(int(x))
+    return out
+
+
+def _blocks_to_image_token_indices(
+    block_ids,
+    start_idx,
+    end_idx,
+    patch_grid=24,
+    block_grid=4,
+    device=None,
+):
+    """
+    Convert 4x4 block ids to absolute image-token indices.
+
+    For LLaVA-1.5 with ViT-L/14-336:
+        patch_grid = 24
+        total image patches = 24 * 24 = 576
+
+    block_grid = 4 means:
+        each block is 6x6 patches.
+
+    start_idx / end_idx are inclusive sequence indices of image tokens.
+    """
+    if not block_ids:
+        return None
+
+    if block_grid <= 0 or patch_grid <= 0:
+        return None
+
+    block_size = patch_grid // block_grid
+    if block_size <= 0:
+        return None
+
+    local_indices = []
+
+    for bid in block_ids:
+        br = bid // block_grid
+        bc = bid % block_grid
+
+        if br < 0 or br >= block_grid or bc < 0 or bc >= block_grid:
+            continue
+
+        r0 = br * block_size
+        r1 = r0 + block_size
+        c0 = bc * block_size
+        c1 = c0 + block_size
+
+        for rr in range(r0, r1):
+            for cc in range(c0, c1):
+                local_indices.append(rr * patch_grid + cc)
+
+    if len(local_indices) == 0:
+        return None
+
+    token_idx = torch.tensor(
+        [start_idx + x for x in local_indices],
+        device=device,
+        dtype=torch.long,
+    )
+
+    token_idx = token_idx[
+        (token_idx >= start_idx) & (token_idx <= end_idx)
+    ]
+
+    if token_idx.numel() == 0:
+        return None
+
+    return token_idx
+
+
 def _make_causal_mask(
     input_ids_shape: torch.Size,
     dtype: torch.dtype,
@@ -612,13 +694,67 @@ class LLaMAAttention(nn.Module):
                 # It redistributes attention probabilities after softmax.
                 pass
 
+            elif adjust_method == "probe_bias":
+                # Relation-logit contribution probe.
+                #
+                # Instead of multiplying logits, add a small positive bias
+                # to selected image block tokens at a specific layer/head.
+                #
+                # Env variables:
+                #   PROBE_LAYER=16
+                #   PROBE_HEAD=-1          # -1 means all heads
+                #   PROBE_BLOCK_IDS=13,14
+                #   PROBE_BETA=0.05
+                #   PATCH_GRID_SIZE=24
+                #   PATCH_BLOCK_GRID=4
+                probe_layer = int(os.getenv("PROBE_LAYER", "-1"))
+                probe_head = int(os.getenv("PROBE_HEAD", "-1"))
+                probe_beta = float(os.getenv("PROBE_BETA", "0.05"))
+
+                patch_grid = int(os.getenv("PATCH_GRID_SIZE", "24"))
+                block_grid = int(os.getenv("PATCH_BLOCK_GRID", "4"))
+
+                block_ids = _parse_int_list_from_env("PROBE_BLOCK_IDS")
+
+                if idx == probe_layer and len(block_ids) > 0:
+                    token_idx = _blocks_to_image_token_indices(
+                        block_ids=block_ids,
+                        start_idx=start_idx,
+                        end_idx=end_idx,
+                        patch_grid=patch_grid,
+                        block_grid=block_grid,
+                        device=attn_weights.device,
+                    )
+
+                    if token_idx is not None:
+                        # Probe only the answer-generation query.
+                        # In both prefill and decode stages, -1 corresponds
+                        # to the current last query used to produce the next token.
+                        if probe_head < 0:
+                            # All heads.
+                            attn_weights[:, :, -1, token_idx] += probe_beta
+                        else:
+                            # One specific head.
+                            if 0 <= probe_head < self.num_heads:
+                                attn_weights[:, probe_head, -1, token_idx] += probe_beta
+
+                        if (
+                            os.getenv("PROBE_DEBUG", "False") == "True"
+                            and idx == probe_layer
+                        ):
+                            print(
+                                f"[PROBE_BIAS] layer={idx}, head={probe_head}, "
+                                f"blocks={block_ids}, tokens={token_idx.numel()}, "
+                                f"beta={probe_beta}, start={start_idx}, end={end_idx}"
+                            )
+
             else:
                 raise ValueError(f"Unknown adjust_method: {adjust_method}")
 
             # ScalingVis / AdaptVis:
             # multiply selected attention logits by weight.
             # VAR-sink is handled after softmax, so skip logit scaling here.
-            if adjust_method != "var_sink":
+            if adjust_method not in ["var_sink", "probe_bias"]:
                 attn_weights[:, :, mask] *= weight
 
         ######################################################################
