@@ -340,6 +340,19 @@ class LLaMAAttention(nn.Module):
             selected image tokens is scaled.
         """
 
+        # Allow environment-controlled intervention even if the caller does not
+        # explicitly pass adjust_method through generation kwargs.
+        if adjust_method is None:
+            env_adjust_method = os.getenv("ADJUST_METHOD", "").strip()
+            if env_adjust_method:
+                adjust_method = env_adjust_method
+
+        # VAR-sink works on attention probabilities and does not need a logit
+        # scaling weight. Keep weight=1.0 as a safe default so image-token
+        # span detection still runs.
+        if weight is None:
+            weight = 1.0
+
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states).view(
@@ -440,7 +453,12 @@ class LLaMAAttention(nn.Module):
         # 3. Locate image-token range from keys
         ######################################################################
 
-        if idx is not None and idx < 32 and keys is not None and weight is not None:
+        if (
+            idx is not None
+            and idx < 32
+            and keys is not None
+            and (weight is not None or adjust_method == "var_sink")
+        ):
             if isinstance(keys, (list, tuple)):
                 key_mask = keys[0]
             else:
@@ -464,6 +482,17 @@ class LLaMAAttention(nn.Module):
 
                 if end_idx >= start_idx:
                     valid_image_tokens = True
+
+        if (
+            os.getenv("VAR_DEBUG", "False") == "True"
+            and adjust_method == "var_sink"
+            and idx == 0
+        ):
+            print(
+                f"[VAR DEBUG] layer={idx}, q_len={q_len}, kv_seq_len={kv_seq_len}, "
+                f"keys_is_none={keys is None}, valid_image_tokens={valid_image_tokens}, "
+                f"start_idx={start_idx}, end_idx={end_idx}, weight={weight}"
+            )
 
         ######################################################################
         # 4. Apply attention intervention
@@ -656,6 +685,13 @@ class LLaMAAttention(nn.Module):
         ######################################################################
 
         if valid_image_tokens and adjust_method == "var_sink":
+            if os.getenv("VAR_DEBUG", "False") == "True" and idx == 0:
+                print(
+                    f"[VAR DEBUG] enter var_sink | layer={idx}, "
+                    f"q_len={q_len}, kv_seq_len={kv_seq_len}, "
+                    f"start_idx={start_idx}, end_idx={end_idx}"
+                )
+
             after_probs = apply_var_sink_attention(
                 attn_weights=after_probs,
                 image_token_start=start_idx,
@@ -1254,6 +1290,15 @@ class LLaMAForCausalLMScal(LLaMAPreTrainedModel):
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
+
+                # Keep AdaptVis / VAR arguments alive during generation.
+                # Without these, generation steps after prepare_inputs_for_generation()
+                # may silently lose the intervention configuration.
+                "keys": kwargs.get("keys", None),
+                "pos": kwargs.get("pos", None),
+                "weight": kwargs.get("weight", None),
+                "caption_length": kwargs.get("caption_length", None),
+                "adjust_method": kwargs.get("adjust_method", None),
                 "object_patch_mask": kwargs.get("object_patch_mask", None),
             }
         )
