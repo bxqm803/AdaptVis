@@ -52,6 +52,59 @@ MODEL = "llava-hf/llava-1.5-7b-hf"
 
 
 # ============================================================
+# Probe / output helpers
+# ============================================================
+
+def load_probe_sample_id_set():
+    """
+    Optional filter for contribution probe.
+
+    Env:
+        PROBE_SAMPLE_IDS_FILE=output/relation_contribution_probe/ids_gold_on_under.txt
+
+    The ids should be original dataset indices. Do NOT use Subset(dataset, ids),
+    because AdaptVis prompts/answers are indexed by original index_of_total.
+    """
+    sample_id_file = os.getenv("PROBE_SAMPLE_IDS_FILE", "").strip()
+
+    if not sample_id_file:
+        return None
+
+    if not os.path.exists(sample_id_file):
+        raise FileNotFoundError(f"PROBE_SAMPLE_IDS_FILE not found: {sample_id_file}")
+
+    sample_id_set = set()
+
+    with open(sample_id_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                sample_id_set.add(int(line))
+
+    print(
+        f"[PROBE FILTER] loaded {len(sample_id_set)} sample ids "
+        f"from {sample_id_file}"
+    )
+
+    return sample_id_set
+
+
+def make_tagged_output_path(dataset, method, weight, option, test_flag):
+    """
+    Original AdaptVis writes to a fixed filename. That is unsafe for multi-GPU
+    probe jobs. If PROBE_RUN_TAG is set, append it to the output filename.
+    """
+    base = f"./output/results1.5_{dataset}_{method}_{weight}_{option}option_{test_flag}"
+    tag = os.getenv("PROBE_RUN_TAG", "").strip()
+
+    if tag:
+        safe_tag = re.sub(r"[^A-Za-z0-9_\-\.]+", "_", tag)
+        return f"{base}_{safe_tag}.json"
+
+    return f"{base}.json"
+
+
+# ============================================================
 # Object-mask CLIP helpers
 # ============================================================
 
@@ -89,13 +142,11 @@ def is_generation_correct(golden: str, gen: str) -> bool:
     golden_l = golden.strip().lower()
     gen_l = gen.strip().lower()
 
-    # Normalize common variants.
     golden_norm = golden_l.replace("in front", "in-front").replace("in_front", "in-front")
     gen_norm = gen_l.replace("in front", "in-front").replace("in_front", "in-front")
 
     ok = (golden in gen) or (golden_l in gen_l) or (golden_norm in gen_norm)
 
-    # Allow front to match in-front when datasets use the relation name in-front.
     if golden_norm in ["in-front", "front"]:
         ok = (
             ("front" in gen_norm)
@@ -103,13 +154,10 @@ def is_generation_correct(golden: str, gen: str) -> bool:
             or ("in front" in gen_l)
         )
 
-    # Original special case: avoid counting "front" as "on".
     if golden_norm == "on" and "front" in gen_l:
         ok = False
 
     return bool(ok)
-
-
 
 
 RELATION_WORDS = ["left", "right", "on", "under"]
@@ -169,8 +217,6 @@ def normalize_relation_token_text(s: str) -> str:
     s = s.strip()
     s = re.sub(r"^[\s\.,:;!\?\-\(\)\[\]\{\}'\"]+", "", s)
     s = re.sub(r"[\s\.,:;!\?\-\(\)\[\]\{\}'\"]+$", "", s)
-
-    # Normalize front variants.
     s = s.replace("in front", "in-front").replace("in_front", "in-front")
     return s
 
@@ -181,7 +227,6 @@ def canonicalize_relation_text(text: str, dataset: Optional[str] = None) -> str:
 
     canonical, aliases = get_probe_relation_set(dataset)
 
-    # For Controlled_Images_B, prefer behind before front to avoid weird strings.
     if "behind" in canonical and re.search(r"\bbehind\b", s_norm):
         return "behind"
 
@@ -198,7 +243,6 @@ def canonicalize_relation_text(text: str, dataset: Optional[str] = None) -> str:
             continue
 
         if re.search(rf"\b{re.escape(rel)}\b", s_norm):
-            # For Controlled_Images_A, avoid counting "front" as "on".
             if rel == "on" and "front" in s_norm:
                 continue
             return rel
@@ -237,10 +281,6 @@ def parse_relation_from_text(text: str, dataset: Optional[str] = None) -> str:
 
 
 def _single_token_prob(tokenizer, probs: torch.Tensor, alias: str):
-    """
-    Probability of alias if it is encoded as a single token.
-    Try both raw alias and space-prefixed alias.
-    """
     candidates = [alias, " " + alias]
     best = None
     best_token_id = None
@@ -278,13 +318,6 @@ def _generated_phrase_prob_if_matches(
     end_step: int,
     phrase: str,
 ):
-    """
-    Compute product probability for a phrase only if the generated token window
-    ending at end_step exactly matches one tokenizer encoding of the phrase.
-
-    This is not a counterfactual teacher-forced probability. It is the probability
-    of the actually generated phrase when that phrase appears in the output.
-    """
     variants = [phrase, " " + phrase]
     best = None
     best_ids = None
@@ -301,14 +334,17 @@ def _generated_phrase_prob_if_matches(
 
         L = len(ids)
         start = end_step - L + 1
+
         if start < 0:
             continue
 
         actual = [int(x.item()) for x in generated_ids[start:end_step + 1]]
+
         if actual != [int(x) for x in ids]:
             continue
 
         prob = 1.0
+
         for off, tid in enumerate(ids):
             step = start + off
             logits = scores[step][0].detach().float()
@@ -341,14 +377,6 @@ def build_relation_candidate_probs(
     probs: torch.Tensor,
     dataset: Optional[str] = None,
 ):
-    """
-    Save relation-candidate probabilities at the selected relation step.
-
-    For Controlled_Images_B:
-      - in-front may appear as one token, as "front", or as two tokens "in front".
-      - We record single-token probabilities for in/front/in-front/front,
-        and phrase probability if the actually generated tokens match "in front".
-    """
     canonical, aliases = get_probe_relation_set(dataset)
     out = {}
 
@@ -374,7 +402,6 @@ def build_relation_candidate_probs(
             )
             rel_info["generated_phrase"][alias_norm] = phrase
 
-        # Special record for in front split into in + front.
         if rel == "in-front":
             rel_info["in_front_parts"] = {}
 
@@ -385,7 +412,6 @@ def build_relation_candidate_probs(
                     part,
                 )
 
-            # If current selected step is front, also try to record previous "in" probability.
             if step >= 1:
                 prev_logits = scores[step - 1][0].detach().float()
                 prev_probs = torch.softmax(prev_logits, dim=-1)
@@ -413,22 +439,6 @@ def extract_relation_token_topk_from_generate_output(
     topk: int = 10,
     dataset: Optional[str] = None,
 ):
-    """
-    Find the LAST generated relation token for the dataset's relation set.
-
-    Controlled_Images_A:
-        left / right / on / under
-
-    Controlled_Images_B:
-        left / right / in-front / behind
-        "in-front" supports "front", "in front", and "in-front".
-
-    COCO_QA_two_obj:
-        left / right / above / below
-
-    The returned dict also contains relation_candidate_probs so downstream
-    analysis can inspect all relation probabilities, not only the generated one.
-    """
     if output is None:
         return None
 
@@ -467,7 +477,6 @@ def extract_relation_token_topk_from_generate_output(
 
         relation = None
 
-        # Single-token direct match.
         for rel in canonical:
             if rel == "in-front":
                 if token_norm in ["front", "in-front"]:
@@ -478,7 +487,6 @@ def extract_relation_token_topk_from_generate_output(
                     relation = rel
                     break
 
-        # Text-level newly-added relation.
         if relation is None:
             before_relations = relations_in_text(prev_text, dataset=dataset)
             after_relations = relations_in_text(curr_text, dataset=dataset)
@@ -577,7 +585,6 @@ def extract_relation_token_topk_from_generate_output(
             "top_tokens": top_tokens,
         }
 
-    # Fallback: no explicit relation token found.
     first_logits = scores[0][0].detach().float()
     first_probs = torch.softmax(first_logits, dim=-1)
     top_probs, top_ids = torch.topk(first_probs, k=topk)
@@ -633,15 +640,11 @@ def extract_relation_token_topk_from_generate_output(
 
 
 def extract_objects_from_question(question: str) -> Optional[Tuple[str, str]]:
-    """
-    Parse:
-        USER: Where is the obj1 in relation to the obj2?
-        Answer with left, right, on or under.
-    """
     if question is None:
         return None
 
     m = QUESTION_RE.search(question)
+
     if m is None:
         return None
 
@@ -661,10 +664,6 @@ def build_clip_text_prompts(obj_name: str) -> List[str]:
 
 
 def ensure_pil_image(image) -> Image.Image:
-    """
-    Controlled_Images_A normally returns PIL images because image_preprocess is None.
-    This function keeps it robust.
-    """
     if isinstance(image, Image.Image):
         return image.convert("RGB")
 
@@ -677,13 +676,11 @@ def ensure_pil_image(image) -> Image.Image:
         if x.dim() != 3:
             raise ValueError(f"Cannot convert tensor with shape {tuple(x.shape)} to PIL.")
 
-        # CHW -> HWC
         if x.shape[0] in [1, 3]:
             x = x.permute(1, 2, 0)
 
         x = x.float()
 
-        # Best-effort normalization back to [0, 1]
         if x.min() < 0 or x.max() > 1:
             x = x - x.min()
             x = x / (x.max() + 1e-8)
@@ -731,9 +728,6 @@ def get_clip_text_embed(
 
 
 def dilate_binary_mask(mask_2d: torch.Tensor, dilate: int = 0) -> torch.Tensor:
-    """
-    mask_2d: [H, W], bool
-    """
     if dilate <= 0:
         return mask_2d
 
@@ -754,22 +748,8 @@ def compute_clip_object_mask_binary(
     invert: bool = True,
     dilate: int = 1,
 ) -> Optional[torch.Tensor]:
-    """
-    Binary object mask.
-
-    Steps:
-        1. parse obj1 / obj2 from question
-        2. compute CLIP patch-text similarity for obj1 and obj2
-        3. invert similarity because current observation shows -sim localizes objects better
-        4. normalize each heatmap to [0, 1]
-        5. object_score = max(score1, score2)
-        6. object_mask = object_score >= clip_threshold
-        7. optional dilation
-
-    Return:
-        object_patch_mask: [num_patches], bool tensor
-    """
     objs = extract_objects_from_question(question)
+
     if objs is None:
         return None
 
@@ -785,10 +765,8 @@ def compute_clip_object_mask_binary(
         return_dict=True,
     )
 
-    # [1, 1 + N, hidden_dim] -> [1, N, hidden_dim]
     patch_tokens = vision_outputs.last_hidden_state[:, 1:, :]
 
-    # Keep consistent with the visualization script.
     if hasattr(clip_model.vision_model, "post_layernorm"):
         patch_tokens = clip_model.vision_model.post_layernorm(patch_tokens)
 
@@ -814,7 +792,6 @@ def compute_clip_object_mask_binary(
     score1 = _normalize_01(sim1).view(grid_size, grid_size)
     score2 = _normalize_01(sim2).view(grid_size, grid_size)
 
-    # Use max, not average.
     object_score = torch.maximum(score1, score2)
 
     object_mask_2d = object_score >= clip_threshold
@@ -822,8 +799,6 @@ def compute_clip_object_mask_binary(
 
     object_patch_mask = object_mask_2d.reshape(-1)
 
-    # Fallback: if threshold is too high and no patch is selected,
-    # select top ratio according to object_score.
     if object_patch_mask.sum() == 0:
         fallback_ratio = float(os.getenv("CLIP_OBJ_FALLBACK_TOP_RATIO", "0.05"))
         k = max(1, int(fallback_ratio * object_score.numel()))
@@ -846,29 +821,6 @@ def compute_clip_object_mask_binary(
 
 
 def build_manual_patch_mask_from_env(device):
-    """
-    Manual patch/block mask for brute-force search.
-
-    Assumes LLaVA-1.5 image tokens are 24x24 = 576.
-
-    Environment variables:
-        PATCH_MASK_MODE:
-            ""              -> disabled
-            "all"           -> select all patches
-            "block"         -> select only one block by PATCH_BLOCK_ID
-            "blocks"        -> select multiple blocks by PATCH_BLOCK_IDS
-            "except_block"  -> select all patches except one block by PATCH_BLOCK_ID
-            "except_blocks" -> select all patches except multiple blocks by PATCH_BLOCK_IDS
-            "row"           -> select one row
-            "col"           -> select one column
-
-        PATCH_GRID_SIZE=24
-        PATCH_BLOCK_GRID=4
-        PATCH_BLOCK_ID=0
-        PATCH_BLOCK_IDS=12,13,14,15
-        PATCH_ROW_ID=0
-        PATCH_COL_ID=0
-    """
     mode = os.getenv("PATCH_MASK_MODE", "").strip()
 
     if mode == "":
@@ -883,11 +835,6 @@ def build_manual_patch_mask_from_env(device):
     mask_2d = torch.zeros((grid_size, grid_size), dtype=torch.bool)
 
     def parse_block_ids():
-        """
-        PATCH_BLOCK_IDS has higher priority when using blocks / except_blocks.
-        Example:
-            PATCH_BLOCK_IDS=12,13,14,15
-        """
         if block_ids_env.strip() == "":
             return [block_id]
 
@@ -1070,9 +1017,11 @@ def _add_weight_greedy_search(
     while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
         model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
-        # Keep custom kwargs robustly across generation.
-        # Some prepare_inputs_for_generation implementations may drop them.
-        for custom_key in ["keys", "object_patch_mask"]:
+        for custom_key in [
+            "keys",
+            "object_patch_mask",
+            "caption_length",
+        ]:
             if custom_key not in model_inputs and custom_key in model_kwargs:
                 model_inputs[custom_key] = model_kwargs.get(custom_key, None)
 
@@ -1138,9 +1087,11 @@ def _add_weight_greedy_search(
             is_encoder_decoder=self.config.is_encoder_decoder,
         )
 
-        # Keep custom kwargs after HF updates model_kwargs.
-        # This avoids losing object_patch_mask / keys after the first decode step.
-        for custom_key in ["keys", "object_patch_mask"]:
+        for custom_key in [
+            "keys",
+            "object_patch_mask",
+            "caption_length",
+        ]:
             if custom_key in model_inputs and custom_key not in model_kwargs:
                 model_kwargs[custom_key] = model_inputs[custom_key]
 
@@ -1226,7 +1177,6 @@ class LlavaWrapper:
 
         self.device = device
 
-        # External CLIP for object binary mask.
         self.use_clip_obj_mask = os.getenv("CLIP_OBJ_MASK", "False") == "True"
 
         if self.use_clip_obj_mask:
@@ -1306,8 +1256,13 @@ class LlavaWrapper:
     ):
         scores = []
         index_of_total = 0
+        processed_count = 0
+        skipped_count = 0
         acc = 0
         correct_id = []
+        processed_sample_ids = []
+
+        sample_id_set = load_probe_sample_id_set()
 
         qst_ans_file = f"prompts/{dataset}_with_answer_{option}_options.jsonl"
 
@@ -1359,9 +1314,26 @@ class LlavaWrapper:
 
         os.makedirs(save_attn_dir, exist_ok=True)
 
+        output_file_path = make_tagged_output_path(
+            dataset=dataset,
+            method=method,
+            weight=weight,
+            option=option,
+            test_flag=TEST,
+        )
+
+        print(f"[OUTPUT] result path = {output_file_path}")
+
         results = []
 
         for batch in tqdm(joint_loader):
+            # For Controlled_Images_* this loader is normally batch_size=1.
+            # Keep index_of_total as the original dataset index.
+            if sample_id_set is not None and index_of_total not in sample_id_set:
+                skipped_count += 1
+                index_of_total += 1
+                continue
+
             batch_scores = []
 
             os.environ["SAVE_ATTN_PATH"] = f"{save_attn_dir}/{index_of_total}/"
@@ -1371,6 +1343,7 @@ class LlavaWrapper:
                 im_scores = []
 
                 for _ in i_option:
+                    sample_id = int(index_of_total)
                     prompt = prompt_list[index_of_total]
 
                     single_input = self.processor(
@@ -1397,8 +1370,6 @@ class LlavaWrapper:
 
                     object_patch_mask = None
 
-                    # Manual brute-force mask has higher priority than CLIP mask.
-                    # This lets you test which image patch/block is useful without using CLIP.
                     manual_patch_mask = build_manual_patch_mask_from_env(self.device)
 
                     if adjust_method_env == "object_mask" and manual_patch_mask is not None:
@@ -1454,7 +1425,6 @@ class LlavaWrapper:
                     elif method == "adapt_vis":
                         change_greedy_to_add_weight()
 
-                        # First pass: weight=1.0 only estimates confidence.
                         output = self.model.generate(
                             **single_input,
                             keys=keys,
@@ -1474,7 +1444,6 @@ class LlavaWrapper:
 
                         print(uncertainty, threshold)
 
-                        # Second pass: original AdaptVis confidence rule.
                         if uncertainty < threshold:
                             selected_weight = weight1
 
@@ -1556,7 +1525,7 @@ class LlavaWrapper:
                     if num_options == 4:
                         if is_correct:
                             acc += 1
-                            correct_id.append(index_of_total)
+                            correct_id.append(sample_id)
                             answers = [1, 0, 0, 0]
                         else:
                             answers = [0, 0, 1, 0]
@@ -1564,7 +1533,7 @@ class LlavaWrapper:
                     elif num_options == 2:
                         if is_correct:
                             acc += 1
-                            correct_id.append(index_of_total)
+                            correct_id.append(sample_id)
                             answers = [1, 0]
                         else:
                             answers = [0, 1]
@@ -1577,7 +1546,7 @@ class LlavaWrapper:
                         patch_selected = int(object_patch_mask.detach().bool().sum().item())
 
                     result = {
-                        "sample_id": int(index_of_total),
+                        "sample_id": sample_id,
                         "Prompt": prompt,
                         "Generation": gen,
                         "Golden": golden,
@@ -1586,8 +1555,13 @@ class LlavaWrapper:
                         "selected_weight": float(selected_weight) if selected_weight is not None else None,
                         "relation_probe": relation_probe,
 
-                        # Mask / block metadata for per-image flip analysis.
                         "adjust_method": os.getenv("ADJUST_METHOD", "last_query"),
+                        "probe_layer": os.getenv("PROBE_LAYER", ""),
+                        "probe_head": os.getenv("PROBE_HEAD", ""),
+                        "probe_block_ids": os.getenv("PROBE_BLOCK_IDS", ""),
+                        "probe_beta": os.getenv("PROBE_BETA", ""),
+                        "probe_run_tag": os.getenv("PROBE_RUN_TAG", ""),
+
                         "patch_mask_mode": os.getenv("PATCH_MASK_MODE", ""),
                         "patch_grid_size": os.getenv("PATCH_GRID_SIZE", ""),
                         "patch_block_grid": os.getenv("PATCH_BLOCK_GRID", ""),
@@ -1602,38 +1576,68 @@ class LlavaWrapper:
                     results.append(result)
 
                     im_scores.append(np.expand_dims(np.array(answers), -1))
+
+                    processed_count += 1
+                    processed_sample_ids.append(sample_id)
                     index_of_total += 1
 
-                batch_scores.append(np.concatenate(im_scores, axis=-1))
+                if len(im_scores) > 0:
+                    batch_scores.append(np.concatenate(im_scores, axis=-1))
 
-            scores.append(batch_scores)
+            if len(batch_scores) > 0:
+                scores.append(batch_scores)
 
-            output_file_path = f"./output/results1.5_{dataset}_{method}_{weight}_{option}option_{TEST}.json"
             print("Saving results to", output_file_path)
 
             with open(output_file_path, "w", encoding="utf-8") as fout:
                 json.dump(results, fout, ensure_ascii=False, indent=4)
 
-            print(acc, index_of_total, acc / index_of_total)
+            denom = processed_count if processed_count > 0 else 1
+            print(
+                f"[RUNNING] acc={acc}/{processed_count}={acc / denom:.6f}, "
+                f"scanned={index_of_total}, skipped={skipped_count}"
+            )
 
-        print(acc / index_of_total)
+        denom = processed_count if processed_count > 0 else 1
+        final_acc = acc / denom
+
+        print(
+            f"[FINAL] acc={acc}/{processed_count}={final_acc:.6f}, "
+            f"scanned={index_of_total}, skipped={skipped_count}"
+        )
 
         output_score_file = output_file_path.replace(".json", "scores.json")
 
         with open(output_score_file, "w", encoding="utf-8") as fout:
             json.dump(
-                {"acc": acc / index_of_total, "correct_id": correct_id},
+                {
+                    "acc": final_acc,
+                    "correct_id": correct_id,
+                    "processed_count": processed_count,
+                    "skipped_count": skipped_count,
+                    "processed_sample_ids": processed_sample_ids,
+                    "sample_filter_file": os.getenv("PROBE_SAMPLE_IDS_FILE", ""),
+                    "probe_run_tag": os.getenv("PROBE_RUN_TAG", ""),
+                },
                 fout,
                 ensure_ascii=False,
                 indent=4,
             )
 
-        all_scores = np.concatenate(scores, axis=0)
+        if len(scores) > 0:
+            all_scores = np.concatenate(scores, axis=0)
+        else:
+            if option == "four":
+                all_scores = np.zeros((0, 4, 1))
+            elif option == "two":
+                all_scores = np.zeros((0, 2, 1))
+            else:
+                all_scores = np.zeros((0, 4, 1))
 
         if dataset in ["Controlled_Images_B", "Controlled_Images_A"]:
             return all_scores, []
         else:
-            return acc / index_of_total, correct_id
+            return final_acc, correct_id
 
     @torch.no_grad()
     def get_judge_scores_vsr_batched(
