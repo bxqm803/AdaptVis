@@ -748,13 +748,68 @@ class LLaMAAttention(nn.Module):
                                 f"beta={probe_beta}, start={start_idx}, end={end_idx}"
                             )
 
+            elif adjust_method == "probe_scale":
+                # Paper-style multiplicative probe.
+                #
+                # This is different from probe_bias:
+                #   probe_bias  : attn_logits += beta
+                #   probe_scale : attn_logits *= scale
+                #
+                # Env variables:
+                #   PROBE_LAYER=20
+                #   PROBE_HEAD=-1          # -1 means all heads
+                #   PROBE_BLOCK_IDS=13,14
+                #   PROBE_SCALE=1.5
+                #   PATCH_GRID_SIZE=24
+                #   PATCH_BLOCK_GRID=4
+                probe_layer = int(os.getenv("PROBE_LAYER", "-1"))
+                probe_head = int(os.getenv("PROBE_HEAD", "-1"))
+                probe_scale = float(os.getenv("PROBE_SCALE", "1.5"))
+
+                patch_grid = int(os.getenv("PATCH_GRID_SIZE", "24"))
+                block_grid = int(os.getenv("PATCH_BLOCK_GRID", "4"))
+
+                block_ids = _parse_int_list_from_env("PROBE_BLOCK_IDS")
+
+                if idx == probe_layer and len(block_ids) > 0:
+                    token_idx = _blocks_to_image_token_indices(
+                        block_ids=block_ids,
+                        start_idx=start_idx,
+                        end_idx=end_idx,
+                        patch_grid=patch_grid,
+                        block_grid=block_grid,
+                        device=attn_weights.device,
+                    )
+
+                    if token_idx is not None:
+                        # Probe only the answer-generation query.
+                        # In both prefill and decode stages, -1 corresponds
+                        # to the current last query used to produce the next token.
+                        if probe_head < 0:
+                            # All heads.
+                            attn_weights[:, :, -1, token_idx] *= probe_scale
+                        else:
+                            # One specific head.
+                            if 0 <= probe_head < self.num_heads:
+                                attn_weights[:, probe_head, -1, token_idx] *= probe_scale
+
+                        if (
+                            os.getenv("PROBE_DEBUG", "False") == "True"
+                            and idx == probe_layer
+                        ):
+                            print(
+                                f"[PROBE_SCALE] layer={idx}, head={probe_head}, "
+                                f"blocks={block_ids}, tokens={token_idx.numel()}, "
+                                f"scale={probe_scale}, start={start_idx}, end={end_idx}"
+                            )
+
             else:
                 raise ValueError(f"Unknown adjust_method: {adjust_method}")
 
             # ScalingVis / AdaptVis:
             # multiply selected attention logits by weight.
             # VAR-sink is handled after softmax, so skip logit scaling here.
-            if adjust_method not in ["var_sink", "probe_bias"]:
+            if adjust_method not in ["var_sink", "probe_bias", "probe_scale"]:
                 attn_weights[:, :, mask] *= weight
 
         ######################################################################
