@@ -751,13 +751,13 @@ def ensure_rgb_pil_for_control(image) -> Image.Image:
 def apply_image_control_from_env(image, sample_id: int = 0):
     """
     Env:
-        IMAGE_CONTROL=none | blank_gray | blank_mean | shuffle_patches | random_noise
+        IMAGE_CONTROL=none | blank_black | blank_gray | blank_mean | shuffle_patches | random_noise
         IMAGE_CONTROL_SIZE=336
         IMAGE_CONTROL_GRID=24
         IMAGE_CONTROL_SEED=1
 
     Purpose:
-        blank_gray / blank_mean:
+        blank_black / blank_gray / blank_mean:
             Remove visual content. If steering remains, it is likely relation prior / bias.
 
         shuffle_patches:
@@ -778,8 +778,14 @@ def apply_image_control_from_env(image, sample_id: int = 0):
     seed = int(os.getenv("IMAGE_CONTROL_SEED", "1")) + int(sample_id)
     rng = np.random.default_rng(seed)
 
+    if mode == "blank_black":
+        return Image.new("RGB", pil.size, (0, 0, 0))
+
     if mode == "blank_gray":
         return Image.new("RGB", pil.size, (127, 127, 127))
+
+    if mode == "blank_white":
+        return Image.new("RGB", pil.size, (255, 255, 255))
 
     if mode == "blank_mean":
         arr = np.asarray(pil).astype(np.float32)
