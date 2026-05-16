@@ -75,6 +75,33 @@ def config():
     return parser.parse_args()
 
 
+def is_probe_mode():
+    """
+    Probe runs may only process a filtered subset, e.g. gold=on/under ids.
+    In that case, scores are no longer aligned with the full dataset and
+    dataset.evaluate_scores() must be skipped.
+    """
+    if os.getenv("FORCE_DATASET_EVAL", "False") == "True":
+        return False
+
+    probe_env_keys = [
+        "PROBE_SAMPLE_IDS_FILE",
+        "PROBE_RUN_TAG",
+        "PROBE_LAYER",
+        "PROBE_HEAD",
+        "PROBE_BLOCK_IDS",
+    ]
+
+    if os.getenv("ADJUST_METHOD", "").strip() == "probe_bias":
+        return True
+
+    for key in probe_env_keys:
+        if os.getenv(key, "").strip():
+            return True
+
+    return False
+
+
 def main(args):
     seed_all(args.seed)
 
@@ -172,6 +199,18 @@ def main(args):
         )
 
         print("Got the following shape of scores", scores.shape)
+
+        if is_probe_mode():
+            print(
+                "[PROBE MODE] Skip dataset.evaluate_scores because this run "
+                "may contain a filtered subset and scores may not align with "
+                "the full dataset."
+            )
+            print(
+                "[PROBE MODE] Probe outputs have already been saved by "
+                "model.get_out_scores_wh_batched()."
+            )
+            return
 
         # change from (N, 4, 1) to (N, 1, 4)
         scores = scores.transpose(0, 2, 1)
