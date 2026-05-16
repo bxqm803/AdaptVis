@@ -84,16 +84,20 @@ def is_probe_mode():
     if os.getenv("FORCE_DATASET_EVAL", "False") == "True":
         return False
 
+    adjust_method = os.getenv("ADJUST_METHOD", "").strip()
+
+    if adjust_method in ["probe_bias", "probe_scale"]:
+        return True
+
     probe_env_keys = [
         "PROBE_SAMPLE_IDS_FILE",
         "PROBE_RUN_TAG",
         "PROBE_LAYER",
         "PROBE_HEAD",
         "PROBE_BLOCK_IDS",
+        "PROBE_BETA",
+        "PROBE_SCALE",
     ]
-
-    if os.getenv("ADJUST_METHOD", "").strip() == "probe_bias":
-        return True
 
     for key in probe_env_keys:
         if os.getenv(key, "").strip():
@@ -225,17 +229,6 @@ def main(args):
             sampled_indices,
             args.option,
         )
-
-        # dataset.save_scores(
-        #     scores,
-        #     correct_id,
-        #     args.output_dir,
-        #     args.dataset,
-        #     args.method,
-        #     args.weight,
-        #     args.model_name,
-        #     args.option,
-        # )
 
     else:
         scores, correct_id = model.get_out_scores_wh_batched(
