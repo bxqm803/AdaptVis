@@ -1425,32 +1425,21 @@ class LlavaWrapper:
                     elif method == "adapt_vis":
                         change_greedy_to_add_weight()
 
-                        output = self.model.generate(
-                            **single_input,
-                            keys=keys,
-                            weight=1.0,
-                            adjust_method=adjust_method_env,
-                            pos=query_pos,
-                            object_patch_mask=object_patch_mask,
-                            max_new_tokens=100,
-                            output_scores=True,
-                            return_dict_in_generate=True,
+                        probe_single_pass = (
+                            adjust_method_env in ["probe_bias", "probe_scale", "var_sink"]
+                            or os.getenv("PROBE_RUN_TAG", "").strip() != ""
                         )
 
-                        uncertainty = np.round(
-                            float(max(torch.nn.functional.softmax(output["scores"][0], dim=-1)[0])),
-                            2,
-                        )
-
-                        print(uncertainty, threshold)
-
-                        if uncertainty < threshold:
-                            selected_weight = weight1
+                        if probe_single_pass:
+                            # In probe mode, intervention is controlled by env vars:
+                            # PROBE_LAYER / PROBE_HEAD / PROBE_BLOCK_IDS / PROBE_SCALE.
+                            # Do not run the original AdaptVis confidence branch twice.
+                            selected_weight = 1.0
 
                             output = self.model.generate(
                                 **single_input,
                                 keys=keys,
-                                weight=weight1,
+                                weight=1.0,
                                 adjust_method=adjust_method_env,
                                 pos=query_pos,
                                 object_patch_mask=object_patch_mask,
@@ -1458,13 +1447,22 @@ class LlavaWrapper:
                                 output_scores=True,
                                 return_dict_in_generate=True,
                             )
+
+                            uncertainty = np.round(
+                                float(max(torch.nn.functional.softmax(output["scores"][0], dim=-1)[0])),
+                                2,
+                            )
+
+                            gen = self.processor.decode(
+                                output["sequences"][0][len(single_input["input_ids"][-1]):],
+                                skip_special_tokens=True,
+                            )
+
                         else:
-                            selected_weight = weight2
-
                             output = self.model.generate(
                                 **single_input,
                                 keys=keys,
-                                weight=weight2,
+                                weight=1.0,
                                 adjust_method=adjust_method_env,
                                 pos=query_pos,
                                 object_patch_mask=object_patch_mask,
@@ -1473,10 +1471,46 @@ class LlavaWrapper:
                                 return_dict_in_generate=True,
                             )
 
-                        gen = self.processor.decode(
-                            output["sequences"][0][len(single_input["input_ids"][-1]):],
-                            skip_special_tokens=True,
-                        )
+                            uncertainty = np.round(
+                                float(max(torch.nn.functional.softmax(output["scores"][0], dim=-1)[0])),
+                                2,
+                            )
+
+                            print(uncertainty, threshold)
+
+                            if uncertainty < threshold:
+                                selected_weight = weight1
+
+                                output = self.model.generate(
+                                    **single_input,
+                                    keys=keys,
+                                    weight=weight1,
+                                    adjust_method=adjust_method_env,
+                                    pos=query_pos,
+                                    object_patch_mask=object_patch_mask,
+                                    max_new_tokens=100,
+                                    output_scores=True,
+                                    return_dict_in_generate=True,
+                                )
+                            else:
+                                selected_weight = weight2
+
+                                output = self.model.generate(
+                                    **single_input,
+                                    keys=keys,
+                                    weight=weight2,
+                                    adjust_method=adjust_method_env,
+                                    pos=query_pos,
+                                    object_patch_mask=object_patch_mask,
+                                    max_new_tokens=100,
+                                    output_scores=True,
+                                    return_dict_in_generate=True,
+                                )
+
+                            gen = self.processor.decode(
+                                output["sequences"][0][len(single_input["input_ids"][-1]):],
+                                skip_special_tokens=True,
+                            )
 
                     else:
                         selected_weight = None
@@ -1560,6 +1594,7 @@ class LlavaWrapper:
                         "probe_head": os.getenv("PROBE_HEAD", ""),
                         "probe_block_ids": os.getenv("PROBE_BLOCK_IDS", ""),
                         "probe_beta": os.getenv("PROBE_BETA", ""),
+                        "probe_scale": os.getenv("PROBE_SCALE", ""),
                         "probe_run_tag": os.getenv("PROBE_RUN_TAG", ""),
 
                         "patch_mask_mode": os.getenv("PATCH_MASK_MODE", ""),
@@ -1618,6 +1653,7 @@ class LlavaWrapper:
                     "processed_sample_ids": processed_sample_ids,
                     "sample_filter_file": os.getenv("PROBE_SAMPLE_IDS_FILE", ""),
                     "probe_run_tag": os.getenv("PROBE_RUN_TAG", ""),
+                    "probe_scale": os.getenv("PROBE_SCALE", ""),
                 },
                 fout,
                 ensure_ascii=False,
