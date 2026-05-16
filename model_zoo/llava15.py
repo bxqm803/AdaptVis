@@ -700,6 +700,136 @@ def ensure_pil_image(image) -> Image.Image:
     raise TypeError(f"Unsupported image type for CLIP object mask: {type(image)}")
 
 
+# ============================================================
+# Image-control helpers for bias / visual-grounding control
+# ============================================================
+
+def ensure_rgb_pil_for_control(image) -> Image.Image:
+    """
+    Convert input image to RGB PIL for IMAGE_CONTROL.
+    This intentionally mirrors ensure_pil_image but is kept separate to make
+    control logic explicit.
+    """
+    if isinstance(image, Image.Image):
+        return image.convert("RGB")
+
+    if isinstance(image, torch.Tensor):
+        x = image.detach().cpu()
+
+        if x.dim() == 4:
+            x = x[0]
+
+        if x.dim() != 3:
+            raise ValueError(f"Cannot convert tensor with shape {tuple(x.shape)} to PIL.")
+
+        if x.shape[0] in [1, 3]:
+            x = x.permute(1, 2, 0)
+
+        x = x.float()
+
+        if x.min() < 0 or x.max() > 1:
+            x = x - x.min()
+            x = x / (x.max() + 1e-8)
+
+        arr = (x.numpy() * 255).clip(0, 255).astype(np.uint8)
+        return Image.fromarray(arr).convert("RGB")
+
+    if isinstance(image, np.ndarray):
+        arr = image
+
+        if arr.dtype != np.uint8:
+            arr = arr.astype(np.float32)
+            arr = arr - arr.min()
+            arr = arr / (arr.max() + 1e-8)
+            arr = (arr * 255).clip(0, 255).astype(np.uint8)
+
+        return Image.fromarray(arr).convert("RGB")
+
+    raise TypeError(f"Unsupported image type for IMAGE_CONTROL: {type(image)}")
+
+
+def apply_image_control_from_env(image, sample_id: int = 0):
+    """
+    Env:
+        IMAGE_CONTROL=none | blank_gray | blank_mean | shuffle_patches | random_noise
+        IMAGE_CONTROL_SIZE=336
+        IMAGE_CONTROL_GRID=24
+        IMAGE_CONTROL_SEED=1
+
+    Purpose:
+        blank_gray / blank_mean:
+            Remove visual content. If steering remains, it is likely relation prior / bias.
+
+        shuffle_patches:
+            Preserve local color/texture patches but destroy global spatial layout.
+            If steering remains under shuffle but disappears under blank, the effect may depend
+            on visual content but not true spatial arrangement.
+
+        random_noise:
+            Stress test. If steering remains even under noise, it is likely not visual grounding.
+    """
+    mode = os.getenv("IMAGE_CONTROL", "none").strip().lower()
+
+    if mode in ["", "none", "original"]:
+        return image
+
+    pil = ensure_rgb_pil_for_control(image)
+
+    seed = int(os.getenv("IMAGE_CONTROL_SEED", "1")) + int(sample_id)
+    rng = np.random.default_rng(seed)
+
+    if mode == "blank_gray":
+        return Image.new("RGB", pil.size, (127, 127, 127))
+
+    if mode == "blank_mean":
+        arr = np.asarray(pil).astype(np.float32)
+        mean_rgb = arr.reshape(-1, 3).mean(axis=0).clip(0, 255).astype(np.uint8)
+        return Image.new("RGB", pil.size, tuple(int(x) for x in mean_rgb))
+
+    if mode == "random_noise":
+        size = int(os.getenv("IMAGE_CONTROL_SIZE", "336"))
+        noise = rng.integers(0, 256, size=(size, size, 3), dtype=np.uint8)
+        return Image.fromarray(noise, mode="RGB")
+
+    if mode == "shuffle_patches":
+        size = int(os.getenv("IMAGE_CONTROL_SIZE", "336"))
+        grid = int(os.getenv("IMAGE_CONTROL_GRID", "24"))
+
+        if size % grid != 0:
+            raise ValueError(
+                f"IMAGE_CONTROL_SIZE={size} must be divisible by IMAGE_CONTROL_GRID={grid}"
+            )
+
+        patch = size // grid
+        pil_resized = pil.resize((size, size), Image.BICUBIC)
+
+        patches = []
+        for r in range(grid):
+            for c in range(grid):
+                crop = pil_resized.crop(
+                    (
+                        c * patch,
+                        r * patch,
+                        (c + 1) * patch,
+                        (r + 1) * patch,
+                    )
+                )
+                patches.append(crop)
+
+        perm = rng.permutation(len(patches))
+        out = Image.new("RGB", (size, size))
+
+        k = 0
+        for r in range(grid):
+            for c in range(grid):
+                out.paste(patches[int(perm[k])], (c * patch, r * patch))
+                k += 1
+
+        return out
+
+    raise ValueError(f"Unknown IMAGE_CONTROL={mode}")
+
+
 @torch.no_grad()
 def get_clip_text_embed(
     clip_model: CLIPModel,
@@ -1346,9 +1476,11 @@ class LlavaWrapper:
                     sample_id = int(index_of_total)
                     prompt = prompt_list[index_of_total]
 
+                    image_for_model = apply_image_control_from_env(_, sample_id=sample_id)
+
                     single_input = self.processor(
                         text=prompt,
-                        images=_,
+                        images=image_for_model,
                         padding="max_length",
                         return_tensors="pt",
                         max_length=77,
@@ -1380,10 +1512,12 @@ class LlavaWrapper:
                         clip_obj_dilate = int(os.getenv("CLIP_OBJ_DILATE", "1"))
                         clip_obj_invert = os.getenv("CLIP_OBJ_INVERT", "True") == "True"
 
+                        # For IMAGE_CONTROL experiments, object masks should be based on the
+                        # actual image seen by the model, not the original image.
                         object_patch_mask = compute_clip_object_mask_binary(
                             clip_model=self.clip_obj_model,
                             clip_processor=self.clip_obj_processor,
-                            pil_image=_,
+                            pil_image=image_for_model,
                             question=prompt,
                             device=self.device,
                             clip_threshold=clip_obj_threshold,
@@ -1431,9 +1565,6 @@ class LlavaWrapper:
                         )
 
                         if probe_single_pass:
-                            # In probe mode, intervention is controlled by env vars:
-                            # PROBE_LAYER / PROBE_HEAD / PROBE_BLOCK_IDS / PROBE_SCALE.
-                            # Do not run the original AdaptVis confidence branch twice.
                             selected_weight = 1.0
 
                             output = self.model.generate(
@@ -1597,6 +1728,11 @@ class LlavaWrapper:
                         "probe_scale": os.getenv("PROBE_SCALE", ""),
                         "probe_run_tag": os.getenv("PROBE_RUN_TAG", ""),
 
+                        "image_control": os.getenv("IMAGE_CONTROL", "none"),
+                        "image_control_size": os.getenv("IMAGE_CONTROL_SIZE", ""),
+                        "image_control_grid": os.getenv("IMAGE_CONTROL_GRID", ""),
+                        "image_control_seed": os.getenv("IMAGE_CONTROL_SEED", ""),
+
                         "patch_mask_mode": os.getenv("PATCH_MASK_MODE", ""),
                         "patch_grid_size": os.getenv("PATCH_GRID_SIZE", ""),
                         "patch_block_grid": os.getenv("PATCH_BLOCK_GRID", ""),
@@ -1654,6 +1790,10 @@ class LlavaWrapper:
                     "sample_filter_file": os.getenv("PROBE_SAMPLE_IDS_FILE", ""),
                     "probe_run_tag": os.getenv("PROBE_RUN_TAG", ""),
                     "probe_scale": os.getenv("PROBE_SCALE", ""),
+                    "image_control": os.getenv("IMAGE_CONTROL", "none"),
+                    "image_control_size": os.getenv("IMAGE_CONTROL_SIZE", ""),
+                    "image_control_grid": os.getenv("IMAGE_CONTROL_GRID", ""),
+                    "image_control_seed": os.getenv("IMAGE_CONTROL_SEED", ""),
                 },
                 fout,
                 ensure_ascii=False,
@@ -1722,9 +1862,14 @@ class LlavaWrapper:
                     ]
 
                     for idx, text in enumerate(concatenated_list):
+                        image_for_model = apply_image_control_from_env(
+                            list(i_option)[idx],
+                            sample_id=index_of_total,
+                        )
+
                         single_input = self.processor(
                             text=text,
-                            images=list(i_option)[idx],
+                            images=image_for_model,
                             padding="max_length",
                             return_tensors="pt",
                             max_length=77,
@@ -1841,6 +1986,8 @@ class LlavaWrapper:
                             "Generation": gen,
                             "Golden": gold,
                             "Uncertainty": uncertainty,
+                            "image_control": os.getenv("IMAGE_CONTROL", "none"),
+                            "image_control_seed": os.getenv("IMAGE_CONTROL_SEED", ""),
                         }
 
                         results.append(result)
@@ -1876,6 +2023,8 @@ class LlavaWrapper:
                     "precision": precision,
                     "recall": recall,
                     "f1": f1_score,
+                    "image_control": os.getenv("IMAGE_CONTROL", "none"),
+                    "image_control_seed": os.getenv("IMAGE_CONTROL_SEED", ""),
                 },
                 fout,
                 ensure_ascii=False,
