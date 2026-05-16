@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(pwd)"
-OUT_DIR="${ROOT_DIR}/output/relation_contribution_probe_shuffle_patches"
+OUT_DIR="${ROOT_DIR}/output/relation_contribution_probe_mid_bias_controls"
 ID_DIR="${ROOT_DIR}/output/relation_contribution_probe"
 ID_FILE="${ID_DIR}/ids_gold_on_under.txt"
 
@@ -12,7 +12,8 @@ DATASET="Controlled_Images_A"
 MODEL_NAME="llava1.5"
 OPTION="four"
 
-CONTROL="shuffle_patches"
+# 同时跑原图、黑图、shuffle 图
+CONTROLS=("original" "blank_black" "shuffle_patches")
 
 python -m py_compile main_aro.py
 python -m py_compile model_zoo/llava15.py
@@ -20,6 +21,7 @@ python -m py_compile model_zoo/llama/modeling_llama_add_attn.py
 python -m py_compile model_zoo/llava/modeling_llava_scal.py
 
 grep -q "IMAGE_CONTROL" model_zoo/llava15.py || { echo "[ERROR] IMAGE_CONTROL not found in llava15.py"; exit 1; }
+grep -q "blank_black" model_zoo/llava15.py || { echo "[ERROR] blank_black not found in llava15.py"; exit 1; }
 grep -q "shuffle_patches" model_zoo/llava15.py || { echo "[ERROR] shuffle_patches not found in llava15.py"; exit 1; }
 grep -q "apply_image_control_from_env" model_zoo/llava15.py || { echo "[ERROR] apply_image_control_from_env not found in llava15.py"; exit 1; }
 grep -q "probe_scale" model_zoo/llama/modeling_llama_add_attn.py || { echo "[ERROR] probe_scale not found in modeling_llama_add_attn.py"; exit 1; }
@@ -63,24 +65,30 @@ fi
 echo "[CHECK] number of ids:"
 wc -l "${ID_FILE}"
 
-# 只跑前面 signal 强的组合，和 blank_black 对齐，方便比较。
+# 只测试 15 / 17 / 18 层，重点看中层附近是否存在 bias-like steering。
+# groups 选 all / bottom_row / b13_14，因为之前 L16 的 bias-like 信号主要在 all 和 bottom_row。
 # format: layer|group_name|block_ids|scale
 JOBS=(
-  "12|all|0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15|0.5"
-  "12|all|0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15|1.5"
-  "12|b13_14|13,14|0.5"
-  "12|bottom_row|12,13,14,15|0.5"
+  "15|all|0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15|0.5"
+  "15|all|0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15|1.5"
+  "15|bottom_row|12,13,14,15|0.5"
+  "15|bottom_row|12,13,14,15|1.5"
+  "15|b13_14|13,14|0.5"
+  "15|b13_14|13,14|1.5"
 
-  "16|all|0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15|0.5"
-  "16|all|0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15|1.5"
-  "16|bottom_row|12,13,14,15|0.5"
-  "16|bottom_row|12,13,14,15|1.5"
-  "16|b13_14|13,14|1.5"
+  "17|all|0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15|0.5"
+  "17|all|0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15|1.5"
+  "17|bottom_row|12,13,14,15|0.5"
+  "17|bottom_row|12,13,14,15|1.5"
+  "17|b13_14|13,14|0.5"
+  "17|b13_14|13,14|1.5"
 
-  "20|center|5,6,9,10|1.5"
-  "20|all|0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15|1.5"
-  "20|b13_14|13,14|0.5"
-  "20|bottom_row|12,13,14,15|0.5"
+  "18|all|0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15|0.5"
+  "18|all|0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15|1.5"
+  "18|bottom_row|12,13,14,15|0.5"
+  "18|bottom_row|12,13,14,15|1.5"
+  "18|b13_14|13,14|0.5"
+  "18|b13_14|13,14|1.5"
 )
 
 NUM_GPUS=2
@@ -98,17 +106,30 @@ scale_tag () {
   fi
 }
 
+control_env_value () {
+  local CONTROL="$1"
+  if [[ "${CONTROL}" == "original" ]]; then
+    echo "none"
+  else
+    echo "${CONTROL}"
+  fi
+}
+
 run_baseline () {
   local GPU="$1"
+  local CONTROL="$2"
+  local IMAGE_CONTROL_VALUE
+  IMAGE_CONTROL_VALUE=$(control_env_value "${CONTROL}")
+
   local TAG="baseline_on_under_relprob_${CONTROL}"
 
   echo ""
   echo "============================================================"
-  echo "GPU=${GPU} BASELINE CONTROL=${CONTROL} TAG=${TAG}"
+  echo "GPU=${GPU} BASELINE CONTROL=${CONTROL} IMAGE_CONTROL=${IMAGE_CONTROL_VALUE} TAG=${TAG}"
   echo "============================================================"
 
   CUDA_VISIBLE_DEVICES="${GPU}" \
-  IMAGE_CONTROL="${CONTROL}" \
+  IMAGE_CONTROL="${IMAGE_CONTROL_VALUE}" \
   IMAGE_CONTROL_SEED=1 \
   IMAGE_CONTROL_SIZE=336 \
   IMAGE_CONTROL_GRID=24 \
@@ -137,16 +158,29 @@ run_baseline () {
   local RESULT_SRC="./output/results1.5_${DATASET}_adapt_vis_1.0_${OPTION}option_False_${TAG}.json"
   local SCORE_SRC="./output/results1.5_${DATASET}_adapt_vis_1.0_${OPTION}option_False_${TAG}scores.json"
 
-  [[ -f "${RESULT_SRC}" ]] && cp "${RESULT_SRC}" "${OUT_DIR}/results_${TAG}.json"
-  [[ -f "${SCORE_SRC}" ]] && cp "${SCORE_SRC}" "${OUT_DIR}/scores_${TAG}.json"
+  if [[ -f "${RESULT_SRC}" ]]; then
+    cp "${RESULT_SRC}" "${OUT_DIR}/results_${TAG}.json"
+  else
+    echo "[WARN] missing baseline result file: ${RESULT_SRC}"
+  fi
+
+  if [[ -f "${SCORE_SRC}" ]]; then
+    cp "${SCORE_SRC}" "${OUT_DIR}/scores_${TAG}.json"
+  else
+    echo "[WARN] missing baseline score file: ${SCORE_SRC}"
+  fi
 }
 
 run_one () {
   local GPU="$1"
-  local LAYER="$2"
-  local GNAME="$3"
-  local BLOCKS="$4"
-  local SCALE="$5"
+  local CONTROL="$2"
+  local LAYER="$3"
+  local GNAME="$4"
+  local BLOCKS="$5"
+  local SCALE="$6"
+
+  local IMAGE_CONTROL_VALUE
+  IMAGE_CONTROL_VALUE=$(control_env_value "${CONTROL}")
 
   local STAG
   STAG=$(scale_tag "${SCALE}")
@@ -155,12 +189,12 @@ run_one () {
 
   echo ""
   echo "============================================================"
-  echo "GPU=${GPU} CONTROL=${CONTROL} TAG=${TAG}"
+  echo "GPU=${GPU} CONTROL=${CONTROL} IMAGE_CONTROL=${IMAGE_CONTROL_VALUE} TAG=${TAG}"
   echo "layer=${LAYER}, group=${GNAME}, blocks=${BLOCKS}, scale=${SCALE}"
   echo "============================================================"
 
   CUDA_VISIBLE_DEVICES="${GPU}" \
-  IMAGE_CONTROL="${CONTROL}" \
+  IMAGE_CONTROL="${IMAGE_CONTROL_VALUE}" \
   IMAGE_CONTROL_SEED=1 \
   IMAGE_CONTROL_SIZE=336 \
   IMAGE_CONTROL_GRID=24 \
@@ -207,22 +241,28 @@ run_one () {
   fi
 }
 
-# 先跑 shuffle baseline。
-run_baseline 0
+# 先跑三个 baseline：original / black / shuffle。
+# baseline 可以并行跑两个，再跑第三个。
+run_baseline 0 "original" &
+run_baseline 1 "blank_black" &
+wait
+run_baseline 0 "shuffle_patches"
 
 worker () {
   local GPU="$1"
   local OFFSET="$2"
   local JOB_ID=0
 
-  for JOB in "${JOBS[@]}"; do
-    IFS='|' read -r LAYER GNAME BLOCKS SCALE <<< "${JOB}"
+  for CONTROL in "${CONTROLS[@]}"; do
+    for JOB in "${JOBS[@]}"; do
+      IFS='|' read -r LAYER GNAME BLOCKS SCALE <<< "${JOB}"
 
-    if (( JOB_ID % NUM_GPUS == OFFSET )); then
-      run_one "${GPU}" "${LAYER}" "${GNAME}" "${BLOCKS}" "${SCALE}"
-    fi
+      if (( JOB_ID % NUM_GPUS == OFFSET )); then
+        run_one "${GPU}" "${CONTROL}" "${LAYER}" "${GNAME}" "${BLOCKS}" "${SCALE}"
+      fi
 
-    JOB_ID=$((JOB_ID + 1))
+      JOB_ID=$((JOB_ID + 1))
+    done
   done
 }
 
@@ -231,7 +271,7 @@ worker 1 1 &
 wait
 
 echo ""
-echo "All shuffle-patches probe jobs finished."
+echo "All mid-layer bias-control probe jobs finished."
 echo "Results saved to ${OUT_DIR}"
 
 echo "[CHECK] result files:"
