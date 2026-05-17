@@ -2,27 +2,24 @@
 set -euo pipefail
 
 ROOT_DIR="$(pwd)"
-OUT_DIR="${ROOT_DIR}/output/adaptvis_exclude_L15_18_original_all_b1314"
-ID_DIR="${ROOT_DIR}/output/relation_contribution_probe"
-ID_FILE="${ID_DIR}/ids_gold_on_under.txt"
+OUT_DIR="${ROOT_DIR}/output/adaptvis_exclude_L15_18_original_all_b1314_allrels"
 
-mkdir -p "${OUT_DIR}" "${ID_DIR}"
+mkdir -p "${OUT_DIR}"
 
 DATASET="Controlled_Images_A"
 MODEL_NAME="llava1.5"
 OPTION="four"
 NUM_GPUS=2
 
-# 只跑原图，不跑 blank / shuffle。
+# 只跑原图，不跑 black / shuffle。
 CONTROL="original"
 IMAGE_CONTROL_VALUE="none"
 
-# 只跑 exclude L15-L18，不跑 full_adaptvis baseline。
+# L15/16/17/18 不做 AdaptVis，其他层正常乘。
 EXCLUDE_LAYERS="15,16,17,18"
 
-# 两个区域：
-# all: 全部 image tokens
-# b13_14: bottom-center 两个 block
+# 全部关系样本都跑：left / right / on / under。
+# 所以这里不要设置 PROBE_SAMPLE_IDS_FILE。
 GROUP_NAMES=("all" "b13_14")
 
 # AdaptVis 乘法强度。
@@ -43,49 +40,6 @@ grep -q "PROBE_SINGLE_PASS" model_zoo/llava15.py || {
   echo "Your llava15.py may still make PROBE_RUN_TAG trigger single-pass."
   exit 1
 }
-
-# ------------------------------------------------------------
-# Build gold=on/under id file
-# ------------------------------------------------------------
-
-if [[ ! -f "${ID_FILE}" ]]; then
-python - <<'PY'
-import json
-import re
-from pathlib import Path
-
-prompt_file = Path("prompts/Controlled_Images_A_with_answer_four_options.jsonl")
-out_file = Path("output/relation_contribution_probe/ids_gold_on_under.txt")
-out_file.parent.mkdir(parents=True, exist_ok=True)
-
-def norm(x):
-    x = str(x).strip().lower()
-    if "under" in x:
-        return "under"
-    if re.search(r"\bon\b", x) and "front" not in x:
-        return "on"
-    return "other"
-
-ids = []
-with open(prompt_file, "r", encoding="utf-8") as f:
-    for i, line in enumerate(f):
-        d = json.loads(line)
-        ans = d.get("answer", "")
-        if isinstance(ans, list):
-            ans = ans[0] if ans else ""
-        if norm(ans) in ["on", "under"]:
-            ids.append(i)
-
-with open(out_file, "w", encoding="utf-8") as f:
-    for i in ids:
-        f.write(str(i) + "\n")
-
-print("wrote", len(ids), "ids to", out_file)
-PY
-fi
-
-echo "[CHECK] number of on/under ids:"
-wc -l "${ID_FILE}"
 
 weight_tag () {
   local W="$1"
@@ -123,7 +77,7 @@ run_one () {
     exit 1
   fi
 
-  local TAG="adaptvis_exclude_L15_18_${GROUP}_original_${WTAG}"
+  local TAG="adaptvis_exclude_L15_18_${GROUP}_original_allrels_${WTAG}"
 
   local RESULT_SRC="./output/results1.5_${DATASET}_adapt_vis_1.0_${OPTION}option_False_${TAG}.json"
   local SCORE_SRC="./output/results1.5_${DATASET}_adapt_vis_1.0_${OPTION}option_False_${TAG}scores.json"
@@ -143,6 +97,7 @@ run_one () {
   echo "GROUP=${GROUP} ADJUST_METHOD=${ADJUST_METHOD_VALUE}"
   echo "WEIGHT=${WEIGHT}"
   echo "EXCLUDE_LAYERS=${EXCLUDE_LAYERS}"
+  echo "NO PROBE_SAMPLE_IDS_FILE: run all left/right/on/under samples"
   echo "TAG=${TAG}"
   echo "============================================================"
 
@@ -161,7 +116,6 @@ run_one () {
   PATCH_BLOCK_GRID=4 \
   PATCH_BLOCK_IDS="${PATCH_BLOCK_IDS_VALUE}" \
   PATCH_MASK_DEBUG=False \
-  PROBE_SAMPLE_IDS_FILE="${ID_FILE}" \
   PROBE_RELATION_PROBS=True \
   PROBE_RELATION_TOPK=10 \
   PROBE_RUN_TAG="${TAG}" \
@@ -191,10 +145,6 @@ run_one () {
   fi
 }
 
-# ------------------------------------------------------------
-# Build jobs
-# ------------------------------------------------------------
-
 JOBS_FILE="${OUT_DIR}/jobs.txt"
 : > "${JOBS_FILE}"
 
@@ -209,13 +159,11 @@ TOTAL_JOBS=$(wc -l < "${JOBS_FILE}")
 echo ""
 echo "[INFO] total jobs: ${TOTAL_JOBS}"
 echo "[INFO] expected result files: ${TOTAL_JOBS}"
+echo "[INFO] expected rows per result file: 412"
+echo "[INFO] expected skipped count: 0"
 echo "[INFO] output dir: ${OUT_DIR}"
 echo "[INFO] jobs:"
 cat "${JOBS_FILE}"
-
-# ------------------------------------------------------------
-# 2-GPU worker
-# ------------------------------------------------------------
 
 worker () {
   local GPU="$1"
@@ -235,7 +183,7 @@ worker 1 1 &
 wait
 
 echo ""
-echo "All exclude-L15-L18 AdaptVis jobs finished."
+echo "All all-relation exclude-L15-L18 AdaptVis jobs finished."
 echo "Results saved to ${OUT_DIR}"
 
 echo "[CHECK] result files:"
