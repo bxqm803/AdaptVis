@@ -116,105 +116,165 @@ def _blocks_to_image_token_indices(
     return token_idx
 
 
-def _apply_probe_add_attention_to_last_query(
-    attn_probs: torch.Tensor,
+def _apply_probe_logit_add_to_last_query(
+    attn_logits: torch.Tensor,
     token_idx: Optional[torch.Tensor],
+    image_start_idx: int,
+    image_end_idx: int,
     probe_head: int = -1,
     layer_idx: Optional[int] = None,
     block_ids=None,
 ):
     """
-    Additive attention intervention after softmax.
+    Logit-space additive intervention before softmax.
 
-    This changes attention probability mass directly, then renormalizes.
+    This is the fair counterpart of probe_scale:
+
+        probe_scale:
+            attn_logits[..., selected] *= scale
+
+        probe_add:
+            attn_logits[..., selected] += beta
 
     Env:
-        PROBE_ADD_MODE=mass | each
+        PROBE_ADD_BETA_MODE=fixed | std | selected_std
 
-        PROBE_ADD_MODE=mass:
-            PROBE_ADD_MASS=0.20
-            Add total mass 0.20 across all selected tokens.
-            Per token addition = PROBE_ADD_MASS / num_selected_tokens.
+        fixed:
+            beta = PROBE_ADD_BETA
 
-        PROBE_ADD_MODE=each:
-            PROBE_ADD_VALUE=0.005
-            Add fixed value to each selected token.
+        std:
+            beta = PROBE_ADD_ALPHA * std(all image-token logits)
 
-        PROBE_ADD_RENORM=True
-            Renormalize the last-query attention row after addition.
+        selected_std:
+            beta = PROBE_ADD_ALPHA * std(selected-token logits)
 
-    Positive PROBE_ADD_MASS boosts selected tokens.
-    Negative PROBE_ADD_MASS suppresses selected tokens.
+        PROBE_ADD_ALPHA=0.5
+        PROBE_ADD_BETA=0.5
+        PROBE_ADD_BETA_CLAMP=2.0
+        PROBE_ADD_STD_EPS=1e-6
+
+    Recommended:
+        PROBE_ADD_BETA_MODE=std
+        PROBE_ADD_ALPHA=0.5 or -0.5
+
+    Why std mode:
+        Different images / layers / heads can have different logit scales.
+        Using image-token logit std makes the additive perturbation relative
+        to the current row's own attention-logit scale.
+
+    Positive beta boosts selected tokens.
+    Negative beta suppresses selected tokens.
     """
     if token_idx is None:
-        return attn_probs
+        return attn_logits
 
     if not torch.is_tensor(token_idx):
         token_idx = torch.tensor(
             token_idx,
-            device=attn_probs.device,
+            device=attn_logits.device,
             dtype=torch.long,
         )
     else:
-        token_idx = token_idx.to(device=attn_probs.device, dtype=torch.long)
+        token_idx = token_idx.to(device=attn_logits.device, dtype=torch.long)
 
     token_idx = token_idx.reshape(-1)
 
     if token_idx.numel() == 0:
-        return attn_probs
+        return attn_logits
 
-    mode = os.getenv("PROBE_ADD_MODE", "mass").strip().lower()
-    add_mass = float(os.getenv("PROBE_ADD_MASS", "0.20"))
-    add_value = float(os.getenv("PROBE_ADD_VALUE", "0.005"))
-    renorm = os.getenv("PROBE_ADD_RENORM", "True") == "True"
+    if image_start_idx < 0 or image_end_idx < image_start_idx:
+        return attn_logits
+
+    mode = os.getenv("PROBE_ADD_BETA_MODE", "std").strip().lower()
+    fixed_beta = float(os.getenv("PROBE_ADD_BETA", "0.5"))
+    alpha = float(os.getenv("PROBE_ADD_ALPHA", "0.5"))
+    beta_clamp = float(os.getenv("PROBE_ADD_BETA_CLAMP", "2.0"))
+    eps = float(os.getenv("PROBE_ADD_STD_EPS", "1e-6"))
     debug = os.getenv("PROBE_DEBUG", "False") == "True"
 
-    if mode == "mass":
-        per_token_add = add_mass / float(token_idx.numel())
-    elif mode == "each":
-        per_token_add = add_value
-    else:
-        raise ValueError(f"Unknown PROBE_ADD_MODE={mode}. Use mass or each.")
-
     if probe_head is not None and int(probe_head) >= 0:
-        if int(probe_head) >= attn_probs.shape[1]:
-            return attn_probs
+        if int(probe_head) >= attn_logits.shape[1]:
+            return attn_logits
         head_slice = slice(int(probe_head), int(probe_head) + 1)
         head_desc = str(int(probe_head))
     else:
         head_slice = slice(None)
         head_desc = "all"
 
-    dtype = attn_probs.dtype
+    dtype = attn_logits.dtype
 
-    # [bsz, selected_heads, kv_len]
-    row = attn_probs[:, head_slice, -1, :].float()
+    # row: [bsz, selected_heads, kv_len]
+    row = attn_logits[:, head_slice, -1, :].float()
 
-    before_selected_mass = row[..., token_idx].sum(dim=-1).mean().item()
-    before_total_mass = row.sum(dim=-1).mean().item()
+    image_token_idx = torch.arange(
+        image_start_idx,
+        image_end_idx + 1,
+        device=attn_logits.device,
+        dtype=torch.long,
+    )
 
-    row[..., token_idx] = (row[..., token_idx] + per_token_add).clamp_min(0.0)
+    image_token_idx = image_token_idx[
+        (image_token_idx >= 0) & (image_token_idx < row.shape[-1])
+    ]
 
-    if renorm:
-        row_sum = row.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        row = row / row_sum
+    if image_token_idx.numel() == 0:
+        return attn_logits
 
-    after_selected_mass = row[..., token_idx].sum(dim=-1).mean().item()
-    after_total_mass = row.sum(dim=-1).mean().item()
+    before_selected_mean = row[..., token_idx].mean().item()
+    before_selected_std = row[..., token_idx].std(unbiased=False).item()
+    before_image_mean = row[..., image_token_idx].mean().item()
+    before_image_std = row[..., image_token_idx].std(unbiased=False).item()
 
-    attn_probs[:, head_slice, -1, :] = row.to(dtype)
-
-    if debug:
-        print(
-            f"[PROBE_ADD] layer={layer_idx}, head={head_desc}, "
-            f"blocks={block_ids}, tokens={int(token_idx.numel())}, "
-            f"mode={mode}, add_mass={add_mass}, add_value={add_value}, "
-            f"per_token_add={per_token_add:.8f}, renorm={renorm}, "
-            f"selected_mass={before_selected_mass:.6f}->{after_selected_mass:.6f}, "
-            f"total_mass={before_total_mass:.6f}->{after_total_mass:.6f}"
+    if mode == "fixed":
+        beta = torch.full(
+            (*row.shape[:2], 1),
+            fixed_beta,
+            device=row.device,
+            dtype=row.dtype,
         )
 
-    return attn_probs
+    elif mode in ["std", "image_std", "row_std"]:
+        stats = row[..., image_token_idx]
+        std = stats.std(dim=-1, unbiased=False, keepdim=True).clamp_min(eps)
+        beta = alpha * std
+
+    elif mode == "selected_std":
+        stats = row[..., token_idx]
+        std = stats.std(dim=-1, unbiased=False, keepdim=True).clamp_min(eps)
+        beta = alpha * std
+
+    else:
+        raise ValueError(
+            f"Unknown PROBE_ADD_BETA_MODE={mode}. "
+            f"Use fixed, std, or selected_std."
+        )
+
+    if beta_clamp > 0:
+        beta = beta.clamp(-beta_clamp, beta_clamp)
+
+    row[..., token_idx] = row[..., token_idx] + beta
+
+    after_selected_mean = row[..., token_idx].mean().item()
+    after_selected_std = row[..., token_idx].std(unbiased=False).item()
+
+    attn_logits[:, head_slice, -1, :] = row.to(dtype)
+
+    if debug:
+        beta_mean = beta.mean().item()
+        beta_min = beta.min().item()
+        beta_max = beta.max().item()
+
+        print(
+            f"[PROBE_ADD_LOGIT] layer={layer_idx}, head={head_desc}, "
+            f"blocks={block_ids}, tokens={int(token_idx.numel())}, "
+            f"mode={mode}, alpha={alpha}, fixed_beta={fixed_beta}, "
+            f"beta_mean={beta_mean:.6f}, beta_min={beta_min:.6f}, beta_max={beta_max:.6f}, "
+            f"image_logit_mean={before_image_mean:.6f}, image_logit_std={before_image_std:.6f}, "
+            f"selected_logit_mean={before_selected_mean:.6f}->{after_selected_mean:.6f}, "
+            f"selected_logit_std={before_selected_std:.6f}->{after_selected_std:.6f}"
+        )
+
+    return attn_logits
 
 
 def _make_causal_mask(
@@ -575,11 +635,6 @@ class LLaMAAttention(nn.Module):
         start_idx, end_idx = -1, -1
         valid_image_tokens = False
 
-        # For probe_add, we store selected indices here and apply after softmax.
-        probe_add_token_idx = None
-        probe_add_head = -1
-        probe_add_block_ids = []
-
         # ====================================================
         # 2. Decide whether to save this layer
         # ====================================================
@@ -817,8 +872,15 @@ class LLaMAAttention(nn.Module):
                             )
 
             elif adjust_method == "probe_add":
-                # Probability-space additive intervention.
-                # Actual change is applied after softmax.
+                # Logit-space additive intervention.
+                #
+                # Fair counterpart of probe_scale:
+                #   probe_scale: attn_logits[..., selected] *= scale
+                #   probe_add:   attn_logits[..., selected] += beta
+                #
+                # Recommended adaptive mode:
+                #   PROBE_ADD_BETA_MODE=std
+                #   PROBE_ADD_ALPHA=0.5 or -0.5
                 probe_layer = int(os.getenv("PROBE_LAYER", "-1"))
                 probe_head = int(os.getenv("PROBE_HEAD", "-1"))
 
@@ -837,17 +899,24 @@ class LLaMAAttention(nn.Module):
                     )
 
                     if token_idx is not None:
-                        probe_add_token_idx = token_idx
-                        probe_add_head = probe_head
-                        probe_add_block_ids = block_ids
+                        attn_weights = _apply_probe_logit_add_to_last_query(
+                            attn_logits=attn_weights,
+                            token_idx=token_idx,
+                            image_start_idx=start_idx,
+                            image_end_idx=end_idx,
+                            probe_head=probe_head,
+                            layer_idx=idx,
+                            block_ids=block_ids,
+                        )
 
             else:
                 raise ValueError(f"Unknown adjust_method: {adjust_method}")
 
             # ScalingVis / AdaptVis:
             # multiply selected attention logits by weight.
-            # VAR-sink and probe_add are handled after softmax.
-            # probe_bias / probe_scale are explicit probe interventions.
+            #
+            # var_sink is handled after softmax.
+            # probe_bias / probe_scale / probe_add are explicit probe interventions.
             if adjust_method not in [
                 "var_sink",
                 "probe_bias",
@@ -932,14 +1001,9 @@ class LLaMAAttention(nn.Module):
                 layer_idx=idx,
             )
 
-        if valid_image_tokens and adjust_method == "probe_add":
-            after_probs = _apply_probe_add_attention_to_last_query(
-                attn_probs=after_probs,
-                token_idx=probe_add_token_idx,
-                probe_head=probe_add_head,
-                layer_idx=idx,
-                block_ids=probe_add_block_ids,
-            )
+        # NOTE:
+        # probe_add is now a logit-space intervention.
+        # Do NOT apply probability-space add after softmax here.
 
         # ====================================================
         # 8. Save before / after logits and probs
