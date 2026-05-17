@@ -2,24 +2,32 @@
 set -euo pipefail
 
 ROOT_DIR="$(pwd)"
-OUT_DIR="${ROOT_DIR}/output/adaptvis_exclude_L15_18_original_all_b1314_allrels"
+OUT_DIR="${ROOT_DIR}/output/adaptvis_exclude_each_L15_18_original_all_b1314_allrels"
 
 mkdir -p "${OUT_DIR}"
 
 DATASET="Controlled_Images_A"
 MODEL_NAME="llava1.5"
 OPTION="four"
-NUM_GPUS=2
+
+# 单 GPU 顺序跑。
+GPU="${GPU:-0}"
+
+# 默认不跑 full baseline。
+# 如果你缺原始 full_adaptvis 对照，可以这样运行：
+# RUN_FULL_BASELINE=1 bash run_adaptvis_exclude_each_L15_18_original_all_b1314_allrels_1gpu.sh
+RUN_FULL_BASELINE="${RUN_FULL_BASELINE:-0}"
 
 # 只跑原图，不跑 black / shuffle。
-CONTROL="original"
 IMAGE_CONTROL_VALUE="none"
 
-# L15/16/17/18 不做 AdaptVis，其他层正常乘。
-EXCLUDE_LAYERS="15,16,17,18"
+# 不跳过 left/right/on/under，跑全 412。
+unset PROBE_SAMPLE_IDS_FILE || true
 
-# 全部关系样本都跑：left / right / on / under。
-# 所以这里不要设置 PROBE_SAMPLE_IDS_FILE。
+# 分别排除这四层。
+EXCLUDE_LIST=("15" "16" "17" "18")
+
+# 两个区域。
 GROUP_NAMES=("all" "b13_14")
 
 # AdaptVis 乘法强度。
@@ -37,7 +45,7 @@ grep -q "ADAPTVIS_EXCLUDE_LAYERS" model_zoo/llama/modeling_llama_add_attn.py || 
 
 grep -q "PROBE_SINGLE_PASS" model_zoo/llava15.py || {
   echo "[ERROR] PROBE_SINGLE_PASS not found in llava15.py"
-  echo "Your llava15.py may still make PROBE_RUN_TAG trigger single-pass."
+  echo "llava15.py may still make PROBE_RUN_TAG trigger single-pass."
   exit 1
 }
 
@@ -55,7 +63,7 @@ weight_tag () {
 }
 
 run_one () {
-  local GPU="$1"
+  local EXCLUDE_LAYER="$1"
   local GROUP="$2"
   local WEIGHT="$3"
 
@@ -77,7 +85,18 @@ run_one () {
     exit 1
   fi
 
-  local TAG="adaptvis_exclude_L15_18_${GROUP}_original_allrels_${WTAG}"
+  local VARIANT
+  local EXCLUDE_LAYERS_VALUE
+
+  if [[ "${EXCLUDE_LAYER}" == "full" ]]; then
+    VARIANT="full_adaptvis"
+    EXCLUDE_LAYERS_VALUE=""
+  else
+    VARIANT="exclude_L${EXCLUDE_LAYER}"
+    EXCLUDE_LAYERS_VALUE="${EXCLUDE_LAYER}"
+  fi
+
+  local TAG="adaptvis_${VARIANT}_${GROUP}_original_allrels_${WTAG}"
 
   local RESULT_SRC="./output/results1.5_${DATASET}_adapt_vis_1.0_${OPTION}option_False_${TAG}.json"
   local SCORE_SRC="./output/results1.5_${DATASET}_adapt_vis_1.0_${OPTION}option_False_${TAG}scores.json"
@@ -93,16 +112,17 @@ run_one () {
   echo ""
   echo "============================================================"
   echo "GPU=${GPU}"
-  echo "CONTROL=${CONTROL} IMAGE_CONTROL=${IMAGE_CONTROL_VALUE}"
-  echo "GROUP=${GROUP} ADJUST_METHOD=${ADJUST_METHOD_VALUE}"
+  echo "VARIANT=${VARIANT}"
+  echo "GROUP=${GROUP}"
+  echo "ADJUST_METHOD=${ADJUST_METHOD_VALUE}"
   echo "WEIGHT=${WEIGHT}"
-  echo "EXCLUDE_LAYERS=${EXCLUDE_LAYERS}"
-  echo "NO PROBE_SAMPLE_IDS_FILE: run all left/right/on/under samples"
+  echo "ADAPTVIS_EXCLUDE_LAYERS=${EXCLUDE_LAYERS_VALUE}"
+  echo "RUN ALL RELATIONS: left/right/on/under"
   echo "TAG=${TAG}"
   echo "============================================================"
 
   CUDA_VISIBLE_DEVICES="${GPU}" \
-  ADAPTVIS_EXCLUDE_LAYERS="${EXCLUDE_LAYERS}" \
+  ADAPTVIS_EXCLUDE_LAYERS="${EXCLUDE_LAYERS_VALUE}" \
   ADAPTVIS_INCLUDE_LAYERS="" \
   ADAPTVIS_LAYER_DEBUG=False \
   IMAGE_CONTROL="${IMAGE_CONTROL_VALUE}" \
@@ -116,6 +136,7 @@ run_one () {
   PATCH_BLOCK_GRID=4 \
   PATCH_BLOCK_IDS="${PATCH_BLOCK_IDS_VALUE}" \
   PATCH_MASK_DEBUG=False \
+  PROBE_SAMPLE_IDS_FILE="" \
   PROBE_RELATION_PROBS=True \
   PROBE_RELATION_TOPK=10 \
   PROBE_RUN_TAG="${TAG}" \
@@ -148,42 +169,37 @@ run_one () {
 JOBS_FILE="${OUT_DIR}/jobs.txt"
 : > "${JOBS_FILE}"
 
-for GROUP in "${GROUP_NAMES[@]}"; do
-  for WEIGHT in "${WEIGHTS[@]}"; do
-    echo "${GROUP}|${WEIGHT}" >> "${JOBS_FILE}"
+if [[ "${RUN_FULL_BASELINE}" == "1" ]]; then
+  for GROUP in "${GROUP_NAMES[@]}"; do
+    for WEIGHT in "${WEIGHTS[@]}"; do
+      echo "full|${GROUP}|${WEIGHT}" >> "${JOBS_FILE}"
+    done
+  done
+fi
+
+for L in "${EXCLUDE_LIST[@]}"; do
+  for GROUP in "${GROUP_NAMES[@]}"; do
+    for WEIGHT in "${WEIGHTS[@]}"; do
+      echo "${L}|${GROUP}|${WEIGHT}" >> "${JOBS_FILE}"
+    done
   done
 done
 
-TOTAL_JOBS=$(wc -l < "${JOBS_FILE}")
-
 echo ""
-echo "[INFO] total jobs: ${TOTAL_JOBS}"
-echo "[INFO] expected result files: ${TOTAL_JOBS}"
+echo "[INFO] GPU: ${GPU}"
+echo "[INFO] total jobs: $(wc -l < "${JOBS_FILE}")"
 echo "[INFO] expected rows per result file: 412"
 echo "[INFO] expected skipped count: 0"
 echo "[INFO] output dir: ${OUT_DIR}"
 echo "[INFO] jobs:"
 cat "${JOBS_FILE}"
 
-worker () {
-  local GPU="$1"
-  local OFFSET="$2"
-  local JOB_ID=0
-
-  while IFS='|' read -r GROUP WEIGHT; do
-    if (( JOB_ID % NUM_GPUS == OFFSET )); then
-      run_one "${GPU}" "${GROUP}" "${WEIGHT}"
-    fi
-    JOB_ID=$((JOB_ID + 1))
-  done < "${JOBS_FILE}"
-}
-
-worker 0 0 &
-worker 1 1 &
-wait
+while IFS='|' read -r EXCLUDE_LAYER GROUP WEIGHT; do
+  run_one "${EXCLUDE_LAYER}" "${GROUP}" "${WEIGHT}"
+done < "${JOBS_FILE}"
 
 echo ""
-echo "All all-relation exclude-L15-L18 AdaptVis jobs finished."
+echo "All single-layer exclude AdaptVis jobs finished."
 echo "Results saved to ${OUT_DIR}"
 
 echo "[CHECK] result files:"
