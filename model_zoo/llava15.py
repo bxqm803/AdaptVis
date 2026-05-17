@@ -93,6 +93,11 @@ def make_tagged_output_path(dataset, method, weight, option, test_flag):
     """
     Original AdaptVis writes to a fixed filename. That is unsafe for multi-GPU
     probe jobs. If PROBE_RUN_TAG is set, append it to the output filename.
+
+    Important:
+        PROBE_RUN_TAG should only affect filename.
+        It should NOT force single-pass generation.
+        Use PROBE_SINGLE_PASS=True if you explicitly want single-pass probe mode.
     """
     base = f"./output/results1.5_{dataset}_{method}_{weight}_{option}option_{test_flag}"
     tag = os.getenv("PROBE_RUN_TAG", "").strip()
@@ -1518,6 +1523,7 @@ class LlavaWrapper:
                             object_patch_mask = object_patch_mask.to(self.device)
 
                     selected_weight = None
+                    probe_single_pass = False
 
                     if method == "scaling_vis":
                         change_greedy_to_add_weight()
@@ -1548,9 +1554,12 @@ class LlavaWrapper:
                     elif method == "adapt_vis":
                         change_greedy_to_add_weight()
 
+                        # Explicit probe modes should run single-pass.
+                        # PROBE_RUN_TAG only controls output filename and must NOT disable AdaptVis.
+                        # Use PROBE_SINGLE_PASS=True if you explicitly want single-pass with a tag.
                         probe_single_pass = (
                             adjust_method_env in ["probe_bias", "probe_scale", "probe_add", "var_sink"]
-                            or os.getenv("PROBE_RUN_TAG", "").strip() != ""
+                            or os.getenv("PROBE_SINGLE_PASS", "False") == "True"
                         )
 
                         if probe_single_pass:
@@ -1710,6 +1719,16 @@ class LlavaWrapper:
                         "relation_probe": relation_probe,
 
                         "adjust_method": os.getenv("ADJUST_METHOD", "last_query"),
+
+                        # AdaptVis layer control metadata.
+                        "adaptvis_exclude_layers": os.getenv("ADAPTVIS_EXCLUDE_LAYERS", ""),
+                        "adaptvis_include_layers": os.getenv("ADAPTVIS_INCLUDE_LAYERS", ""),
+                        "adaptvis_layer_debug": os.getenv("ADAPTVIS_LAYER_DEBUG", ""),
+
+                        # Single-pass metadata.
+                        "probe_single_pass": bool(probe_single_pass),
+                        "probe_single_pass_env": os.getenv("PROBE_SINGLE_PASS", ""),
+
                         "probe_layer": os.getenv("PROBE_LAYER", ""),
                         "probe_head": os.getenv("PROBE_HEAD", ""),
                         "probe_block_ids": os.getenv("PROBE_BLOCK_IDS", ""),
@@ -1794,6 +1813,13 @@ class LlavaWrapper:
                     "processed_sample_ids": processed_sample_ids,
                     "sample_filter_file": os.getenv("PROBE_SAMPLE_IDS_FILE", ""),
                     "probe_run_tag": os.getenv("PROBE_RUN_TAG", ""),
+                    "probe_single_pass_env": os.getenv("PROBE_SINGLE_PASS", ""),
+
+                    # AdaptVis layer control metadata.
+                    "adaptvis_exclude_layers": os.getenv("ADAPTVIS_EXCLUDE_LAYERS", ""),
+                    "adaptvis_include_layers": os.getenv("ADAPTVIS_INCLUDE_LAYERS", ""),
+                    "adaptvis_layer_debug": os.getenv("ADAPTVIS_LAYER_DEBUG", ""),
+
                     "probe_scale": os.getenv("PROBE_SCALE", ""),
 
                     # Old probability-space probe_add fields.
