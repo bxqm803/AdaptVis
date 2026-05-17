@@ -1716,10 +1716,19 @@ class LlavaWrapper:
                         "probe_beta": os.getenv("PROBE_BETA", ""),
                         "probe_scale": os.getenv("PROBE_SCALE", ""),
 
+                        # Old probability-space probe_add fields.
+                        # Kept for backward compatibility with earlier results.
                         "probe_add_mode": os.getenv("PROBE_ADD_MODE", ""),
                         "probe_add_mass": os.getenv("PROBE_ADD_MASS", ""),
                         "probe_add_value": os.getenv("PROBE_ADD_VALUE", ""),
                         "probe_add_renorm": os.getenv("PROBE_ADD_RENORM", ""),
+
+                        # New logit-space probe_add fields.
+                        "probe_add_beta": os.getenv("PROBE_ADD_BETA", ""),
+                        "probe_add_alpha": os.getenv("PROBE_ADD_ALPHA", ""),
+                        "probe_add_beta_mode": os.getenv("PROBE_ADD_BETA_MODE", ""),
+                        "probe_add_beta_clamp": os.getenv("PROBE_ADD_BETA_CLAMP", ""),
+                        "probe_add_std_eps": os.getenv("PROBE_ADD_STD_EPS", ""),
 
                         "probe_run_tag": os.getenv("PROBE_RUN_TAG", ""),
 
@@ -1787,10 +1796,18 @@ class LlavaWrapper:
                     "probe_run_tag": os.getenv("PROBE_RUN_TAG", ""),
                     "probe_scale": os.getenv("PROBE_SCALE", ""),
 
+                    # Old probability-space probe_add fields.
                     "probe_add_mode": os.getenv("PROBE_ADD_MODE", ""),
                     "probe_add_mass": os.getenv("PROBE_ADD_MASS", ""),
                     "probe_add_value": os.getenv("PROBE_ADD_VALUE", ""),
                     "probe_add_renorm": os.getenv("PROBE_ADD_RENORM", ""),
+
+                    # New logit-space probe_add fields.
+                    "probe_add_beta": os.getenv("PROBE_ADD_BETA", ""),
+                    "probe_add_alpha": os.getenv("PROBE_ADD_ALPHA", ""),
+                    "probe_add_beta_mode": os.getenv("PROBE_ADD_BETA_MODE", ""),
+                    "probe_add_beta_clamp": os.getenv("PROBE_ADD_BETA_CLAMP", ""),
+                    "probe_add_std_eps": os.getenv("PROBE_ADD_STD_EPS", ""),
 
                     "image_control": os.getenv("IMAGE_CONTROL", "none"),
                     "image_control_size": os.getenv("IMAGE_CONTROL_SIZE", ""),
