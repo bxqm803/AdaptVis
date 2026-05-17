@@ -81,10 +81,10 @@ def is_probe_mode():
     In that case, scores are no longer aligned with the full dataset and
     dataset.evaluate_scores() must be skipped.
 
-    This includes:
-        probe_bias   : logit-space additive bias
+    Supported probe/intervention modes:
+        probe_bias   : logit-space additive bias, old beta style
         probe_scale  : logit-space multiplicative scaling
-        probe_add    : probability-space additive attention mass
+        probe_add    : logit-space additive attention-logit intervention
         var_sink     : variance/sink based intervention
     """
     if os.getenv("FORCE_DATASET_EVAL", "False") == "True":
@@ -96,28 +96,45 @@ def is_probe_mode():
         return True
 
     probe_env_keys = [
+        # subset / tagging
         "PROBE_SAMPLE_IDS_FILE",
         "PROBE_RUN_TAG",
+        "ATTN_RUN_TAG",
+
+        # common probe target
         "PROBE_LAYER",
         "PROBE_HEAD",
         "PROBE_BLOCK_IDS",
+
+        # old logit add
         "PROBE_BETA",
+
+        # logit scale
         "PROBE_SCALE",
 
-        # probe_add envs
+        # old probability-space add fields, kept for backward compatibility
         "PROBE_ADD_MODE",
         "PROBE_ADD_MASS",
         "PROBE_ADD_VALUE",
         "PROBE_ADD_RENORM",
+
+        # new logit-space add fields
+        "PROBE_ADD_BETA",
+        "PROBE_ADD_ALPHA",
+        "PROBE_ADD_BETA_MODE",
+        "PROBE_ADD_BETA_CLAMP",
+        "PROBE_ADD_STD_EPS",
 
         # relation-prob extraction
         "PROBE_RELATION_PROBS",
         "PROBE_RELATION_TOPK",
         "PROBE_RELATION_SET",
 
-        # image controls / attention saving tags
+        # image controls
         "IMAGE_CONTROL",
-        "ATTN_RUN_TAG",
+        "IMAGE_CONTROL_SIZE",
+        "IMAGE_CONTROL_GRID",
+        "IMAGE_CONTROL_SEED",
     ]
 
     for key in probe_env_keys:
