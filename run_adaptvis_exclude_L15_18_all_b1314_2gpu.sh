@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(pwd)"
-OUT_DIR="${ROOT_DIR}/output/adaptvis_exclude_L15_18_all_b1314"
+OUT_DIR="${ROOT_DIR}/output/adaptvis_exclude_L15_18_original_all_b1314"
 ID_DIR="${ROOT_DIR}/output/relation_contribution_probe"
 ID_FILE="${ID_DIR}/ids_gold_on_under.txt"
 
@@ -13,22 +13,20 @@ MODEL_NAME="llava1.5"
 OPTION="four"
 NUM_GPUS=2
 
-# controls 用来判断是否是 visual-dependent 还是 bias-like。
-CONTROLS=("original" "blank_black" "shuffle_patches")
+# 只跑原图，不跑 blank / shuffle。
+CONTROL="original"
+IMAGE_CONTROL_VALUE="none"
 
-# 两个空间区域：
+# 只跑 exclude L15-L18，不跑 full_adaptvis baseline。
+EXCLUDE_LAYERS="15,16,17,18"
+
+# 两个区域：
 # all: 全部 image tokens
 # b13_14: bottom-center 两个 block
 GROUP_NAMES=("all" "b13_14")
 
-# AdaptVis 强度。
-# 这里先用 1.5；如果你想看削弱，也可以改成 ("1.5" "0.5")
+# AdaptVis 乘法强度。
 WEIGHTS=("1.5")
-
-# 两个 variant：
-# full_adaptvis: 原始 AdaptVis
-# exclude_L15_18: L15/16/17/18 不乘，其他层照常乘
-VARIANTS=("full_adaptvis" "exclude_L15_18")
 
 echo "[CHECK] compile python files"
 python -m py_compile main_aro.py
@@ -43,11 +41,6 @@ grep -q "ADAPTVIS_EXCLUDE_LAYERS" model_zoo/llama/modeling_llama_add_attn.py || 
 grep -q "PROBE_SINGLE_PASS" model_zoo/llava15.py || {
   echo "[ERROR] PROBE_SINGLE_PASS not found in llava15.py"
   echo "Your llava15.py may still make PROBE_RUN_TAG trigger single-pass."
-  exit 1
-}
-
-grep -q "PROBE_RUN_TAG" model_zoo/llava15.py || {
-  echo "[ERROR] PROBE_RUN_TAG not found in llava15.py"
   exit 1
 }
 
@@ -94,15 +87,6 @@ fi
 echo "[CHECK] number of on/under ids:"
 wc -l "${ID_FILE}"
 
-control_env_value () {
-  local CONTROL="$1"
-  if [[ "${CONTROL}" == "original" ]]; then
-    echo "none"
-  else
-    echo "${CONTROL}"
-  fi
-}
-
 weight_tag () {
   local W="$1"
   if [[ "${W}" == "1.5" ]]; then
@@ -118,26 +102,11 @@ weight_tag () {
 
 run_one () {
   local GPU="$1"
-  local VARIANT="$2"
-  local CONTROL="$3"
-  local GROUP="$4"
-  local WEIGHT="$5"
-
-  local IMAGE_CONTROL_VALUE
-  IMAGE_CONTROL_VALUE=$(control_env_value "${CONTROL}")
+  local GROUP="$2"
+  local WEIGHT="$3"
 
   local WTAG
   WTAG=$(weight_tag "${WEIGHT}")
-
-  local EXCLUDE_LAYERS=""
-  if [[ "${VARIANT}" == "exclude_L15_18" ]]; then
-    EXCLUDE_LAYERS="15,16,17,18"
-  elif [[ "${VARIANT}" == "full_adaptvis" ]]; then
-    EXCLUDE_LAYERS=""
-  else
-    echo "[ERROR] unknown variant: ${VARIANT}"
-    exit 1
-  fi
 
   local ADJUST_METHOD_VALUE
   local PATCH_MODE_VALUE=""
@@ -154,7 +123,7 @@ run_one () {
     exit 1
   fi
 
-  local TAG="adaptvis_${VARIANT}_${GROUP}_${CONTROL}_${WTAG}"
+  local TAG="adaptvis_exclude_L15_18_${GROUP}_original_${WTAG}"
 
   local RESULT_SRC="./output/results1.5_${DATASET}_adapt_vis_1.0_${OPTION}option_False_${TAG}.json"
   local SCORE_SRC="./output/results1.5_${DATASET}_adapt_vis_1.0_${OPTION}option_False_${TAG}scores.json"
@@ -170,7 +139,6 @@ run_one () {
   echo ""
   echo "============================================================"
   echo "GPU=${GPU}"
-  echo "VARIANT=${VARIANT}"
   echo "CONTROL=${CONTROL} IMAGE_CONTROL=${IMAGE_CONTROL_VALUE}"
   echo "GROUP=${GROUP} ADJUST_METHOD=${ADJUST_METHOD_VALUE}"
   echo "WEIGHT=${WEIGHT}"
@@ -230,13 +198,9 @@ run_one () {
 JOBS_FILE="${OUT_DIR}/jobs.txt"
 : > "${JOBS_FILE}"
 
-for VARIANT in "${VARIANTS[@]}"; do
-  for CONTROL in "${CONTROLS[@]}"; do
-    for GROUP in "${GROUP_NAMES[@]}"; do
-      for WEIGHT in "${WEIGHTS[@]}"; do
-        echo "${VARIANT}|${CONTROL}|${GROUP}|${WEIGHT}" >> "${JOBS_FILE}"
-      done
-    done
+for GROUP in "${GROUP_NAMES[@]}"; do
+  for WEIGHT in "${WEIGHTS[@]}"; do
+    echo "${GROUP}|${WEIGHT}" >> "${JOBS_FILE}"
   done
 done
 
@@ -244,6 +208,7 @@ TOTAL_JOBS=$(wc -l < "${JOBS_FILE}")
 
 echo ""
 echo "[INFO] total jobs: ${TOTAL_JOBS}"
+echo "[INFO] expected result files: ${TOTAL_JOBS}"
 echo "[INFO] output dir: ${OUT_DIR}"
 echo "[INFO] jobs:"
 cat "${JOBS_FILE}"
@@ -257,9 +222,9 @@ worker () {
   local OFFSET="$2"
   local JOB_ID=0
 
-  while IFS='|' read -r VARIANT CONTROL GROUP WEIGHT; do
+  while IFS='|' read -r GROUP WEIGHT; do
     if (( JOB_ID % NUM_GPUS == OFFSET )); then
-      run_one "${GPU}" "${VARIANT}" "${CONTROL}" "${GROUP}" "${WEIGHT}"
+      run_one "${GPU}" "${GROUP}" "${WEIGHT}"
     fi
     JOB_ID=$((JOB_ID + 1))
   done < "${JOBS_FILE}"
@@ -270,7 +235,7 @@ worker 1 1 &
 wait
 
 echo ""
-echo "All AdaptVis exclude-layer jobs finished."
+echo "All exclude-L15-L18 AdaptVis jobs finished."
 echo "Results saved to ${OUT_DIR}"
 
 echo "[CHECK] result files:"
@@ -279,5 +244,5 @@ find "${OUT_DIR}" -maxdepth 1 -type f -name "results_*.json" | wc -l
 echo "[CHECK] score files:"
 find "${OUT_DIR}" -maxdepth 1 -type f -name "scores_*.json" | wc -l
 
-echo "[CHECK] first few result files:"
-find "${OUT_DIR}" -maxdepth 1 -type f -name "results_*.json" | sort | head -n 20
+echo "[CHECK] files:"
+find "${OUT_DIR}" -maxdepth 1 -type f -name "results_*.json" | sort
