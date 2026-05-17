@@ -77,16 +77,22 @@ def config():
 
 def is_probe_mode():
     """
-    Probe runs may only process a filtered subset, e.g. gold=on/under ids.
+    Probe / ablation runs may only process a filtered subset, e.g. gold=on/under ids.
     In that case, scores are no longer aligned with the full dataset and
     dataset.evaluate_scores() must be skipped.
+
+    This includes:
+        probe_bias   : logit-space additive bias
+        probe_scale  : logit-space multiplicative scaling
+        probe_add    : probability-space additive attention mass
+        var_sink     : variance/sink based intervention
     """
     if os.getenv("FORCE_DATASET_EVAL", "False") == "True":
         return False
 
     adjust_method = os.getenv("ADJUST_METHOD", "").strip()
 
-    if adjust_method in ["probe_bias", "probe_scale"]:
+    if adjust_method in ["probe_bias", "probe_scale", "probe_add", "var_sink"]:
         return True
 
     probe_env_keys = [
@@ -97,10 +103,31 @@ def is_probe_mode():
         "PROBE_BLOCK_IDS",
         "PROBE_BETA",
         "PROBE_SCALE",
+
+        # probe_add envs
+        "PROBE_ADD_MODE",
+        "PROBE_ADD_MASS",
+        "PROBE_ADD_VALUE",
+        "PROBE_ADD_RENORM",
+
+        # relation-prob extraction
+        "PROBE_RELATION_PROBS",
+        "PROBE_RELATION_TOPK",
+        "PROBE_RELATION_SET",
+
+        # image controls / attention saving tags
+        "IMAGE_CONTROL",
+        "ATTN_RUN_TAG",
     ]
 
     for key in probe_env_keys:
-        if os.getenv(key, "").strip():
+        val = os.getenv(key, "").strip()
+
+        # IMAGE_CONTROL=none / original should not by itself force probe mode.
+        if key == "IMAGE_CONTROL" and val in ["", "none", "original"]:
+            continue
+
+        if val:
             return True
 
     return False
