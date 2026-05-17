@@ -50,6 +50,60 @@ def _parse_int_list_from_env(name: str):
     return out
 
 
+def _parse_layer_set_from_env(name: str):
+    """
+    Parse comma-separated layer ids from env.
+
+    Examples:
+        ADAPTVIS_EXCLUDE_LAYERS=15,16,17,18
+        ADAPTVIS_INCLUDE_LAYERS=12,13,14,19,20,21,22,23,24
+    """
+    s = os.getenv(name, "").strip()
+    if not s:
+        return set()
+
+    out = set()
+    for x in s.split(","):
+        x = x.strip()
+        if x:
+            out.add(int(x))
+    return out
+
+
+def _adaptvis_layer_allowed(layer_idx):
+    """
+    Decide whether normal AdaptVis / ScalingVis should apply on this layer.
+
+    Env:
+        ADAPTVIS_EXCLUDE_LAYERS=15,16,17,18
+            Skip these layers.
+
+        ADAPTVIS_INCLUDE_LAYERS=12,13,14,19,20
+            If non-empty, only apply AdaptVis on these layers.
+
+    INCLUDE is applied first, then EXCLUDE.
+
+    This only controls normal AdaptVis / ScalingVis multiplication.
+    It does NOT affect explicit probe modes:
+        probe_bias / probe_scale / probe_add / var_sink
+    """
+    if layer_idx is None:
+        return True
+
+    include_layers = _parse_layer_set_from_env("ADAPTVIS_INCLUDE_LAYERS")
+    exclude_layers = _parse_layer_set_from_env("ADAPTVIS_EXCLUDE_LAYERS")
+
+    layer_idx = int(layer_idx)
+
+    if include_layers and layer_idx not in include_layers:
+        return False
+
+    if layer_idx in exclude_layers:
+        return False
+
+    return True
+
+
 def _blocks_to_image_token_indices(
     block_ids,
     start_idx,
@@ -917,13 +971,34 @@ class LLaMAAttention(nn.Module):
             #
             # var_sink is handled after softmax.
             # probe_bias / probe_scale / probe_add are explicit probe interventions.
+            #
+            # ADAPTVIS_EXCLUDE_LAYERS / ADAPTVIS_INCLUDE_LAYERS only affects this
+            # normal AdaptVis/ScalingVis path.
             if adjust_method not in [
                 "var_sink",
                 "probe_bias",
                 "probe_scale",
                 "probe_add",
             ]:
-                attn_weights[:, :, mask] *= weight
+                if _adaptvis_layer_allowed(idx):
+                    attn_weights[:, :, mask] *= weight
+
+                    if os.getenv("ADAPTVIS_LAYER_DEBUG", "False") == "True":
+                        print(
+                            f"[ADAPTVIS_APPLY] layer={idx}, "
+                            f"adjust_method={adjust_method}, weight={weight}, "
+                            f"mask_tokens={int(mask.sum().item())}, "
+                            f"exclude={os.getenv('ADAPTVIS_EXCLUDE_LAYERS', '')}, "
+                            f"include={os.getenv('ADAPTVIS_INCLUDE_LAYERS', '')}"
+                        )
+                else:
+                    if os.getenv("ADAPTVIS_LAYER_DEBUG", "False") == "True":
+                        print(
+                            f"[ADAPTVIS_SKIP] layer={idx}, "
+                            f"adjust_method={adjust_method}, weight={weight}, "
+                            f"exclude={os.getenv('ADAPTVIS_EXCLUDE_LAYERS', '')}, "
+                            f"include={os.getenv('ADAPTVIS_INCLUDE_LAYERS', '')}"
+                        )
 
         # ====================================================
         # 5. Save raw logits after logit-space intervention
