@@ -751,22 +751,10 @@ def ensure_rgb_pil_for_control(image) -> Image.Image:
 def apply_image_control_from_env(image, sample_id: int = 0):
     """
     Env:
-        IMAGE_CONTROL=none | blank_black | blank_gray | blank_mean | shuffle_patches | random_noise
+        IMAGE_CONTROL=none | blank_black | blank_gray | blank_white | blank_mean | shuffle_patches | random_noise
         IMAGE_CONTROL_SIZE=336
         IMAGE_CONTROL_GRID=24
         IMAGE_CONTROL_SEED=1
-
-    Purpose:
-        blank_black / blank_gray / blank_mean:
-            Remove visual content. If steering remains, it is likely relation prior / bias.
-
-        shuffle_patches:
-            Preserve local color/texture patches but destroy global spatial layout.
-            If steering remains under shuffle but disappears under blank, the effect may depend
-            on visual content but not true spatial arrangement.
-
-        random_noise:
-            Stress test. If steering remains even under noise, it is likely not visual grounding.
     """
     mode = os.getenv("IMAGE_CONTROL", "none").strip().lower()
 
@@ -1463,8 +1451,6 @@ class LlavaWrapper:
         results = []
 
         for batch in tqdm(joint_loader):
-            # For Controlled_Images_* this loader is normally batch_size=1.
-            # Keep index_of_total as the original dataset index.
             if sample_id_set is not None and index_of_total not in sample_id_set:
                 skipped_count += 1
                 index_of_total += 1
@@ -1507,7 +1493,6 @@ class LlavaWrapper:
                         query_pos = torch.tensor(int(query_pos_env), device=self.device)
 
                     object_patch_mask = None
-
                     manual_patch_mask = build_manual_patch_mask_from_env(self.device)
 
                     if adjust_method_env == "object_mask" and manual_patch_mask is not None:
@@ -1518,8 +1503,6 @@ class LlavaWrapper:
                         clip_obj_dilate = int(os.getenv("CLIP_OBJ_DILATE", "1"))
                         clip_obj_invert = os.getenv("CLIP_OBJ_INVERT", "True") == "True"
 
-                        # For IMAGE_CONTROL experiments, object masks should be based on the
-                        # actual image seen by the model, not the original image.
                         object_patch_mask = compute_clip_object_mask_binary(
                             clip_model=self.clip_obj_model,
                             clip_processor=self.clip_obj_processor,
@@ -1566,7 +1549,7 @@ class LlavaWrapper:
                         change_greedy_to_add_weight()
 
                         probe_single_pass = (
-                            adjust_method_env in ["probe_bias", "probe_scale", "var_sink"]
+                            adjust_method_env in ["probe_bias", "probe_scale", "probe_add", "var_sink"]
                             or os.getenv("PROBE_RUN_TAG", "").strip() != ""
                         )
 
@@ -1732,6 +1715,12 @@ class LlavaWrapper:
                         "probe_block_ids": os.getenv("PROBE_BLOCK_IDS", ""),
                         "probe_beta": os.getenv("PROBE_BETA", ""),
                         "probe_scale": os.getenv("PROBE_SCALE", ""),
+
+                        "probe_add_mode": os.getenv("PROBE_ADD_MODE", ""),
+                        "probe_add_mass": os.getenv("PROBE_ADD_MASS", ""),
+                        "probe_add_value": os.getenv("PROBE_ADD_VALUE", ""),
+                        "probe_add_renorm": os.getenv("PROBE_ADD_RENORM", ""),
+
                         "probe_run_tag": os.getenv("PROBE_RUN_TAG", ""),
 
                         "image_control": os.getenv("IMAGE_CONTROL", "none"),
@@ -1750,6 +1739,7 @@ class LlavaWrapper:
                         "clip_obj_threshold": os.getenv("CLIP_OBJ_THRESHOLD", ""),
                         "selected_patch_count": patch_selected,
                     }
+
                     results.append(result)
 
                     im_scores.append(np.expand_dims(np.array(answers), -1))
@@ -1796,6 +1786,12 @@ class LlavaWrapper:
                     "sample_filter_file": os.getenv("PROBE_SAMPLE_IDS_FILE", ""),
                     "probe_run_tag": os.getenv("PROBE_RUN_TAG", ""),
                     "probe_scale": os.getenv("PROBE_SCALE", ""),
+
+                    "probe_add_mode": os.getenv("PROBE_ADD_MODE", ""),
+                    "probe_add_mass": os.getenv("PROBE_ADD_MASS", ""),
+                    "probe_add_value": os.getenv("PROBE_ADD_VALUE", ""),
+                    "probe_add_renorm": os.getenv("PROBE_ADD_RENORM", ""),
+
                     "image_control": os.getenv("IMAGE_CONTROL", "none"),
                     "image_control_size": os.getenv("IMAGE_CONTROL_SIZE", ""),
                     "image_control_grid": os.getenv("IMAGE_CONTROL_GRID", ""),
