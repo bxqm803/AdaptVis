@@ -10,7 +10,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
-
 from transformers import AutoProcessor
 
 try:
@@ -67,6 +66,8 @@ def strip_article(x: str) -> str:
 
 def parse_two_objects_from_prompt(prompt: str) -> Tuple[Optional[str], Optional[str]]:
     q = clean_question(prompt)
+
+    # Remove answer instruction.
     q = re.sub(r"Answer\s+with\s+.*$", "", q, flags=re.IGNORECASE).strip()
 
     patterns = [
@@ -86,6 +87,7 @@ def parse_two_objects_from_prompt(prompt: str) -> Tuple[Optional[str], Optional[
 
 def normalize_relation(x: str) -> str:
     s = str(x).strip().lower()
+
     if "under" in s:
         return "under"
     if re.search(r"\bon\b", s) and "front" not in s:
@@ -94,6 +96,7 @@ def normalize_relation(x: str) -> str:
         return "left"
     if "right" in s:
         return "right"
+
     return "unknown"
 
 
@@ -374,6 +377,7 @@ def grid_box_to_ids(
 ) -> List[int]:
     if grid_box is None:
         return []
+
     r1, c1, r2, c2 = grid_box
     ids = []
     for r in range(r1, r2 + 1):
@@ -484,6 +488,18 @@ def load_llava(model_id: str, revision: str, cache_dir: str, device: str, dtype:
         low_cpu_mem_usage=True,
     )
 
+    # Fix HF warning:
+    # "Expanding inputs for image tokens in LLaVa should be done in processing..."
+    patch_size = getattr(getattr(model.config, "vision_config", None), "patch_size", 14)
+    vision_feature_select_strategy = getattr(
+        model.config,
+        "vision_feature_select_strategy",
+        "default",
+    )
+
+    processor.patch_size = patch_size
+    processor.vision_feature_select_strategy = vision_feature_select_strategy
+
     model = model.to(device).eval()
     return processor, model
 
@@ -497,70 +513,88 @@ def score_candidates_batch(
     device: str,
 ) -> Dict[str, Dict[str, float]]:
     """
-    Return:
-        {
-          "left": {"sum_logprob": ..., "avg_logprob": ..., "num_tokens": ...},
-          ...
-        }
+    Closed-set relation scoring.
 
-    S(candidate) is average log-prob of answer tokens under original relation prompt.
+    S(candidate) = average log-probability of candidate answer tokens
+    under the original relation prompt.
+
+    This scores the final candidate tokens in each full sequence.
+    It is robust to padding and avoids prompt-length indexing bugs.
     """
+    tokenizer = processor.tokenizer
+
     answer_texts = [" " + c for c in candidates]
     full_texts = [prompt + a for a in answer_texts]
-
     images = [image] * len(candidates)
 
-    full_inputs = processor(
+    inputs = processor(
         text=full_texts,
         images=images,
         return_tensors="pt",
         padding=True,
     ).to(device)
 
-    prompt_inputs = processor(
-        text=[prompt] * len(candidates),
-        images=images,
-        return_tensors="pt",
-        padding=True,
-    ).to(device)
-
-    prompt_lens = prompt_inputs["attention_mask"].sum(dim=1).long()
-
     with torch.no_grad():
-        outputs = model(**full_inputs)
+        outputs = model(**inputs)
 
-    input_ids = full_inputs["input_ids"]
-    attention_mask = full_inputs["attention_mask"]
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
 
+    # logits[:, t-1] predicts input_ids[:, t]
     logits = outputs.logits[:, :-1, :]
     target_ids = input_ids[:, 1:]
-    target_attn = attention_mask[:, 1:]
 
     log_probs = F.log_softmax(logits, dim=-1)
-    gathered = log_probs.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
-
-    seq_len_minus_1 = target_ids.shape[1]
-    pos = torch.arange(seq_len_minus_1, device=device).unsqueeze(0) + 1
+    token_log_probs = log_probs.gather(
+        dim=-1,
+        index=target_ids.unsqueeze(-1),
+    ).squeeze(-1)
 
     result = {}
 
     for b, cand in enumerate(candidates):
-        cand_mask = (pos[b] >= prompt_lens[b]) & (target_attn[b] == 1)
+        cand_text = " " + cand
+        cand_ids = tokenizer(
+            cand_text,
+            add_special_tokens=False,
+        ).input_ids
 
-        vals = gathered[b][cand_mask]
+        n_tok = len(cand_ids)
+        if n_tok == 0:
+            result[cand] = {
+                "sum_logprob": float("-inf"),
+                "avg_logprob": float("-inf"),
+                "num_tokens": 0,
+            }
+            continue
+
+        # Non-padding token positions in full input_ids.
+        nonpad_positions = torch.nonzero(attention_mask[b], as_tuple=False).squeeze(-1)
+
+        # Candidate answer is appended at the end.
+        cand_positions_in_input = nonpad_positions[-n_tok:]
+
+        # Convert input token positions t to target positions t-1.
+        cand_positions_in_target = cand_positions_in_input - 1
+        cand_positions_in_target = cand_positions_in_target[
+            cand_positions_in_target >= 0
+        ]
+
+        vals = token_log_probs[b, cand_positions_in_target]
+
         if vals.numel() == 0:
             sum_lp = float("-inf")
             avg_lp = float("-inf")
-            n_tok = 0
+            n_used = 0
         else:
             sum_lp = float(vals.sum().detach().cpu().item())
             avg_lp = float(vals.mean().detach().cpu().item())
-            n_tok = int(vals.numel())
+            n_used = int(vals.numel())
 
         result[cand] = {
             "sum_logprob": sum_lp,
             "avg_logprob": avg_lp,
-            "num_tokens": n_tok,
+            "num_tokens": n_used,
         }
 
     return result
@@ -577,9 +611,11 @@ def pred_from_scores(scores: Dict[str, float]) -> str:
 def correct_margin(scores: Dict[str, float], gold: str) -> Optional[float]:
     if gold not in scores:
         return None
+
     others = [v for k, v in scores.items() if k != gold]
     if not others:
         return None
+
     return scores[gold] - max(others)
 
 
@@ -876,8 +912,14 @@ def main():
 
         print("\n" + "=" * 100)
         print(f"[{run_i + 1}/{len(indices)}] sample_id={sample_id}")
-        print(f"gold={gold} | obj1={obj1} found={box1 is not None} score={score1} grid={obj1_grid_box} patches={len(obj1_ids)}")
-        print(f"gold={gold} | obj2={obj2} found={box2 is not None} score={score2} grid={obj2_grid_box} patches={len(obj2_ids)}")
+        print(
+            f"gold={gold} | obj1={obj1} found={box1 is not None} "
+            f"score={score1} grid={obj1_grid_box} patches={len(obj1_ids)}"
+        )
+        print(
+            f"gold={gold} | obj2={obj2} found={box2 is not None} "
+            f"score={score2} grid={obj2_grid_box} patches={len(obj2_ids)}"
+        )
         print("question:", clean_question(prompt))
 
         for cond in ["original", "mask_obj1", "mask_obj2", "mask_both", "mask_background"]:
@@ -886,7 +928,8 @@ def main():
                 f"{cond:16s} "
                 f"pred={pred_by_condition[cond]:6s} "
                 f"margin={margin_by_condition[cond]} "
-                f"scores={{left:{s['left']:.3f}, right:{s['right']:.3f}, on:{s['on']:.3f}, under:{s['under']:.3f}}}"
+                f"scores={{left:{s['left']:.3f}, right:{s['right']:.3f}, "
+                f"on:{s['on']:.3f}, under:{s['under']:.3f}}}"
             )
 
         print(
