@@ -12,14 +12,22 @@ WEIGHT2="${WEIGHT2:-1.5}"
 THRESHOLD="${THRESHOLD:-0.5}"
 
 PROMPT_FILE="prompts/${DATASET}_with_answer_${OPTION}_options.jsonl"
-BACKUP_FILE="${PROMPT_FILE}.bak.option_order.$(date +%Y%m%d_%H%M%S)"
 
-cp "${PROMPT_FILE}" "${BACKUP_FILE}"
+# 当前文件备份，防止出错。
+RAW_BACKUP_FILE="${PROMPT_FILE}.bak.raw.option_order_only.$(date +%Y%m%d_%H%M%S)"
+
+# clean backup：统一恢复成 canonical instruction。
+CLEAN_BACKUP_FILE="${PROMPT_FILE}.bak.clean.option_order_only.$(date +%Y%m%d_%H%M%S)"
+
+cp "${PROMPT_FILE}" "${RAW_BACKUP_FILE}"
 
 restore_prompt () {
-  if [[ -f "${BACKUP_FILE}" ]]; then
-    cp "${BACKUP_FILE}" "${PROMPT_FILE}"
-    echo "[RESTORE] prompt restored from ${BACKUP_FILE}"
+  if [[ -f "${CLEAN_BACKUP_FILE}" ]]; then
+    cp "${CLEAN_BACKUP_FILE}" "${PROMPT_FILE}"
+    echo "[RESTORE] prompt restored to clean canonical version from ${CLEAN_BACKUP_FILE}"
+  elif [[ -f "${RAW_BACKUP_FILE}" ]]; then
+    cp "${RAW_BACKUP_FILE}" "${PROMPT_FILE}"
+    echo "[RESTORE] prompt restored from raw backup ${RAW_BACKUP_FILE}"
   fi
 }
 
@@ -59,12 +67,76 @@ grep -q "PROBE_SINGLE_PASS" model_zoo/llava15.py || {
   exit 1
 }
 
+echo "[BUILD CLEAN PROMPT] normalize current prompt to canonical order with only"
+python - <<PY
+import json
+import re
+from pathlib import Path
+from collections import Counter
+
+src = Path("${RAW_BACKUP_FILE}")
+dst = Path("${CLEAN_BACKUP_FILE}")
+
+canonical = "left, right, on or under"
+
+def replace_instruction(q, order_text):
+    # Robustly replace anything after "Answer with" until ASSISTANT or line end.
+    q2, n = re.subn(
+        r"Answer\s+with\s+.*?(?=\s*ASSISTANT:|$)",
+        f"Answer with {order_text} only.",
+        q,
+        flags=re.IGNORECASE | re.S,
+    )
+    if n != 1:
+        raise ValueError(f"Failed to replace answer instruction:\\n{q}")
+    return q2
+
+def extract_instruction(q):
+    m = re.search(
+        r"Answer\s+with\s+(.+?)(?=\s*ASSISTANT:|$)",
+        q,
+        flags=re.IGNORECASE | re.S,
+    )
+    return m.group(1).strip() if m else "NO_MATCH"
+
+rows = []
+instr_before = Counter()
+instr_after = Counter()
+
+with src.open("r", encoding="utf-8") as f:
+    for line in f:
+        d = json.loads(line)
+        q = d.get("question", "")
+        instr_before[extract_instruction(q)] += 1
+        d["question"] = replace_instruction(q, canonical)
+        instr_after[extract_instruction(d["question"])] += 1
+        rows.append(d)
+
+with dst.open("w", encoding="utf-8") as f:
+    for d in rows:
+        f.write(json.dumps(d, ensure_ascii=False) + "\\n")
+
+# Also put clean canonical version into active prompt before starting.
+with Path("${PROMPT_FILE}").open("w", encoding="utf-8") as f:
+    for d in rows:
+        f.write(json.dumps(d, ensure_ascii=False) + "\\n")
+
+print("raw backup:", src)
+print("clean backup:", dst)
+print("before:", instr_before)
+print("after:", instr_after)
+print("first clean question:")
+print(rows[0]["question"])
+print("first answer:", rows[0]["answer"])
+PY
+
 run_one_order () {
   local ORDER_TAG="$1"
   local ORDER_TEXT="$2"
 
-  local TAG="adaptvis_full_all_order_${ORDER_TAG}_w${W1TAG}_${W2TAG}_t${TTAG}"
+  local TAG="adaptvis_full_all_order_${ORDER_TAG}_only_w${W1TAG}_${W2TAG}_t${TTAG}"
   local RESULT_FILE="./output/results1.5_${DATASET}_adapt_vis_1.0_${OPTION}option_False_${TAG}.json"
+  local SCORE_FILE="${RESULT_FILE%.json}scores.json"
 
   echo ""
   echo "============================================================"
@@ -74,47 +146,48 @@ run_one_order () {
   echo "WEIGHT1=${WEIGHT1}, WEIGHT2=${WEIGHT2}, THRESHOLD=${THRESHOLD}"
   echo "============================================================"
 
-  # 每次都从原始 backup 重新生成 prompt，避免上一次替换影响下一次。
-  cp "${BACKUP_FILE}" "${PROMPT_FILE}"
+  # 每次都从 clean canonical prompt 重新生成。
+  cp "${CLEAN_BACKUP_FILE}" "${PROMPT_FILE}"
 
   python - <<PY
 import json
 import re
 from pathlib import Path
+from collections import Counter
 
 path = Path("${PROMPT_FILE}")
 order_text = "${ORDER_TEXT}"
 
+def replace_instruction(q, order_text):
+    q2, n = re.subn(
+        r"Answer\s+with\s+.*?(?=\s*ASSISTANT:|$)",
+        f"Answer with {order_text} only.",
+        q,
+        flags=re.IGNORECASE | re.S,
+    )
+    if n != 1:
+        raise ValueError(f"Failed to replace answer instruction:\\n{q}")
+    return q2
+
+def extract_instruction(q):
+    m = re.search(
+        r"Answer\s+with\s+(.+?)(?=\s*ASSISTANT:|$)",
+        q,
+        flags=re.IGNORECASE | re.S,
+    )
+    return m.group(1).strip() if m else "NO_MATCH"
+
 rows = []
+instr = Counter()
 
 with path.open("r", encoding="utf-8") as f:
     for line in f:
         d = json.loads(line)
-
         q = d.get("question", "")
+        d["question"] = replace_instruction(q, order_text)
+        instr[extract_instruction(d["question"])] += 1
 
-        # Replace only the answer instruction.
-        q2 = re.sub(
-            r"Answer\\s+with\\s+left,\\s*right,\\s*on\\s+or\\s+under\\.?",
-            f"Answer with {order_text}.",
-            q,
-            flags=re.IGNORECASE,
-        )
-
-        # Fallback for exact strings.
-        q2 = q2.replace(
-            "Answer with left, right, on or under.",
-            f"Answer with {order_text}."
-        )
-        q2 = q2.replace(
-            "Answer with left, right, on or under",
-            f"Answer with {order_text}"
-        )
-
-        d["question"] = q2
-
-        # IMPORTANT:
-        # Do not change d["answer"].
+        # Do not change answer.
         # Golden remains left/right/on/under.
         rows.append(d)
 
@@ -123,10 +196,14 @@ with path.open("w", encoding="utf-8") as f:
         f.write(json.dumps(d, ensure_ascii=False) + "\\n")
 
 print("patched prompt:", path)
+print("instruction distribution:", instr)
 print("num rows:", len(rows))
 print("example question:", rows[0]["question"])
 print("example answer:", rows[0]["answer"])
 PY
+
+  # 删除旧结果，避免读到上次错误文件。
+  rm -f "${RESULT_FILE}" "${SCORE_FILE}"
 
   CUDA_VISIBLE_DEVICES="${GPU}" \
   ADAPTVIS_EXCLUDE_LAYERS="" \
@@ -167,8 +244,44 @@ run_one_order "under_on_left_right" "under, on, left, right"
 run_one_order "on_under_right_left" "on, under, right, left"
 run_one_order "under_left_right_on" "under, left, right, on"
 
-# Restore original prompt before stats.
-cp "${BACKUP_FILE}" "${PROMPT_FILE}"
+# Restore clean canonical prompt before stats.
+cp "${CLEAN_BACKUP_FILE}" "${PROMPT_FILE}"
+
+echo ""
+echo "============================================================"
+echo "VERIFY PROMPTS"
+echo "============================================================"
+
+python - <<PY
+import json
+import re
+from collections import Counter
+
+DATASET = "${DATASET}"
+OPTION = "${OPTION}"
+
+tags = [
+    "adaptvis_full_all_order_right_left_under_on_only_w${W1TAG}_${W2TAG}_t${TTAG}",
+    "adaptvis_full_all_order_under_on_left_right_only_w${W1TAG}_${W2TAG}_t${TTAG}",
+    "adaptvis_full_all_order_on_under_right_left_only_w${W1TAG}_${W2TAG}_t${TTAG}",
+    "adaptvis_full_all_order_under_left_right_on_only_w${W1TAG}_${W2TAG}_t${TTAG}",
+]
+
+def extract_instruction(prompt):
+    m = re.search(
+        r"Answer\s+with\s+(.+?)(?=\s*ASSISTANT:|$)",
+        prompt,
+        flags=re.IGNORECASE | re.S,
+    )
+    return m.group(1).strip() if m else "NO_MATCH"
+
+for tag in tags:
+    path = f"./output/results1.5_{DATASET}_adapt_vis_1.0_{OPTION}option_False_{tag}.json"
+    rows = json.load(open(path, "r", encoding="utf-8"))
+    print("\\n" + tag)
+    print(Counter(extract_instruction(r["Prompt"]) for r in rows))
+    print("first prompt:", rows[0]["Prompt"])
+PY
 
 echo ""
 echo "============================================================"
@@ -184,10 +297,10 @@ DATASET = "${DATASET}"
 OPTION = "${OPTION}"
 
 tags = [
-    "adaptvis_full_all_order_right_left_under_on_w${W1TAG}_${W2TAG}_t${TTAG}",
-    "adaptvis_full_all_order_under_on_left_right_w${W1TAG}_${W2TAG}_t${TTAG}",
-    "adaptvis_full_all_order_on_under_right_left_w${W1TAG}_${W2TAG}_t${TTAG}",
-    "adaptvis_full_all_order_under_left_right_on_w${W1TAG}_${W2TAG}_t${TTAG}",
+    "adaptvis_full_all_order_right_left_under_on_only_w${W1TAG}_${W2TAG}_t${TTAG}",
+    "adaptvis_full_all_order_under_on_left_right_only_w${W1TAG}_${W2TAG}_t${TTAG}",
+    "adaptvis_full_all_order_on_under_right_left_only_w${W1TAG}_${W2TAG}_t${TTAG}",
+    "adaptvis_full_all_order_under_left_right_on_only_w${W1TAG}_${W2TAG}_t${TTAG}",
 ]
 
 def norm_rel(x):
@@ -206,7 +319,6 @@ def norm_rel(x):
 
 def summarize(tag):
     path = f"./output/results1.5_{DATASET}_adapt_vis_1.0_{OPTION}option_False_{tag}.json"
-
     rows = json.load(open(path, "r", encoding="utf-8"))
 
     correct = sum(bool(r.get("Correct", False)) for r in rows)
@@ -247,7 +359,7 @@ def summarize(tag):
             f"{row.get('left', 0):7d}"
             f"{row.get('right', 0):7d}"
             f"{row.get('on', 0):7d}"
-            f"{row.get('under', 0):7d}"
+            f"{row.get('under', 0):8d}"
             f"{row.get('unknown', 0):8d}"
         )
 
@@ -257,4 +369,5 @@ PY
 
 echo ""
 echo "[DONE ALL]"
-echo "Prompt restored to original."
+echo "Prompt restored to clean canonical version:"
+echo "Answer with left, right, on or under only."
