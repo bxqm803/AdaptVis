@@ -239,10 +239,10 @@ PY
   echo "[DONE ORDER] result: ${RESULT_FILE}"
 }
 
-run_one_order "right_left_under_on" "right, left, under, on"
-run_one_order "under_on_left_right" "under, on, left, right"
-run_one_order "on_under_right_left" "on, under, right, left"
-run_one_order "under_left_right_on" "under, left, right, on"
+run_one_order "right_left_under_on" "right, left, under or on"
+run_one_order "under_on_left_right" "under, on, left or right"
+run_one_order "on_under_right_left" "on, under, right or left"
+run_one_order "under_left_right_on" "under, left, right or on"
 
 # Restore clean canonical prompt before stats.
 cp "${CLEAN_BACKUP_FILE}" "${PROMPT_FILE}"
