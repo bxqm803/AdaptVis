@@ -71,10 +71,17 @@ def parse_two_objects_from_prompt(prompt: str) -> Tuple[Optional[str], Optional[
     q = re.sub(r"Answer\s+with\s+.*$", "", q, flags=re.IGNORECASE).strip()
 
     patterns = [
+        # singular: Where is ...
         r"Where\s+is\s+the\s+(.+?)\s+in\s+relation\s+to\s+the\s+(.+?)\?",
         r"Where\s+is\s+the\s+(.+?)\s+in\s+relation\s+to\s+(.+?)\?",
         r"Where\s+is\s+(.+?)\s+in\s+relation\s+to\s+the\s+(.+?)\?",
         r"Where\s+is\s+(.+?)\s+in\s+relation\s+to\s+(.+?)\?",
+
+        # plural: Where are ...
+        r"Where\s+are\s+the\s+(.+?)\s+in\s+relation\s+to\s+the\s+(.+?)\?",
+        r"Where\s+are\s+the\s+(.+?)\s+in\s+relation\s+to\s+(.+?)\?",
+        r"Where\s+are\s+(.+?)\s+in\s+relation\s+to\s+the\s+(.+?)\?",
+        r"Where\s+are\s+(.+?)\s+in\s+relation\s+to\s+(.+?)\?",
     ]
 
     for p in patterns:
@@ -633,6 +640,11 @@ def main():
 
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--max-samples", type=int, default=-1)
+    parser.add_argument(
+        "--sample-ids",
+        default="",
+        help="Comma-separated sample ids to run, e.g. 6,19,60. If set, only these ids are processed.",
+    )
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--llava-model-id", default=LLAVA_MODEL_ID)
@@ -703,13 +715,26 @@ def main():
     prompt_rows = load_prompt_rows(args.dataset, args.option)
 
     n_total = min(len(dataset), len(prompt_rows))
-    indices = list(range(n_total))
 
-    if args.max_samples > 0:
-        random.seed(args.seed)
-        indices = random.sample(indices, min(args.max_samples, len(indices)))
+    if args.sample_ids.strip():
+        indices = []
+        for x in args.sample_ids.split(","):
+            x = x.strip()
+            if not x:
+                continue
+            sid = int(x)
+            if 0 <= sid < n_total:
+                indices.append(sid)
+            else:
+                print(f"[WARN] sample_id out of range and skipped: {sid}")
+    else:
+        indices = list(range(n_total))
+        if args.max_samples > 0:
+            random.seed(args.seed)
+            indices = random.sample(indices, min(args.max_samples, len(indices)))
 
     print(f"[INFO] total samples to run: {len(indices)}")
+    print(f"[INFO] sample ids: {indices[:50]}{' ...' if len(indices) > 50 else ''}")
 
     csv_fields = [
         "sample_id",
