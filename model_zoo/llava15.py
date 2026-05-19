@@ -100,6 +100,10 @@ def make_tagged_output_path(dataset, method, weight, option, test_flag):
         Use PROBE_SINGLE_PASS=True if you explicitly want single-pass probe mode.
     """
     base = f"./output/results1.5_{dataset}_{method}_{weight}_{option}option_{test_flag}"
+
+    if use_closed_set_scoring_from_env():
+        base = f"{base}_closedset"
+
     tag = os.getenv("PROBE_RUN_TAG", "").strip()
 
     if tag:
@@ -1065,6 +1069,440 @@ def build_manual_patch_mask_from_env(device):
     return patch_mask
 
 
+
+# ============================================================
+# Closed-set relation scoring helpers
+# ============================================================
+
+def _env_flag(name: str, default: str = "False") -> bool:
+    return str(os.getenv(name, default)).strip().lower() in [
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    ]
+
+
+def use_closed_set_scoring_from_env() -> bool:
+    """
+    Turn on closed-set decision without touching main_aro.py.
+
+    Supported envs:
+        CLOSED_SET_SCORING=True
+        DECISION_MODE=closed_set
+    """
+    decision_mode = os.getenv("DECISION_MODE", "").strip().lower()
+    return (
+        _env_flag("CLOSED_SET_SCORING", "False")
+        or decision_mode in ["closed_set", "closed-set", "closedset", "cs"]
+    )
+
+
+def extract_closed_set_candidates(
+    prompt: str,
+    dataset: Optional[str] = None,
+    option: Optional[str] = None,
+) -> List[str]:
+    """
+    Extract candidate answer strings from prompts like:
+        "Answer with left, right, on or under."
+
+    Falls back to dataset/option-aware relation sets when parsing fails.
+    """
+    prompt = str(prompt)
+
+    m = re.search(
+        r"Answer\s+with\s+(.+?)(?:\.|\n|$)",
+        prompt,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    if m is not None:
+        raw = m.group(1).strip()
+        raw = re.sub(r"\bonly\b", "", raw, flags=re.IGNORECASE).strip()
+        raw = re.sub(
+            r"^(?:one\s+of\s+)?(?:the\s+)?(?:following\s*)?:",
+            "",
+            raw,
+            flags=re.IGNORECASE,
+        ).strip()
+        raw = raw.replace(";", ",").replace("/", ",")
+        raw = re.sub(r"\s+(?:or|and)\s+", ",", raw, flags=re.IGNORECASE)
+
+        candidates = []
+        for x in raw.split(","):
+            x = x.strip()
+            x = re.sub(r"^[\s\.:;\-\(\)\[\]\{\}'\"]+", "", x)
+            x = re.sub(r"[\s\.:;\-\(\)\[\]\{\}'\"]+$", "", x)
+            x = re.sub(r"\s+", " ", x).strip()
+
+            if x and x.lower() not in ["answer", "answers"]:
+                candidates.append(x)
+
+        # Keep order while removing duplicates.
+        deduped = []
+        seen = set()
+        for x in candidates:
+            key = x.lower()
+            if key not in seen:
+                seen.add(key)
+                deduped.append(x)
+
+        if len(deduped) >= 2:
+            return deduped
+
+    dataset_l = str(dataset or "").lower()
+    option_l = str(option or "").lower()
+
+    if "controlled_images_b" in dataset_l:
+        return ["left", "right", "in front", "behind"]
+
+    if "coco" in dataset_l:
+        return ["left", "right", "above", "below"]
+
+    if "vg" in dataset_l or option_l == "six":
+        return ["left", "right", "above", "below", "in front", "behind"]
+
+    return ["left", "right", "on", "under"]
+
+
+def _candidate_answer_token_ids(tokenizer, candidate: str) -> List[int]:
+    """
+    Tokenize the appended answer exactly as used in full_text:
+        prompt.rstrip() + " " + candidate
+    """
+    candidate = str(candidate).strip()
+    token_ids = tokenizer.encode(" " + candidate, add_special_tokens=False)
+
+    if len(token_ids) == 0:
+        token_ids = tokenizer.encode(candidate, add_special_tokens=False)
+
+    return [int(x) for x in token_ids]
+
+
+def _score_dict_to_prob_dict(
+    score_dict: Dict[str, Dict[str, Any]],
+    score_key: str = "score",
+) -> Tuple[Dict[str, float], float, float]:
+    candidates = list(score_dict.keys())
+
+    if len(candidates) == 0:
+        return {}, 0.0, 0.0
+
+    score_tensor = torch.tensor(
+        [float(score_dict[c][score_key]) for c in candidates],
+        dtype=torch.float32,
+    )
+
+    probs = torch.softmax(score_tensor, dim=0)
+    prob_dict = {
+        c: float(p)
+        for c, p in zip(candidates, probs.tolist())
+    }
+
+    sorted_scores = torch.sort(score_tensor, descending=True).values
+    margin = (
+        float((sorted_scores[0] - sorted_scores[1]).item())
+        if len(candidates) >= 2
+        else 0.0
+    )
+
+    confidence = float(probs.max().item())
+    return prob_dict, confidence, margin
+
+
+@torch.no_grad()
+def score_candidates_closed_set(
+    model,
+    processor,
+    image,
+    prompt: str,
+    candidates: List[str],
+    device: str,
+    method: Optional[str] = None,
+    weight: float = 1.0,
+    adjust_method: Optional[str] = "last_query",
+    pos: Optional[torch.Tensor] = None,
+    object_patch_mask: Optional[torch.Tensor] = None,
+) -> Tuple[str, Dict[str, Dict[str, Any]], Dict[str, float], float, float]:
+    """
+    Closed-set relation scoring:
+        S(candidate) = mean log p(candidate_tokens | prompt, image)
+
+    For ScalingVis / AdaptVis, this function calls the Scal model forward with
+    the same AdaptVis parameters used during generation. Thus the attention-logit
+    multiplication is applied during teacher-forced scoring as well.
+    """
+    if len(candidates) == 0:
+        raise ValueError("score_candidates_closed_set received empty candidates.")
+
+    prompt = str(prompt).rstrip()
+    full_texts = [prompt + " " + str(c).strip() for c in candidates]
+    images = [image] * len(candidates)
+
+    inputs = processor(
+        text=full_texts,
+        images=images,
+        return_tensors="pt",
+        padding=True,
+    ).to(device)
+
+    # Build keys from the actual closed-set batch, not from the shorter prompt-only
+    # batch. This avoids length mismatch when the appended candidate adds tokens.
+    image_token_id = int(
+        os.getenv(
+            "IMAGE_TOKEN_ID",
+            str(getattr(getattr(model, "config", None), "image_token_index", 32001)),
+        )
+    )
+    scoring_keys = [
+        torch.where(input_id == image_token_id, 1, 0)
+        for input_id in inputs["input_ids"]
+    ]
+
+    model_kwargs = {
+        "return_dict": True,
+    }
+
+    # Only the Scal model accepts AdaptVis arguments.
+    if "Scal" in str(type(model)):
+        model_kwargs.update(
+            {
+                "keys": scoring_keys,
+                "weight": float(weight),
+                "adjust_method": adjust_method,
+                "pos": pos,
+                "object_patch_mask": object_patch_mask,
+            }
+        )
+
+    outputs = model(**inputs, **model_kwargs)
+
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+
+    # logits[:, t - 1] predicts input_ids[:, t].
+    logits = outputs.logits[:, :-1, :]
+    target_ids = input_ids[:, 1:]
+
+    token_logprobs = F.log_softmax(logits.float(), dim=-1)
+    token_logprobs = token_logprobs.gather(
+        dim=-1,
+        index=target_ids.unsqueeze(-1),
+    ).squeeze(-1)
+
+    score_dict: Dict[str, Dict[str, Any]] = {}
+
+    tokenizer = processor.tokenizer
+
+    for i, cand in enumerate(candidates):
+        cand_ids = _candidate_answer_token_ids(tokenizer, cand)
+        ans_len = len(cand_ids)
+
+        if ans_len <= 0:
+            raise ValueError(f"Candidate produced no tokens: {cand!r}")
+
+        valid_positions = torch.where(attention_mask[i].bool())[0]
+
+        if valid_positions.numel() == 0:
+            raise ValueError("Empty input after tokenization in closed-set scoring.")
+
+        last_input_pos = int(valid_positions[-1].item())
+        answer_input_start = last_input_pos - ans_len + 1
+        answer_target_start = answer_input_start - 1
+        answer_target_end = last_input_pos
+
+        if answer_target_start < 0 or answer_target_end > token_logprobs.shape[1]:
+            raise ValueError(
+                f"Invalid answer span for candidate={cand!r}: "
+                f"answer_target_start={answer_target_start}, "
+                f"answer_target_end={answer_target_end}, "
+                f"logprob_len={token_logprobs.shape[1]}"
+            )
+
+        suffix_ids = [
+            int(x)
+            for x in input_ids[i, answer_input_start:last_input_pos + 1].detach().cpu().tolist()
+        ]
+
+        # The suffix should normally match cand_ids. If it does not, keep scoring
+        # the final ans_len tokens but expose the mismatch for debugging.
+        suffix_match = suffix_ids == cand_ids
+
+        cand_token_logprobs = token_logprobs[i, answer_target_start:answer_target_end]
+        cand_score_sum = float(cand_token_logprobs.sum().item())
+        cand_score_mean = float(cand_token_logprobs.mean().item())
+
+        score_dict[str(cand)] = {
+            "score": cand_score_mean,
+            "sum_logprob": cand_score_sum,
+            "num_tokens": int(ans_len),
+            "token_ids": cand_ids,
+            "suffix_token_ids": suffix_ids,
+            "suffix_match": bool(suffix_match),
+            "token_logprobs": [
+                float(x)
+                for x in cand_token_logprobs.detach().cpu().tolist()
+            ],
+        }
+
+    prob_dict, confidence, margin = _score_dict_to_prob_dict(score_dict, score_key="score")
+    pred = max(score_dict.keys(), key=lambda c: score_dict[c]["score"])
+
+    return pred, score_dict, prob_dict, confidence, margin
+
+
+@torch.no_grad()
+def decide_closed_set_with_method(
+    model,
+    processor,
+    image,
+    prompt: str,
+    candidates: List[str],
+    device: str,
+    dataset: Optional[str],
+    method: str,
+    weight: float,
+    threshold: float,
+    weight1: float,
+    weight2: float,
+    adjust_method: str,
+    pos: Optional[torch.Tensor] = None,
+    object_patch_mask: Optional[torch.Tensor] = None,
+) -> Dict[str, Any]:
+    """
+    Run base / ScalingVis / AdaptVis using closed-set scoring instead of
+    generation.
+
+    For adapt_vis:
+        pass 1: weight=1.0, compute closed-set confidence.
+        pass 2: choose weight1 or weight2 by threshold, then rescore.
+    """
+    method = str(method)
+
+    if method == "scaling_vis":
+        pred, scores, probs, conf, margin = score_candidates_closed_set(
+            model=model,
+            processor=processor,
+            image=image,
+            prompt=prompt,
+            candidates=candidates,
+            device=device,
+            method=method,
+            weight=weight,
+            adjust_method=adjust_method,
+            pos=pos,
+            object_patch_mask=object_patch_mask,
+        )
+
+        return {
+            "prediction": pred,
+            "scores": scores,
+            "probs": probs,
+            "confidence": conf,
+            "confidence_raw": conf,
+            "margin": margin,
+            "selected_weight": float(weight),
+            "base_prediction": None,
+            "base_scores": None,
+            "base_probs": None,
+            "base_confidence": None,
+            "base_margin": None,
+            "probe_single_pass": False,
+        }
+
+    if method == "adapt_vis":
+        probe_single_pass = (
+            adjust_method in ["probe_bias", "probe_scale", "probe_add", "var_sink"]
+            or os.getenv("PROBE_SINGLE_PASS", "False") == "True"
+        )
+
+        base_pred, base_scores, base_probs, base_conf, base_margin = score_candidates_closed_set(
+            model=model,
+            processor=processor,
+            image=image,
+            prompt=prompt,
+            candidates=candidates,
+            device=device,
+            method=method,
+            weight=1.0,
+            adjust_method=adjust_method,
+            pos=pos,
+            object_patch_mask=object_patch_mask,
+        )
+
+        confidence_mode = os.getenv("CLOSED_SET_CONFIDENCE_MODE", "prob").strip().lower()
+        confidence_value_raw = base_margin if confidence_mode == "margin" else base_conf
+        confidence_value = float(np.round(confidence_value_raw, 2))
+
+        if probe_single_pass:
+            selected_weight = 1.0
+        else:
+            selected_weight = weight1 if confidence_value < threshold else weight2
+
+        pred, scores, probs, conf, margin = score_candidates_closed_set(
+            model=model,
+            processor=processor,
+            image=image,
+            prompt=prompt,
+            candidates=candidates,
+            device=device,
+            method=method,
+            weight=selected_weight,
+            adjust_method=adjust_method,
+            pos=pos,
+            object_patch_mask=object_patch_mask,
+        )
+
+        return {
+            "prediction": pred,
+            "scores": scores,
+            "probs": probs,
+            "confidence": confidence_value,
+            "confidence_raw": float(confidence_value_raw),
+            "margin": margin,
+            "selected_weight": float(selected_weight),
+            "base_prediction": base_pred,
+            "base_scores": base_scores,
+            "base_probs": base_probs,
+            "base_confidence": float(base_conf),
+            "base_margin": float(base_margin),
+            "probe_single_pass": bool(probe_single_pass),
+        }
+
+    pred, scores, probs, conf, margin = score_candidates_closed_set(
+        model=model,
+        processor=processor,
+        image=image,
+        prompt=prompt,
+        candidates=candidates,
+        device=device,
+        method=method,
+        weight=1.0,
+        adjust_method=adjust_method,
+        pos=pos,
+        object_patch_mask=object_patch_mask,
+    )
+
+    return {
+        "prediction": pred,
+        "scores": scores,
+        "probs": probs,
+        "confidence": conf,
+        "confidence_raw": conf,
+        "margin": margin,
+        "selected_weight": None,
+        "base_prediction": None,
+        "base_scores": None,
+        "base_probs": None,
+        "base_confidence": None,
+        "base_margin": None,
+        "probe_single_pass": False,
+    }
+
+
+
 # ============================================================
 # Custom greedy search
 # ============================================================
@@ -1524,153 +1962,185 @@ class LlavaWrapper:
 
                     selected_weight = None
                     probe_single_pass = False
+                    relation_probe = None
+                    closed_set_info = None
+                    output = None
 
-                    if method == "scaling_vis":
-                        change_greedy_to_add_weight()
-                        selected_weight = weight
+                    if use_closed_set_scoring_from_env():
+                        candidates = extract_closed_set_candidates(
+                            prompt=prompt,
+                            dataset=dataset,
+                            option=option,
+                        )
 
-                        output = self.model.generate(
-                            **single_input,
-                            keys=keys,
+                        closed_set_info = decide_closed_set_with_method(
+                            model=self.model,
+                            processor=self.processor,
+                            image=image_for_model,
+                            prompt=prompt,
+                            candidates=candidates,
+                            device=self.device,
+                            dataset=dataset,
+                            method=method,
                             weight=weight,
+                            threshold=threshold,
+                            weight1=weight1,
+                            weight2=weight2,
                             adjust_method=adjust_method_env,
                             pos=query_pos,
                             object_patch_mask=object_patch_mask,
-                            max_new_tokens=100,
-                            output_scores=True,
-                            return_dict_in_generate=True,
                         )
 
-                        uncertainty = np.round(
-                            float(max(torch.nn.functional.softmax(output["scores"][0], dim=-1)[0])),
-                            2,
-                        )
-
-                        gen = self.processor.decode(
-                            output["sequences"][0][len(single_input["input_ids"][-1]):],
-                            skip_special_tokens=True,
-                        )
-
-                    elif method == "adapt_vis":
-                        change_greedy_to_add_weight()
-
-                        # Explicit probe modes should run single-pass.
-                        # PROBE_RUN_TAG only controls output filename and must NOT disable AdaptVis.
-                        # Use PROBE_SINGLE_PASS=True if you explicitly want single-pass with a tag.
-                        probe_single_pass = (
-                            adjust_method_env in ["probe_bias", "probe_scale", "probe_add", "var_sink"]
-                            or os.getenv("PROBE_SINGLE_PASS", "False") == "True"
-                        )
-
-                        if probe_single_pass:
-                            selected_weight = 1.0
-
-                            output = self.model.generate(
-                                **single_input,
-                                keys=keys,
-                                weight=1.0,
-                                adjust_method=adjust_method_env,
-                                pos=query_pos,
-                                object_patch_mask=object_patch_mask,
-                                max_new_tokens=100,
-                                output_scores=True,
-                                return_dict_in_generate=True,
-                            )
-
-                            uncertainty = np.round(
-                                float(max(torch.nn.functional.softmax(output["scores"][0], dim=-1)[0])),
-                                2,
-                            )
-
-                            gen = self.processor.decode(
-                                output["sequences"][0][len(single_input["input_ids"][-1]):],
-                                skip_special_tokens=True,
-                            )
-
-                        else:
-                            output = self.model.generate(
-                                **single_input,
-                                keys=keys,
-                                weight=1.0,
-                                adjust_method=adjust_method_env,
-                                pos=query_pos,
-                                object_patch_mask=object_patch_mask,
-                                max_new_tokens=100,
-                                output_scores=True,
-                                return_dict_in_generate=True,
-                            )
-
-                            uncertainty = np.round(
-                                float(max(torch.nn.functional.softmax(output["scores"][0], dim=-1)[0])),
-                                2,
-                            )
-
-                            print(uncertainty, threshold)
-
-                            if uncertainty < threshold:
-                                selected_weight = weight1
-
-                                output = self.model.generate(
-                                    **single_input,
-                                    keys=keys,
-                                    weight=weight1,
-                                    adjust_method=adjust_method_env,
-                                    pos=query_pos,
-                                    object_patch_mask=object_patch_mask,
-                                    max_new_tokens=100,
-                                    output_scores=True,
-                                    return_dict_in_generate=True,
-                                )
-                            else:
-                                selected_weight = weight2
-
-                                output = self.model.generate(
-                                    **single_input,
-                                    keys=keys,
-                                    weight=weight2,
-                                    adjust_method=adjust_method_env,
-                                    pos=query_pos,
-                                    object_patch_mask=object_patch_mask,
-                                    max_new_tokens=100,
-                                    output_scores=True,
-                                    return_dict_in_generate=True,
-                                )
-
-                            gen = self.processor.decode(
-                                output["sequences"][0][len(single_input["input_ids"][-1]):],
-                                skip_special_tokens=True,
-                            )
+                        gen = closed_set_info["prediction"]
+                        selected_weight = closed_set_info["selected_weight"]
+                        uncertainty = float(closed_set_info["confidence"])
+                        probe_single_pass = bool(closed_set_info["probe_single_pass"])
 
                     else:
-                        selected_weight = None
+                        if method == "scaling_vis":
+                            change_greedy_to_add_weight()
+                            selected_weight = weight
 
-                        output = self.model.generate(
-                            **single_input,
-                            max_new_tokens=100,
-                            output_scores=True,
-                            return_dict_in_generate=True,
-                        )
+                            output = self.model.generate(
+                                **single_input,
+                                keys=keys,
+                                weight=weight,
+                                adjust_method=adjust_method_env,
+                                pos=query_pos,
+                                object_patch_mask=object_patch_mask,
+                                max_new_tokens=100,
+                                output_scores=True,
+                                return_dict_in_generate=True,
+                            )
 
-                        gen = self.processor.decode(
-                            output["sequences"][0][len(single_input["input_ids"][-1]):],
-                            skip_special_tokens=True,
-                        )
+                            uncertainty = np.round(
+                                float(max(torch.nn.functional.softmax(output["scores"][0], dim=-1)[0])),
+                                2,
+                            )
 
-                        uncertainty = np.round(float(max(output["scores"][0][0])), 2)
+                            gen = self.processor.decode(
+                                output["sequences"][0][len(single_input["input_ids"][-1]):],
+                                skip_special_tokens=True,
+                            )
 
-                    relation_probe = None
+                        elif method == "adapt_vis":
+                            change_greedy_to_add_weight()
 
-                    if os.getenv("PROBE_RELATION_PROBS", "False") == "True":
-                        probe_topk = int(os.getenv("PROBE_RELATION_TOPK", "10"))
-                        input_len = len(single_input["input_ids"][-1])
+                            # Explicit probe modes should run single-pass.
+                            # PROBE_RUN_TAG only controls output filename and must NOT disable AdaptVis.
+                            # Use PROBE_SINGLE_PASS=True if you explicitly want single-pass with a tag.
+                            probe_single_pass = (
+                                adjust_method_env in ["probe_bias", "probe_scale", "probe_add", "var_sink"]
+                                or os.getenv("PROBE_SINGLE_PASS", "False") == "True"
+                            )
 
-                        relation_probe = extract_relation_token_topk_from_generate_output(
-                            output=output,
-                            input_len=input_len,
-                            tokenizer=self.processor.tokenizer,
-                            topk=probe_topk,
-                            dataset=dataset,
-                        )
+                            if probe_single_pass:
+                                selected_weight = 1.0
+
+                                output = self.model.generate(
+                                    **single_input,
+                                    keys=keys,
+                                    weight=1.0,
+                                    adjust_method=adjust_method_env,
+                                    pos=query_pos,
+                                    object_patch_mask=object_patch_mask,
+                                    max_new_tokens=100,
+                                    output_scores=True,
+                                    return_dict_in_generate=True,
+                                )
+
+                                uncertainty = np.round(
+                                    float(max(torch.nn.functional.softmax(output["scores"][0], dim=-1)[0])),
+                                    2,
+                                )
+
+                                gen = self.processor.decode(
+                                    output["sequences"][0][len(single_input["input_ids"][-1]):],
+                                    skip_special_tokens=True,
+                                )
+
+                            else:
+                                output = self.model.generate(
+                                    **single_input,
+                                    keys=keys,
+                                    weight=1.0,
+                                    adjust_method=adjust_method_env,
+                                    pos=query_pos,
+                                    object_patch_mask=object_patch_mask,
+                                    max_new_tokens=100,
+                                    output_scores=True,
+                                    return_dict_in_generate=True,
+                                )
+
+                                uncertainty = np.round(
+                                    float(max(torch.nn.functional.softmax(output["scores"][0], dim=-1)[0])),
+                                    2,
+                                )
+
+                                print(uncertainty, threshold)
+
+                                if uncertainty < threshold:
+                                    selected_weight = weight1
+
+                                    output = self.model.generate(
+                                        **single_input,
+                                        keys=keys,
+                                        weight=weight1,
+                                        adjust_method=adjust_method_env,
+                                        pos=query_pos,
+                                        object_patch_mask=object_patch_mask,
+                                        max_new_tokens=100,
+                                        output_scores=True,
+                                        return_dict_in_generate=True,
+                                    )
+                                else:
+                                    selected_weight = weight2
+
+                                    output = self.model.generate(
+                                        **single_input,
+                                        keys=keys,
+                                        weight=weight2,
+                                        adjust_method=adjust_method_env,
+                                        pos=query_pos,
+                                        object_patch_mask=object_patch_mask,
+                                        max_new_tokens=100,
+                                        output_scores=True,
+                                        return_dict_in_generate=True,
+                                    )
+
+                                gen = self.processor.decode(
+                                    output["sequences"][0][len(single_input["input_ids"][-1]):],
+                                    skip_special_tokens=True,
+                                )
+
+                        else:
+                            selected_weight = None
+
+                            output = self.model.generate(
+                                **single_input,
+                                max_new_tokens=100,
+                                output_scores=True,
+                                return_dict_in_generate=True,
+                            )
+
+                            gen = self.processor.decode(
+                                output["sequences"][0][len(single_input["input_ids"][-1]):],
+                                skip_special_tokens=True,
+                            )
+
+                            uncertainty = np.round(float(max(output["scores"][0][0])), 2)
+
+                        if os.getenv("PROBE_RELATION_PROBS", "False") == "True":
+                            probe_topk = int(os.getenv("PROBE_RELATION_TOPK", "10"))
+                            input_len = len(single_input["input_ids"][-1])
+
+                            relation_probe = extract_relation_token_topk_from_generate_output(
+                                output=output,
+                                input_len=input_len,
+                                tokenizer=self.processor.tokenizer,
+                                topk=probe_topk,
+                                dataset=dataset,
+                            )
 
                     golden = answer_list[index_of_total][0]
                     is_correct = is_generation_correct(golden, gen)
@@ -1717,6 +2187,53 @@ class LlavaWrapper:
                         "Uncertainty": float(uncertainty) if "uncertainty" in locals() else None,
                         "selected_weight": float(selected_weight) if selected_weight is not None else None,
                         "relation_probe": relation_probe,
+
+                        "decision_mode": "closed_set" if use_closed_set_scoring_from_env() else "generation",
+                        "closed_set_candidates": (
+                            list(closed_set_info["scores"].keys())
+                            if closed_set_info is not None else None
+                        ),
+                        "closed_set_scores": (
+                            closed_set_info["scores"]
+                            if closed_set_info is not None else None
+                        ),
+                        "closed_set_probs": (
+                            closed_set_info["probs"]
+                            if closed_set_info is not None else None
+                        ),
+                        "closed_set_confidence": (
+                            float(closed_set_info["confidence"])
+                            if closed_set_info is not None else None
+                        ),
+                        "closed_set_confidence_raw": (
+                            float(closed_set_info["confidence_raw"])
+                            if closed_set_info is not None else None
+                        ),
+                        "closed_set_margin": (
+                            float(closed_set_info["margin"])
+                            if closed_set_info is not None else None
+                        ),
+                        "closed_set_base_prediction": (
+                            closed_set_info["base_prediction"]
+                            if closed_set_info is not None else None
+                        ),
+                        "closed_set_base_scores": (
+                            closed_set_info["base_scores"]
+                            if closed_set_info is not None else None
+                        ),
+                        "closed_set_base_probs": (
+                            closed_set_info["base_probs"]
+                            if closed_set_info is not None else None
+                        ),
+                        "closed_set_base_confidence": (
+                            float(closed_set_info["base_confidence"])
+                            if closed_set_info is not None and closed_set_info["base_confidence"] is not None else None
+                        ),
+                        "closed_set_base_margin": (
+                            float(closed_set_info["base_margin"])
+                            if closed_set_info is not None and closed_set_info["base_margin"] is not None else None
+                        ),
+                        "closed_set_confidence_mode": os.getenv("CLOSED_SET_CONFIDENCE_MODE", "prob"),
 
                         "adjust_method": os.getenv("ADJUST_METHOD", "last_query"),
 
@@ -1814,6 +2331,9 @@ class LlavaWrapper:
                     "sample_filter_file": os.getenv("PROBE_SAMPLE_IDS_FILE", ""),
                     "probe_run_tag": os.getenv("PROBE_RUN_TAG", ""),
                     "probe_single_pass_env": os.getenv("PROBE_SINGLE_PASS", ""),
+                    "decision_mode": "closed_set" if use_closed_set_scoring_from_env() else "generation",
+                    "closed_set_scoring": bool(use_closed_set_scoring_from_env()),
+                    "closed_set_confidence_mode": os.getenv("CLOSED_SET_CONFIDENCE_MODE", "prob"),
 
                     # AdaptVis layer control metadata.
                     "adaptvis_exclude_layers": os.getenv("ADAPTVIS_EXCLUDE_LAYERS", ""),
