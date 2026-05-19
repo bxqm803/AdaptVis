@@ -1153,6 +1153,46 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
                     apply_final_norm_for_intermediate=apply_final_norm,
                 )
 
+                # ------------------------------------------------------------
+                # Normal generation comparison.
+                # This is computed once per sample, then copied into:
+                #   1) layer_rows.csv for every layer
+                #   2) final_layer_summary.csv
+                #
+                # generation_pred is parsed from generated_text by taking the
+                # first/last occurrence of left/right/on/under according to
+                # --trajectory-generation-relation-pick. Default is last.
+                # ------------------------------------------------------------
+                generation_info = {
+                    "generated_text": None,
+                    "generation_pred": None,
+                    "generation_correct": None,
+                    "generation_relation_hits": [],
+                    "generation_relation_hits_json": "[]",
+                }
+
+                if args.trajectory_compare_generation:
+                    generation_info = _run_generation_comparison_one(
+                        wrapper=model,
+                        image=image_for_model,
+                        prompt=prompt,
+                        relations=relations,
+                        method=args.method,
+                        weight=trajectory_weight,
+                        adjust_method=trajectory_adjust_method,
+                        query_pos=args.trajectory_query_pos,
+                        max_new_tokens=args.trajectory_generation_max_new_tokens,
+                        relation_pick=args.trajectory_generation_relation_pick,
+                    )
+
+                    generation_info["generation_correct"] = bool(
+                        generation_info["generation_pred"] == gold
+                    )
+                    generation_info["generation_relation_hits_json"] = json.dumps(
+                        generation_info.get("generation_relation_hits", []),
+                        ensure_ascii=False,
+                    )
+
                 per_layer = []
 
                 for rec in layer_raw:
@@ -1189,6 +1229,15 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
                         "best_non_gold_score": lower_pack["best_non_gold_score"],
                         "best_non_gold_logit": lower_pack["best_non_gold_score"],  # legacy name
                         "gold_margin": lower_pack["gold_margin"],
+
+                        # Normal generation result copied to every layer row.
+                        # This makes layer_rows.csv self-contained.
+                        "generation_pred": generation_info["generation_pred"],
+                        "generation_correct": generation_info["generation_correct"],
+                        "generated_text": generation_info["generated_text"],
+                        "generation_relation_hits_json": generation_info[
+                            "generation_relation_hits_json"
+                        ],
                     }
 
                     for mode in modes:
@@ -1214,31 +1263,6 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
                     all_layer_rows.append(flat)
 
                 final_rec = per_layer[-1]
-
-                generation_info = {
-                    "generated_text": None,
-                    "generation_pred": None,
-                    "generation_correct": None,
-                    "generation_relation_hits": [],
-                }
-
-                if args.trajectory_compare_generation:
-                    generation_info = _run_generation_comparison_one(
-                        wrapper=model,
-                        image=image_for_model,
-                        prompt=prompt,
-                        relations=relations,
-                        method=args.method,
-                        weight=trajectory_weight,
-                        adjust_method=trajectory_adjust_method,
-                        query_pos=args.trajectory_query_pos,
-                        max_new_tokens=args.trajectory_generation_max_new_tokens,
-                        relation_pick=args.trajectory_generation_relation_pick,
-                    )
-
-                    generation_info["generation_correct"] = bool(
-                        generation_info["generation_pred"] == gold
-                    )
 
                 lower_final = final_rec["lower_space"]
                 cap_final = final_rec["cap_space"]
@@ -1279,10 +1303,16 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
                         "gold_prob_relation_softmax"
                     ],
 
-                    # Normal generation result:
+                    # Normal generation result.
+                    # generation_pred is parsed from generated_text by taking the
+                    # first/last occurrence of left/right/on/under according to
+                    # --trajectory-generation-relation-pick. Default is last.
                     "generation_pred": generation_info["generation_pred"],
                     "generation_correct": generation_info["generation_correct"],
                     "generated_text": generation_info["generated_text"],
+                    "generation_relation_hits_json": generation_info[
+                        "generation_relation_hits_json"
+                    ],
 
                     "prompt": prompt,
                 }
