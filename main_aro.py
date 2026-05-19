@@ -362,69 +362,57 @@ def _get_lm_head_and_final_norm(hf_model):
 
 def _build_relation_token_info(tokenizer, relations):
     """
-    For left/right/on/under, LLaMA tokenizer should usually produce a single
-    token for ' left', ' right', ' on', ' under'.
+    Build tokenization info for two teacher-forced candidate forms:
 
-    If a relation is multi-token, this function uses the first token and warns.
-    For Controlled_Images_A four-option setting, this should not be an issue.
+        lower_space: " left",  " right",  " on",  " under"
+        cap_space  : " Left",  " Right",  " On",  " Under"
+
+    Note:
+        This function does NOT force these forms to be single-token.
+        For LLaMA tokenizer, " left" is usually [space_token, left_token].
+        We keep the full token list and score all appended answer tokens.
     """
     out = {}
 
     for rel in relations:
-        variants = [" " + rel, rel]
-        chosen = None
+        rel_key = str(rel).strip().lower()
+        cap_key = rel_key[:1].upper() + rel_key[1:]
 
-        for text in variants:
-            try:
-                ids = tokenizer.encode(text, add_special_tokens=False)
-            except Exception:
-                ids = []
+        forms = {
+            "lower_space": " " + rel_key,
+            "cap_space": " " + cap_key,
+        }
 
-            if len(ids) == 1:
-                tid = int(ids[0])
-                chosen = {
-                    "relation": rel,
-                    "text": text,
-                    "token_ids": [tid],
-                    "token_id": tid,
-                    "single_token": True,
-                    "decoded": tokenizer.decode(
-                        [tid],
-                        skip_special_tokens=True,
-                        clean_up_tokenization_spaces=False,
-                    ),
-                }
-                break
+        form_infos = {}
 
-        if chosen is None:
-            ids = tokenizer.encode(" " + rel, add_special_tokens=False)
+        for form_name, text in forms.items():
+            ids = tokenizer(
+                text,
+                add_special_tokens=False,
+            ).input_ids
 
             if len(ids) == 0:
-                raise RuntimeError(f"Could not tokenize relation: {rel}")
+                raise RuntimeError(
+                    f"Could not tokenize candidate form={form_name}, text={text!r}"
+                )
 
-            tid = int(ids[0])
-            chosen = {
-                "relation": rel,
-                "text": " " + rel,
+            form_infos[form_name] = {
+                "text": text,
                 "token_ids": [int(x) for x in ids],
-                "token_id": tid,
-                "single_token": False,
+                "num_tokens": int(len(ids)),
                 "decoded": tokenizer.decode(
-                    [tid],
-                    skip_special_tokens=True,
+                    ids,
+                    skip_special_tokens=False,
                     clean_up_tokenization_spaces=False,
                 ),
             }
 
-            print(
-                f"[WARN] relation={rel} is multi-token under tokenizer: "
-                f"{ids}. Using first-token logit only."
-            )
-
-        out[rel] = chosen
+        out[rel_key] = {
+            "relation": rel_key,
+            "forms": form_infos,
+        }
 
     return out
-
 
 def _get_last_prompt_position(inputs):
     """
@@ -465,50 +453,101 @@ def _selected_lm_head_logits(hidden_pos, lm_head, token_ids):
     return logits[0]
 
 
-def _relation_layer_record(layer_idx, layer_name, cand_logits, relations, gold):
-    logits_np = cand_logits.detach().float().cpu().numpy()
-    probs_np = torch.softmax(cand_logits.detach().float(), dim=-1).cpu().numpy()
+def _relation_layer_record(layer_idx, layer_name, scores_by_form, relations, gold):
+    """
+    Build per-layer records from ablation-style teacher-forcing scores.
 
-    logits = {rel: float(logits_np[i]) for i, rel in enumerate(relations)}
-    probs = {rel: float(probs_np[i]) for i, rel in enumerate(relations)}
+    scores_by_form:
+        {
+          "lower_space": {"left": avg_logprob, ...},
+          "cap_space":   {"left": avg_logprob, ...},
+        }
 
-    pred_idx = int(np.argmax(logits_np))
-    pred = relations[pred_idx]
+    We also compute:
+        case_space score = logsumexp(lower_space_score, cap_space_score)
+    for each canonical relation. This is a case-marginalized relation score.
+    """
 
-    if gold in relations:
-        gold_idx = relations.index(gold)
-        gold_logit = float(logits_np[gold_idx])
+    def _pack(score_dict):
+        vals_np = np.array([float(score_dict[rel]) for rel in relations], dtype=np.float64)
 
-        non_gold = [i for i in range(len(relations)) if i != gold_idx]
-        best_non_gold_idx = max(non_gold, key=lambda i: logits_np[i])
+        # Relation-softmax probability over the four candidate scores.
+        probs_np = torch.softmax(
+            torch.tensor(vals_np, dtype=torch.float32),
+            dim=-1,
+        ).numpy()
 
-        best_non_gold = relations[int(best_non_gold_idx)]
-        best_non_gold_logit = float(logits_np[best_non_gold_idx])
+        scores = {rel: float(vals_np[i]) for i, rel in enumerate(relations)}
+        probs = {rel: float(probs_np[i]) for i, rel in enumerate(relations)}
 
-        gold_margin = gold_logit - best_non_gold_logit
-        gold_prob = float(probs_np[gold_idx])
-    else:
-        gold_logit = None
-        best_non_gold = None
-        best_non_gold_logit = None
-        gold_margin = None
-        gold_prob = None
+        pred_idx = int(np.argmax(vals_np))
+        pred = relations[pred_idx]
+
+        if gold in relations:
+            gold_idx = relations.index(gold)
+            gold_score = float(vals_np[gold_idx])
+
+            non_gold = [i for i in range(len(relations)) if i != gold_idx]
+            best_non_gold_idx = max(non_gold, key=lambda i: vals_np[i])
+
+            best_non_gold = relations[int(best_non_gold_idx)]
+            best_non_gold_score = float(vals_np[best_non_gold_idx])
+
+            gold_margin = gold_score - best_non_gold_score
+            gold_prob = float(probs_np[gold_idx])
+        else:
+            gold_score = None
+            best_non_gold = None
+            best_non_gold_score = None
+            gold_margin = None
+            gold_prob = None
+
+        return {
+            "pred": pred,
+            "correct": bool(pred == gold),
+            "gold_score": gold_score,
+            "gold_prob_relation_softmax": gold_prob,
+            "best_non_gold": best_non_gold,
+            "best_non_gold_score": best_non_gold_score,
+            "gold_margin": gold_margin,
+            "scores": scores,
+            "relation_softmax_probs": probs,
+        }
+
+    lower_scores = scores_by_form["lower_space"]
+    cap_scores = scores_by_form["cap_space"]
+
+    # Case-marginalized relation score:
+    # score(rel) = logsumexp(score(" rel"), score(" Rel"))
+    # This removes pure capitalization surface-form effects.
+    case_scores = {}
+    for rel in relations:
+        pair = torch.tensor(
+            [float(lower_scores[rel]), float(cap_scores[rel])],
+            dtype=torch.float32,
+        )
+        case_scores[rel] = float(torch.logsumexp(pair, dim=0).item())
+
+    lower_pack = _pack(lower_scores)
+    cap_pack = _pack(cap_scores)
+    case_pack = _pack(case_scores)
 
     return {
         "layer_idx": int(layer_idx),
         "layer_name": layer_name,
-        "pred": pred,
-        "correct": bool(pred == gold),
         "gold": gold,
-        "gold_logit": gold_logit,
-        "gold_prob_relation_softmax": gold_prob,
-        "best_non_gold": best_non_gold,
-        "best_non_gold_logit": best_non_gold_logit,
-        "gold_margin": gold_margin,
-        "logits": logits,
-        "relation_softmax_probs": probs,
-    }
 
+        # Original ablation-style baseline:
+        # prompt + " left/right/on/under"
+        "lower_space": lower_pack,
+
+        # Capitalized answer surface:
+        # prompt + " Left/Right/On/Under"
+        "cap_space": cap_pack,
+
+        # Case-marginalized relation score.
+        "case_space": case_pack,
+    }
 
 def _parse_generated_relation(text, relations, pick="last"):
     """
@@ -662,38 +701,54 @@ def _compute_relation_logit_trajectory_one(
     apply_final_norm_for_intermediate=True,
 ):
     """
-    Closed-set relation logit trajectory.
+    Ablation-style candidate scoring trajectory.
 
-    For each layer hidden state at the last prompt position:
-        hidden[layer, answer_position] -> final_norm -> lm_head
-    Then compare logits of relation tokens:
-        left / right / on / under
+    For each relation r, construct two teacher-forced completions:
 
-    This is NOT actual generation from that layer.
-    It is a logit-lens diagnostic using the original model's lm_head.
+        prompt + " r"      lower_space
+        prompt + " R"      cap_space
+
+    For every hidden-state layer, compute the average log-probability of the
+    appended answer tokens only. This matches the original stage-1 ablation
+    baseline more closely than directly reading P(r | prompt).
+
+    Output per layer:
+        lower_space scores/probs over left/right/on/under
+        cap_space scores/probs over left/right/on/under
+        case_space = logsumexp(lower_space, cap_space) per relation
     """
     hf_model = wrapper.model
+    processor = wrapper.processor
     device = wrapper.device
+    tokenizer = processor.tokenizer
 
-    inputs, controls = _build_forward_inputs_and_controls(
-        wrapper=wrapper,
-        image=image,
-        prompt=prompt,
-        method=method,
-        weight=weight,
-        adjust_method=adjust_method,
-        query_pos=query_pos,
-    )
+    # Build 8 teacher-forced sequences:
+    #   prompt + " left", ..., prompt + " Under"
+    rows = []
+    full_texts = []
+    images = []
 
-    last_pos = _get_last_prompt_position(inputs)
+    for form_name in ["lower_space", "cap_space"]:
+        for rel in relations:
+            cand_text = relation_token_info[rel]["forms"][form_name]["text"]
+            rows.append(
+                {
+                    "form_name": form_name,
+                    "relation": rel,
+                    "candidate_text": cand_text,
+                }
+            )
+            full_texts.append(prompt + cand_text)
+            images.append(image)
+
+    inputs = processor(
+        text=full_texts,
+        images=images,
+        return_tensors="pt",
+        padding=True,
+    ).to(device)
 
     lm_head, final_norm = _get_lm_head_and_final_norm(hf_model)
-
-    token_ids = torch.tensor(
-        [relation_token_info[rel]["token_id"] for rel in relations],
-        dtype=torch.long,
-        device=device,
-    )
 
     forward_kwargs = {
         "output_hidden_states": True,
@@ -701,6 +756,30 @@ def _compute_relation_logit_trajectory_one(
     }
 
     if method in ["scaling_vis", "adapt_vis"]:
+        keys = _build_image_keys(inputs["input_ids"])
+
+        pos = None
+        if adjust_method == "text_offset":
+            if query_pos is None:
+                raise ValueError(
+                    "adjust_method=text_offset requires --trajectory-query-pos."
+                )
+            pos = torch.tensor(int(query_pos), device=device)
+
+        object_patch_mask = None
+
+        if adjust_method == "object_mask":
+            _, build_manual_patch_mask_from_env, _ = _maybe_import_llava15_helpers()
+            object_patch_mask = build_manual_patch_mask_from_env(device)
+
+        controls = {
+            "keys": keys,
+            "weight": float(weight),
+            "adjust_method": adjust_method,
+            "pos": pos,
+            "object_patch_mask": object_patch_mask,
+        }
+
         outputs = hf_model(
             **inputs,
             **controls,
@@ -718,35 +797,118 @@ def _compute_relation_logit_trajectory_one(
             "Check whether output_hidden_states=True is propagated correctly."
         )
 
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+
+    # Candidate answer tokens are appended at the end of each full sequence.
+    # For each row, store the target positions in logits[:, :-1, :].
+    target_positions_by_row = []
+    answer_token_ids_by_row = []
+    answer_token_texts_by_row = []
+
+    for b, row in enumerate(rows):
+        cand_text = row["candidate_text"]
+        cand_ids = tokenizer(
+            cand_text,
+            add_special_tokens=False,
+        ).input_ids
+
+        n_tok = len(cand_ids)
+        if n_tok == 0:
+            raise RuntimeError(f"Empty candidate tokenization: {cand_text!r}")
+
+        nonpad_positions = torch.nonzero(
+            attention_mask[b],
+            as_tuple=False,
+        ).squeeze(-1)
+
+        cand_positions_in_input = nonpad_positions[-n_tok:]
+
+        # logits at position t-1 predict input token at position t.
+        cand_positions_in_target = cand_positions_in_input - 1
+        cand_positions_in_target = cand_positions_in_target[
+            cand_positions_in_target >= 0
+        ]
+
+        target_positions_by_row.append(cand_positions_in_target)
+
+        answer_ids = input_ids[b, cand_positions_in_input].detach().cpu().tolist()
+        answer_token_ids_by_row.append([int(x) for x in answer_ids])
+
+        answer_token_texts_by_row.append(
+            tokenizer.decode(
+                answer_ids,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        )
+
     hidden_states = outputs.hidden_states
     num_states = len(hidden_states)
 
     layer_records = []
 
     for idx, h in enumerate(hidden_states):
-        h_pos = h[0, last_pos, :]
-
         is_final_state = idx == num_states - 1
 
-        if (
-            apply_final_norm_for_intermediate
-            and not is_final_state
-            and final_norm is not None
-        ):
-            h_pos = final_norm(h_pos)
-
         if is_final_state:
-            # Use actual forward logits for final layer.
-            cand_logits = outputs.logits[0, last_pos, :].index_select(
-                0,
-                token_ids.to(outputs.logits.device),
-            )
+            # Actual final logits. logits[:, t] predicts input_ids[:, t+1].
+            layer_logits = outputs.logits[:, :-1, :]
         else:
-            cand_logits = _selected_lm_head_logits(
-                hidden_pos=h_pos,
-                lm_head=lm_head,
-                token_ids=token_ids,
-            )
+            h_use = h
+
+            if apply_final_norm_for_intermediate and final_norm is not None:
+                h_use = final_norm(h_use)
+
+            # Intermediate logit lens over every position.
+            layer_logits = lm_head(h_use[:, :-1, :])
+
+        log_probs = torch.log_softmax(layer_logits.float(), dim=-1)
+
+        scores_by_form = {
+            "lower_space": {},
+            "cap_space": {},
+        }
+
+        nested_scores_by_form = {
+            "lower_space": {},
+            "cap_space": {},
+        }
+
+        for b, row in enumerate(rows):
+            form_name = row["form_name"]
+            rel = row["relation"]
+
+            pos = target_positions_by_row[b]
+
+            if pos.numel() == 0:
+                sum_lp = float("-inf")
+                avg_lp = float("-inf")
+                n_used = 0
+                token_lps = []
+            else:
+                target_ids = input_ids[b, pos + 1]
+                vals = log_probs[b, pos, :].gather(
+                    dim=-1,
+                    index=target_ids.unsqueeze(-1),
+                ).squeeze(-1)
+
+                sum_lp = float(vals.sum().detach().cpu().item())
+                avg_lp = float(vals.mean().detach().cpu().item())
+                n_used = int(vals.numel())
+                token_lps = [float(x) for x in vals.detach().cpu().tolist()]
+
+            scores_by_form[form_name][rel] = avg_lp
+
+            nested_scores_by_form[form_name][rel] = {
+                "candidate_text": row["candidate_text"],
+                "sum_logprob": sum_lp,
+                "avg_logprob": avg_lp,
+                "num_tokens": n_used,
+                "token_logprobs": token_lps,
+                "answer_token_ids": answer_token_ids_by_row[b],
+                "answer_token_text": answer_token_texts_by_row[b],
+            }
 
         if idx == 0:
             layer_name = "emb"
@@ -759,11 +921,20 @@ def _compute_relation_logit_trajectory_one(
             {
                 "layer_idx": int(idx),
                 "layer_name": layer_name,
-                "candidate_logits": cand_logits.detach().float().cpu(),
+                "scores_by_form": scores_by_form,
+                "nested_scores_by_form": nested_scores_by_form,
             }
         )
 
-    return layer_records, last_pos, inputs
+    debug_info = {
+        "mode": "ablation_style_space_lower_and_space_cap",
+        "rows": rows,
+        "relation_token_info": relation_token_info,
+        "answer_token_ids_by_row": answer_token_ids_by_row,
+        "answer_token_texts_by_row": answer_token_texts_by_row,
+    }
+
+    return layer_records, debug_info, inputs
 
 
 @torch.no_grad()
@@ -843,16 +1014,22 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
     """
     Integrated trajectory runner.
 
-    Saves:
+    This version uses ablation-style teacher-forcing candidate scoring at every
+    layer. For each relation it scores two appended answer forms:
+
+        lower_space: prompt + " left/right/on/under"
+        cap_space  : prompt + " Left/Right/On/Under"
+
+    It also records:
+        case_space = logsumexp(lower_space, cap_space)
+
+    Saved files:
       - relation_token_info.json
       - layer_rows.csv
       - final_layer_summary.csv
       - summary_by_gold_layer.csv
       - summary_all_layer.csv
       - trajectory.jsonl if --trajectory-save-jsonl is used
-
-    layer_rows.csv records closed-set logit-lens prediction for every layer.
-    final_layer_summary.csv also includes optional normal generation comparison.
     """
     apply_image_control_from_env, _, _ = _maybe_import_llava15_helpers()
 
@@ -887,14 +1064,19 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
     print(f"  out_dir={out_dir}")
     print(f"  relations={relations}")
     print(f"  compare_generation={args.trajectory_compare_generation}")
+    print("  scoring=ablation_style_teacher_forcing")
+    print("  candidate forms: lower_space=' left', cap_space=' Left'")
 
     for rel in relations:
         info = relation_token_info[rel]
+        lower_info = info["forms"]["lower_space"]
+        cap_info = info["forms"]["cap_space"]
         print(
-            f"  token {rel:>8s}: id={info['token_id']}, "
-            f"text={repr(info['text'])}, "
-            f"decoded={repr(info['decoded'])}, "
-            f"single_token={info['single_token']}"
+            f"  relation {rel:>8s}: "
+            f"lower={repr(lower_info['text'])} ids={lower_info['token_ids']} "
+            f"decoded={repr(lower_info['decoded'])}; "
+            f"cap={repr(cap_info['text'])} ids={cap_info['token_ids']} "
+            f"decoded={repr(cap_info['decoded'])}"
         )
 
     trajectory_weight = (
@@ -932,6 +1114,8 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
     processed = 0
     skipped = 0
 
+    modes = ["lower_space", "cap_space", "case_space"]
+
     for batch in tqdm(joint_loader):
         for i_option in batch["image_options"]:
             for img in i_option:
@@ -956,7 +1140,7 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
                     sample_id=sample_id,
                 )
 
-                layer_raw, last_pos, _ = _compute_relation_logit_trajectory_one(
+                layer_raw, traj_debug_info, _ = _compute_relation_logit_trajectory_one(
                     wrapper=model,
                     image=image_for_model,
                     prompt=prompt,
@@ -975,33 +1159,57 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
                     layer_rec = _relation_layer_record(
                         layer_idx=rec["layer_idx"],
                         layer_name=rec["layer_name"],
-                        cand_logits=rec["candidate_logits"],
+                        scores_by_form=rec["scores_by_form"],
                         relations=relations,
                         gold=gold,
                     )
 
                     per_layer.append(layer_rec)
 
+                    lower_pack = layer_rec["lower_space"]
+
+                    # Backward-compatible alias:
+                    # closed_set_* refers to the original ablation-style lower-case
+                    # candidate scoring: prompt + " left/right/on/under".
                     flat = {
                         "sample_id": sample_id,
                         "gold": gold,
                         "prompt": prompt,
                         "layer_idx": layer_rec["layer_idx"],
                         "layer_name": layer_rec["layer_name"],
-                        "closed_set_pred": layer_rec["pred"],
-                        "closed_set_correct": layer_rec["correct"],
-                        "gold_logit": layer_rec["gold_logit"],
-                        "gold_prob_relation_softmax": layer_rec[
+
+                        "closed_set_pred": lower_pack["pred"],
+                        "closed_set_correct": lower_pack["correct"],
+                        "gold_score": lower_pack["gold_score"],
+                        "gold_logit": lower_pack["gold_score"],  # legacy name
+                        "gold_prob_relation_softmax": lower_pack[
                             "gold_prob_relation_softmax"
                         ],
-                        "best_non_gold": layer_rec["best_non_gold"],
-                        "best_non_gold_logit": layer_rec["best_non_gold_logit"],
-                        "gold_margin": layer_rec["gold_margin"],
+                        "best_non_gold": lower_pack["best_non_gold"],
+                        "best_non_gold_score": lower_pack["best_non_gold_score"],
+                        "best_non_gold_logit": lower_pack["best_non_gold_score"],  # legacy name
+                        "gold_margin": lower_pack["gold_margin"],
                     }
 
+                    for mode in modes:
+                        pack = layer_rec[mode]
+
+                        flat[f"pred_{mode}"] = pack["pred"]
+                        flat[f"correct_{mode}"] = pack["correct"]
+                        flat[f"gold_score_{mode}"] = pack["gold_score"]
+                        flat[f"gold_prob_{mode}"] = pack["gold_prob_relation_softmax"]
+                        flat[f"best_non_gold_{mode}"] = pack["best_non_gold"]
+                        flat[f"best_non_gold_score_{mode}"] = pack["best_non_gold_score"]
+                        flat[f"gold_margin_{mode}"] = pack["gold_margin"]
+
+                        for rel in relations:
+                            flat[f"score_{rel}_{mode}"] = pack["scores"][rel]
+                            flat[f"prob_{rel}_{mode}"] = pack["relation_softmax_probs"][rel]
+
+                    # Also keep old score/prob aliases for lower_space.
                     for rel in relations:
-                        flat[f"logit_{rel}"] = layer_rec["logits"][rel]
-                        flat[f"prob_{rel}"] = layer_rec["relation_softmax_probs"][rel]
+                        flat[f"score_{rel}"] = lower_pack["scores"][rel]
+                        flat[f"prob_{rel}"] = lower_pack["relation_softmax_probs"][rel]
 
                     all_layer_rows.append(flat)
 
@@ -1032,41 +1240,80 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
                         generation_info["generation_pred"] == gold
                     )
 
-                final_rows.append(
-                    {
-                        "sample_id": sample_id,
-                        "gold": gold,
+                lower_final = final_rec["lower_space"]
+                cap_final = final_rec["cap_space"]
+                case_final = final_rec["case_space"]
 
-                        # Closed-set final layer result:
-                        "closed_set_pred_final": final_rec["pred"],
-                        "closed_set_correct_final": final_rec["correct"],
-                        "closed_set_gold_margin_final": final_rec["gold_margin"],
-                        "closed_set_gold_prob_final": final_rec[
-                            "gold_prob_relation_softmax"
-                        ],
+                final_row = {
+                    "sample_id": sample_id,
+                    "gold": gold,
 
-                        # Normal generation result:
-                        "generation_pred": generation_info["generation_pred"],
-                        "generation_correct": generation_info["generation_correct"],
-                        "generated_text": generation_info["generated_text"],
+                    # Backward-compatible alias:
+                    # original ablation-style lower-case candidate scoring.
+                    "closed_set_pred_final": lower_final["pred"],
+                    "closed_set_correct_final": lower_final["correct"],
+                    "closed_set_gold_margin_final": lower_final["gold_margin"],
+                    "closed_set_gold_prob_final": lower_final[
+                        "gold_prob_relation_softmax"
+                    ],
 
-                        "prompt": prompt,
-                    }
-                )
+                    # Explicit final results for each scoring form.
+                    "pred_lower_space_final": lower_final["pred"],
+                    "correct_lower_space_final": lower_final["correct"],
+                    "gold_margin_lower_space_final": lower_final["gold_margin"],
+                    "gold_prob_lower_space_final": lower_final[
+                        "gold_prob_relation_softmax"
+                    ],
+
+                    "pred_cap_space_final": cap_final["pred"],
+                    "correct_cap_space_final": cap_final["correct"],
+                    "gold_margin_cap_space_final": cap_final["gold_margin"],
+                    "gold_prob_cap_space_final": cap_final[
+                        "gold_prob_relation_softmax"
+                    ],
+
+                    "pred_case_space_final": case_final["pred"],
+                    "correct_case_space_final": case_final["correct"],
+                    "gold_margin_case_space_final": case_final["gold_margin"],
+                    "gold_prob_case_space_final": case_final[
+                        "gold_prob_relation_softmax"
+                    ],
+
+                    # Normal generation result:
+                    "generation_pred": generation_info["generation_pred"],
+                    "generation_correct": generation_info["generation_correct"],
+                    "generated_text": generation_info["generated_text"],
+
+                    "prompt": prompt,
+                }
+
+                # Store final per-relation score/prob for all forms.
+                for mode, pack in [
+                    ("lower_space", lower_final),
+                    ("cap_space", cap_final),
+                    ("case_space", case_final),
+                ]:
+                    for rel in relations:
+                        final_row[f"score_{rel}_{mode}_final"] = pack["scores"][rel]
+                        final_row[f"prob_{rel}_{mode}_final"] = pack[
+                            "relation_softmax_probs"
+                        ][rel]
+
+                final_rows.append(final_row)
 
                 if fout is not None:
                     obj = {
                         "sample_id": sample_id,
                         "prompt": prompt,
                         "gold": gold,
-                        "last_prompt_position": int(last_pos),
                         "method": args.method,
                         "trajectory_weight": trajectory_weight,
                         "trajectory_adjust_method": trajectory_adjust_method,
                         "relations": relations,
                         "relation_token_info": relation_token_info,
+                        "trajectory_debug": traj_debug_info,
 
-                        # closed-set layer trajectory:
+                        # ablation-style candidate score trajectory:
                         "per_layer": per_layer,
 
                         # normal generation comparison:
@@ -1084,8 +1331,12 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
                         f"[TRAJECTORY RUNNING] processed={processed}, "
                         f"skipped={skipped}, last_sample={sample_id}, "
                         f"gold={gold}, "
-                        f"closed_set_final={final_rec['pred']}, "
-                        f"closed_set_margin={final_rec['gold_margin']}, "
+                        f"lower={lower_final['pred']} "
+                        f"lower_margin={lower_final['gold_margin']}, "
+                        f"cap={cap_final['pred']} "
+                        f"cap_margin={cap_final['gold_margin']}, "
+                        f"case={case_final['pred']} "
+                        f"case_margin={case_final['gold_margin']}, "
                         f"generation={generation_info['generation_pred']}"
                     )
 
@@ -1120,9 +1371,19 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
         "gold_prob_relation_softmax": ["mean", "median"],
     }
 
+    for mode in modes:
+        agg_dict[f"correct_{mode}"] = "mean"
+        agg_dict[f"gold_margin_{mode}"] = ["mean", "median"]
+        agg_dict[f"gold_prob_{mode}"] = ["mean", "median"]
+
     for rel in relations:
-        agg_dict[f"logit_{rel}"] = "mean"
+        # Backward-compatible lower-space aliases.
+        agg_dict[f"score_{rel}"] = "mean"
         agg_dict[f"prob_{rel}"] = "mean"
+
+        for mode in modes:
+            agg_dict[f"score_{rel}_{mode}"] = "mean"
+            agg_dict[f"prob_{rel}_{mode}"] = "mean"
 
     summary_by_gold = (
         df.groupby(["gold", "layer_idx", "layer_name"])
@@ -1163,7 +1424,6 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
 
     if args.trajectory_save_jsonl:
         print(f"  detailed jsonl: {jsonl_path}")
-
 
 def is_probe_mode():
     """
