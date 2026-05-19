@@ -224,6 +224,19 @@ def main(args):
 
     setup_decision_mode_env(args)
 
+    # ============================================================
+    # Ensure output directories exist.
+    #
+    # ./output:
+    #   used by llava15.py for detailed per-sample json results,
+    #   sampled_idx files, attention folders, etc.
+    #
+    # args.output_dir, default ./outputs:
+    #   used by dataset.evaluate_scores() / dataset.save_scores().
+    # ============================================================
+    os.makedirs("./output", exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
+
     model, image_preprocess = get_model(
         args.model_name,
         args.device,
@@ -357,6 +370,9 @@ def main(args):
             args.weight2,
         )
 
+        # Make sure output directory still exists before saving.
+        os.makedirs(args.output_dir, exist_ok=True)
+
         dataset.save_scores(
             scores,
             correct_id,
@@ -367,7 +383,6 @@ def main(args):
             args.model_name,
             args.option,
         )
-
 
 if __name__ == "__main__":
     args = config()
