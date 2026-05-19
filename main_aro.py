@@ -72,7 +72,78 @@ def config():
         choices=["two", "four", "six"],
     )
 
+    # ============================================================
+    # Decision mode
+    # ============================================================
+    # generation:
+    #   Original behavior. Use model.generate(), then parse the generated answer.
+    #
+    # closed_set:
+    #   Score fixed candidate continuations, e.g.
+    #       prompt + " left"
+    #       prompt + " right"
+    #       prompt + " on"
+    #       prompt + " under"
+    #
+    # This flag is consumed by model_zoo/llava15.py through env variables:
+    #   DECISION_MODE=closed_set
+    #   CLOSED_SET_SCORING=True
+    #
+    # Keep generation as the default so old scripts remain unchanged.
+    parser.add_argument(
+        "--decision-mode",
+        default=os.getenv("DECISION_MODE", "generation"),
+        type=str,
+        choices=["generation", "closed_set"],
+        help="Use normal generation decoding or closed-set continuation scoring.",
+    )
+
+    # Convenience alias:
+    #   --closed-set-scoring
+    # is equivalent to
+    #   --decision-mode closed_set
+    parser.add_argument(
+        "--closed-set-scoring",
+        action="store_true",
+        help="Shortcut for --decision-mode closed_set.",
+    )
+
     return parser.parse_args()
+
+
+def setup_decision_mode_env(args):
+    """
+    Synchronize command-line decision mode with environment variables.
+
+    The modified llava15.py checks:
+        DECISION_MODE=closed_set
+    or:
+        CLOSED_SET_SCORING=True
+
+    This function makes command-line usage explicit and reproducible.
+    """
+    if args.closed_set_scoring:
+        args.decision_mode = "closed_set"
+
+    args.decision_mode = str(args.decision_mode).strip().lower()
+
+    if args.decision_mode not in ["generation", "closed_set"]:
+        raise ValueError(
+            f"Invalid decision mode: {args.decision_mode}. "
+            f"Expected 'generation' or 'closed_set'."
+        )
+
+    os.environ["DECISION_MODE"] = args.decision_mode
+
+    if args.decision_mode == "closed_set":
+        os.environ["CLOSED_SET_SCORING"] = "True"
+    else:
+        os.environ["CLOSED_SET_SCORING"] = "False"
+
+    print(
+        f"[DECISION MODE] decision_mode={args.decision_mode}, "
+        f"CLOSED_SET_SCORING={os.environ.get('CLOSED_SET_SCORING')}"
+    )
 
 
 def is_probe_mode():
@@ -81,11 +152,9 @@ def is_probe_mode():
     In that case, scores are no longer aligned with the full dataset and
     dataset.evaluate_scores() must be skipped.
 
-    Supported probe/intervention modes:
-        probe_bias   : logit-space additive bias, old beta style
-        probe_scale  : logit-space multiplicative scaling
-        probe_add    : logit-space additive attention-logit intervention
-        var_sink     : variance/sink based intervention
+    Important:
+        CLOSED_SET_SCORING / DECISION_MODE should NOT by itself trigger probe mode.
+        Closed-set scoring still processes the full dataset and returns aligned scores.
     """
     if os.getenv("FORCE_DATASET_EVAL", "False") == "True":
         return False
@@ -152,6 +221,8 @@ def is_probe_mode():
 
 def main(args):
     seed_all(args.seed)
+
+    setup_decision_mode_env(args)
 
     model, image_preprocess = get_model(
         args.model_name,
