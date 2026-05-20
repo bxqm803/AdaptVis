@@ -1285,22 +1285,18 @@ def _run_generation_comparison_one(
 
 def run_relation_logit_trajectory(args, model, dataset, joint_loader):
     """
-    Generation-only relation trajectory runner.
+    Actual generation-only runner.
 
-    This branch does NOT run closed-set candidate scoring. It only records:
-      1) generation-style first-token layer trajectory:
-            gen_lower: left/right/on/under
-            gen_cap  : Left/Right/On/Under
-            gen_case : logsumexp(gen_lower, gen_cap)
-      2) normal model.generate() output parsed by first/last occurrence of
-         left/right/on/under, controlled by --trajectory-generation-relation-pick.
+    This branch does NOT run closed-set candidate scoring and does NOT run
+    generation-style logit-lens variants such as gen_lower/gen_cap/gen_case.
+
+    For each sample, it only runs model.generate(), decodes the generated text,
+    and parses the first/last occurrence of left/right/on/under according to
+    --trajectory-generation-relation-pick. Default is last.
 
     Saved files:
-      - generation_token_info.json
-      - layer_rows.csv
       - final_layer_summary.csv
-      - summary_by_gold_layer.csv
-      - summary_all_layer.csv
+      - generation_results.csv
       - trajectory.jsonl if --trajectory-save-jsonl is used
     """
     apply_image_control_from_env, _, _ = _maybe_import_llava15_helpers()
@@ -1321,37 +1317,6 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
     prompt_list, answer_list = _load_prompt_answer_lists(args.dataset, args.option)
     sample_id_set = _load_sample_id_set(args.trajectory_sample_ids_file)
 
-    tokenizer = model.processor.tokenizer
-    generation_token_info = _build_generation_token_info(tokenizer, relations)
-
-    token_info_path = os.path.join(out_dir, "generation_token_info.json")
-
-    with open(token_info_path, "w", encoding="utf-8") as f:
-        json.dump(generation_token_info, f, ensure_ascii=False, indent=2)
-
-    print("[GENERATION-ONLY RELATION TRAJECTORY]")
-    print(f"  dataset={args.dataset}")
-    print(f"  option={args.option}")
-    print(f"  method={args.method}")
-    print(f"  out_dir={out_dir}")
-    print(f"  relations={relations}")
-    print("  closed_set_candidate_scoring=False")
-    print("  layer modes: gen_lower, gen_cap, gen_case")
-    print(f"  compare_generation=True")
-    print(f"  generation_parse_pick={args.trajectory_generation_relation_pick}")
-
-    for rel in relations:
-        info = generation_token_info[rel]
-        lower_info = info["forms"]["gen_lower"]
-        cap_info = info["forms"]["gen_cap"]
-        print(
-            f"  relation {rel:>8s}: "
-            f"lower={repr(lower_info['text'])} id={lower_info['token_id']} "
-            f"decoded={repr(lower_info['decoded'])}; "
-            f"cap={repr(cap_info['text'])} id={cap_info['token_id']} "
-            f"decoded={repr(cap_info['decoded'])}"
-        )
-
     trajectory_weight = (
         float(args.trajectory_weight)
         if args.trajectory_weight is not None
@@ -1364,30 +1329,33 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
         else os.getenv("ADJUST_METHOD", "last_query")
     )
 
-    apply_final_norm = not bool(args.trajectory_no_final_norm)
-
-    print(
-        f"  trajectory_weight={trajectory_weight}, "
-        f"trajectory_adjust_method={trajectory_adjust_method}, "
-        f"apply_final_norm={apply_final_norm}"
-    )
-
     jsonl_path = os.path.join(out_dir, "trajectory.jsonl")
-    layer_rows_path = os.path.join(out_dir, "layer_rows.csv")
     final_summary_path = os.path.join(out_dir, "final_layer_summary.csv")
-    summary_by_gold_path = os.path.join(out_dir, "summary_by_gold_layer.csv")
-    summary_all_path = os.path.join(out_dir, "summary_all_layer.csv")
+    generation_results_path = os.path.join(out_dir, "generation_results.csv")
 
     fout = open(jsonl_path, "w", encoding="utf-8") if args.trajectory_save_jsonl else None
 
-    all_layer_rows = []
-    final_rows = []
+    print("[ACTUAL GENERATION ONLY]")
+    print(f"  dataset={args.dataset}")
+    print(f"  option={args.option}")
+    print(f"  method={args.method}")
+    print(f"  out_dir={out_dir}")
+    print(f"  relations={relations}")
+    print("  closed_set_candidate_scoring=False")
+    print("  logit_lens_gen_lower_cap_case=False")
+    print("  per_layer_outputs=False")
+    print(f"  generation_parse_pick={args.trajectory_generation_relation_pick}")
+    print(f"  generation_max_new_tokens={args.trajectory_generation_max_new_tokens}")
+    print(
+        f"  trajectory_weight={trajectory_weight}, "
+        f"trajectory_adjust_method={trajectory_adjust_method}"
+    )
 
+    rows = []
     index_of_total = 0
     processed = 0
     skipped = 0
-
-    gen_modes = ["gen_lower", "gen_cap", "gen_case"]
+    correct_count = 0
 
     for batch in tqdm(joint_loader):
         for i_option in batch["image_options"]:
@@ -1413,21 +1381,6 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
                     sample_id=sample_id,
                 )
 
-                gen_layer_raw, gen_traj_debug_info, _ = _compute_generation_style_trajectory_one(
-                    wrapper=model,
-                    image=image_for_model,
-                    prompt=prompt,
-                    relations=relations,
-                    generation_token_info=generation_token_info,
-                    method=args.method,
-                    weight=trajectory_weight,
-                    adjust_method=trajectory_adjust_method,
-                    query_pos=args.trajectory_query_pos,
-                    gold=gold,
-                    apply_final_norm_for_intermediate=apply_final_norm,
-                )
-
-                # Always run normal generation in this generation-only branch.
                 generation_info = _run_generation_comparison_one(
                     wrapper=model,
                     image=image_for_model,
@@ -1441,105 +1394,26 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
                     relation_pick=args.trajectory_generation_relation_pick,
                 )
 
-                generation_info["generation_correct"] = bool(
-                    generation_info["generation_pred"] == gold
-                )
-                generation_info["generation_relation_hits_json"] = json.dumps(
-                    generation_info.get("generation_relation_hits", []),
-                    ensure_ascii=False,
-                )
+                generation_pred = generation_info["generation_pred"]
+                generation_correct = bool(generation_pred == gold)
+                generation_hits = generation_info.get("generation_relation_hits", [])
+                generation_hits_json = json.dumps(generation_hits, ensure_ascii=False)
 
-                for rec in gen_layer_raw:
-                    flat = {
-                        "sample_id": sample_id,
-                        "gold": gold,
-                        "prompt": prompt,
-                        "layer_idx": rec["layer_idx"],
-                        "layer_name": rec["layer_name"],
-                        "last_prompt_position": rec["last_prompt_position"],
-
-                        # Actual model.generate() result copied to every layer row.
-                        "generation_pred": generation_info["generation_pred"],
-                        "generation_correct": generation_info["generation_correct"],
-                        "generated_text": generation_info["generated_text"],
-                        "generation_relation_hits_json": generation_info[
-                            "generation_relation_hits_json"
-                        ],
-                    }
-
-                    # Backward-compatible alias: closed_set_* is intentionally NOT present,
-                    # because this branch does not run closed-set candidate scoring.
-                    for gen_mode in gen_modes:
-                        pack = rec[gen_mode]
-
-                        flat[f"pred_{gen_mode}"] = pack["pred"]
-                        flat[f"correct_{gen_mode}"] = pack["correct"]
-                        flat[f"gold_logit_{gen_mode}"] = pack["gold_logit"]
-                        flat[f"gold_prob_{gen_mode}"] = pack[
-                            "gold_prob_relation_softmax"
-                        ]
-                        flat[f"best_non_gold_{gen_mode}"] = pack["best_non_gold"]
-                        flat[f"best_non_gold_logit_{gen_mode}"] = pack[
-                            "best_non_gold_logit"
-                        ]
-                        flat[f"gold_margin_{gen_mode}"] = pack["gold_margin"]
-
-                        for rel in relations:
-                            flat[f"logit_{rel}_{gen_mode}"] = pack["logits"][rel]
-                            flat[f"prob_{rel}_{gen_mode}"] = pack[
-                                "relation_softmax_probs"
-                            ][rel]
-
-                    all_layer_rows.append(flat)
-
-                final_rec = gen_layer_raw[-1]
-
-                final_row = {
+                row = {
                     "sample_id": sample_id,
                     "gold": gold,
-
-                    # Final generation-style logit-lens predictions.
-                    "pred_gen_lower_final": final_rec["gen_lower"]["pred"],
-                    "correct_gen_lower_final": final_rec["gen_lower"]["correct"],
-                    "gold_margin_gen_lower_final": final_rec["gen_lower"]["gold_margin"],
-                    "gold_prob_gen_lower_final": final_rec["gen_lower"][
-                        "gold_prob_relation_softmax"
-                    ],
-
-                    "pred_gen_cap_final": final_rec["gen_cap"]["pred"],
-                    "correct_gen_cap_final": final_rec["gen_cap"]["correct"],
-                    "gold_margin_gen_cap_final": final_rec["gen_cap"]["gold_margin"],
-                    "gold_prob_gen_cap_final": final_rec["gen_cap"][
-                        "gold_prob_relation_softmax"
-                    ],
-
-                    "pred_gen_case_final": final_rec["gen_case"]["pred"],
-                    "correct_gen_case_final": final_rec["gen_case"]["correct"],
-                    "gold_margin_gen_case_final": final_rec["gen_case"]["gold_margin"],
-                    "gold_prob_gen_case_final": final_rec["gen_case"][
-                        "gold_prob_relation_softmax"
-                    ],
-
-                    # Actual model.generate() parsed result.
-                    "generation_pred": generation_info["generation_pred"],
-                    "generation_correct": generation_info["generation_correct"],
+                    "generation_pred": generation_pred,
+                    "generation_correct": generation_correct,
                     "generated_text": generation_info["generated_text"],
-                    "generation_relation_hits_json": generation_info[
-                        "generation_relation_hits_json"
-                    ],
-
+                    "generation_relation_hits_json": generation_hits_json,
+                    "generation_relation_pick": args.trajectory_generation_relation_pick,
                     "prompt": prompt,
                 }
 
-                for gen_mode in gen_modes:
-                    pack = final_rec[gen_mode]
-                    for rel in relations:
-                        final_row[f"logit_{rel}_{gen_mode}_final"] = pack["logits"][rel]
-                        final_row[f"prob_{rel}_{gen_mode}_final"] = pack[
-                            "relation_softmax_probs"
-                        ][rel]
+                rows.append(row)
 
-                final_rows.append(final_row)
+                if generation_correct:
+                    correct_count += 1
 
                 if fout is not None:
                     obj = {
@@ -1550,12 +1424,13 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
                         "trajectory_weight": trajectory_weight,
                         "trajectory_adjust_method": trajectory_adjust_method,
                         "relations": relations,
-                        "generation_token_info": generation_token_info,
-                        "generation_style_debug": gen_traj_debug_info,
-                        "generation_style_per_layer": gen_layer_raw,
-                        "generation": generation_info,
+                        "generation": {
+                            **generation_info,
+                            "generation_correct": generation_correct,
+                            "generation_relation_hits_json": generation_hits_json,
+                            "generation_relation_pick": args.trajectory_generation_relation_pick,
+                        },
                     }
-
                     fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
                     fout.flush()
 
@@ -1563,15 +1438,12 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
                 index_of_total += 1
 
                 if processed % 20 == 0:
+                    acc = correct_count / processed if processed > 0 else 0.0
                     print(
-                        f"[GEN TRAJ RUNNING] processed={processed}, "
+                        f"[GENERATION RUNNING] processed={processed}, "
                         f"skipped={skipped}, last_sample={sample_id}, "
-                        f"gold={gold}, "
-                        f"gen_cap_final={final_rec['gen_cap']['pred']} "
-                        f"gen_cap_margin={final_rec['gen_cap']['gold_margin']}, "
-                        f"gen_case_final={final_rec['gen_case']['pred']} "
-                        f"gen_case_margin={final_rec['gen_case']['gold_margin']}, "
-                        f"generation={generation_info['generation_pred']}"
+                        f"gold={gold}, generation={generation_pred}, "
+                        f"correct={generation_correct}, acc={correct_count}/{processed}={acc:.6f}"
                     )
 
             if (
@@ -1589,68 +1461,33 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
     if fout is not None:
         fout.close()
 
-    if len(all_layer_rows) == 0:
-        print("[GENERATION TRAJECTORY DONE] No samples processed.")
+    if len(rows) == 0:
+        print("[GENERATION DONE] No samples processed.")
         return
 
-    df = pd.DataFrame(all_layer_rows)
-    df.to_csv(layer_rows_path, index=False)
+    df = pd.DataFrame(rows)
+    df.to_csv(final_summary_path, index=False)
+    df.to_csv(generation_results_path, index=False)
 
-    final_df = pd.DataFrame(final_rows)
-    final_df.to_csv(final_summary_path, index=False)
+    acc = correct_count / processed if processed > 0 else 0.0
 
-    agg_dict = {}
-
-    for gen_mode in gen_modes:
-        agg_dict[f"correct_{gen_mode}"] = "mean"
-        agg_dict[f"gold_margin_{gen_mode}"] = ["mean", "median"]
-        agg_dict[f"gold_prob_{gen_mode}"] = ["mean", "median"]
-
-    for rel in relations:
-        for gen_mode in gen_modes:
-            agg_dict[f"logit_{rel}_{gen_mode}"] = "mean"
-            agg_dict[f"prob_{rel}_{gen_mode}"] = "mean"
-
-    summary_by_gold = (
-        df.groupby(["gold", "layer_idx", "layer_name"])
-        .agg(agg_dict)
-        .reset_index()
-    )
-
-    summary_by_gold.columns = [
-        "_".join([str(x) for x in col if str(x) != ""]).rstrip("_")
-        if isinstance(col, tuple)
-        else col
-        for col in summary_by_gold.columns
-    ]
-
-    summary_by_gold.to_csv(summary_by_gold_path, index=False)
-
-    summary_all = (
-        df.groupby(["layer_idx", "layer_name"])
-        .agg(agg_dict)
-        .reset_index()
-    )
-
-    summary_all.columns = [
-        "_".join([str(x) for x in col if str(x) != ""]).rstrip("_")
-        if isinstance(col, tuple)
-        else col
-        for col in summary_all.columns
-    ]
-
-    summary_all.to_csv(summary_all_path, index=False)
-
-    print("[GENERATION TRAJECTORY DONE]")
+    print("[GENERATION DONE]")
     print(f"  processed={processed}, skipped={skipped}")
-    print(f"  layer rows: {layer_rows_path}")
+    print(f"  acc={correct_count}/{processed}={acc:.6f}")
     print(f"  final summary: {final_summary_path}")
-    print(f"  summary by gold/layer: {summary_by_gold_path}")
-    print(f"  summary all/layer: {summary_all_path}")
-
+    print(f"  generation results: {generation_results_path}")
     if args.trajectory_save_jsonl:
         print(f"  detailed jsonl: {jsonl_path}")
 
+    print("\n[GENERATION PRED DISTRIBUTION]")
+    print(df["generation_pred"].value_counts(dropna=False).to_string())
+
+    print("\n[PER-GOLD GENERATION SUMMARY]")
+    for gold_value, g in df.groupby("gold"):
+        n = len(g)
+        c = int(g["generation_correct"].sum())
+        print(f"  {gold_value:>8s}: {c}/{n}={c / n if n else 0.0:.6f}")
+        print(g["generation_pred"].value_counts(dropna=False).to_string())
 
 def is_probe_mode():
     """
