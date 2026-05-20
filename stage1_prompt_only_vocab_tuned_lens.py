@@ -1056,7 +1056,7 @@ def main():
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--max-samples", type=int, default=-1)
     parser.add_argument("--sample-ids", default="")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=0)
 
     parser.add_argument("--llava-model-id", default=LLAVA_MODEL_ID)
     parser.add_argument("--llava-revision", default=LLAVA_REVISION)
