@@ -398,10 +398,6 @@ def layer_name_from_idx(idx: int, num_states: int) -> str:
 
 
 def pack_scores(scores: Dict[str, float], relations: List[str], gold: str) -> Dict:
-    """
-    scores = average log-probability per relation.
-    probs = softmax over the four average log-prob scores.
-    """
     vals = torch.tensor([float(scores[r]) for r in relations], dtype=torch.float32)
     probs = torch.softmax(vals, dim=-1).detach().cpu().tolist()
     vals_list = vals.detach().cpu().tolist()
@@ -459,10 +455,9 @@ def score_one_surface_form_layerwise(
     """
     One surface form only.
 
-    Saved values:
-      scores[rel] = average log-prob of candidate tokens.
-      logits[rel] = average raw logit of candidate tokens.
-      probs[rel]  = softmax over scores[left/right/on/under].
+    score_* = average log-probability of candidate answer tokens.
+    logit_* = average raw logit of candidate answer tokens.
+    prob_*  = softmax over score_left/right/on/under.
     """
     tokenizer = processor.tokenizer
 
@@ -644,4 +639,485 @@ def score_one_surface_form_layerwise(
                 avg_logit = float(vals_logit.mean().detach().cpu().item())
 
                 n_used = int(vals.numel())
-                token_lps = [float(x) for x in
+                token_lps = [float(x) for x in vals.detach().cpu().tolist()]
+                token_logits = [float(x) for x in vals_logit.detach().cpu().tolist()]
+
+            scores[rel] = avg_lp
+            logits_score[rel] = avg_logit
+
+            nested[rel] = {
+                "candidate_text": row["candidate_text"],
+                "sum_logprob": sum_lp,
+                "avg_logprob": avg_lp,
+                "sum_logit": sum_logit,
+                "avg_logit": avg_logit,
+                "num_tokens": n_used,
+                "token_logprobs": token_lps,
+                "token_logits": token_logits,
+                "answer_token_ids": answer_token_ids_by_row[b],
+                "answer_token_text": answer_token_texts_by_row[b],
+            }
+
+        packed = pack_scores(scores, candidates, gold)
+
+        layer_records.append(
+            {
+                "layer_idx": int(layer_idx),
+                "layer_name": layer_name_from_idx(layer_idx, num_states),
+                "form": form,
+                "pred": packed["pred"],
+                "correct": packed["correct"],
+                "scores": packed["scores"],       # avg log-prob
+                "logits": logits_score,           # avg raw logit
+                "probs": packed["probs"],         # softmax over avg log-prob
+                "gold_score": packed["gold_score"],
+                "gold_prob": packed["gold_prob"],
+                "best_non_gold": packed["best_non_gold"],
+                "best_non_gold_score": packed["best_non_gold_score"],
+                "gold_margin": packed["gold_margin"],
+                "nested_scores": nested,
+            }
+        )
+
+    return layer_records, debug_info
+
+
+@torch.no_grad()
+def score_candidates_layerwise(
+    model,
+    processor,
+    image: Image.Image,
+    prompt: str,
+    candidates: List[str],
+    gold: str,
+    device: str,
+    apply_final_norm: bool = True,
+    surface_forms: List[str] = None,
+    debug: bool = False,
+) -> Tuple[List[Dict], Dict]:
+    if surface_forms is None:
+        surface_forms = SURFACE_FORMS
+
+    all_records = []
+    debug_infos = {}
+
+    for form_i, form in enumerate(surface_forms):
+        recs, dbg = score_one_surface_form_layerwise(
+            model=model,
+            processor=processor,
+            image=image,
+            prompt=prompt,
+            candidates=candidates,
+            gold=gold,
+            form=form,
+            device=device,
+            apply_final_norm=apply_final_norm,
+            debug=bool(debug and form_i == 0),
+        )
+        all_records.extend(recs)
+        debug_infos[form] = dbg
+
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+    return all_records, debug_infos
+
+
+# ============================================================
+# Summary helpers
+# ============================================================
+
+def write_summaries(
+    rows: List[Dict],
+    final_rows: List[Dict],
+    out_dir: Path,
+    relations: List[str],
+):
+    layer_rows_path = out_dir / "layer_rows.csv"
+    final_summary_path = out_dir / "final_layer_summary.csv"
+    summary_all_path = out_dir / "summary_all_layer.csv"
+    summary_by_gold_path = out_dir / "summary_by_gold_layer.csv"
+
+    df = pd.DataFrame(rows)
+    df.to_csv(layer_rows_path, index=False)
+
+    final_df = pd.DataFrame(final_rows)
+    final_df.to_csv(final_summary_path, index=False)
+
+    def summarize_group(g: pd.DataFrame) -> Dict:
+        out = {
+            "n": int(len(g)),
+            "acc": float(g["correct"].mean()) if len(g) else 0.0,
+            "gold_margin_mean": float(g["gold_margin"].mean()) if "gold_margin" in g else None,
+            "gold_prob_mean": float(g["gold_prob"].mean()) if "gold_prob" in g else None,
+        }
+
+        for rel in relations:
+            out[f"pred_{rel}_count"] = int((g["pred"] == rel).sum())
+            out[f"pred_{rel}_ratio"] = float((g["pred"] == rel).mean()) if len(g) else 0.0
+
+            score_col = f"score_{rel}"
+            logit_col = f"logit_{rel}"
+            prob_col = f"prob_{rel}"
+
+            if score_col in g.columns:
+                out[f"mean_score_{rel}"] = float(g[score_col].mean())
+            if logit_col in g.columns:
+                out[f"mean_logit_{rel}"] = float(g[logit_col].mean())
+            if prob_col in g.columns:
+                out[f"mean_prob_{rel}"] = float(g[prob_col].mean())
+
+        return out
+
+    all_rows = []
+    for (form, layer_idx, layer_name), g in df.groupby(
+        ["form", "layer_idx", "layer_name"],
+        sort=True,
+    ):
+        row = {
+            "form": form,
+            "layer_idx": int(layer_idx),
+            "layer_name": layer_name,
+        }
+        row.update(summarize_group(g))
+        all_rows.append(row)
+
+    pd.DataFrame(all_rows).to_csv(summary_all_path, index=False)
+
+    by_gold_rows = []
+    for (form, gold, layer_idx, layer_name), g in df.groupby(
+        ["form", "gold", "layer_idx", "layer_name"],
+        sort=True,
+    ):
+        row = {
+            "form": form,
+            "gold": gold,
+            "layer_idx": int(layer_idx),
+            "layer_name": layer_name,
+        }
+        row.update(summarize_group(g))
+        by_gold_rows.append(row)
+
+    pd.DataFrame(by_gold_rows).to_csv(summary_by_gold_path, index=False)
+
+    print("[SAVED]")
+    print("  layer rows:", layer_rows_path)
+    print("  final summary:", final_summary_path)
+    print("  summary all/layer:", summary_all_path)
+    print("  summary by gold/layer:", summary_by_gold_path)
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--option", default="four")
+    parser.add_argument("--root-dir", default="data")
+    parser.add_argument("--download", action="store_true")
+
+    parser.add_argument("--out-dir", default=None)
+    parser.add_argument("--max-samples", type=int, default=-1)
+    parser.add_argument(
+        "--sample-ids",
+        default="",
+        help="Comma-separated sample ids, e.g. 0,1,2. If set, only these samples are processed.",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument("--llava-model-id", default=LLAVA_MODEL_ID)
+    parser.add_argument("--llava-revision", default=LLAVA_REVISION)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"])
+
+    parser.add_argument("--preprocess-mode", default="auto", choices=["auto", "crop", "pad"])
+    parser.add_argument(
+        "--image-source",
+        default="processed",
+        choices=["processed", "raw"],
+        help="processed keeps original stage1 baseline behavior.",
+    )
+
+    parser.add_argument(
+        "--surface-forms",
+        default="lower_space,cap_space,lower_nospace,cap_nospace",
+        help=(
+            "Comma-separated surface forms: "
+            "lower_space,cap_space,lower_nospace,cap_nospace"
+        ),
+    )
+
+    parser.add_argument(
+        "--no-final-norm",
+        action="store_true",
+        help="Do not apply final norm before lm_head for intermediate layers.",
+    )
+    parser.add_argument(
+        "--debug-first",
+        action="store_true",
+        help="Print shape/token-position debug for first processed sample.",
+    )
+    parser.add_argument(
+        "--save-jsonl",
+        action="store_true",
+        help="Save detailed per-sample layer scores to results.jsonl.",
+    )
+
+    args = parser.parse_args()
+
+    surface_forms = [
+        x.strip()
+        for x in str(args.surface_forms).split(",")
+        if x.strip()
+    ]
+
+    valid_forms = set(SURFACE_FORMS)
+    bad_forms = [x for x in surface_forms if x not in valid_forms]
+    if bad_forms:
+        raise ValueError(
+            f"Invalid surface forms: {bad_forms}. Valid forms: {sorted(valid_forms)}"
+        )
+
+    device = args.device
+    if device == "cuda" and not torch.cuda.is_available():
+        device = "cpu"
+        args.dtype = "float32"
+
+    out_dir = Path(args.out_dir or f"output/stage1_closedset_layer_traj_{args.dataset}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    jsonl_path = out_dir / "results.jsonl"
+    if jsonl_path.exists():
+        jsonl_path.unlink()
+
+    print(f"[INFO] dataset={args.dataset}")
+    print(f"[INFO] device={device}, dtype={args.dtype}")
+    print(f"[INFO] out_dir={out_dir}")
+    print(f"[INFO] image_source={args.image_source}")
+    print(f"[INFO] surface_forms={surface_forms}")
+    print(f"[INFO] apply_final_norm={not args.no_final_norm}")
+
+    print("[INFO] loading official HF LLaVA")
+    processor, model = load_llava_hf(
+        model_id=args.llava_model_id,
+        revision=args.llava_revision,
+        cache_dir=args.root_dir,
+        device=device,
+        dtype=args.dtype,
+    )
+
+    image_processor = processor.image_processor
+    geom = infer_llava_geometry(image_processor)
+
+    print("[INFO] inferred LLaVA image geometry:")
+    for k, v in geom.items():
+        if k != "resample":
+            print(f"  {k}: {v}")
+    print("[INFO] preprocess mode:", args.preprocess_mode)
+
+    print("[INFO] loading dataset")
+    dataset = load_dataset_any_signature(
+        dataset_name=args.dataset,
+        root_dir=args.root_dir,
+        download=args.download,
+    )
+
+    prompt_rows = load_prompt_rows(args.dataset, args.option)
+    n_total = min(len(dataset), len(prompt_rows))
+
+    if args.sample_ids.strip():
+        indices = []
+        for x in args.sample_ids.split(","):
+            x = x.strip()
+            if not x:
+                continue
+            sid = int(x)
+            if 0 <= sid < n_total:
+                indices.append(sid)
+            else:
+                print(f"[WARN] sample_id out of range and skipped: {sid}")
+    else:
+        indices = list(range(n_total))
+        if args.max_samples > 0:
+            random.seed(args.seed)
+            indices = random.sample(indices, min(args.max_samples, len(indices)))
+
+    print(f"[INFO] total samples to run: {len(indices)}")
+    print(f"[INFO] sample ids: {indices[:50]}{' ...' if len(indices) > 50 else ''}")
+
+    all_layer_rows = []
+    final_rows = []
+
+    processed_count = 0
+    skipped_count = 0
+
+    jsonl_file = jsonl_path.open("w", encoding="utf-8") if args.save_jsonl else None
+
+    for run_i, sample_id in enumerate(tqdm(indices)):
+        prompt = prompt_rows[sample_id].get("question", "")
+        gold = get_gold_from_prompt_row(prompt_rows[sample_id])
+
+        if gold not in RELATIONS:
+            skipped_count += 1
+            print(f"[SKIP] sample_id={sample_id}, invalid gold={gold}")
+            continue
+
+        raw = get_raw_pil_from_dataset(dataset, sample_id)
+
+        processed, meta = make_processed_pil_like_llava(
+            raw=raw,
+            image_processor=image_processor,
+            force_mode=args.preprocess_mode,
+        )
+
+        image = processed if args.image_source == "processed" else raw
+
+        layer_records, debug_info = score_candidates_layerwise(
+            model=model,
+            processor=processor,
+            image=image,
+            prompt=prompt,
+            candidates=RELATIONS,
+            gold=gold,
+            device=device,
+            apply_final_norm=not args.no_final_norm,
+            surface_forms=surface_forms,
+            debug=bool(args.debug_first and processed_count == 0),
+        )
+
+        max_layer_idx = max(r["layer_idx"] for r in layer_records)
+        final_recs = [r for r in layer_records if r["layer_idx"] == max_layer_idx]
+
+        for rec in layer_records:
+            flat = {
+                "sample_id": sample_id,
+                "gold": gold,
+                "prompt": prompt,
+                "clean_prompt": clean_question(prompt),
+                "form": rec["form"],
+                "layer_idx": rec["layer_idx"],
+                "layer_name": rec["layer_name"],
+                "pred": rec["pred"],
+                "correct": rec["correct"],
+                "gold_score": rec["gold_score"],
+                "gold_prob": rec["gold_prob"],
+                "best_non_gold": rec["best_non_gold"],
+                "best_non_gold_score": rec["best_non_gold_score"],
+                "gold_margin": rec["gold_margin"],
+                "image_source": args.image_source,
+                "raw_size": str(raw.size),
+                "processed_size": str(processed.size),
+            }
+
+            for rel in RELATIONS:
+                flat[f"score_{rel}"] = rec["scores"][rel]    # avg log-prob
+                flat[f"logit_{rel}"] = rec["logits"][rel]    # avg raw logit
+                flat[f"prob_{rel}"] = rec["probs"][rel]      # softmax over avg log-prob
+
+            all_layer_rows.append(flat)
+
+        for final_rec in final_recs:
+            final_flat = {
+                "sample_id": sample_id,
+                "gold": gold,
+                "prompt": prompt,
+                "clean_prompt": clean_question(prompt),
+                "form": final_rec["form"],
+                "pred": final_rec["pred"],
+                "correct": final_rec["correct"],
+                "gold_score": final_rec["gold_score"],
+                "gold_prob": final_rec["gold_prob"],
+                "best_non_gold": final_rec["best_non_gold"],
+                "best_non_gold_score": final_rec["best_non_gold_score"],
+                "gold_margin": final_rec["gold_margin"],
+                "image_source": args.image_source,
+                "raw_size": str(raw.size),
+                "processed_size": str(processed.size),
+                "processed_meta": json.dumps(meta, ensure_ascii=False),
+            }
+
+            for rel in RELATIONS:
+                final_flat[f"score_{rel}"] = final_rec["scores"][rel]
+                final_flat[f"logit_{rel}"] = final_rec["logits"][rel]
+                final_flat[f"prob_{rel}"] = final_rec["probs"][rel]
+
+            final_rows.append(final_flat)
+
+        if jsonl_file is not None:
+            obj = {
+                "sample_id": sample_id,
+                "gold": gold,
+                "prompt": prompt,
+                "clean_prompt": clean_question(prompt),
+                "image_source": args.image_source,
+                "raw_size": raw.size,
+                "processed_size": processed.size,
+                "processed_meta": meta,
+                "surface_forms": surface_forms,
+                "debug_info": debug_info,
+                "per_layer": layer_records,
+            }
+            jsonl_file.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            jsonl_file.flush()
+
+        processed_count += 1
+
+        msg_parts = []
+        for final_rec in final_recs:
+            msg_parts.append(
+                f"{final_rec['form']}:pred={final_rec['pred']},"
+                f"correct={final_rec['correct']},"
+                f"scores={{left:{final_rec['scores']['left']:.4f}, "
+                f"right:{final_rec['scores']['right']:.4f}, "
+                f"on:{final_rec['scores']['on']:.4f}, "
+                f"under:{final_rec['scores']['under']:.4f}}},"
+                f"logits={{left:{final_rec['logits']['left']:.4f}, "
+                f"right:{final_rec['logits']['right']:.4f}, "
+                f"on:{final_rec['logits']['on']:.4f}, "
+                f"under:{final_rec['logits']['under']:.4f}}}"
+            )
+
+        print(
+            f"[{run_i + 1}/{len(indices)}] "
+            f"sample_id={sample_id} gold={gold} | "
+            + " | ".join(msg_parts)
+        )
+
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+    if jsonl_file is not None:
+        jsonl_file.close()
+
+    if len(all_layer_rows) == 0:
+        print("[DONE] No valid samples processed.")
+        return
+
+    write_summaries(
+        rows=all_layer_rows,
+        final_rows=final_rows,
+        out_dir=out_dir,
+        relations=RELATIONS,
+    )
+
+    final_df_tmp = pd.DataFrame(final_rows)
+
+    print("\n[FINAL LAYER ACC BY FORM]")
+    for form, g in final_df_tmp.groupby("form"):
+        c = int(g["correct"].sum())
+        n = len(g)
+        print(f"  {form}: {c}/{n}={c / n if n else 0.0:.6f}")
+        print(g["pred"].value_counts(dropna=False).to_string())
+
+    print("\n[DONE]")
+    print("processed:", processed_count)
+    print("skipped:", skipped_count)
+    if args.save_jsonl:
+        print("jsonl:", jsonl_path)
+
+
+if __name__ == "__main__":
+    main()
