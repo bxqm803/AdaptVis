@@ -1,10 +1,9 @@
 import argparse
-import csv
 import json
 import random
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import pandas as pd
 import torch
@@ -25,6 +24,13 @@ LLAVA_MODEL_ID = "llava-hf/llava-1.5-7b-hf"
 LLAVA_REVISION = "a272c74"
 
 RELATIONS = ["left", "right", "on", "under"]
+
+SURFACE_FORMS = [
+    "lower_space",
+    "cap_space",
+    "lower_nospace",
+    "cap_nospace",
+]
 
 
 # ============================================================
@@ -112,7 +118,7 @@ def load_dataset_any_signature(dataset_name: str, root_dir: str, download: bool)
 
 
 # ============================================================
-# LLaVA-like manual image preprocessing, same as stage1 baseline
+# LLaVA-like manual image preprocessing
 # ============================================================
 
 def get_size_value(size_obj, key: str, default: int) -> int:
@@ -357,6 +363,29 @@ def get_lm_head_and_final_norm(model):
 
 
 # ============================================================
+# Surface forms
+# ============================================================
+
+def candidate_text_for_form(rel: str, form: str) -> str:
+    rel = str(rel).strip().lower()
+    cap = rel[:1].upper() + rel[1:]
+
+    if form == "lower_space":
+        return " " + rel
+
+    if form == "cap_space":
+        return " " + cap
+
+    if form == "lower_nospace":
+        return rel
+
+    if form == "cap_nospace":
+        return cap
+
+    raise ValueError(f"Unknown surface form: {form}")
+
+
+# ============================================================
 # Layer-wise closed-set scoring
 # ============================================================
 
@@ -411,38 +440,40 @@ def pack_scores(scores: Dict[str, float], relations: List[str], gold: str) -> Di
 
 
 @torch.no_grad()
-def score_candidates_layerwise(
+def score_one_surface_form_layerwise(
     model,
     processor,
     image: Image.Image,
     prompt: str,
     candidates: List[str],
     gold: str,
+    form: str,
     device: str,
     apply_final_norm: bool = True,
     debug: bool = False,
 ) -> Tuple[List[Dict], Dict]:
     """
-    Exact stage1 closed-set baseline extended to every layer.
+    One surface form only.
 
-    For each candidate, construct:
-        prompt + " left"
-        prompt + " right"
-        prompt + " on"
-        prompt + " under"
-
-    For final layer:
-        use outputs.logits, identical to normal closed-set baseline.
-
-    For intermediate layers:
-        hidden_states[layer] -> final_norm -> lm_head
-        then score the same appended candidate tokens.
+    This keeps memory lower than batching all 16 candidate strings together.
     """
     tokenizer = processor.tokenizer
 
-    answer_texts = [" " + c for c in candidates]
-    full_texts = [prompt + a for a in answer_texts]
-    images = [image] * len(candidates)
+    rows = []
+    full_texts = []
+    images = []
+
+    for cand in candidates:
+        cand_text = candidate_text_for_form(cand, form)
+        rows.append(
+            {
+                "form": form,
+                "relation": cand,
+                "candidate_text": cand_text,
+            }
+        )
+        full_texts.append(prompt + cand_text)
+        images.append(image)
 
     inputs = processor(
         text=full_texts,
@@ -468,13 +499,12 @@ def score_candidates_layerwise(
     hidden_states = outputs.hidden_states
     num_states = len(hidden_states)
 
-    # Prepare answer-token positions exactly as stage1 closed-set baseline.
     target_positions_by_row = []
     answer_token_ids_by_row = []
     answer_token_texts_by_row = []
 
-    for b, cand in enumerate(candidates):
-        cand_text = " " + cand
+    for b, row in enumerate(rows):
+        cand_text = row["candidate_text"]
         cand_ids = tokenizer(
             cand_text,
             add_special_tokens=False,
@@ -509,9 +539,11 @@ def score_candidates_layerwise(
         answer_token_texts_by_row.append(answer_text)
 
     debug_info = {
+        "form": form,
         "input_ids_shape": tuple(input_ids.shape),
         "outputs_logits_shape": tuple(outputs.logits.shape),
         "attention_sum": attention_mask.sum(dim=1).detach().cpu().tolist(),
+        "rows": rows,
         "answer_token_ids_by_row": answer_token_ids_by_row,
         "answer_token_texts_by_row": answer_token_texts_by_row,
     }
@@ -520,20 +552,35 @@ def score_candidates_layerwise(
         image_token_id = getattr(model.config, "image_token_index", None)
         if image_token_id is None:
             image_token_id = tokenizer.convert_tokens_to_ids("<image>")
-        print("[DEBUG]")
+
+        print(f"[DEBUG FORM={form}]")
         print("  input_ids.shape:", tuple(input_ids.shape))
         print("  outputs.logits.shape:", tuple(outputs.logits.shape))
-        print("  hidden_states:", [tuple(h.shape) for h in hidden_states[:3]], "...", tuple(hidden_states[-1].shape))
+        print(
+            "  hidden_states:",
+            [tuple(h.shape) for h in hidden_states[:3]],
+            "...",
+            tuple(hidden_states[-1].shape),
+        )
         print("  attention_sum:", debug_info["attention_sum"])
         print("  image_token_id:", image_token_id)
-        if image_token_id is not None:
-            print("  num_image_tokens:", (input_ids == image_token_id).sum(dim=1).detach().cpu().tolist())
 
-        for b, cand in enumerate(candidates):
+        if image_token_id is not None:
             print(
-                f"  cand={cand:>5s}",
-                "answer_ids=", answer_token_ids_by_row[b],
-                "answer_text=", repr(answer_token_texts_by_row[b]),
+                "  num_image_tokens:",
+                (input_ids == image_token_id).sum(dim=1).detach().cpu().tolist(),
+            )
+
+        for b, row in enumerate(rows):
+            print(
+                f"  form={row['form']:>13s}",
+                f"cand={row['relation']:>5s}",
+                "candidate_text=",
+                repr(row["candidate_text"]),
+                "answer_ids=",
+                answer_token_ids_by_row[b],
+                "answer_text=",
+                repr(answer_token_texts_by_row[b]),
                 "target_positions=",
                 target_positions_by_row[b].detach().cpu().tolist(),
             )
@@ -544,7 +591,6 @@ def score_candidates_layerwise(
         is_final = layer_idx == num_states - 1
 
         if is_final:
-            # Final layer must reproduce the exact baseline.
             layer_logits = outputs.logits[:, :-1, :]
         else:
             h_use = h
@@ -557,7 +603,8 @@ def score_candidates_layerwise(
         scores = {}
         nested = {}
 
-        for b, cand in enumerate(candidates):
+        for b, row in enumerate(rows):
+            rel = row["relation"]
             pos = target_positions_by_row[b]
 
             if pos.numel() == 0:
@@ -577,9 +624,9 @@ def score_candidates_layerwise(
                 n_used = int(vals.numel())
                 token_lps = [float(x) for x in vals.detach().cpu().tolist()]
 
-            scores[cand] = avg_lp
-            nested[cand] = {
-                "candidate_text": " " + cand,
+            scores[rel] = avg_lp
+            nested[rel] = {
+                "candidate_text": row["candidate_text"],
                 "sum_logprob": sum_lp,
                 "avg_logprob": avg_lp,
                 "num_tokens": n_used,
@@ -594,6 +641,7 @@ def score_candidates_layerwise(
             {
                 "layer_idx": int(layer_idx),
                 "layer_name": layer_name_from_idx(layer_idx, num_states),
+                "form": form,
                 "pred": packed["pred"],
                 "correct": packed["correct"],
                 "scores": packed["scores"],
@@ -608,6 +656,47 @@ def score_candidates_layerwise(
         )
 
     return layer_records, debug_info
+
+
+@torch.no_grad()
+def score_candidates_layerwise(
+    model,
+    processor,
+    image: Image.Image,
+    prompt: str,
+    candidates: List[str],
+    gold: str,
+    device: str,
+    apply_final_norm: bool = True,
+    surface_forms: List[str] = None,
+    debug: bool = False,
+) -> Tuple[List[Dict], Dict]:
+    if surface_forms is None:
+        surface_forms = SURFACE_FORMS
+
+    all_records = []
+    debug_infos = {}
+
+    for form_i, form in enumerate(surface_forms):
+        recs, dbg = score_one_surface_form_layerwise(
+            model=model,
+            processor=processor,
+            image=image,
+            prompt=prompt,
+            candidates=candidates,
+            gold=gold,
+            form=form,
+            device=device,
+            apply_final_norm=apply_final_norm,
+            debug=bool(debug and form_i == 0),
+        )
+        all_records.extend(recs)
+        debug_infos[form] = dbg
+
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+    return all_records, debug_infos
 
 
 # ============================================================
@@ -654,8 +743,12 @@ def write_summaries(
         return out
 
     all_rows = []
-    for (layer_idx, layer_name), g in df.groupby(["layer_idx", "layer_name"], sort=True):
+    for (form, layer_idx, layer_name), g in df.groupby(
+        ["form", "layer_idx", "layer_name"],
+        sort=True,
+    ):
         row = {
+            "form": form,
             "layer_idx": int(layer_idx),
             "layer_name": layer_name,
         }
@@ -665,8 +758,12 @@ def write_summaries(
     pd.DataFrame(all_rows).to_csv(summary_all_path, index=False)
 
     by_gold_rows = []
-    for (gold, layer_idx, layer_name), g in df.groupby(["gold", "layer_idx", "layer_name"], sort=True):
+    for (form, gold, layer_idx, layer_name), g in df.groupby(
+        ["form", "gold", "layer_idx", "layer_name"],
+        sort=True,
+    ):
         row = {
+            "form": form,
             "gold": gold,
             "layer_idx": int(layer_idx),
             "layer_name": layer_name,
@@ -718,6 +815,15 @@ def main():
     )
 
     parser.add_argument(
+        "--surface-forms",
+        default="lower_space,cap_space,lower_nospace,cap_nospace",
+        help=(
+            "Comma-separated surface forms: "
+            "lower_space,cap_space,lower_nospace,cap_nospace"
+        ),
+    )
+
+    parser.add_argument(
         "--no-final-norm",
         action="store_true",
         help="Do not apply final norm before lm_head for intermediate layers.",
@@ -735,6 +841,19 @@ def main():
 
     args = parser.parse_args()
 
+    surface_forms = [
+        x.strip()
+        for x in str(args.surface_forms).split(",")
+        if x.strip()
+    ]
+
+    valid_forms = set(SURFACE_FORMS)
+    bad_forms = [x for x in surface_forms if x not in valid_forms]
+    if bad_forms:
+        raise ValueError(
+            f"Invalid surface forms: {bad_forms}. Valid forms: {sorted(valid_forms)}"
+        )
+
     device = args.device
     if device == "cuda" and not torch.cuda.is_available():
         device = "cpu"
@@ -751,6 +870,7 @@ def main():
     print(f"[INFO] device={device}, dtype={args.dtype}")
     print(f"[INFO] out_dir={out_dir}")
     print(f"[INFO] image_source={args.image_source}")
+    print(f"[INFO] surface_forms={surface_forms}")
     print(f"[INFO] apply_final_norm={not args.no_final_norm}")
 
     print("[INFO] loading official HF LLaVA")
@@ -806,7 +926,6 @@ def main():
 
     processed_count = 0
     skipped_count = 0
-    final_correct_count = 0
 
     jsonl_file = jsonl_path.open("w", encoding="utf-8") if args.save_jsonl else None
 
@@ -838,12 +957,12 @@ def main():
             gold=gold,
             device=device,
             apply_final_norm=not args.no_final_norm,
+            surface_forms=surface_forms,
             debug=bool(args.debug_first and processed_count == 0),
         )
 
-        final_rec = layer_records[-1]
-        if final_rec["correct"]:
-            final_correct_count += 1
+        max_layer_idx = max(r["layer_idx"] for r in layer_records)
+        final_recs = [r for r in layer_records if r["layer_idx"] == max_layer_idx]
 
         for rec in layer_records:
             flat = {
@@ -851,6 +970,7 @@ def main():
                 "gold": gold,
                 "prompt": prompt,
                 "clean_prompt": clean_question(prompt),
+                "form": rec["form"],
                 "layer_idx": rec["layer_idx"],
                 "layer_name": rec["layer_name"],
                 "pred": rec["pred"],
@@ -871,29 +991,31 @@ def main():
 
             all_layer_rows.append(flat)
 
-        final_flat = {
-            "sample_id": sample_id,
-            "gold": gold,
-            "prompt": prompt,
-            "clean_prompt": clean_question(prompt),
-            "pred": final_rec["pred"],
-            "correct": final_rec["correct"],
-            "gold_score": final_rec["gold_score"],
-            "gold_prob": final_rec["gold_prob"],
-            "best_non_gold": final_rec["best_non_gold"],
-            "best_non_gold_score": final_rec["best_non_gold_score"],
-            "gold_margin": final_rec["gold_margin"],
-            "image_source": args.image_source,
-            "raw_size": str(raw.size),
-            "processed_size": str(processed.size),
-            "processed_meta": json.dumps(meta, ensure_ascii=False),
-        }
+        for final_rec in final_recs:
+            final_flat = {
+                "sample_id": sample_id,
+                "gold": gold,
+                "prompt": prompt,
+                "clean_prompt": clean_question(prompt),
+                "form": final_rec["form"],
+                "pred": final_rec["pred"],
+                "correct": final_rec["correct"],
+                "gold_score": final_rec["gold_score"],
+                "gold_prob": final_rec["gold_prob"],
+                "best_non_gold": final_rec["best_non_gold"],
+                "best_non_gold_score": final_rec["best_non_gold_score"],
+                "gold_margin": final_rec["gold_margin"],
+                "image_source": args.image_source,
+                "raw_size": str(raw.size),
+                "processed_size": str(processed.size),
+                "processed_meta": json.dumps(meta, ensure_ascii=False),
+            }
 
-        for rel in RELATIONS:
-            final_flat[f"score_{rel}"] = final_rec["scores"][rel]
-            final_flat[f"prob_{rel}"] = final_rec["probs"][rel]
+            for rel in RELATIONS:
+                final_flat[f"score_{rel}"] = final_rec["scores"][rel]
+                final_flat[f"prob_{rel}"] = final_rec["probs"][rel]
 
-        final_rows.append(final_flat)
+            final_rows.append(final_flat)
 
         if jsonl_file is not None:
             obj = {
@@ -905,6 +1027,7 @@ def main():
                 "raw_size": raw.size,
                 "processed_size": processed.size,
                 "processed_meta": meta,
+                "surface_forms": surface_forms,
                 "debug_info": debug_info,
                 "per_layer": layer_records,
             }
@@ -913,14 +1036,21 @@ def main():
 
         processed_count += 1
 
+        msg_parts = []
+        for final_rec in final_recs:
+            msg_parts.append(
+                f"{final_rec['form']}:pred={final_rec['pred']},"
+                f"correct={final_rec['correct']},"
+                f"scores={{left:{final_rec['scores']['left']:.4f}, "
+                f"right:{final_rec['scores']['right']:.4f}, "
+                f"on:{final_rec['scores']['on']:.4f}, "
+                f"under:{final_rec['scores']['under']:.4f}}}"
+            )
+
         print(
             f"[{run_i + 1}/{len(indices)}] "
-            f"sample_id={sample_id} gold={gold} "
-            f"final_pred={final_rec['pred']} final_correct={final_rec['correct']} "
-            f"final_scores={{left:{final_rec['scores']['left']:.4f}, "
-            f"right:{final_rec['scores']['right']:.4f}, "
-            f"on:{final_rec['scores']['on']:.4f}, "
-            f"under:{final_rec['scores']['under']:.4f}}}"
+            f"sample_id={sample_id} gold={gold} | "
+            + " | ".join(msg_parts)
         )
 
         if device.startswith("cuda"):
@@ -940,12 +1070,18 @@ def main():
         relations=RELATIONS,
     )
 
-    final_acc = final_correct_count / processed_count if processed_count else 0.0
+    final_df_tmp = pd.DataFrame(final_rows)
+
+    print("\n[FINAL LAYER ACC BY FORM]")
+    for form, g in final_df_tmp.groupby("form"):
+        c = int(g["correct"].sum())
+        n = len(g)
+        print(f"  {form}: {c}/{n}={c / n if n else 0.0:.6f}")
+        print(g["pred"].value_counts(dropna=False).to_string())
 
     print("\n[DONE]")
     print("processed:", processed_count)
     print("skipped:", skipped_count)
-    print(f"final-layer closed-set acc: {final_correct_count}/{processed_count}={final_acc:.6f}")
     if args.save_jsonl:
         print("jsonl:", jsonl_path)
 
