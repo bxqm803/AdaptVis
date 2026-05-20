@@ -713,7 +713,7 @@ def main():
         choices=["processed", "raw"],
     )
 
-    parser.add_argument("--val-ratio", type=float, default=0.2)
+    parser.add_argument("--val-ratio", type=float, default=0.4)
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
