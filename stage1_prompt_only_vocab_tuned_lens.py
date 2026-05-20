@@ -554,15 +554,12 @@ def stratified_split(labels: torch.Tensor, val_ratio: float, seed: int):
 
 
 # ============================================================
-# Translator
+# Translators
 # ============================================================
 
 class LowRankResidualTranslator(nn.Module):
     """
     h' = h + Up(Down(LN(h))) + bias
-
-    Up is zero-initialized, so the module starts as identity.
-    This is much safer than a full 4096x4096 affine on a tiny dataset.
     """
     def __init__(self, hidden_dim: int, rank: int):
         super().__init__()
@@ -574,7 +571,54 @@ class LowRankResidualTranslator(nn.Module):
         nn.init.zeros_(self.up.weight)
 
     def forward(self, h):
+        h = h.float()
         return h + self.up(self.down(self.ln(h))) + self.bias
+
+
+class DiagonalLinearTranslator(nn.Module):
+    """
+    h' = scale * h + bias
+    """
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(hidden_dim))
+        self.bias = nn.Parameter(torch.zeros(hidden_dim))
+
+    def forward(self, h):
+        h = h.float()
+        return h * self.scale + self.bias
+
+
+class FullLinearTranslator(nn.Module):
+    """
+    h' = W h + b
+    """
+    def __init__(self, hidden_dim: int, init_identity: bool = True):
+        super().__init__()
+        self.linear = nn.Linear(hidden_dim, hidden_dim, bias=True)
+
+        if init_identity:
+            nn.init.eye_(self.linear.weight)
+            nn.init.zeros_(self.linear.bias)
+
+    def forward(self, h):
+        return self.linear(h.float())
+
+
+def build_translator(hidden_dim: int, translator_type: str, rank: int):
+    if translator_type == "low_rank":
+        return LowRankResidualTranslator(hidden_dim=hidden_dim, rank=rank)
+
+    if translator_type == "diagonal_linear":
+        return DiagonalLinearTranslator(hidden_dim=hidden_dim)
+
+    if translator_type == "full_linear":
+        return FullLinearTranslator(hidden_dim=hidden_dim, init_identity=True)
+
+    raise ValueError(
+        f"Unknown translator_type={translator_type}. "
+        f"Choose from: low_rank, diagonal_linear, full_linear"
+    )
 
 
 def student_logits_from_translator(
@@ -583,10 +627,6 @@ def student_logits_from_translator(
     final_norm,
     lm_head,
 ):
-    """
-    x: float32 hidden state [B, H].
-    final_norm/lm_head are model modules, usually fp16.
-    """
     h = translator(x.float())
 
     model_dtype = next(lm_head.parameters()).dtype
@@ -615,10 +655,6 @@ def relation_metrics_from_logits(
     labels: torch.Tensor,
     token_ids_by_form: Dict[str, List[int]],
 ):
-    """
-    logits: [N, vocab]
-    labels: [N]
-    """
     out = {}
 
     for form, ids in token_ids_by_form.items():
@@ -724,7 +760,9 @@ def evaluate_translator(
     for form in token_ids_by_form:
         student_pred = student_rel[form]["pred"]
         teacher_pred = teacher_rel[form]["pred"]
-        result[f"match_teacher_{form}"] = float(student_pred.eq(teacher_pred).float().mean().item())
+        result[f"match_teacher_{form}"] = float(
+            student_pred.eq(teacher_pred).float().mean().item()
+        )
 
     return result
 
@@ -737,6 +775,7 @@ def train_one_layer_tuned_lens(
     val_idx: torch.Tensor,
     layer_idx: int,
     hidden_dim: int,
+    translator_type: str,
     rank: int,
     final_norm,
     lm_head,
@@ -752,8 +791,9 @@ def train_one_layer_tuned_lens(
 ):
     torch.manual_seed(seed + layer_idx)
 
-    translator = LowRankResidualTranslator(
+    translator = build_translator(
         hidden_dim=hidden_dim,
+        translator_type=translator_type,
         rank=rank,
     ).to(device)
 
@@ -775,9 +815,6 @@ def train_one_layer_tuned_lens(
 
         rng = random.Random(seed + layer_idx * 100000 + ep)
         rng.shuffle(train_ids)
-
-        total_loss = 0.0
-        total_n = 0
 
         for start in range(0, len(train_ids), batch_size):
             batch_ids = train_ids[start:start + batch_size]
@@ -801,9 +838,6 @@ def train_one_layer_tuned_lens(
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
-
-            total_loss += float(loss.item()) * len(batch_ids)
-            total_n += len(batch_ids)
 
         val_eval = evaluate_translator(
             translator=translator,
@@ -833,6 +867,12 @@ def train_one_layer_tuned_lens(
 
         if patience > 0 and wait >= patience:
             break
+
+    if best_state is None:
+        best_state = {
+            k: v.detach().cpu().clone()
+            for k, v in translator.state_dict().items()
+        }
 
     translator.load_state_dict(best_state)
     translator.eval()
@@ -904,6 +944,7 @@ def run_tuned_lens(
     lr: float,
     weight_decay: float,
     temperature: float,
+    translator_type: str,
     rank: int,
     patience: int,
     save_translators: bool,
@@ -915,7 +956,8 @@ def run_tuned_lens(
     print("\n[INFO] tuned lens training")
     print(f"  N={N}, num_layers={num_layers}, hidden_dim={hidden_dim}")
     print(f"  train={len(train_idx)}, val={len(val_idx)}")
-    print(f"  rank={rank}, epochs={epochs}, batch_size={batch_size}")
+    print(f"  translator_type={translator_type}, rank={rank}")
+    print(f"  epochs={epochs}, batch_size={batch_size}")
     print(f"  lr={lr}, weight_decay={weight_decay}, temperature={temperature}, patience={patience}")
 
     summary_rows = []
@@ -936,6 +978,7 @@ def run_tuned_lens(
             val_idx=val_idx,
             layer_idx=layer_idx,
             hidden_dim=hidden_dim,
+            translator_type=translator_type,
             rank=rank,
             final_norm=final_norm,
             lm_head=lm_head,
@@ -953,7 +996,7 @@ def run_tuned_lens(
         if save_translators:
             torch.save(
                 result["state_dict"],
-                translators_dir / f"translator_layer_{layer_idx:02d}.pt",
+                translators_dir / f"translator_{translator_type}_layer_{layer_idx:02d}.pt",
             )
 
         for form in token_ids_by_form:
@@ -962,6 +1005,7 @@ def run_tuned_lens(
             val_teacher_rel = result["val_eval"]["teacher_rel"][form]
 
             row = {
+                "translator_type": translator_type,
                 "layer_idx": layer_idx,
                 "layer_name": layer_name,
                 "form": form,
@@ -995,6 +1039,7 @@ def run_tuned_lens(
 
                 pred_rows.append(
                     {
+                        "translator_type": translator_type,
                         "layer_idx": layer_idx,
                         "layer_name": layer_name,
                         "form": form,
@@ -1023,6 +1068,7 @@ def run_tuned_lens(
         msg.append(f"val_kl={result['val_eval']['kl']:.4f}")
         print(" | ".join(msg))
 
+        del result
         if device.startswith("cuda"):
             torch.cuda.empty_cache()
 
@@ -1078,7 +1124,24 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--temperature", type=float, default=2.0)
-    parser.add_argument("--rank", type=int, default=64)
+
+    parser.add_argument(
+        "--translator-type",
+        default="low_rank",
+        choices=["low_rank", "diagonal_linear", "full_linear"],
+        help=(
+            "low_rank = h + Up(Down(LN(h))) + bias; "
+            "diagonal_linear = scale*h + bias; "
+            "full_linear = W*h + b."
+        ),
+    )
+    parser.add_argument(
+        "--rank",
+        type=int,
+        default=64,
+        help="Only used when --translator-type low_rank.",
+    )
+
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--save-translators", action="store_true")
 
@@ -1095,7 +1158,7 @@ def main():
         device = "cpu"
         args.dtype = "float32"
 
-    out_dir = Path(args.out_dir or f"output/stage1_prompt_only_vocab_tuned_lens_{args.dataset}")
+    out_dir = Path(args.out_dir or f"output/stage1_prompt_only_vocab_tuned_lens_{args.dataset}_{args.translator_type}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     random.seed(args.seed)
@@ -1107,6 +1170,7 @@ def main():
     print(f"[INFO] out_dir={out_dir}")
     print(f"[INFO] image_source={args.image_source}")
     print(f"[INFO] surface_forms={surface_forms}")
+    print(f"[INFO] translator_type={args.translator_type}")
 
     processor, model = load_llava_hf(
         model_id=args.llava_model_id,
@@ -1177,8 +1241,11 @@ def main():
                 "teacher_target": obj["teacher_target"],
                 "surface_forms": surface_forms,
                 "token_ids_by_form": token_ids_by_form,
+                "translator_type": args.translator_type,
                 "rank": args.rank,
                 "temperature": args.temperature,
+                "val_ratio": args.val_ratio,
+                "seed": args.seed,
             },
             f,
             ensure_ascii=False,
@@ -1203,6 +1270,7 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
         temperature=args.temperature,
+        translator_type=args.translator_type,
         rank=args.rank,
         patience=args.patience,
         save_translators=args.save_translators,
@@ -1216,6 +1284,7 @@ def main():
         print(
             sub[
                 [
+                    "translator_type",
                     "layer_idx",
                     "layer_name",
                     "student_val_acc_gold",
@@ -1234,6 +1303,7 @@ def main():
         print(
             sub[
                 [
+                    "translator_type",
                     "layer_idx",
                     "layer_name",
                     "student_val_acc_gold",
