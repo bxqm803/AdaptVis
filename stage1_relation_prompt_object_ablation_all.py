@@ -60,7 +60,6 @@ def strip_article(x: str) -> str:
 def parse_two_objects_from_prompt(prompt: str) -> Tuple[Optional[str], Optional[str]]:
     q = clean_question(prompt)
 
-    # Remove answer instruction.
     q = re.sub(r"Answer\s+with\s+.*$", "", q, flags=re.IGNORECASE).strip()
 
     patterns = [
@@ -68,6 +67,7 @@ def parse_two_objects_from_prompt(prompt: str) -> Tuple[Optional[str], Optional[
         r"Where\s+is\s+the\s+(.+?)\s+in\s+relation\s+to\s+(.+?)\?",
         r"Where\s+is\s+(.+?)\s+in\s+relation\s+to\s+the\s+(.+?)\?",
         r"Where\s+is\s+(.+?)\s+in\s+relation\s+to\s+(.+?)\?",
+
         r"Where\s+are\s+the\s+(.+?)\s+in\s+relation\s+to\s+the\s+(.+?)\?",
         r"Where\s+are\s+the\s+(.+?)\s+in\s+relation\s+to\s+(.+?)\?",
         r"Where\s+are\s+(.+?)\s+in\s+relation\s+to\s+the\s+(.+?)\?",
@@ -229,7 +229,11 @@ def make_processed_pil_like_llava(
         mode = "pad" if geom["do_pad"] else "crop"
 
     if mode == "pad":
-        mean = getattr(image_processor, "image_mean", [0.48145466, 0.4578275, 0.40821073])
+        mean = getattr(
+            image_processor,
+            "image_mean",
+            [0.48145466, 0.4578275, 0.40821073],
+        )
         bg = tuple(int(float(x) * 255) for x in mean)
 
         square, pad_x, pad_y, square_size = expand2square(raw, bg)
@@ -249,7 +253,6 @@ def make_processed_pil_like_llava(
         }
         return processed, meta
 
-    # crop mode
     w, h = raw.size
 
     if geom["resize_h"] is not None and geom["resize_w"] is not None:
@@ -283,7 +286,11 @@ def make_processed_pil_like_llava(
 
 
 def get_mask_color(image_processor) -> Tuple[int, int, int]:
-    mean = getattr(image_processor, "image_mean", [0.48145466, 0.4578275, 0.40821073])
+    mean = getattr(
+        image_processor,
+        "image_mean",
+        [0.48145466, 0.4578275, 0.40821073],
+    )
     return tuple(int(float(x) * 255) for x in mean)
 
 
@@ -417,7 +424,9 @@ def sample_background_ids_like_objects(
 ) -> List[int]:
     rng = random.Random(seed)
 
-    object_ids = set(grid_box_to_ids(grid_box1, grid)) | set(grid_box_to_ids(grid_box2, grid))
+    object_ids = set(grid_box_to_ids(grid_box1, grid)) | set(
+        grid_box_to_ids(grid_box2, grid)
+    )
     bg_ids = set()
 
     def try_place_like(gb):
@@ -451,7 +460,10 @@ def sample_background_ids_like_objects(
 
     target_count = len(object_ids)
     if len(bg_ids) < target_count:
-        all_non_obj = [i for i in range(grid * grid) if i not in object_ids and i not in bg_ids]
+        all_non_obj = [
+            i for i in range(grid * grid)
+            if i not in object_ids and i not in bg_ids
+        ]
         rng.shuffle(all_non_obj)
         need = target_count - len(bg_ids)
         bg_ids.update(all_non_obj[:need])
@@ -460,16 +472,27 @@ def sample_background_ids_like_objects(
 
 
 # ============================================================
-# Repo-wrapper LLaVA closed-set relation scoring
+# Repo LLaVA wrapper loading
 # ============================================================
 
-def load_llava_repo(model_name: str, device: str, method: str):
+def load_llava_repo_wrapper(
+    model_name: str,
+    device: str,
+    method: str,
+):
     """
-    Load LLaVA through AdaptVis repo wrapper instead of directly through
-    transformers.LlavaForConditionalGeneration.
+    Load LLaVA exactly through repo wrapper, same style as main_aro.py:
 
-    This makes the ablation script use the same wrapper.model and
-    wrapper.processor path as main_aro.py.
+        model, image_preprocess = get_model(args.model_name, args.device, args.method)
+
+    Important:
+        Do NOT manually set processor.patch_size or
+        processor.vision_feature_select_strategy here.
+
+        The repo custom LLaVA implementation expects one <image> token per image
+        and expands image features inside model_zoo/llava/modeling_llava.py.
+        Manually setting processor.patch_size can make the processor expand image
+        tokens first, causing image-token count mismatch.
     """
     wrapper, image_preprocess = get_repo_model(
         model_name,
@@ -479,18 +502,6 @@ def load_llava_repo(model_name: str, device: str, method: str):
 
     processor = wrapper.processor
     model = wrapper.model
-
-    # Match the image-token expansion alignment used in the original HF baseline.
-    patch_size = getattr(getattr(model.config, "vision_config", None), "patch_size", 14)
-    vision_feature_select_strategy = getattr(
-        model.config,
-        "vision_feature_select_strategy",
-        "default",
-    )
-
-    processor.patch_size = patch_size
-    processor.vision_feature_select_strategy = vision_feature_select_strategy
-
     model = model.to(device).eval()
 
     print("[INFO] loaded LLaVA through repo wrapper")
@@ -500,11 +511,18 @@ def load_llava_repo(model_name: str, device: str, method: str):
     print(f"  hf_model={type(model)}")
     print(f"  processor={type(processor)}")
     print(f"  image_preprocess={image_preprocess}")
-    print(f"  patch_size={processor.patch_size}")
-    print(f"  vision_feature_select_strategy={processor.vision_feature_select_strategy}")
+    print(f"  processor.patch_size={getattr(processor, 'patch_size', None)}")
+    print(
+        "  processor.vision_feature_select_strategy="
+        f"{getattr(processor, 'vision_feature_select_strategy', None)}"
+    )
 
-    return processor, model, wrapper
+    return processor, model, wrapper, image_preprocess
 
+
+# ============================================================
+# LLaVA closed-set relation scoring
+# ============================================================
 
 def score_candidates_batch(
     model,
@@ -515,12 +533,16 @@ def score_candidates_batch(
     device: str,
 ) -> Dict[str, Dict[str, float]]:
     """
-    Closed-set relation scoring exactly matching the stage1 baseline definition:
+    Closed-set relation scoring aligned with stage1 baseline.
 
-        full_texts = [prompt + " left", prompt + " right", ...]
-        score(candidate) = average log-probability of the appended candidate tokens.
+    For candidates ["left", "right", "on", "under"], construct:
 
-    This uses repo-wrapper model/processor, but keeps the scoring formula unchanged.
+        prompt + " left"
+        prompt + " right"
+        prompt + " on"
+        prompt + " under"
+
+    Then score only the appended answer tokens with average log-probability.
     """
     tokenizer = processor.tokenizer
 
@@ -541,7 +563,6 @@ def score_candidates_batch(
     input_ids = inputs["input_ids"]
     attention_mask = inputs["attention_mask"]
 
-    # logits[:, t-1] predicts input_ids[:, t]
     logits = outputs.logits[:, :-1, :]
     target_ids = input_ids[:, 1:]
 
@@ -569,24 +590,23 @@ def score_candidates_batch(
                 "candidate_text": cand_text,
                 "candidate_token_ids": [],
                 "candidate_token_text": "",
+                "token_logprobs": [],
             }
             continue
 
-        nonpad_positions = torch.nonzero(attention_mask[b], as_tuple=False).squeeze(-1)
+        nonpad_positions = torch.nonzero(
+            attention_mask[b],
+            as_tuple=False,
+        ).squeeze(-1)
+
         cand_positions_in_input = nonpad_positions[-n_tok:]
+
         cand_positions_in_target = cand_positions_in_input - 1
         cand_positions_in_target = cand_positions_in_target[
             cand_positions_in_target >= 0
         ]
 
         vals = token_log_probs[b, cand_positions_in_target]
-
-        answer_ids = input_ids[b, cand_positions_in_input].detach().cpu().tolist()
-        answer_text = tokenizer.decode(
-            answer_ids,
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        )
 
         if vals.numel() == 0:
             sum_lp = float("-inf")
@@ -599,12 +619,20 @@ def score_candidates_batch(
             n_used = int(vals.numel())
             token_lps = [float(x) for x in vals.detach().cpu().tolist()]
 
+        answer_ids = input_ids[b, cand_positions_in_input].detach().cpu().tolist()
+        answer_ids = [int(x) for x in answer_ids]
+        answer_text = tokenizer.decode(
+            answer_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+
         result[cand] = {
             "sum_logprob": sum_lp,
             "avg_logprob": avg_lp,
             "num_tokens": n_used,
             "candidate_text": cand_text,
-            "candidate_token_ids": [int(x) for x in answer_ids],
+            "candidate_token_ids": answer_ids,
             "candidate_token_text": answer_text,
             "token_logprobs": token_lps,
         }
@@ -656,32 +684,32 @@ def main():
         "--model-name",
         default="llava1.5",
         choices=["llava1.5", "llava1.6"],
-        help="AdaptVis repo wrapper model name.",
+        help="Repo model name, aligned with main_aro.py.",
     )
     parser.add_argument(
         "--method",
         default="base",
-        help="AdaptVis repo wrapper method. Use base for baseline comparison.",
+        help="Repo wrapper method. Use base for baseline comparison.",
     )
+
     parser.add_argument("--grounding-model-id", default="IDEA-Research/grounding-dino-base")
 
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"], help="Kept for CLI compatibility; repo wrapper controls its own dtype.")
 
     parser.add_argument("--box-threshold", type=float, default=0.25)
     parser.add_argument("--text-threshold", type=float, default=0.20)
     parser.add_argument("--patch-size", type=int, default=14)
 
     parser.add_argument("--preprocess-mode", default="auto", choices=["auto", "crop", "pad"])
+
     parser.add_argument(
         "--original-image-source",
         default="processed",
         choices=["processed", "raw"],
         help=(
-            "Image used for the 'original' closed-set score. "
-            "processed matches the original stage1 ablation script. "
-            "raw is useful for comparing against main_aro dataloader behavior. "
-            "Mask conditions always use processed images."
+            "processed: original condition uses manually LLaVA-like processed PIL, same as stage1. "
+            "raw: original condition uses raw dataset PIL, closer to main_aro raw-image path. "
+            "Mask conditions still use processed image because masks are patch-grid based."
         ),
     )
 
@@ -690,7 +718,6 @@ def main():
     device = args.device
     if device == "cuda" and not torch.cuda.is_available():
         device = "cpu"
-        args.dtype = "float32"
 
     out_dir = Path(args.out_dir or f"output/stage1_relation_ablation_{args.dataset}_repo_wrapper")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -704,12 +731,12 @@ def main():
         csv_path.unlink()
 
     print(f"[INFO] dataset={args.dataset}")
-    print(f"[INFO] device={device}, dtype_arg={args.dtype}")
+    print(f"[INFO] device={device}")
     print(f"[INFO] out_dir={out_dir}")
     print(f"[INFO] original_image_source={args.original_image_source}")
 
     print("[INFO] loading LLaVA through repo wrapper")
-    llava_processor, llava_model, llava_wrapper = load_llava_repo(
+    llava_processor, llava_model, llava_wrapper, image_preprocess = load_llava_repo_wrapper(
         model_name=args.model_name,
         device=device,
         method=args.method,
@@ -773,7 +800,6 @@ def main():
         "obj2_grid_box",
         "obj1_patch_count",
         "obj2_patch_count",
-        "processed_meta",
         "original_image_source",
         "orig_pred",
         "mask_obj1_pred",
@@ -872,9 +898,9 @@ def main():
         }
 
         scores_by_condition = {}
+        nested_scores_by_condition = {}
         pred_by_condition = {}
         margin_by_condition = {}
-        nested_scores_by_condition = {}
 
         for cond, img in images_by_condition.items():
             nested = score_candidates_batch(
@@ -886,6 +912,7 @@ def main():
                 device=device,
             )
             scores = simple_score_dict(nested)
+
             nested_scores_by_condition[cond] = nested
             scores_by_condition[cond] = scores
             pred_by_condition[cond] = pred_from_scores(scores)
@@ -918,6 +945,8 @@ def main():
             "background_patch_ids": bg_ids,
             "processed_meta": meta,
             "original_image_source": args.original_image_source,
+            "raw_size": raw.size,
+            "processed_size": processed.size,
             "scores": scores_by_condition,
             "nested_scores": nested_scores_by_condition,
             "pred": pred_by_condition,
@@ -946,7 +975,6 @@ def main():
             "obj2_grid_box": str(obj2_grid_box),
             "obj1_patch_count": len(obj1_ids),
             "obj2_patch_count": len(obj2_ids),
-            "processed_meta": json.dumps(meta, ensure_ascii=False),
             "original_image_source": args.original_image_source,
             "orig_pred": pred_by_condition["original"],
             "mask_obj1_pred": pred_by_condition["mask_obj1"],
@@ -980,8 +1008,8 @@ def main():
             f"score={score2} grid={obj2_grid_box} patches={len(obj2_ids)}"
         )
         print("question:", clean_question(prompt))
-        print("processed_meta:", meta)
         print("original_image_source:", args.original_image_source)
+        print("raw_size:", raw.size, "processed_size:", processed.size)
 
         for cond in ["original", "mask_obj1", "mask_obj2", "mask_both", "mask_background"]:
             s = scores_by_condition[cond]
