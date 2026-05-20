@@ -192,6 +192,26 @@ def config():
         type=int,
         help="max_new_tokens for trajectory generation comparison.",
     )
+    parser.add_argument(
+        "--trajectory-layer-generation-max-new-tokens",
+        default=None,
+        type=int,
+        help=(
+            "max_new_tokens for per-layer greedy generation. "
+            "If unset, use --trajectory-generation-max-new-tokens."
+        ),
+    )
+
+    parser.add_argument(
+        "--trajectory-layer-generation-layers",
+        default="all",
+        type=str,
+        help=(
+            "Layers to run per-layer greedy generation on. Use 'all' or "
+            "comma-separated layer indices, e.g. 0,8,16,24,32. "
+            "This can be very slow when set to all."
+        ),
+    )
 
     parser.add_argument(
         "--trajectory-generation-relation-pick",
@@ -1284,24 +1304,429 @@ def _run_generation_comparison_one(
 
 
 
+
+def _parse_layer_generation_layers(spec, num_layers):
+    """
+    Parse --trajectory-layer-generation-layers.
+
+    num_layers is len(outputs.hidden_states). Valid layer ids: 0..num_layers-1.
+    """
+    spec = str(spec or "all").strip().lower()
+
+    if spec in ["", "all", "*"]:
+        return list(range(num_layers))
+
+    out = []
+    for x in spec.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        li = int(x)
+        if li < 0:
+            li = num_layers + li
+        if li < 0 or li >= num_layers:
+            raise ValueError(
+                f"Layer index {x} resolves to {li}, out of valid range 0..{num_layers - 1}."
+            )
+        out.append(li)
+
+    if not out:
+        raise ValueError("No valid layers specified for --trajectory-layer-generation-layers.")
+
+    # Keep unique while preserving order.
+    seen = set()
+    uniq = []
+    for li in out:
+        if li not in seen:
+            uniq.append(li)
+            seen.add(li)
+    return uniq
+
+
+def _get_layer_name_from_index(layer_idx, num_layers):
+    if layer_idx == 0:
+        return "emb"
+    if layer_idx == num_layers - 1:
+        return "final"
+    return f"layer_{layer_idx}"
+
+
+@torch.no_grad()
+def _get_num_hidden_states_one(
+    wrapper,
+    image,
+    prompt,
+    method,
+    weight,
+    adjust_method,
+    query_pos,
+):
+    """Run one prompt forward only to determine len(outputs.hidden_states)."""
+    hf_model = wrapper.model
+
+    inputs, controls = _build_forward_inputs_and_controls(
+        wrapper=wrapper,
+        image=image,
+        prompt=prompt,
+        method=method,
+        weight=weight,
+        adjust_method=adjust_method,
+        query_pos=query_pos,
+    )
+
+    forward_kwargs = {
+        "output_hidden_states": True,
+        "return_dict": True,
+    }
+
+    if method in ["scaling_vis", "adapt_vis"]:
+        outputs = hf_model(**inputs, **controls, **forward_kwargs)
+    else:
+        outputs = hf_model(**inputs, **forward_kwargs)
+
+    if outputs.hidden_states is None:
+        raise RuntimeError("outputs.hidden_states is None; cannot infer layer count.")
+
+    return len(outputs.hidden_states)
+
+
+def _relation_from_generated_token_text(token_text, relations):
+    """
+    Best-effort mapping from a single decoded generated token to a relation.
+
+    This is used only to choose which generation step's relation probabilities
+    should be reported. The actual prediction is still parsed from the full
+    decoded generated text by _parse_generated_relation().
+    """
+    s = str(token_text).strip().lower()
+    s = s.replace("in_front", "in-front").replace("in front", "in-front")
+    s = re.sub(r"^[\s\n\r\t:;,.!?()\[\]{}\"']+", "", s)
+    s = re.sub(r"[\s\n\r\t:;,.!?()\[\]{}\"']+$", "", s)
+
+    for rel in relations:
+        rel_norm = rel.lower().replace("in_front", "in-front").replace("in front", "in-front")
+        if s == rel_norm:
+            return rel
+
+    return "unknown"
+
+
+def _relation_case_pack_from_full_logits(full_logits, generation_token_info, relations, gold):
+    """
+    Convert full-vocab logits at one generation step into a relation-softmax pack.
+
+    For each relation, score = logsumexp(logit(lowercase_token), logit(Capitalized_token)).
+    This probability is diagnostic only; the generated token itself is selected
+    by full-vocab argmax, not by relation closed-set argmax.
+    """
+    device = full_logits.device
+
+    lower_ids = torch.tensor(
+        [generation_token_info[rel]["forms"]["gen_lower"]["token_id"] for rel in relations],
+        dtype=torch.long,
+        device=device,
+    )
+    cap_ids = torch.tensor(
+        [generation_token_info[rel]["forms"]["gen_cap"]["token_id"] for rel in relations],
+        dtype=torch.long,
+        device=device,
+    )
+
+    lower_logits = full_logits.index_select(0, lower_ids).detach().float()
+    cap_logits = full_logits.index_select(0, cap_ids).detach().float()
+    case_logits = torch.logsumexp(torch.stack([lower_logits, cap_logits], dim=0), dim=0)
+
+    return _pack_generation_logits(case_logits, relations, gold)
+
+
+@torch.no_grad()
+def _greedy_generate_from_layer_one(
+    wrapper,
+    image,
+    prompt,
+    relations,
+    generation_token_info,
+    layer_idx,
+    num_layers,
+    method,
+    weight,
+    adjust_method,
+    query_pos,
+    gold,
+    max_new_tokens,
+    relation_pick,
+    apply_final_norm_for_intermediate=True,
+):
+    """
+    True per-layer greedy generation.
+
+    For a fixed layer k:
+      step t:
+        forward image + prompt + generated_prefix
+        take hidden_states[k] at the last prompt/prefix token
+        if k is not final: final_norm + lm_head
+        full-vocab argmax -> next token
+      repeat autoregressively.
+
+    This is NOT closed-set. The next token is selected from the full vocabulary.
+    The relation prediction is obtained by decoding all generated tokens and
+    parsing the first/last occurrence of left/right/on/under, matching the
+    actual-generation evaluation rule.
+    """
+    hf_model = wrapper.model
+    processor = wrapper.processor
+    tokenizer = processor.tokenizer
+    device = wrapper.device
+
+    lm_head, final_norm = _get_lm_head_and_final_norm(hf_model)
+
+    generated_ids = []
+    step_records = []
+
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+
+    layer_name = _get_layer_name_from_index(layer_idx, num_layers)
+
+    for step_idx in range(int(max_new_tokens)):
+        prefix_text = tokenizer.decode(
+            generated_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        current_text = prompt + prefix_text
+
+        inputs, controls = _build_forward_inputs_and_controls(
+            wrapper=wrapper,
+            image=image,
+            prompt=current_text,
+            method=method,
+            weight=weight,
+            adjust_method=adjust_method,
+            query_pos=query_pos,
+        )
+
+        forward_kwargs = {
+            "output_hidden_states": True,
+            "return_dict": True,
+        }
+
+        if method in ["scaling_vis", "adapt_vis"]:
+            outputs = hf_model(**inputs, **controls, **forward_kwargs)
+        else:
+            outputs = hf_model(**inputs, **forward_kwargs)
+
+        if outputs.hidden_states is None:
+            raise RuntimeError("outputs.hidden_states is None during layer generation.")
+
+        hidden_states = outputs.hidden_states
+        if layer_idx >= len(hidden_states):
+            raise RuntimeError(
+                f"Requested layer_idx={layer_idx}, but current forward has "
+                f"only {len(hidden_states)} hidden states."
+            )
+
+        last_pos = _get_last_prompt_position(inputs)
+        is_final_state = layer_idx == len(hidden_states) - 1
+
+        if is_final_state:
+            full_logits = outputs.logits[0, last_pos, :].detach().float()
+        else:
+            h_pos = hidden_states[layer_idx][0, last_pos, :]
+            if apply_final_norm_for_intermediate and final_norm is not None:
+                h_pos = final_norm(h_pos)
+            full_logits = lm_head(h_pos.unsqueeze(0))[0].detach().float()
+
+        relation_pack = _relation_case_pack_from_full_logits(
+            full_logits=full_logits,
+            generation_token_info=generation_token_info,
+            relations=relations,
+            gold=gold,
+        )
+
+        next_id = int(torch.argmax(full_logits).item())
+        next_text = tokenizer.decode(
+            [next_id],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        next_relation = _relation_from_generated_token_text(next_text, relations)
+
+        step_records.append(
+            {
+                "step_idx": int(step_idx),
+                "input_length": int(inputs["input_ids"].shape[-1]),
+                "last_prompt_position": int(last_pos),
+                "token_id": next_id,
+                "token_text": next_text,
+                "token_relation": next_relation,
+                "relation_argmax": relation_pack["pred"],
+                "relation_probs": relation_pack["relation_softmax_probs"],
+                "relation_logits": relation_pack["logits"],
+            }
+        )
+
+        # Add token after recording it. This mirrors greedy generation.
+        generated_ids.append(next_id)
+
+        if eos_token_id is not None and next_id == int(eos_token_id):
+            break
+        # Avoid infinite pad-only continuations.
+        if pad_token_id is not None and next_id == int(pad_token_id):
+            break
+
+    generated_text = tokenizer.decode(
+        generated_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+
+    pred, relation_hits = _parse_generated_relation(
+        generated_text,
+        relations=relations,
+        pick=relation_pick,
+    )
+
+    relation_step_records = [
+        s for s in step_records if s.get("token_relation", "unknown") in relations
+    ]
+
+    if relation_step_records:
+        chosen_step = relation_step_records[0] if relation_pick == "first" else relation_step_records[-1]
+        prob_source = "matched_generated_relation_token"
+    elif step_records:
+        chosen_step = step_records[-1]
+        prob_source = "last_generated_step_no_relation_token_match"
+    else:
+        chosen_step = None
+        prob_source = "no_generated_steps"
+
+    if chosen_step is not None:
+        probs = chosen_step["relation_probs"]
+        logits = chosen_step["relation_logits"]
+        relation_argmax_at_prob_step = chosen_step["relation_argmax"]
+        prob_step_idx = chosen_step["step_idx"]
+        prob_step_token_text = chosen_step["token_text"]
+        prob_step_token_id = chosen_step["token_id"]
+    else:
+        probs = {rel: None for rel in relations}
+        logits = {rel: None for rel in relations}
+        relation_argmax_at_prob_step = None
+        prob_step_idx = None
+        prob_step_token_text = None
+        prob_step_token_id = None
+
+    return {
+        "layer_idx": int(layer_idx),
+        "layer_name": layer_name,
+        "gold": gold,
+        "generated_ids": [int(x) for x in generated_ids],
+        "generated_text_layer": generated_text,
+        "pred_gen": pred,
+        "correct_gen": bool(pred == gold),
+        "generation_relation_hits": relation_hits,
+        "generation_relation_hits_json": json.dumps(relation_hits, ensure_ascii=False),
+        "generation_relation_pick": relation_pick,
+        "num_generated_tokens": int(len(generated_ids)),
+        "stop_reason": (
+            "eos" if (eos_token_id is not None and generated_ids and generated_ids[-1] == int(eos_token_id))
+            else "pad" if (pad_token_id is not None and generated_ids and generated_ids[-1] == int(pad_token_id))
+            else "max_new_tokens_or_no_stop"
+        ),
+        "relation_prob_source": prob_source,
+        "relation_prob_step_idx": prob_step_idx,
+        "relation_prob_step_token_id": prob_step_token_id,
+        "relation_prob_step_token_text": prob_step_token_text,
+        "relation_argmax_at_prob_step": relation_argmax_at_prob_step,
+        "relation_probs": probs,
+        "relation_logits": logits,
+        "step_records": step_records,
+    }
+
+
+@torch.no_grad()
+def _compute_per_layer_greedy_generation_one(
+    wrapper,
+    image,
+    prompt,
+    relations,
+    generation_token_info,
+    method,
+    weight,
+    adjust_method,
+    query_pos,
+    gold,
+    max_new_tokens,
+    relation_pick,
+    layer_indices,
+    apply_final_norm_for_intermediate=True,
+):
+    """Run true greedy generation separately for each requested layer."""
+    # Determine hidden-state count if needed.
+    num_layers = _get_num_hidden_states_one(
+        wrapper=wrapper,
+        image=image,
+        prompt=prompt,
+        method=method,
+        weight=weight,
+        adjust_method=adjust_method,
+        query_pos=query_pos,
+    )
+
+    if layer_indices is None:
+        selected_layers = list(range(num_layers))
+    else:
+        selected_layers = layer_indices
+
+    layer_records = []
+    for li in selected_layers:
+        layer_records.append(
+            _greedy_generate_from_layer_one(
+                wrapper=wrapper,
+                image=image,
+                prompt=prompt,
+                relations=relations,
+                generation_token_info=generation_token_info,
+                layer_idx=int(li),
+                num_layers=num_layers,
+                method=method,
+                weight=weight,
+                adjust_method=adjust_method,
+                query_pos=query_pos,
+                gold=gold,
+                max_new_tokens=max_new_tokens,
+                relation_pick=relation_pick,
+                apply_final_norm_for_intermediate=apply_final_norm_for_intermediate,
+            )
+        )
+
+    debug_info = {
+        "mode": "true_per_layer_full_vocab_greedy_generation",
+        "num_hidden_states": int(num_layers),
+        "selected_layers": [int(x) for x in selected_layers],
+        "max_new_tokens": int(max_new_tokens),
+        "relation_pick": relation_pick,
+        "generation_token_info": generation_token_info,
+    }
+
+    return layer_records, debug_info
+
 def run_relation_logit_trajectory(args, model, dataset, joint_loader):
     """
-    Generation-style layer trajectory runner.
+    True per-layer generation runner.
 
     This branch does NOT run closed-set candidate scoring.
 
-    For each sample, it does two things:
-      1) Run actual model.generate(), decode generated_text, and parse the
-         first/last occurrence of left/right/on/under according to
-         --trajectory-generation-relation-pick. Default is last.
-      2) Run a prompt-only forward with output_hidden_states=True. For each
-         layer, take the hidden state at the last prompt token, apply
-         final_norm + lm_head, and compare the capitalized first-token
-         candidates:
-             Left / Right / On / Under
+    For each sample:
+      1) Run normal model.generate() once and parse the first/last relation word.
+      2) For every requested layer k, run a separate full-vocabulary greedy
+         generation loop where each step uses hidden_states[k] -> final_norm
+         -> lm_head as the output head.
+      3) Decode each layer's generated text and parse the first/last occurrence
+         of left/right/on/under. This is the layer-level prediction.
 
-    The per-layer result is a logit-lens diagnostic for the first generated
-    relation token. It is not closed-set continuation scoring.
+    Therefore pred_gen in layer_rows.csv comes from actual generated text for
+    that layer, not from P(Left/Right/On/Under | prompt) closed-set comparison.
 
     Saved files:
       - generation_token_info.json
@@ -1351,6 +1776,12 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
 
     apply_final_norm = not bool(args.trajectory_no_final_norm)
 
+    layer_generation_max_new_tokens = (
+        int(args.trajectory_layer_generation_max_new_tokens)
+        if args.trajectory_layer_generation_max_new_tokens is not None
+        else int(args.trajectory_generation_max_new_tokens)
+    )
+
     jsonl_path = os.path.join(out_dir, "trajectory.jsonl")
     layer_rows_path = os.path.join(out_dir, "layer_rows.csv")
     final_summary_path = os.path.join(out_dir, "final_layer_summary.csv")
@@ -1360,30 +1791,32 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
 
     fout = open(jsonl_path, "w", encoding="utf-8") if args.trajectory_save_jsonl else None
 
-    print("[GENERATION-STYLE LAYER TRAJECTORY]")
+    print("[TRUE PER-LAYER FULL-VOCAB GENERATION]")
     print(f"  dataset={args.dataset}")
     print(f"  option={args.option}")
     print(f"  method={args.method}")
     print(f"  out_dir={out_dir}")
     print(f"  relations={relations}")
     print("  closed_set_candidate_scoring=False")
+    print("  first_token_closed_set_logit_lens=False")
     print("  per_layer_outputs=True")
-    print("  layer scoring=prompt_only_capitalized_first_token_logit_lens")
-    print("  layer candidates=Left/Right/On/Under")
+    print("  per_layer_decision=full_vocab_greedy_generate_then_parse_relation")
     print(f"  actual_generation_parse_pick={args.trajectory_generation_relation_pick}")
-    print(f"  generation_max_new_tokens={args.trajectory_generation_max_new_tokens}")
+    print(f"  actual_generation_max_new_tokens={args.trajectory_generation_max_new_tokens}")
+    print(f"  layer_generation_max_new_tokens={layer_generation_max_new_tokens}")
+    print(f"  layer_generation_layers={args.trajectory_layer_generation_layers}")
     print(
         f"  trajectory_weight={trajectory_weight}, "
         f"trajectory_adjust_method={trajectory_adjust_method}, "
         f"apply_final_norm={apply_final_norm}"
     )
-
-    print("  generation-style token ids:")
+    print("  relation token ids used only for diagnostic probabilities at generated relation step:")
     for rel in relations:
-        info = generation_token_info[rel]["forms"]["gen_cap"]
+        lower = generation_token_info[rel]["forms"]["gen_lower"]
+        cap = generation_token_info[rel]["forms"]["gen_cap"]
         print(
-            f"    {rel:>8s}: text={repr(info['text'])}, "
-            f"id={info['token_id']}, decoded={repr(info['decoded'])}"
+            f"    {rel:>8s}: lower={repr(lower['text'])} id={lower['token_id']}; "
+            f"cap={repr(cap['text'])} id={cap['token_id']}"
         )
 
     all_layer_rows = []
@@ -1393,6 +1826,7 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
     processed = 0
     skipped = 0
     correct_count = 0
+    selected_layer_cache = None
 
     for batch in tqdm(joint_loader):
         for i_option in batch["image_options"]:
@@ -1418,7 +1852,7 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
                     sample_id=sample_id,
                 )
 
-                # Actual generation result: model.generate() + parse last/first relation.
+                # Normal model.generate() for reference.
                 generation_info = _run_generation_comparison_one(
                     wrapper=model,
                     image=image_for_model,
@@ -1437,8 +1871,25 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
                 generation_hits = generation_info.get("generation_relation_hits", [])
                 generation_hits_json = json.dumps(generation_hits, ensure_ascii=False)
 
-                # Layer-wise generation-style trajectory.
-                gen_layer_raw, gen_debug_info, _ = _compute_generation_style_trajectory_one(
+                # Determine layers on first processed sample, then reuse.
+                if selected_layer_cache is None:
+                    n_states = _get_num_hidden_states_one(
+                        wrapper=model,
+                        image=image_for_model,
+                        prompt=prompt,
+                        method=args.method,
+                        weight=trajectory_weight,
+                        adjust_method=trajectory_adjust_method,
+                        query_pos=args.trajectory_query_pos,
+                    )
+                    selected_layer_cache = _parse_layer_generation_layers(
+                        args.trajectory_layer_generation_layers,
+                        n_states,
+                    )
+                    print(f"[LAYER SELECTION] num_hidden_states={n_states}, selected_layers={selected_layer_cache}")
+
+                # True per-layer greedy generation.
+                layer_generated, layer_debug_info = _compute_per_layer_greedy_generation_one(
                     wrapper=model,
                     image=image_for_model,
                     prompt=prompt,
@@ -1449,73 +1900,81 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
                     adjust_method=trajectory_adjust_method,
                     query_pos=args.trajectory_query_pos,
                     gold=gold,
+                    max_new_tokens=layer_generation_max_new_tokens,
+                    relation_pick=args.trajectory_generation_relation_pick,
+                    layer_indices=selected_layer_cache,
                     apply_final_norm_for_intermediate=apply_final_norm,
                 )
 
-                for rec in gen_layer_raw:
-                    # Only use gen_cap for the layer-wise output, because actual
-                    # generation usually emits capitalized answer words.
-                    pack = rec["gen_cap"]
-
+                for rec in layer_generated:
                     flat = {
                         "sample_id": sample_id,
                         "gold": gold,
                         "prompt": prompt,
                         "layer_idx": rec["layer_idx"],
                         "layer_name": rec["layer_name"],
-                        "last_prompt_position": rec["last_prompt_position"],
 
-                        # Layer-wise generation-style result.
-                        "pred_gen": pack["pred"],
-                        "correct_gen": pack["correct"],
-                        "gold_logit_gen": pack["gold_logit"],
-                        "gold_prob_gen": pack["gold_prob_relation_softmax"],
-                        "best_non_gold_gen": pack["best_non_gold"],
-                        "best_non_gold_logit_gen": pack["best_non_gold_logit"],
-                        "gold_margin_gen": pack["gold_margin"],
+                        # True per-layer generated-text result.
+                        "pred_gen": rec["pred_gen"],
+                        "correct_gen": rec["correct_gen"],
+                        "generated_text_layer": rec["generated_text_layer"],
+                        "generated_ids_layer_json": json.dumps(rec["generated_ids"], ensure_ascii=False),
+                        "num_generated_tokens_layer": rec["num_generated_tokens"],
+                        "stop_reason_layer": rec["stop_reason"],
+                        "generation_relation_hits_layer_json": rec["generation_relation_hits_json"],
+                        "generation_relation_pick": rec["generation_relation_pick"],
 
-                        # Actual generated text result copied to every layer row.
-                        "generation_pred": generation_pred,
-                        "generation_correct": generation_correct,
-                        "generated_text": generation_info["generated_text"],
-                        "generation_relation_hits_json": generation_hits_json,
-                        "generation_relation_pick": args.trajectory_generation_relation_pick,
+                        # Diagnostic relation probabilities at the generated relation step.
+                        "relation_prob_source": rec["relation_prob_source"],
+                        "relation_prob_step_idx": rec["relation_prob_step_idx"],
+                        "relation_prob_step_token_id": rec["relation_prob_step_token_id"],
+                        "relation_prob_step_token_text": rec["relation_prob_step_token_text"],
+                        "relation_argmax_at_prob_step": rec["relation_argmax_at_prob_step"],
+
+                        # Normal actual model.generate result copied to every row.
+                        "actual_generation_pred": generation_pred,
+                        "actual_generation_correct": generation_correct,
+                        "actual_generated_text": generation_info["generated_text"],
+                        "actual_generation_relation_hits_json": generation_hits_json,
                     }
 
                     for rel in relations:
-                        flat[f"logit_{rel}_gen"] = pack["logits"][rel]
-                        flat[f"prob_{rel}_gen"] = pack["relation_softmax_probs"][rel]
+                        flat[f"prob_{rel}_gen"] = rec["relation_probs"].get(rel)
+                        flat[f"logit_{rel}_gen"] = rec["relation_logits"].get(rel)
 
                     all_layer_rows.append(flat)
 
-                final_rec = gen_layer_raw[-1]
-                final_pack = final_rec["gen_cap"]
+                # Final layer row if it was selected; otherwise use the last selected layer.
+                final_layer_idx = max(x["layer_idx"] for x in layer_generated)
+                final_recs = [x for x in layer_generated if x["layer_idx"] == final_layer_idx]
+                final_rec = final_recs[0]
 
                 final_row = {
                     "sample_id": sample_id,
                     "gold": gold,
 
-                    # Final-layer generation-style logit-lens result.
-                    "pred_gen_final": final_pack["pred"],
-                    "correct_gen_final": final_pack["correct"],
-                    "gold_logit_gen_final": final_pack["gold_logit"],
-                    "gold_prob_gen_final": final_pack["gold_prob_relation_softmax"],
-                    "best_non_gold_gen_final": final_pack["best_non_gold"],
-                    "best_non_gold_logit_gen_final": final_pack["best_non_gold_logit"],
-                    "gold_margin_gen_final": final_pack["gold_margin"],
+                    "pred_gen_final": final_rec["pred_gen"],
+                    "correct_gen_final": final_rec["correct_gen"],
+                    "generated_text_layer_final": final_rec["generated_text_layer"],
+                    "num_generated_tokens_layer_final": final_rec["num_generated_tokens"],
+                    "stop_reason_layer_final": final_rec["stop_reason"],
+                    "relation_prob_source_final": final_rec["relation_prob_source"],
+                    "relation_prob_step_idx_final": final_rec["relation_prob_step_idx"],
+                    "relation_prob_step_token_text_final": final_rec["relation_prob_step_token_text"],
+                    "relation_argmax_at_prob_step_final": final_rec["relation_argmax_at_prob_step"],
 
-                    # Actual model.generate result.
-                    "generation_pred": generation_pred,
-                    "generation_correct": generation_correct,
-                    "generated_text": generation_info["generated_text"],
-                    "generation_relation_hits_json": generation_hits_json,
+                    # Normal actual model.generate result.
+                    "actual_generation_pred": generation_pred,
+                    "actual_generation_correct": generation_correct,
+                    "actual_generated_text": generation_info["generated_text"],
+                    "actual_generation_relation_hits_json": generation_hits_json,
                     "generation_relation_pick": args.trajectory_generation_relation_pick,
                     "prompt": prompt,
                 }
 
                 for rel in relations:
-                    final_row[f"logit_{rel}_gen_final"] = final_pack["logits"][rel]
-                    final_row[f"prob_{rel}_gen_final"] = final_pack["relation_softmax_probs"][rel]
+                    final_row[f"prob_{rel}_gen_final"] = final_rec["relation_probs"].get(rel)
+                    final_row[f"logit_{rel}_gen_final"] = final_rec["relation_logits"].get(rel)
 
                 final_rows.append(final_row)
 
@@ -1532,9 +1991,9 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
                         "trajectory_adjust_method": trajectory_adjust_method,
                         "relations": relations,
                         "generation_token_info": generation_token_info,
-                        "generation_style_debug": gen_debug_info,
-                        "generation_style_per_layer": gen_layer_raw,
-                        "generation": {
+                        "layer_generation_debug": layer_debug_info,
+                        "layer_generation_per_layer": layer_generated,
+                        "actual_generation": {
                             **generation_info,
                             "generation_correct": generation_correct,
                             "generation_relation_hits_json": generation_hits_json,
@@ -1547,15 +2006,14 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
                 processed += 1
                 index_of_total += 1
 
-                if processed % 20 == 0:
-                    acc = correct_count / processed if processed > 0 else 0.0
+                if processed % 5 == 0:
+                    acc_now = correct_count / processed if processed > 0 else 0.0
                     print(
-                        f"[GEN-LAYER RUNNING] processed={processed}, "
-                        f"skipped={skipped}, last_sample={sample_id}, "
-                        f"gold={gold}, actual_generation={generation_pred}, "
-                        f"final_layer_pred={final_pack['pred']}, "
-                        f"actual_correct={generation_correct}, "
-                        f"actual_acc={correct_count}/{processed}={acc:.6f}"
+                        f"[LAYER GENERATION RUNNING] processed={processed}, "
+                        f"skipped={skipped}, last_sample={sample_id}, gold={gold}, "
+                        f"actual={generation_pred}, actual_correct={generation_correct}, "
+                        f"actual_acc={correct_count}/{processed}={acc_now:.6f}, "
+                        f"last_selected_layer={final_rec['layer_idx']}:{final_rec['pred_gen']}"
                     )
 
             if (
@@ -1574,11 +2032,11 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
         fout.close()
 
     if len(all_layer_rows) == 0:
-        print("[GENERATION-STYLE TRAJECTORY DONE] No samples processed.")
+        print("[LAYER GENERATION DONE] No samples processed.")
         return
 
-    layer_df = pd.DataFrame(all_layer_rows)
-    layer_df.to_csv(layer_rows_path, index=False)
+    df = pd.DataFrame(all_layer_rows)
+    df.to_csv(layer_rows_path, index=False)
 
     final_df = pd.DataFrame(final_rows)
     final_df.to_csv(final_summary_path, index=False)
@@ -1586,20 +2044,18 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
 
     agg_dict = {
         "correct_gen": "mean",
-        "gold_margin_gen": ["mean", "median"],
-        "gold_prob_gen": ["mean", "median"],
+        "num_generated_tokens_layer": ["mean", "median"],
     }
 
     for rel in relations:
-        agg_dict[f"logit_{rel}_gen"] = "mean"
         agg_dict[f"prob_{rel}_gen"] = "mean"
+        agg_dict[f"logit_{rel}_gen"] = "mean"
 
     summary_by_gold = (
-        layer_df.groupby(["gold", "layer_idx", "layer_name"])
+        df.groupby(["gold", "layer_idx", "layer_name"])
         .agg(agg_dict)
         .reset_index()
     )
-
     summary_by_gold.columns = [
         "_".join([str(x) for x in col if str(x) != ""]).rstrip("_")
         if isinstance(col, tuple)
@@ -1609,11 +2065,10 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
     summary_by_gold.to_csv(summary_by_gold_path, index=False)
 
     summary_all = (
-        layer_df.groupby(["layer_idx", "layer_name"])
+        df.groupby(["layer_idx", "layer_name"])
         .agg(agg_dict)
         .reset_index()
     )
-
     summary_all.columns = [
         "_".join([str(x) for x in col if str(x) != ""]).rstrip("_")
         if isinstance(col, tuple)
@@ -1623,12 +2078,10 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
     summary_all.to_csv(summary_all_path, index=False)
 
     actual_acc = correct_count / processed if processed > 0 else 0.0
-    final_layer_acc = float(final_df["correct_gen_final"].mean())
 
-    print("[GENERATION-STYLE TRAJECTORY DONE]")
+    print("[LAYER GENERATION DONE]")
     print(f"  processed={processed}, skipped={skipped}")
     print(f"  actual generation acc={correct_count}/{processed}={actual_acc:.6f}")
-    print(f"  final-layer gen-cap logit-lens acc={final_layer_acc:.6f}")
     print(f"  layer rows: {layer_rows_path}")
     print(f"  final summary: {final_summary_path}")
     print(f"  generation results: {generation_results_path}")
@@ -1638,17 +2091,14 @@ def run_relation_logit_trajectory(args, model, dataset, joint_loader):
         print(f"  detailed jsonl: {jsonl_path}")
 
     print("\n[ACTUAL GENERATION PRED DISTRIBUTION]")
-    print(final_df["generation_pred"].value_counts(dropna=False).to_string())
-
-    print("\n[FINAL-LAYER GEN-CAP PRED DISTRIBUTION]")
-    print(final_df["pred_gen_final"].value_counts(dropna=False).to_string())
+    print(final_df["actual_generation_pred"].value_counts(dropna=False).to_string())
 
     print("\n[PER-GOLD ACTUAL GENERATION SUMMARY]")
     for gold_value, g in final_df.groupby("gold"):
         n = len(g)
-        c = int(g["generation_correct"].sum())
+        c = int(g["actual_generation_correct"].sum())
         print(f"  {gold_value:>8s}: {c}/{n}={c / n if n else 0.0:.6f}")
-        print(g["generation_pred"].value_counts(dropna=False).to_string())
+        print(g["actual_generation_pred"].value_counts(dropna=False).to_string())
 
 def is_probe_mode():
     """
