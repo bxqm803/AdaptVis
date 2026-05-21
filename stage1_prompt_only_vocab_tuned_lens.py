@@ -655,6 +655,12 @@ def relation_metrics_from_logits(
     labels: torch.Tensor,
     token_ids_by_form: Dict[str, List[int]],
 ):
+    """
+    logits: raw vocabulary logits, shape [N, vocab]
+    return:
+      logits: raw relation-token logits, shape [N, 4]
+      probs : softmax over four relation-token raw logits, shape [N, 4]
+    """
     out = {}
 
     for form, ids in token_ids_by_form.items():
@@ -916,6 +922,100 @@ def train_one_layer_tuned_lens(
 
 
 # ============================================================
+# Probability / logit summary printing
+# ============================================================
+
+def fmt_rel_values(g: pd.DataFrame, prefix: str) -> str:
+    parts = []
+    for rel in RELATIONS:
+        col = f"{prefix}_{rel}"
+        if col in g.columns:
+            parts.append(f"{rel}:{g[col].mean():.4f}")
+        else:
+            parts.append(f"{rel}:NA")
+    return " | ".join(parts)
+
+
+def print_prob_logit_summary(pred_df: pd.DataFrame):
+    """
+    Print:
+    1. Overall per form/layer mean probability and raw logit.
+    2. Per gold/form/layer mean probability and raw logit.
+
+    prob_*  = softmax over four relation raw logits, not log(prob)
+    logit_* = raw relation-token logit
+    """
+    print("\n\n================ PER-LAYER RELATION PROB / RAW LOGIT SUMMARY ================")
+
+    needed = []
+    for who in ["student", "teacher"]:
+        for kind in ["prob", "logit"]:
+            for rel in RELATIONS:
+                needed.append(f"{who}_{kind}_{rel}")
+
+    missing = [c for c in needed if c not in pred_df.columns]
+    if missing:
+        print("[WARN] Missing probability/logit columns:")
+        print(missing)
+        return
+
+    pred_df = pred_df.copy()
+    pred_df["gold_norm"] = pred_df["gold"].astype(str).str.strip().str.lower()
+    pred_df["student_pred_norm"] = pred_df["student_pred"].astype(str).str.strip().str.lower()
+    pred_df["teacher_pred_norm"] = pred_df["teacher_pred"].astype(str).str.strip().str.lower()
+
+    pred_df["student_correct_recalc"] = pred_df["student_pred_norm"].eq(pred_df["gold_norm"])
+    pred_df["teacher_correct_recalc"] = pred_df["teacher_pred_norm"].eq(pred_df["gold_norm"])
+    pred_df["match_teacher_recalc"] = pred_df["student_pred_norm"].eq(pred_df["teacher_pred_norm"])
+
+    forms = list(pred_df["form"].dropna().unique())
+
+    print("\n================ OVERALL BY FORM / LAYER ================")
+    for form in forms:
+        fdf = pred_df[pred_df["form"] == form]
+        print("\n" + "#" * 120)
+        print(f"FORM = {form}")
+        print("#" * 120)
+
+        for (layer_idx, layer_name), g in fdf.groupby(["layer_idx", "layer_name"], sort=True):
+            print(f"\nlayer {int(layer_idx):02d} ({layer_name}) | n={len(g)}")
+            print(f"  student acc: {g['student_correct_recalc'].mean():.6f}")
+            print(f"  teacher acc: {g['teacher_correct_recalc'].mean():.6f}")
+            print(f"  match teacher: {g['match_teacher_recalc'].mean():.6f}")
+            print("  student mean prob :", fmt_rel_values(g, "student_prob"))
+            print("  teacher mean prob :", fmt_rel_values(g, "teacher_prob"))
+            print("  student mean logit:", fmt_rel_values(g, "student_logit"))
+            print("  teacher mean logit:", fmt_rel_values(g, "teacher_logit"))
+
+    print("\n\n================ BY GOLD / FORM / LAYER ================")
+    for form in forms:
+        fdf = pred_df[pred_df["form"] == form]
+
+        print("\n" + "#" * 120)
+        print(f"FORM = {form} | PER GOLD")
+        print("#" * 120)
+
+        for gold in RELATIONS:
+            gdf = fdf[fdf["gold_norm"] == gold]
+            if len(gdf) == 0:
+                continue
+
+            print("\n" + "=" * 120)
+            print(f"GOLD = {gold} | sample_n={gdf['sample_id'].nunique()}")
+            print("=" * 120)
+
+            for (layer_idx, layer_name), g in gdf.groupby(["layer_idx", "layer_name"], sort=True):
+                print(f"\nlayer {int(layer_idx):02d} ({layer_name}) | n={len(g)}")
+                print(f"  student acc: {g['student_correct_recalc'].mean():.6f}")
+                print(f"  teacher acc: {g['teacher_correct_recalc'].mean():.6f}")
+                print(f"  match teacher: {g['match_teacher_recalc'].mean():.6f}")
+                print("  student mean prob :", fmt_rel_values(g, "student_prob"))
+                print("  teacher mean prob :", fmt_rel_values(g, "teacher_prob"))
+                print("  student mean logit:", fmt_rel_values(g, "student_logit"))
+                print("  teacher mean logit:", fmt_rel_values(g, "teacher_logit"))
+
+
+# ============================================================
 # Main experiment
 # ============================================================
 
@@ -1032,29 +1132,50 @@ def run_tuned_lens(
             val_pred = val_rel["pred"].tolist()
             teacher_pred = val_teacher_rel["pred"].tolist()
 
+            student_probs = val_rel["probs"]           # [N_val, 4]
+            teacher_probs = val_teacher_rel["probs"]   # [N_val, 4]
+            student_logits = val_rel["logits"]         # [N_val, 4]
+            teacher_logits_small = val_teacher_rel["logits"]
+
             for local_i, global_i in enumerate(val_idx.tolist()):
                 gold_id = int(labels[global_i].item())
                 pred_id = int(val_pred[local_i])
                 teacher_id = int(teacher_pred[local_i])
 
-                pred_rows.append(
-                    {
-                        "translator_type": translator_type,
-                        "layer_idx": layer_idx,
-                        "layer_name": layer_name,
-                        "form": form,
-                        "sample_id": sample_ids[global_i],
-                        "gold_id": gold_id,
-                        "gold": ID2REL[gold_id],
-                        "student_pred_id": pred_id,
-                        "student_pred": ID2REL[pred_id],
-                        "teacher_pred_id": teacher_id,
-                        "teacher_pred": ID2REL[teacher_id],
-                        "student_correct": bool(pred_id == gold_id),
-                        "teacher_correct": bool(teacher_id == gold_id),
-                        "match_teacher": bool(pred_id == teacher_id),
-                    }
-                )
+                pred_row = {
+                    "translator_type": translator_type,
+                    "layer_idx": layer_idx,
+                    "layer_name": layer_name,
+                    "form": form,
+                    "sample_id": sample_ids[global_i],
+                    "gold_id": gold_id,
+                    "gold": ID2REL[gold_id],
+                    "student_pred_id": pred_id,
+                    "student_pred": ID2REL[pred_id],
+                    "teacher_pred_id": teacher_id,
+                    "teacher_pred": ID2REL[teacher_id],
+                    "student_correct": bool(pred_id == gold_id),
+                    "teacher_correct": bool(teacher_id == gold_id),
+                    "match_teacher": bool(pred_id == teacher_id),
+                }
+
+                for rel_i, rel in enumerate(RELATIONS):
+                    pred_row[f"student_prob_{rel}"] = float(student_probs[local_i, rel_i].item())
+                    pred_row[f"teacher_prob_{rel}"] = float(teacher_probs[local_i, rel_i].item())
+                    pred_row[f"student_logit_{rel}"] = float(student_logits[local_i, rel_i].item())
+                    pred_row[f"teacher_logit_{rel}"] = float(teacher_logits_small[local_i, rel_i].item())
+
+                pred_row["student_gold_prob"] = float(student_probs[local_i, gold_id].item())
+                pred_row["teacher_gold_prob"] = float(teacher_probs[local_i, gold_id].item())
+                pred_row["student_pred_prob"] = float(student_probs[local_i, pred_id].item())
+                pred_row["teacher_pred_prob"] = float(teacher_probs[local_i, teacher_id].item())
+
+                pred_row["student_gold_logit"] = float(student_logits[local_i, gold_id].item())
+                pred_row["teacher_gold_logit"] = float(teacher_logits_small[local_i, gold_id].item())
+                pred_row["student_pred_logit"] = float(student_logits[local_i, pred_id].item())
+                pred_row["teacher_pred_logit"] = float(teacher_logits_small[local_i, teacher_id].item())
+
+                pred_rows.append(pred_row)
 
         msg = [f"layer {layer_idx:02d} ({layer_name})"]
         for form in token_ids_by_form:
@@ -1083,6 +1204,8 @@ def run_tuned_lens(
 
     print("\n[SAVED]", summary_path)
     print("[SAVED]", pred_path)
+
+    print_prob_logit_summary(pred_df)
 
     return summary_df, pred_df
 
@@ -1158,7 +1281,10 @@ def main():
         device = "cpu"
         args.dtype = "float32"
 
-    out_dir = Path(args.out_dir or f"output/stage1_prompt_only_vocab_tuned_lens_{args.dataset}_{args.translator_type}")
+    out_dir = Path(
+        args.out_dir
+        or f"output/stage1_prompt_only_vocab_tuned_lens_{args.dataset}_{args.translator_type}"
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
 
     random.seed(args.seed)
