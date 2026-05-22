@@ -1348,6 +1348,71 @@ def build_adaptvis_keys_from_input_batch(
     return keys
 
 
+
+def get_llava_pad_token_id(model, processor) -> int:
+    """
+    Match the pad_token_id used by LlavaForConditionalGenerationScal._merge_input_ids_with_image_features.
+    """
+    pad_token_id = getattr(model, "pad_token_id", None)
+
+    if pad_token_id is None:
+        pad_token_id = getattr(getattr(model, "config", None), "pad_token_id", None)
+
+    if pad_token_id is None:
+        tokenizer = getattr(processor, "tokenizer", None)
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+
+    if pad_token_id is None:
+        pad_token_id = -1
+
+    return int(pad_token_id)
+
+
+def build_original_to_expanded_position_map(
+    input_ids: torch.Tensor,
+    image_token_id: int,
+    num_image_tokens: int,
+    pad_token_id: int,
+) -> torch.Tensor:
+    """
+    Map original input_ids positions to expanded LLaVA sequence positions.
+
+    Current AdaptVis/LLaVA-1.5 processor input_ids usually contains one <image>
+    placeholder. The custom LlavaForConditionalGenerationScal expands this
+    placeholder into many visual patch embeddings inside forward(), so
+    outputs.logits may be indexed by the expanded sequence rather than the
+    original input_ids sequence.
+
+    This mirrors the position mapping in _merge_input_ids_with_image_features:
+        new_token_positions = cumsum(mask * (num_image_tokens - 1) + 1) - 1
+
+    Returns:
+        LongTensor [batch, original_seq_len].
+        Text-token positions map to their corresponding expanded positions.
+        The <image> placeholder maps to the last image patch position; we do not
+        use that placeholder position for answer scoring.
+    """
+    special_image_token_mask = input_ids == int(image_token_id)
+
+    step = special_image_token_mask.long() * (int(num_image_tokens) - 1) + 1
+    new_token_positions = torch.cumsum(step, dim=-1) - 1
+
+    max_embed_dim = (
+        int(special_image_token_mask.sum(dim=-1).max().item()) * (int(num_image_tokens) - 1)
+    ) + input_ids.shape[1]
+
+    # Same left-padding check as HF/LLaVA merge code:
+    # if no sample has pad at the final position, assume left padding.
+    last_is_pad = input_ids[:, -1] == int(pad_token_id)
+    left_padding = not bool(last_is_pad.sum().item())
+
+    nb_image_pad = max_embed_dim - 1 - new_token_positions[:, -1]
+
+    if left_padding:
+        new_token_positions = new_token_positions + nb_image_pad[:, None]
+
+    return new_token_positions.long()
+
 def _score_dict_to_prob_dict(
     score_dict: Dict[str, Dict[str, Any]],
     score_key: str = "score",
@@ -1398,8 +1463,15 @@ def score_candidates_closed_set(
         S(candidate) = mean log p(candidate_tokens | prompt, image)
 
     For ScalingVis / AdaptVis, this function calls the Scal model forward with
-    the same AdaptVis parameters used during generation. Thus the attention-logit
-    multiplication is applied during teacher-forced scoring as well.
+    the same AdaptVis parameters used during generation.
+
+    Important index detail:
+        In this repository's custom LLaVA path, input_ids often contains only one
+        <image> placeholder, while the forward pass expands that placeholder into
+        many visual patch embeddings. In that case outputs.logits is indexed by
+        the expanded sequence. Therefore candidate answer-token positions must be
+        mapped from original input_ids positions to expanded positions before
+        reading log-probabilities.
     """
     if len(candidates) == 0:
         raise ValueError("score_candidates_closed_set received empty candidates.")
@@ -1417,17 +1489,13 @@ def score_candidates_closed_set(
 
     # Build keys from the actual closed-set batch, not from the shorter prompt-only
     # batch. This avoids length mismatch when the appended candidate adds tokens.
-    #
-    # Important:
-    #   input_ids usually contains a single <image> placeholder,
-    #   while LLaVA attention sees that placeholder expanded into image patch tokens.
-    #   Therefore AdaptVis keys must be expanded to the attention-level image span.
     image_token_id = int(
         os.getenv(
             "IMAGE_TOKEN_ID",
             str(getattr(getattr(model, "config", None), "image_token_index", 32001)),
         )
     )
+
     scoring_keys = build_adaptvis_keys_from_input_batch(
         input_ids_batch=inputs["input_ids"],
         model=model,
@@ -1456,20 +1524,48 @@ def score_candidates_closed_set(
 
     input_ids = inputs["input_ids"]
     attention_mask = inputs["attention_mask"]
+    tokenizer = processor.tokenizer
 
-    # logits[:, t - 1] predicts input_ids[:, t].
-    logits = outputs.logits[:, :-1, :]
-    target_ids = input_ids[:, 1:]
+    # If outputs.logits has a different sequence length from input_ids, the model
+    # returned expanded-sequence logits. Otherwise it returned input_ids-aligned logits.
+    use_expanded_logits = outputs.logits.shape[1] != input_ids.shape[1]
 
-    token_logprobs = F.log_softmax(logits.float(), dim=-1)
-    token_logprobs = token_logprobs.gather(
-        dim=-1,
-        index=target_ids.unsqueeze(-1),
-    ).squeeze(-1)
+    full_token_logprobs = F.log_softmax(outputs.logits.float(), dim=-1)
+
+    if use_expanded_logits:
+        num_image_tokens = infer_llava_num_image_tokens(model, processor)
+        pad_token_id = get_llava_pad_token_id(model, processor)
+
+        orig_to_expanded = build_original_to_expanded_position_map(
+            input_ids=input_ids,
+            image_token_id=image_token_id,
+            num_image_tokens=num_image_tokens,
+            pad_token_id=pad_token_id,
+        )
+
+        if os.getenv("DEBUG_CLOSED_SET_SHAPE", "False") == "True":
+            print("[DEBUG CLOSED SET SHAPE]")
+            print("  input_ids shape:", tuple(input_ids.shape))
+            print("  logits shape:", tuple(outputs.logits.shape))
+            print("  use_expanded_logits:", use_expanded_logits)
+            print("  num_image_tokens:", num_image_tokens)
+            print("  pad_token_id:", pad_token_id)
+            print("  orig_to_expanded shape:", tuple(orig_to_expanded.shape))
+    else:
+        orig_to_expanded = None
+
+        # Legacy/original-aligned case:
+        # logits[:, t - 1] predicts input_ids[:, t].
+        legacy_logits = outputs.logits[:, :-1, :]
+        legacy_target_ids = input_ids[:, 1:]
+
+        legacy_token_logprobs = F.log_softmax(legacy_logits.float(), dim=-1)
+        legacy_token_logprobs = legacy_token_logprobs.gather(
+            dim=-1,
+            index=legacy_target_ids.unsqueeze(-1),
+        ).squeeze(-1)
 
     score_dict: Dict[str, Dict[str, Any]] = {}
-
-    tokenizer = processor.tokenizer
 
     for i, cand in enumerate(candidates):
         cand_ids = _candidate_answer_token_ids(tokenizer, cand)
@@ -1485,15 +1581,11 @@ def score_candidates_closed_set(
 
         last_input_pos = int(valid_positions[-1].item())
         answer_input_start = last_input_pos - ans_len + 1
-        answer_target_start = answer_input_start - 1
-        answer_target_end = last_input_pos
 
-        if answer_target_start < 0 or answer_target_end > token_logprobs.shape[1]:
+        if answer_input_start < 0:
             raise ValueError(
                 f"Invalid answer span for candidate={cand!r}: "
-                f"answer_target_start={answer_target_start}, "
-                f"answer_target_end={answer_target_end}, "
-                f"logprob_len={token_logprobs.shape[1]}"
+                f"answer_input_start={answer_input_start}, last_input_pos={last_input_pos}"
             )
 
         suffix_ids = [
@@ -1505,7 +1597,71 @@ def score_candidates_closed_set(
         # the final ans_len tokens but expose the mismatch for debugging.
         suffix_match = suffix_ids == cand_ids
 
-        cand_token_logprobs = token_logprobs[i, answer_target_start:answer_target_end]
+        target_token_ids = input_ids[
+            i,
+            answer_input_start:last_input_pos + 1,
+        ].long()
+
+        if use_expanded_logits:
+            answer_expanded_positions = orig_to_expanded[
+                i,
+                answer_input_start:last_input_pos + 1,
+            ].long()
+
+            # logits at expanded_pos - 1 predict the token at expanded_pos.
+            predict_positions = answer_expanded_positions - 1
+
+            if int(predict_positions.min().item()) < 0:
+                raise ValueError(
+                    f"Invalid expanded predict position for candidate={cand!r}: "
+                    f"predict_positions={predict_positions.detach().cpu().tolist()}"
+                )
+
+            if int(predict_positions.max().item()) >= full_token_logprobs.shape[1]:
+                raise ValueError(
+                    f"Expanded answer span out of range for candidate={cand!r}: "
+                    f"predict_positions={predict_positions.detach().cpu().tolist()}, "
+                    f"logit_len={full_token_logprobs.shape[1]}"
+                )
+
+            cand_token_logprobs = full_token_logprobs[
+                i,
+                predict_positions,
+                target_token_ids,
+            ]
+
+            answer_target_start = int(predict_positions[0].item())
+            answer_target_end = int(predict_positions[-1].item()) + 1
+
+            expanded_answer_positions_list = [
+                int(x)
+                for x in answer_expanded_positions.detach().cpu().tolist()
+            ]
+            predict_positions_list = [
+                int(x)
+                for x in predict_positions.detach().cpu().tolist()
+            ]
+
+        else:
+            answer_target_start = answer_input_start - 1
+            answer_target_end = last_input_pos
+
+            if answer_target_start < 0 or answer_target_end > legacy_token_logprobs.shape[1]:
+                raise ValueError(
+                    f"Invalid answer span for candidate={cand!r}: "
+                    f"answer_target_start={answer_target_start}, "
+                    f"answer_target_end={answer_target_end}, "
+                    f"logprob_len={legacy_token_logprobs.shape[1]}"
+                )
+
+            cand_token_logprobs = legacy_token_logprobs[
+                i,
+                answer_target_start:answer_target_end,
+            ]
+
+            expanded_answer_positions_list = None
+            predict_positions_list = None
+
         cand_score_sum = float(cand_token_logprobs.sum().item())
         cand_score_mean = float(cand_token_logprobs.mean().item())
 
@@ -1516,11 +1672,29 @@ def score_candidates_closed_set(
             "token_ids": cand_ids,
             "suffix_token_ids": suffix_ids,
             "suffix_match": bool(suffix_match),
+            "use_expanded_logits": bool(use_expanded_logits),
+            "answer_input_start_original": int(answer_input_start),
+            "last_input_pos_original": int(last_input_pos),
+            "answer_target_start": int(answer_target_start),
+            "answer_target_end": int(answer_target_end),
+            "expanded_answer_positions": expanded_answer_positions_list,
+            "predict_positions": predict_positions_list,
             "token_logprobs": [
                 float(x)
                 for x in cand_token_logprobs.detach().cpu().tolist()
             ],
         }
+
+        if os.getenv("DEBUG_CLOSED_SET_SPAN", "False") == "True":
+            print(
+                f"[DEBUG CLOSED SET SPAN] cand={cand!r} "
+                f"use_expanded={use_expanded_logits} "
+                f"orig_answer=({answer_input_start},{last_input_pos}) "
+                f"expanded_answer={expanded_answer_positions_list} "
+                f"predict_positions={predict_positions_list} "
+                f"suffix_match={suffix_match} "
+                f"score={cand_score_mean:.6f}"
+            )
 
     prob_dict, confidence, margin = _score_dict_to_prob_dict(score_dict, score_key="score")
     pred = max(score_dict.keys(), key=lambda c: score_dict[c]["score"])
