@@ -943,32 +943,7 @@ def add_metric_values(row: Dict, prefix: str, metrics: Dict):
     for k, v in metrics.items():
         row[f"{prefix}_{k}"] = float(v)
 
-
-def add_delta_values(row: Dict, before_prefix: str, after_prefix: str):
-    for r in RELATIONS:
-        row[f"delta_logit_{r}"] = row[f"{after_prefix}_logit_{r}"] - row[f"{before_prefix}_logit_{r}"]
-        row[f"delta_prob_{r}"] = row[f"{after_prefix}_prob_{r}"] - row[f"{before_prefix}_prob_{r}"]
-
-    metric_names = [
-        "image_mass",
-        "entropy_norm",
-        "effective_patches",
-        "top1_in_image",
-        "top5_in_image",
-        "obj1_ratio_in_image",
-        "obj2_ratio_in_image",
-        "pair_ratio_in_image",
-        "background_ratio_in_image",
-        "pair_balance",
-    ]
-
-    for m in metric_names:
-        b = row.get(f"{before_prefix}_{m}", np.nan)
-        a = row.get(f"{after_prefix}_{m}", np.nan)
-        try:
-            row[f"delta_{m"] = float(a) - float(b)
-        except Exception:
-            row[f"delta_{m}"] = np.nan
+、
 
 
 def safe_add_delta_values(row: Dict, before_prefix: str, after_prefix: str):
