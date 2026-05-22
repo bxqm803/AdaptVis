@@ -1,8 +1,10 @@
 import argparse
+import contextlib
 import json
 import math
 import random
 import re
+import types
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -10,7 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from tqdm import tqdm
 from transformers import AutoProcessor
 
@@ -24,6 +26,15 @@ try:
 except ImportError:
     from transformers import GroundingDinoForObjectDetection as GroundingDINOModel
 
+try:
+    from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
+except Exception as e:
+    apply_rotary_pos_emb = None
+    repeat_kv = None
+    LLAMA_IMPORT_ERROR = e
+else:
+    LLAMA_IMPORT_ERROR = None
+
 from dataset_zoo import get_dataset
 
 
@@ -33,10 +44,11 @@ GDINO_MODEL_ID = "IDEA-Research/grounding-dino-base"
 
 RELATIONS = ["left", "right", "on", "under"]
 REL2ID = {r: i for i, r in enumerate(RELATIONS)}
+ID2REL = {i: r for r, i in REL2ID.items()}
 
 
 # ============================================================
-# Prompt / dataset helpers
+# Dataset / prompt helpers
 # ============================================================
 
 def load_prompt_rows(dataset_name: str, option: str) -> List[dict]:
@@ -65,24 +77,41 @@ def strip_article(x: str) -> str:
     x = str(x).strip()
     x = re.sub(r"^(a|an|the)\s+", "", x, flags=re.IGNORECASE)
     x = re.sub(r"[.?!,:;]+$", "", x)
-    return x.strip()
+    x = re.sub(r"\s+", " ", x).strip()
+    return x
+
+
+def remove_answer_suffix(q: str) -> str:
+    q = clean_question(q)
+    q = re.sub(r"Answer\s+with\s+.*$", "", q, flags=re.IGNORECASE).strip()
+    q = re.sub(r"Choose\s+from\s+.*$", "", q, flags=re.IGNORECASE).strip()
+    q = re.sub(r"Options?\s*:.*$", "", q, flags=re.IGNORECASE).strip()
+    return q.strip()
 
 
 def parse_two_objects_from_prompt(prompt: str) -> Tuple[Optional[str], Optional[str]]:
-    q = clean_question(prompt)
-    q = re.sub(r"Answer\s+with\s+.*$", "", q, flags=re.IGNORECASE).strip()
+    """
+    Supports:
+      Where is/are X in relation to Y?
+      What is/are X in relation to Y?
+      Where is/are X relative to Y?
+      What is/are the spatial relation between X and Y?
+    """
+    q = remove_answer_suffix(prompt)
 
     patterns = [
-        r"Where\s+is\s+the\s+(.+?)\s+in\s+relation\s+to\s+the\s+(.+?)\?",
-        r"Where\s+is\s+the\s+(.+?)\s+in\s+relation\s+to\s+(.+?)\?",
-        r"Where\s+is\s+(.+?)\s+in\s+relation\s+to\s+the\s+(.+?)\?",
-        r"Where\s+is\s+(.+?)\s+in\s+relation\s+to\s+(.+?)\?",
+        r"(?:where|what)\s+(?:is|are)\s+(?:the\s+)?(.+?)\s+in\s+relation\s+to\s+(?:the\s+)?(.+?)\?",
+        r"(?:where|what)\s+(?:is|are)\s+(?:the\s+)?(.+?)\s+relative\s+to\s+(?:the\s+)?(.+?)\?",
+        r"(?:what)\s+(?:is|are)\s+(?:the\s+)?spatial\s+relation\s+(?:of|between)\s+(?:the\s+)?(.+?)\s+(?:to|and)\s+(?:the\s+)?(.+?)\?",
+        r"(?:what)\s+(?:is|are)\s+(?:the\s+)?(?:relationship|relation)\s+between\s+(?:the\s+)?(.+?)\s+and\s+(?:the\s+)?(.+?)\?",
     ]
 
     for p in patterns:
         m = re.search(p, q, flags=re.IGNORECASE)
         if m:
-            return strip_article(m.group(1)), strip_article(m.group(2))
+            obj1 = strip_article(m.group(1))
+            obj2 = strip_article(m.group(2))
+            return obj1, obj2
 
     return None, None
 
@@ -145,7 +174,7 @@ def load_dataset_any_signature(dataset_name: str, root_dir: str, download: bool)
 
 
 # ============================================================
-# LLaVA-like preprocessing
+# LLaVA image preprocessing
 # ============================================================
 
 def get_size_value(size_obj, key: str, default: int) -> int:
@@ -316,8 +345,8 @@ def load_llava_hf(
             attn_implementation="eager",
         )
     except TypeError:
-        print("[WARN] attn_implementation='eager' not supported by this transformers version.")
-        print("[WARN] If output_attentions returns None, upgrade transformers or load model with eager attention.")
+        print("[WARN] attn_implementation='eager' not supported.")
+        print("[WARN] output_attentions may be None unless transformers supports eager attention.")
         model = LlavaModel.from_pretrained(
             model_id,
             revision=revision,
@@ -341,50 +370,13 @@ def load_llava_hf(
     model.config.output_hidden_states = True
     model.config.use_cache = False
 
+    print("[INFO] loaded LLaVA")
+    print("  model:", type(model))
+    print("  processor:", type(processor))
+    print("  patch_size:", processor.patch_size)
+    print("  vision_feature_select_strategy:", processor.vision_feature_select_strategy)
+
     return processor, model
-
-
-def nested_getattr(obj, path: str):
-    cur = obj
-    for p in path.split("."):
-        if not hasattr(cur, p):
-            return None
-        cur = getattr(cur, p)
-    return cur
-
-
-def get_lm_head_and_final_norm(model):
-    lm_head_candidates = [
-        "language_model.lm_head",
-        "lm_head",
-        "model.lm_head",
-    ]
-
-    norm_candidates = [
-        "language_model.model.norm",
-        "language_model.norm",
-        "model.norm",
-        "norm",
-    ]
-
-    lm_head = None
-    for p in lm_head_candidates:
-        lm_head = nested_getattr(model, p)
-        if lm_head is not None:
-            break
-
-    final_norm = None
-    for p in norm_candidates:
-        final_norm = nested_getattr(model, p)
-        if final_norm is not None:
-            break
-
-    if lm_head is None:
-        raise RuntimeError("Cannot find lm_head.")
-    if final_norm is None:
-        raise RuntimeError("Cannot find final_norm.")
-
-    return lm_head, final_norm
 
 
 # ============================================================
@@ -401,7 +393,7 @@ def detect_one(
     box_threshold: float,
     text_threshold: float,
 ) -> Tuple[Optional[List[float]], Optional[float]]:
-    text = phrase.strip()
+    text = str(phrase).strip()
     if not text.endswith("."):
         text += "."
 
@@ -437,7 +429,7 @@ def detect_one(
 
 
 # ============================================================
-# Token / grid helpers
+# Tokens / boxes / metrics
 # ============================================================
 
 def candidate_text_for_rel(rel: str, form: str = "lower_nospace") -> str:
@@ -470,21 +462,12 @@ def get_image_token_positions(inputs, model, processor) -> torch.Tensor:
 
     image_token_id = getattr(model.config, "image_token_index", None)
     if image_token_id is None:
-        try:
-            image_token_id = processor.tokenizer.convert_tokens_to_ids("<image>")
-        except Exception:
-            image_token_id = None
-
-    if image_token_id is None:
-        raise RuntimeError("Cannot infer image token id.")
+        image_token_id = processor.tokenizer.convert_tokens_to_ids("<image>")
 
     pos = torch.nonzero(input_ids == image_token_id, as_tuple=False).squeeze(-1)
 
     if pos.numel() == 0:
-        raise RuntimeError(
-            "No image token found in input_ids. "
-            "Check prompt format and processor.patch_size / vision_feature_select_strategy."
-        )
+        raise RuntimeError("No image token found in input_ids.")
 
     return pos
 
@@ -517,56 +500,11 @@ def union_ids(a: List[int], b: List[int]) -> List[int]:
     return sorted(set(a) | set(b))
 
 
-# ============================================================
-# Relation logits and attention metrics
-# ============================================================
-
-@torch.no_grad()
-def relation_probs_from_hidden_states(
-    hidden_states,
-    last_pos: int,
-    rel_token_ids: torch.Tensor,
-    final_norm,
-    lm_head,
-    device: str,
-) -> Dict:
-    rel_token_ids = rel_token_ids.to(device)
-    model_dtype = next(lm_head.parameters()).dtype
-
-    all_logits = []
-    all_probs = []
-
-    for h in hidden_states:
-        h_last = h[0, last_pos, :].to(model_dtype)
-        logits = lm_head(final_norm(h_last)).float()
-        rel_logits = logits.index_select(dim=-1, index=rel_token_ids)
-        rel_probs = torch.softmax(rel_logits, dim=-1)
-
-        all_logits.append(rel_logits.detach().cpu())
-        all_probs.append(rel_probs.detach().cpu())
-
-    layer_logits = torch.stack(all_logits, dim=0)  # [num_hidden_layers, 4]
-    layer_probs = torch.stack(all_probs, dim=0)
-
-    return {
-        "layer_logits": layer_logits,
-        "layer_probs": layer_probs,
-    }
-
-
-def top_margin(prob: torch.Tensor) -> Tuple[int, float]:
-    top2 = torch.topk(prob, k=2)
-    pred = int(top2.indices[0].item())
-    margin = float((top2.values[0] - top2.values[1]).item())
-    return pred, margin
-
-
 def entropy_metrics(vec: torch.Tensor, eps: float = 1e-12) -> Dict:
     vec = vec.float()
     total = float(vec.sum().item())
 
     if total <= eps:
-        n = int(vec.numel())
         return {
             "image_mass": 0.0,
             "entropy": 0.0,
@@ -581,7 +519,6 @@ def entropy_metrics(vec: torch.Tensor, eps: float = 1e-12) -> Dict:
     n = int(p.numel())
     ent_norm = ent / math.log(max(n, 2))
     eff = math.exp(ent)
-
     topk = torch.topk(p, k=min(5, n)).values
 
     return {
@@ -648,78 +585,318 @@ def attention_box_metrics(
     return base
 
 
-@torch.no_grad()
-def compute_sample_diagnostics(
-    model,
-    processor,
-    final_norm,
-    lm_head,
-    gdino_processor,
-    gdino_model,
-    dataset,
-    prompt_rows,
-    sample_id: int,
-    device: str,
-    rel_token_ids: torch.Tensor,
-    image_source: str,
-    preprocess_mode: str,
-    box_threshold: float,
-    text_threshold: float,
-    patch_size: int,
+def rel_from_logits(vocab_logits: torch.Tensor, rel_token_ids: torch.Tensor) -> Dict:
+    rel_token_ids = rel_token_ids.to(vocab_logits.device)
+    rel_logits = vocab_logits.index_select(dim=-1, index=rel_token_ids).float()
+    rel_probs = torch.softmax(rel_logits, dim=-1)
+    pred_id = int(rel_probs.argmax().item())
+
+    top2 = torch.topk(rel_probs, k=2)
+    margin = float((top2.values[0] - top2.values[1]).item())
+
+    out = {
+        "pred_id": pred_id,
+        "pred": RELATIONS[pred_id],
+        "margin": margin,
+        "rel_logits": rel_logits.detach().cpu(),
+        "rel_probs": rel_probs.detach().cpu(),
+    }
+    return out
+
+
+def collect_attention_metrics(
+    attentions,
+    image_positions: torch.Tensor,
+    last_pos: int,
     attn_layers: List[int],
-    mid_layers: List[int],
-    save_heatmap_tensor: bool = False,
-):
-    prompt = prompt_rows[sample_id].get("question", "")
-    gold = get_gold_from_prompt_row(prompt_rows[sample_id])
-    obj1, obj2 = parse_two_objects_from_prompt(prompt)
+    obj1_ids: List[int],
+    obj2_ids: List[int],
+) -> Dict:
+    rows = []
 
-    if obj1 is None or obj2 is None:
-        return None
+    for layer_id in attn_layers:
+        if layer_id <= 0:
+            continue
 
-    raw = get_raw_pil_from_dataset(dataset, sample_id)
-    processed, meta = make_processed_pil_like_llava(
-        raw=raw,
-        image_processor=processor.image_processor,
-        force_mode=preprocess_mode,
-    )
-    image = processed if image_source == "processed" else raw
+        attn_idx = layer_id - 1
+        if attn_idx < 0 or attn_idx >= len(attentions):
+            continue
 
-    box1, score1 = detect_one(
-        image=processed,
-        phrase=obj1,
-        processor=gdino_processor,
-        model=gdino_model,
-        device=device,
-        box_threshold=box_threshold,
-        text_threshold=text_threshold,
-    )
-    box2, score2 = detect_one(
-        image=processed,
-        phrase=obj2,
-        processor=gdino_processor,
-        model=gdino_model,
-        device=device,
-        box_threshold=box_threshold,
-        text_threshold=text_threshold,
-    )
+        A = attentions[attn_idx]  # [1, heads, tgt, src]
+        A_img = A[0, :, last_pos, :].index_select(dim=-1, index=image_positions)
+        A_img_mean = A_img.mean(dim=0).detach().float().cpu()
 
-    image_size = processed.size[0]
-    grid = image_size // patch_size
-    obj1_ids, grid_box1 = box_to_patch_ids(box1, image_size=image_size, patch_size=patch_size)
-    obj2_ids, grid_box2 = box_to_patch_ids(box2, image_size=image_size, patch_size=patch_size)
+        m = attention_box_metrics(A_img_mean, obj1_ids, obj2_ids)
+        m["attn_layer"] = layer_id
+        rows.append(m)
 
-    inputs = processor(
-        text=[prompt],
-        images=[image],
-        return_tensors="pt",
-        padding=True,
-    ).to(device)
+    if not rows:
+        return {}
 
+    df = pd.DataFrame(rows)
+    avg = df.drop(columns=["attn_layer"]).mean(numeric_only=True).to_dict()
+    return avg
+
+
+# ============================================================
+# Attention intervention
+# ============================================================
+
+class AttentionScalingController:
+    """
+    Post-softmax renormalized attention scaling.
+
+    For selected decoder layers and selected query position:
+      A[..., target_key_positions] *= alpha
+      A = A / sum(A)
+
+    This directly tests whether boosting/suppressing specific key groups
+    changes final relation logits.
+    """
+    def __init__(
+        self,
+        layers_hidden_idx: List[int],
+        target_positions: torch.Tensor,
+        query_position: int,
+        alpha: float,
+        heads: Optional[List[int]] = None,
+    ):
+        self.layers_hidden_idx = set(int(x) for x in layers_hidden_idx)
+        self.target_positions = target_positions
+        self.query_position = int(query_position)
+        self.alpha = float(alpha)
+        self.heads = heads
+
+    def should_apply(self, decoder_layer_idx: int) -> bool:
+        # decoder layer 0 corresponds to hidden state layer 1
+        hidden_layer_idx = decoder_layer_idx + 1
+        return hidden_layer_idx in self.layers_hidden_idx
+
+    def modify(self, decoder_layer_idx: int, attn_probs: torch.Tensor) -> torch.Tensor:
+        if not self.should_apply(decoder_layer_idx):
+            return attn_probs
+
+        if self.target_positions is None or self.target_positions.numel() == 0:
+            return attn_probs
+
+        q = self.query_position
+        target = self.target_positions.to(attn_probs.device)
+
+        attn_probs = attn_probs.clone()
+
+        if self.heads is None:
+            slice_q = attn_probs[:, :, q, :]
+            slice_q[:, :, target] = slice_q[:, :, target] * self.alpha
+            slice_q = slice_q / (slice_q.sum(dim=-1, keepdim=True) + 1e-12)
+            attn_probs[:, :, q, :] = slice_q
+        else:
+            heads = torch.tensor(self.heads, dtype=torch.long, device=attn_probs.device)
+            slice_q = attn_probs[:, heads, q, :]
+            slice_q[:, :, target] = slice_q[:, :, target] * self.alpha
+            slice_q = slice_q / (slice_q.sum(dim=-1, keepdim=True) + 1e-12)
+            attn_probs[:, heads, q, :] = slice_q
+
+        return attn_probs
+
+
+def get_decoder_layers(model):
+    candidates = [
+        "language_model.model.layers",
+        "model.layers",
+        "language_model.layers",
+    ]
+
+    cur = None
+    for path in candidates:
+        obj = model
+        ok = True
+        for p in path.split("."):
+            if not hasattr(obj, p):
+                ok = False
+                break
+            obj = getattr(obj, p)
+        if ok:
+            cur = obj
+            break
+
+    if cur is None:
+        raise RuntimeError("Cannot find decoder layers in model.")
+
+    return cur
+
+
+def make_patched_llama_attention_forward(controller: AttentionScalingController):
+    if apply_rotary_pos_emb is None or repeat_kv is None:
+        raise RuntimeError(f"Cannot import LLaMA attention utilities: {LLAMA_IMPORT_ERROR}")
+
+    def patched_forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value=None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
+    ):
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        num_heads = getattr(self, "num_heads")
+        num_kv_heads = getattr(self, "num_key_value_heads")
+        num_kv_groups = getattr(self, "num_key_value_groups")
+        head_dim = getattr(self, "head_dim")
+
+        query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+
+        if position_embeddings is None:
+            # older/newer transformers compatibility
+            try:
+                cos, sin = self.rotary_emb(value_states, position_ids)
+            except TypeError:
+                kv_seq_len = key_states.shape[-2]
+                if past_key_value is not None:
+                    try:
+                        kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+                    except Exception:
+                        pass
+                cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        else:
+            cos, sin = position_embeddings
+
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states,
+            key_states,
+            cos,
+            sin,
+            position_ids,
+        )
+
+        if past_key_value is not None:
+            cache_kwargs = {
+                "sin": sin,
+                "cos": cos,
+                "cache_position": cache_position,
+            }
+            key_states, value_states = past_key_value.update(
+                key_states,
+                value_states,
+                self.layer_idx,
+                cache_kwargs,
+            )
+
+        key_states = repeat_kv(key_states, num_kv_groups)
+        value_states = repeat_kv(value_states, num_kv_groups)
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
+
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights = attn_weights + causal_mask
+
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+        layer_idx = int(getattr(self, "layer_idx", -1))
+        attn_weights = controller.modify(layer_idx, attn_weights)
+
+        dropout_p = float(getattr(self, "attention_dropout", 0.0))
+        attn_weights_drop = F.dropout(attn_weights, p=dropout_p, training=self.training)
+
+        attn_output = torch.matmul(attn_weights_drop, value_states)
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, -1)
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights_to_return = None
+        else:
+            attn_weights_to_return = attn_weights
+
+        return attn_output, attn_weights_to_return, past_key_value
+
+    return patched_forward
+
+
+@contextlib.contextmanager
+def patch_llama_attentions(model, controller: AttentionScalingController):
+    layers = get_decoder_layers(model)
+    patched_forward = make_patched_llama_attention_forward(controller)
+
+    originals = []
+    try:
+        for layer in layers:
+            attn = layer.self_attn
+            originals.append((attn, attn.forward))
+            attn.forward = types.MethodType(patched_forward, attn)
+        yield
+    finally:
+        for attn, orig_forward in originals:
+            attn.forward = orig_forward
+
+
+def local_patch_ids_for_target(
+    mode: str,
+    n_img: int,
+    obj1_ids: List[int],
+    obj2_ids: List[int],
+    rng: random.Random,
+) -> List[int]:
+    obj1_ids = [i for i in obj1_ids if 0 <= i < n_img]
+    obj2_ids = [i for i in obj2_ids if 0 <= i < n_img]
+    pair_ids = union_ids(obj1_ids, obj2_ids)
+    all_ids = list(range(n_img))
+    bg_ids = sorted(set(all_ids) - set(pair_ids))
+
+    if mode == "global":
+        return all_ids
+
+    if mode == "object1":
+        return obj1_ids
+
+    if mode == "object2":
+        return obj2_ids
+
+    if mode == "object_pair":
+        return pair_ids
+
+    if mode == "background":
+        return bg_ids
+
+    if mode == "random":
+        k = max(1, len(pair_ids))
+        k = min(k, n_img)
+        return sorted(rng.sample(all_ids, k))
+
+    raise ValueError(f"Unknown target mode: {mode}")
+
+
+# ============================================================
+# Forward + collection
+# ============================================================
+
+@torch.no_grad()
+def run_forward_collect(
+    model,
+    inputs,
+    rel_token_ids: torch.Tensor,
+    image_positions: torch.Tensor,
+    last_pos: int,
+    attn_layers: List[int],
+    obj1_ids: List[int],
+    obj2_ids: List[int],
+) -> Dict:
     outputs = model(
         **inputs,
-        output_hidden_states=True,
         output_attentions=True,
+        output_hidden_states=True,
         return_dict=True,
         use_cache=False,
     )
@@ -727,308 +904,374 @@ def compute_sample_diagnostics(
     if outputs.attentions is None:
         raise RuntimeError(
             "outputs.attentions is None. "
-            "Load LLaVA with attn_implementation='eager' or upgrade transformers."
+            "Use attn_implementation='eager' or compatible transformers."
         )
+
+    # Pure final output: exactly the model output logits.
+    final_vocab_logits = outputs.logits[0, last_pos, :].detach().float()
+    rel = rel_from_logits(final_vocab_logits, rel_token_ids.to(final_vocab_logits.device))
+
+    attn_metrics = collect_attention_metrics(
+        attentions=outputs.attentions,
+        image_positions=image_positions,
+        last_pos=last_pos,
+        attn_layers=attn_layers,
+        obj1_ids=obj1_ids,
+        obj2_ids=obj2_ids,
+    )
+
+    return {
+        "rel": rel,
+        "attn_metrics": attn_metrics,
+    }
+
+
+def add_rel_values(row: Dict, prefix: str, rel_obj: Dict):
+    row[f"{prefix}_pred"] = rel_obj["pred"]
+    row[f"{prefix}_pred_id"] = rel_obj["pred_id"]
+    row[f"{prefix}_margin"] = rel_obj["margin"]
+
+    logits = rel_obj["rel_logits"]
+    probs = rel_obj["rel_probs"]
+
+    for i, r in enumerate(RELATIONS):
+        row[f"{prefix}_logit_{r}"] = float(logits[i].item())
+        row[f"{prefix}_prob_{r}"] = float(probs[i].item())
+
+
+def add_metric_values(row: Dict, prefix: str, metrics: Dict):
+    for k, v in metrics.items():
+        row[f"{prefix}_{k}"] = float(v)
+
+
+def add_delta_values(row: Dict, before_prefix: str, after_prefix: str):
+    for r in RELATIONS:
+        row[f"delta_logit_{r}"] = row[f"{after_prefix}_logit_{r}"] - row[f"{before_prefix}_logit_{r}"]
+        row[f"delta_prob_{r}"] = row[f"{after_prefix}_prob_{r}"] - row[f"{before_prefix}_prob_{r}"]
+
+    metric_names = [
+        "image_mass",
+        "entropy_norm",
+        "effective_patches",
+        "top1_in_image",
+        "top5_in_image",
+        "obj1_ratio_in_image",
+        "obj2_ratio_in_image",
+        "pair_ratio_in_image",
+        "background_ratio_in_image",
+        "pair_balance",
+    ]
+
+    for m in metric_names:
+        b = row.get(f"{before_prefix}_{m}", np.nan)
+        a = row.get(f"{after_prefix}_{m}", np.nan)
+        try:
+            row[f"delta_{m"] = float(a) - float(b)
+        except Exception:
+            row[f"delta_{m}"] = np.nan
+
+
+def safe_add_delta_values(row: Dict, before_prefix: str, after_prefix: str):
+    for r in RELATIONS:
+        row[f"delta_logit_{r}"] = row[f"{after_prefix}_logit_{r}"] - row[f"{before_prefix}_logit_{r}"]
+        row[f"delta_prob_{r}"] = row[f"{after_prefix}_prob_{r}"] - row[f"{before_prefix}_prob_{r}"]
+
+    metric_names = [
+        "image_mass",
+        "entropy_norm",
+        "effective_patches",
+        "top1_in_image",
+        "top5_in_image",
+        "obj1_ratio_in_image",
+        "obj2_ratio_in_image",
+        "pair_ratio_in_image",
+        "background_ratio_in_image",
+        "pair_balance",
+    ]
+
+    for m in metric_names:
+        b = row.get(f"{before_prefix}_{m}", np.nan)
+        a = row.get(f"{after_prefix}_{m}", np.nan)
+        try:
+            row[f"delta_{m}"] = float(a) - float(b)
+        except Exception:
+            row[f"delta_{m}"] = np.nan
+
+
+def parse_experiments(spec: str):
+    """
+    spec example:
+      global:1.5,object_pair:1.5,background:1.5,random:1.5,global:0.7,object_pair:0.7
+    """
+    exps = []
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        mode, alpha = item.split(":")
+        exps.append((mode.strip(), float(alpha)))
+    return exps
+
+
+# ============================================================
+# Sample processing
+# ============================================================
+
+@torch.no_grad()
+def process_one_sample(
+    sid: int,
+    model,
+    processor,
+    gdino_processor,
+    gdino_model,
+    dataset,
+    prompt_rows,
+    rel_token_ids,
+    args,
+    attn_layers: List[int],
+    intervention_layers: List[int],
+    experiments: List[Tuple[str, float]],
+    rng: random.Random,
+):
+    prompt = prompt_rows[sid].get("question", "")
+    gold = get_gold_from_prompt_row(prompt_rows[sid])
+    obj1, obj2 = parse_two_objects_from_prompt(prompt)
+
+    if obj1 is None or obj2 is None:
+        return [], {"parse_fail": 1, "parse_prompt": clean_question(prompt)}
+
+    raw = get_raw_pil_from_dataset(dataset, sid)
+    processed, _ = make_processed_pil_like_llava(
+        raw=raw,
+        image_processor=processor.image_processor,
+        force_mode=args.preprocess_mode,
+    )
+    image = processed if args.image_source == "processed" else raw
+
+    box1, score1 = detect_one(
+        image=processed,
+        phrase=obj1,
+        processor=gdino_processor,
+        model=gdino_model,
+        device=args.device,
+        box_threshold=args.box_threshold,
+        text_threshold=args.text_threshold,
+    )
+
+    box2, score2 = detect_one(
+        image=processed,
+        phrase=obj2,
+        processor=gdino_processor,
+        model=gdino_model,
+        device=args.device,
+        box_threshold=args.box_threshold,
+        text_threshold=args.text_threshold,
+    )
+
+    image_size = processed.size[0]
+    obj1_ids, grid_box1 = box_to_patch_ids(
+        box1,
+        image_size=image_size,
+        patch_size=args.patch_size,
+    )
+    obj2_ids, grid_box2 = box_to_patch_ids(
+        box2,
+        image_size=image_size,
+        patch_size=args.patch_size,
+    )
+
+    inputs = processor(
+        text=[prompt],
+        images=[image],
+        return_tensors="pt",
+        padding=True,
+    ).to(args.device)
 
     attention_mask = inputs["attention_mask"]
     nonpad_positions = torch.nonzero(attention_mask[0], as_tuple=False).squeeze(-1)
     last_pos = int(nonpad_positions[-1].item())
 
-    image_positions = get_image_token_positions(inputs, model, processor).to(device)
+    image_positions = get_image_token_positions(inputs, model, processor).to(args.device)
+    n_img = int(image_positions.numel())
 
-    rel_obj = relation_probs_from_hidden_states(
-        hidden_states=outputs.hidden_states,
-        last_pos=last_pos,
+    base = run_forward_collect(
+        model=model,
+        inputs=inputs,
         rel_token_ids=rel_token_ids,
-        final_norm=final_norm,
-        lm_head=lm_head,
-        device=device,
+        image_positions=image_positions,
+        last_pos=last_pos,
+        attn_layers=attn_layers,
+        obj1_ids=obj1_ids,
+        obj2_ids=obj2_ids,
     )
 
-    layer_probs = rel_obj["layer_probs"]
-    layer_logits = rel_obj["layer_logits"]
+    base_pred = base["rel"]["pred"]
+    base_correct = bool(gold in REL2ID and base_pred == gold)
 
-    final_probs = layer_probs[-1]
-    final_logits = layer_logits[-1]
+    rows = []
 
-    mid_valid_layers = [l for l in mid_layers if 0 <= l < layer_probs.shape[0]]
-    mid_probs = layer_probs[mid_valid_layers].mean(dim=0)
-    mid_logits = layer_logits[mid_valid_layers].mean(dim=0)
-
-    final_pred_id, final_margin = top_margin(final_probs)
-    mid_pred_id, mid_margin = top_margin(mid_probs)
-
-    attn_layer_rows = []
-    heatmap_sum = None
-    heatmap_count = 0
-
-    for layer_id in attn_layers:
-        # hidden_state layer_i corresponds to attention tuple index i - 1
-        if layer_id <= 0:
-            continue
-
-        attn_idx = layer_id - 1
-        if attn_idx < 0 or attn_idx >= len(outputs.attentions):
-            continue
-
-        A = outputs.attentions[attn_idx]  # [1, heads, tgt, src]
-        A_img = A[0, :, last_pos, :].index_select(dim=-1, index=image_positions)  # [heads, n_img]
-
-        # average over heads first
-        A_img_mean = A_img.mean(dim=0).detach().float().cpu()
-
-        metrics = attention_box_metrics(
-            att_img_raw=A_img_mean,
+    for target_mode, alpha in experiments:
+        local_target_ids = local_patch_ids_for_target(
+            mode=target_mode,
+            n_img=n_img,
             obj1_ids=obj1_ids,
             obj2_ids=obj2_ids,
-        )
-        metrics["attn_layer"] = layer_id
-        attn_layer_rows.append(metrics)
-
-        if save_heatmap_tensor:
-            if heatmap_sum is None:
-                heatmap_sum = A_img_mean.clone()
-            else:
-                heatmap_sum += A_img_mean
-            heatmap_count += 1
-
-    if len(attn_layer_rows) == 0:
-        return None
-
-    attn_df = pd.DataFrame(attn_layer_rows)
-    avg_metrics = attn_df.drop(columns=["attn_layer"]).mean(numeric_only=True).to_dict()
-
-    row = {
-        "sample_id": sample_id,
-        "gold": gold,
-        "question": clean_question(prompt),
-        "obj1": obj1,
-        "obj2": obj2,
-        "gdino_score1": score1,
-        "gdino_score2": score2,
-        "box1": json.dumps(box1),
-        "box2": json.dumps(box2),
-        "grid_box1": json.dumps(grid_box1),
-        "grid_box2": json.dumps(grid_box2),
-        "final_pred": RELATIONS[final_pred_id],
-        "mid_pred": RELATIONS[mid_pred_id],
-        "final_margin": final_margin,
-        "mid_margin": mid_margin,
-        "middle_final_disagree": bool(final_pred_id != mid_pred_id),
-        "final_correct": bool(gold in REL2ID and final_pred_id == REL2ID[gold]),
-        "mid_correct": bool(gold in REL2ID and mid_pred_id == REL2ID[gold]),
-        "processed_width": processed.size[0],
-        "processed_height": processed.size[1],
-        "grid": grid,
-    }
-
-    for i, rel in enumerate(RELATIONS):
-        row[f"final_prob_{rel}"] = float(final_probs[i].item())
-        row[f"mid_prob_{rel}"] = float(mid_probs[i].item())
-        row[f"final_logit_{rel}"] = float(final_logits[i].item())
-        row[f"mid_logit_{rel}"] = float(mid_logits[i].item())
-
-    row.update({f"attn_{k}": v for k, v in avg_metrics.items()})
-
-    heatmap = None
-    if save_heatmap_tensor and heatmap_sum is not None and heatmap_count > 0:
-        heatmap = heatmap_sum / heatmap_count
-
-    return {
-        "row": row,
-        "processed": processed,
-        "heatmap": heatmap,
-        "box1": box1,
-        "box2": box2,
-        "obj1": obj1,
-        "obj2": obj2,
-    }
-
-
-# ============================================================
-# Classification after collecting metrics
-# ============================================================
-
-def classify_rows_with_quantiles(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    eff = df["attn_effective_patches"]
-    top5 = df["attn_top5_in_image"]
-    pair = df["attn_pair_ratio_in_image"]
-    bal = df["attn_pair_balance"]
-
-    high_eff = eff.quantile(0.75)
-    low_eff = eff.quantile(0.25)
-    high_top5 = top5.quantile(0.75)
-    low_pair = pair.quantile(0.33)
-    low_balance = bal.quantile(0.33)
-
-    final_low_margin = df["final_margin"].quantile(0.35)
-    mid_high_margin = df["mid_margin"].quantile(0.65)
-
-    categories = []
-
-    for _, r in df.iterrows():
-        is_stable = (
-            r["final_margin"] > final_low_margin
-            and r["middle_final_disagree"] is False
+            rng=rng,
         )
 
-        is_diffuse = (
-            r["attn_effective_patches"] >= high_eff
-            and r["attn_pair_ratio_in_image"] <= low_pair
+        if len(local_target_ids) == 0:
+            continue
+
+        target_local_t = torch.tensor(local_target_ids, dtype=torch.long, device=args.device)
+        target_positions = image_positions.index_select(dim=0, index=target_local_t)
+
+        controller = AttentionScalingController(
+            layers_hidden_idx=intervention_layers,
+            target_positions=target_positions,
+            query_position=last_pos,
+            alpha=alpha,
+            heads=None,
         )
 
-        is_wrong_region_focus = (
-            r["attn_effective_patches"] <= low_eff
-            and r["attn_top5_in_image"] >= high_top5
-            and r["attn_pair_ratio_in_image"] <= low_pair
-        )
+        with patch_llama_attentions(model, controller):
+            after = run_forward_collect(
+                model=model,
+                inputs=inputs,
+                rel_token_ids=rel_token_ids,
+                image_positions=image_positions,
+                last_pos=last_pos,
+                attn_layers=attn_layers,
+                obj1_ids=obj1_ids,
+                obj2_ids=obj2_ids,
+            )
 
-        is_too_sharp_one_object = (
-            r["attn_effective_patches"] <= low_eff
-            and r["attn_top5_in_image"] >= high_top5
-            and r["attn_pair_balance"] <= low_balance
-            and r["attn_pair_ratio_in_image"] > low_pair
-        )
+        after_pred = after["rel"]["pred"]
+        after_correct = bool(gold in REL2ID and after_pred == gold)
 
-        is_middle_final_mismatch = (
-            r["final_margin"] <= final_low_margin
-            and r["mid_margin"] >= mid_high_margin
-            and bool(r["middle_final_disagree"])
-        )
+        row = {
+            "sample_id": sid,
+            "gold": gold,
+            "question": clean_question(prompt),
+            "obj1": obj1,
+            "obj2": obj2,
+            "gdino_score1": score1,
+            "gdino_score2": score2,
+            "box1": json.dumps(box1),
+            "box2": json.dumps(box2),
+            "grid_box1": json.dumps(grid_box1),
+            "grid_box2": json.dumps(grid_box2),
+            "target_mode": target_mode,
+            "alpha": alpha,
+            "intervention_layers": ",".join(map(str, intervention_layers)),
+            "attn_layers": ",".join(map(str, attn_layers)),
+            "target_patch_count": len(local_target_ids),
+            "n_image_tokens": n_img,
+            "base_correct": base_correct,
+            "after_correct": after_correct,
+            "corrected": bool((not base_correct) and after_correct),
+            "damaged": bool(base_correct and (not after_correct)),
+            "pred_changed": bool(base_pred != after_pred),
+        }
 
-        if is_wrong_region_focus:
-            cat = "wrong_region_focus"
-        elif is_too_sharp_one_object:
-            cat = "too_sharp_one_object"
-        elif is_diffuse:
-            cat = "too_diffuse"
-        elif is_middle_final_mismatch:
-            cat = "middle_final_mismatch"
-        elif is_stable:
-            cat = "stable_no_intervention"
+        add_rel_values(row, "base", base["rel"])
+        add_rel_values(row, "after", after["rel"])
+
+        add_metric_values(row, "base_attn", base["attn_metrics"])
+        add_metric_values(row, "after_attn", after["attn_metrics"])
+
+        safe_add_delta_values(row, "base", "after")
+        safe_add_delta_values(row, "base_attn", "after_attn")
+
+        if gold in REL2ID:
+            gid = REL2ID[gold]
+            row["base_gold_logit"] = row[f"base_logit_{gold}"]
+            row["after_gold_logit"] = row[f"after_logit_{gold}"]
+            row["delta_gold_logit"] = row[f"delta_logit_{gold}"]
+
+            row["base_gold_prob"] = row[f"base_prob_{gold}"]
+            row["after_gold_prob"] = row[f"after_prob_{gold}"]
+            row["delta_gold_prob"] = row[f"delta_prob_{gold}"]
         else:
-            cat = "ambiguous"
+            row["base_gold_logit"] = np.nan
+            row["after_gold_logit"] = np.nan
+            row["delta_gold_logit"] = np.nan
+            row["base_gold_prob"] = np.nan
+            row["after_gold_prob"] = np.nan
+            row["delta_gold_prob"] = np.nan
 
-        categories.append(cat)
+        rows.append(row)
 
-    df["pathology"] = categories
-
-    print("\n[INFO] dynamic thresholds")
-    print(f"  high_eff(q75)={high_eff:.4f}")
-    print(f"  low_eff(q25)={low_eff:.4f}")
-    print(f"  high_top5(q75)={high_top5:.4f}")
-    print(f"  low_pair(q33)={low_pair:.4f}")
-    print(f"  low_balance(q33)={low_balance:.4f}")
-    print(f"  final_low_margin(q35)={final_low_margin:.4f}")
-    print(f"  mid_high_margin(q65)={mid_high_margin:.4f}")
-
-    return df
+    return rows, {"parse_fail": 0}
 
 
 # ============================================================
-# Visualization
+# Summary
 # ============================================================
 
-def draw_grid(draw: ImageDraw.ImageDraw, size: int, grid: int):
-    step = size / grid
-    for i in range(1, grid):
-        x = int(round(i * step))
-        y = int(round(i * step))
-        draw.line([(x, 0), (x, size)], fill=(210, 210, 210), width=1)
-        draw.line([(0, y), (size, y)], fill=(210, 210, 210), width=1)
+def print_summary(df: pd.DataFrame):
+    print("\n================ SUMMARY ================")
+    print("rows:", len(df))
+    print("unique samples:", df["sample_id"].nunique())
 
+    print("\n[base pred ratio]")
+    print(df.drop_duplicates("sample_id")["base_pred"].value_counts(normalize=True).reindex(RELATIONS).fillna(0).to_string())
 
-def draw_box(
-    draw: ImageDraw.ImageDraw,
-    box: Optional[List[float]],
-    label: str,
-    color: Tuple[int, int, int],
-    font,
-):
-    if box is None:
-        return
-
-    x1, y1, x2, y2 = box
-    draw.rectangle([x1, y1, x2, y2], outline=color, width=4)
-
-    tb = draw.textbbox((0, 0), label, font=font)
-    tw, th = tb[2] - tb[0], tb[3] - tb[1]
-    y_text = max(0, int(y1) - th - 8)
-    x_text = max(0, int(x1))
-    draw.rectangle([x_text, y_text, x_text + tw + 8, y_text + th + 6], fill=(255, 255, 255))
-    draw.text((x_text + 4, y_text + 3), label, fill=color, font=font)
-
-
-def make_heatmap_overlay(
-    img: Image.Image,
-    heatmap: Optional[torch.Tensor],
-    alpha: float = 0.45,
-) -> Image.Image:
-    img = img.convert("RGB")
-
-    if heatmap is None:
-        return img
-
-    n = int(heatmap.numel())
-    grid = int(math.sqrt(n))
-    if grid * grid != n:
-        return img
-
-    h = heatmap.float()
-    h = h / (h.max() + 1e-12)
-    h_img = h.view(grid, grid).numpy()
-
-    heat = Image.fromarray(np.uint8(h_img * 255)).resize(img.size, Image.BICUBIC).convert("L")
-
-    red = Image.new("RGB", img.size, (255, 0, 0))
-    out = Image.composite(red, img, heat.point(lambda x: int(x * alpha)))
-    return out
-
-
-def make_vis(
-    processed: Image.Image,
-    heatmap: Optional[torch.Tensor],
-    box1,
-    box2,
-    obj1,
-    obj2,
-    row: Dict,
-) -> Image.Image:
-    base = make_heatmap_overlay(processed, heatmap)
-    draw = ImageDraw.Draw(base)
-
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 13)
-    except Exception:
-        font = ImageFont.load_default()
-
-    grid = int(row["grid"])
-    draw_grid(draw, size=base.size[0], grid=grid)
-
-    draw_box(draw, box1, f"obj1: {obj1}", (255, 0, 0), font)
-    draw_box(draw, box2, f"obj2: {obj2}", (0, 80, 255), font)
-
-    panel_h = 150
-    out = Image.new("RGB", (base.size[0], base.size[1] + panel_h), (255, 255, 255))
-    out.paste(base, (0, 0))
-    draw = ImageDraw.Draw(out)
-
-    lines = [
-        f"sid={row['sample_id']} | pathology={row.get('pathology', 'NA')} | gold={row['gold']}",
-        f"final={row['final_pred']} margin={row['final_margin']:.4f} | mid={row['mid_pred']} margin={row['mid_margin']:.4f}",
-        f"eff={row['attn_effective_patches']:.2f} | top5={row['attn_top5_in_image']:.3f} | pair={row['attn_pair_ratio_in_image']:.3f} | balance={row['attn_pair_balance']:.3f}",
-        f"obj1={obj1} | obj2={obj2}",
-        str(row["question"])[:110],
+    print("\n[by experiment]")
+    cols = [
+        "base_correct",
+        "after_correct",
+        "corrected",
+        "damaged",
+        "pred_changed",
+        "delta_gold_logit",
+        "delta_gold_prob",
+        "delta_pair_ratio_in_image",
+        "delta_background_ratio_in_image",
+        "delta_pair_balance",
+        "delta_effective_patches",
     ]
+    cols = [c for c in cols if c in df.columns]
 
-    y = base.size[1] + 6
-    for line in lines:
-        draw.text((6, y), line, fill=(0, 0, 0), font=font)
-        y += 27
+    g = (
+        df.groupby(["target_mode", "alpha"])[cols]
+        .mean()
+        .reset_index()
+        .sort_values(["after_correct", "corrected"], ascending=False)
+    )
+    print(g.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
 
-    return out
+    print("\n[pred ratio after by experiment]")
+    for (mode, alpha), sub in df.groupby(["target_mode", "alpha"]):
+        print(f"\n--- target={mode}, alpha={alpha} ---")
+        print(sub["after_pred"].value_counts(normalize=True).reindex(RELATIONS).fillna(0).to_string())
+
+    print("\n[per gold by experiment]")
+    rows = []
+    for (mode, alpha, gold), sub in df.groupby(["target_mode", "alpha", "gold"]):
+        rows.append({
+            "target_mode": mode,
+            "alpha": alpha,
+            "gold": gold,
+            "n": len(sub),
+            "base_acc": sub["base_correct"].mean(),
+            "after_acc": sub["after_correct"].mean(),
+            "corrected": sub["corrected"].mean(),
+            "damaged": sub["damaged"].mean(),
+            "delta_gold_logit": sub["delta_gold_logit"].mean(),
+            "delta_gold_prob": sub["delta_gold_prob"].mean(),
+            "delta_pair_ratio": sub.get("delta_pair_ratio_in_image", pd.Series([np.nan])).mean(),
+            "delta_balance": sub.get("delta_pair_balance", pd.Series([np.nan])).mean(),
+        })
+
+    per_gold = pd.DataFrame(rows)
+    print(
+        per_gold.sort_values(["target_mode", "alpha", "gold"])
+        .to_string(index=False, float_format=lambda x: f"{x:.6f}")
+    )
+
+    print("\n[mechanism hint]")
+    print("Grounding-like effect: corrected samples should show delta_pair_ratio > 0, delta_pair_balance > 0, delta_background < 0.")
+    print("Prior-shift effect: one relation logit/prob rises broadly even without pair_ratio improvement; check after pred ratio and delta_logit_*.")
 
 
 # ============================================================
@@ -1063,11 +1306,14 @@ def main():
     parser.add_argument("--patch-size", type=int, default=14)
 
     parser.add_argument("--attn-layers", default="16,17,18,19,20")
-    parser.add_argument("--mid-layers", default="16,17,18,19,20")
+    parser.add_argument("--intervention-layers", default="16,17,18,19,20")
     parser.add_argument("--relation-form", default="lower_nospace")
 
-    parser.add_argument("--save-vis", action="store_true")
-    parser.add_argument("--vis-per-category", type=int, default=20)
+    parser.add_argument(
+        "--experiments",
+        default="global:1.5,object_pair:1.5,background:1.5,random:1.5,global:0.7,object_pair:0.7",
+        help="Comma list like global:1.5,object_pair:1.5,background:1.5,random:1.5",
+    )
 
     args = parser.parse_args()
 
@@ -1075,20 +1321,19 @@ def main():
     if device == "cuda" and not torch.cuda.is_available():
         device = "cpu"
         args.dtype = "float32"
+    args.device = device
 
     out_dir = Path(
         args.out_dir
-        or f"output/stage1_attention_pathology_{args.dataset}"
+        or f"output/stage1_attention_scaling_mechanism_{args.dataset}"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    vis_dir = out_dir / "vis"
-    if args.save_vis:
-        vis_dir.mkdir(parents=True, exist_ok=True)
-
     attn_layers = [int(x) for x in args.attn_layers.split(",") if x.strip()]
-    mid_layers = [int(x) for x in args.mid_layers.split(",") if x.strip()]
+    intervention_layers = [int(x) for x in args.intervention_layers.split(",") if x.strip()]
+    experiments = parse_experiments(args.experiments)
 
+    rng = random.Random(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1097,7 +1342,8 @@ def main():
     print("[INFO] out_dir:", out_dir)
     print("[INFO] device:", device)
     print("[INFO] attn_layers:", attn_layers)
-    print("[INFO] mid_layers:", mid_layers)
+    print("[INFO] intervention_layers:", intervention_layers)
+    print("[INFO] experiments:", experiments)
 
     print("[INFO] loading LLaVA")
     processor, model = load_llava_hf(
@@ -1107,8 +1353,6 @@ def main():
         device=device,
         dtype=args.dtype,
     )
-    final_norm, lm_head = None, None
-    lm_head, final_norm = get_lm_head_and_final_norm(model)
 
     rel_token_ids = build_relation_token_ids(
         tokenizer=processor.tokenizer,
@@ -1143,45 +1387,40 @@ def main():
     else:
         indices = list(range(n_total))
         if args.max_samples > 0:
-            random.shuffle(indices)
+            rng.shuffle(indices)
             indices = indices[: args.max_samples]
 
-    print("[INFO] samples:", len(indices))
+    print("[INFO] samples requested:", len(indices))
 
-    rows = []
-    vis_cache = []
+    all_rows = []
+    parse_fail_examples = []
+    parse_fail_n = 0
 
-    for sid in tqdm(indices, desc="diagnosing samples"):
+    for sid in tqdm(indices, desc="mechanism probe"):
         try:
-            obj = compute_sample_diagnostics(
+            rows, meta = process_one_sample(
+                sid=sid,
                 model=model,
                 processor=processor,
-                final_norm=final_norm,
-                lm_head=lm_head,
                 gdino_processor=gdino_processor,
                 gdino_model=gdino_model,
                 dataset=dataset,
                 prompt_rows=prompt_rows,
-                sample_id=sid,
-                device=device,
                 rel_token_ids=rel_token_ids,
-                image_source=args.image_source,
-                preprocess_mode=args.preprocess_mode,
-                box_threshold=args.box_threshold,
-                text_threshold=args.text_threshold,
-                patch_size=args.patch_size,
+                args=args,
                 attn_layers=attn_layers,
-                mid_layers=mid_layers,
-                save_heatmap_tensor=args.save_vis,
+                intervention_layers=intervention_layers,
+                experiments=experiments,
+                rng=rng,
             )
 
-            if obj is None:
+            if meta.get("parse_fail", 0):
+                parse_fail_n += 1
+                if len(parse_fail_examples) < 30:
+                    parse_fail_examples.append((sid, meta.get("parse_prompt", "")))
                 continue
 
-            rows.append(obj["row"])
-
-            if args.save_vis:
-                vis_cache.append(obj)
+            all_rows.extend(rows)
 
         except RuntimeError as e:
             print(f"\n[ERROR] sid={sid}: {e}")
@@ -1189,97 +1428,29 @@ def main():
                 torch.cuda.empty_cache()
             continue
         except Exception as e:
-            print(f"\n[WARN] sid={sid} skipped due to: {repr(e)}")
+            print(f"\n[WARN] sid={sid} skipped: {repr(e)}")
             continue
 
         if device.startswith("cuda"):
             torch.cuda.empty_cache()
 
-    if len(rows) == 0:
-        raise RuntimeError("No valid rows collected.")
+    print("\n[PARSE]")
+    print("  parse_fail_n:", parse_fail_n)
+    if parse_fail_examples:
+        print("  failed examples:")
+        for sid, q in parse_fail_examples:
+            print(f"    sid={sid}: {q}")
 
-    df = pd.DataFrame(rows)
-    df = classify_rows_with_quantiles(df)
+    if not all_rows:
+        raise RuntimeError("No rows collected.")
 
-    csv_path = out_dir / "attention_pathology.csv"
+    df = pd.DataFrame(all_rows)
+
+    csv_path = out_dir / "attention_scaling_mechanism_probe.csv"
     df.to_csv(csv_path, index=False)
     print("\n[SAVED]", csv_path)
 
-    print("\n================ SUMMARY ================")
-    print("n:", len(df))
-    print("\n[pathology counts]")
-    print(df["pathology"].value_counts().to_string())
-
-    print("\n[final pred ratio]")
-    print(df["final_pred"].value_counts(normalize=True).reindex(RELATIONS).fillna(0).to_string())
-
-    print("\n[mid pred ratio]")
-    print(df["mid_pred"].value_counts(normalize=True).reindex(RELATIONS).fillna(0).to_string())
-
-    if "final_correct" in df.columns:
-        print("\n[accuracy by pathology]")
-        print(
-            df.groupby("pathology")[["final_correct", "mid_correct"]]
-            .mean()
-            .sort_values("final_correct")
-            .to_string()
-        )
-
-    print("\n[mean metrics by pathology]")
-    metric_cols = [
-        "attn_image_mass",
-        "attn_effective_patches",
-        "attn_top5_in_image",
-        "attn_pair_ratio_in_image",
-        "attn_background_ratio_in_image",
-        "attn_pair_balance",
-        "final_margin",
-        "mid_margin",
-    ]
-    metric_cols = [c for c in metric_cols if c in df.columns]
-    print(df.groupby("pathology")[metric_cols].mean().to_string())
-
-    if args.save_vis:
-        print("\n[INFO] saving visualizations")
-        saved_per_cat = {}
-
-        row_by_sid = {
-            int(r["sample_id"]): r
-            for _, r in df.iterrows()
-        }
-
-        for obj in vis_cache:
-            sid = int(obj["row"]["sample_id"])
-            if sid not in row_by_sid:
-                continue
-
-            row = dict(row_by_sid[sid])
-            cat = row["pathology"]
-            saved_per_cat.setdefault(cat, 0)
-
-            if saved_per_cat[cat] >= args.vis_per_category:
-                continue
-
-            cat_dir = vis_dir / cat
-            cat_dir.mkdir(parents=True, exist_ok=True)
-
-            vis = make_vis(
-                processed=obj["processed"],
-                heatmap=obj["heatmap"],
-                box1=obj["box1"],
-                box2=obj["box2"],
-                obj1=obj["obj1"],
-                obj2=obj["obj2"],
-                row=row,
-            )
-
-            out_path = cat_dir / f"sid{sid}_{row['gold']}_final-{row['final_pred']}_mid-{row['mid_pred']}.png"
-            vis.save(out_path)
-
-            saved_per_cat[cat] += 1
-
-        print("[SAVED VIS]", vis_dir)
-        print("saved_per_cat:", saved_per_cat)
+    print_summary(df)
 
     print("\n[DONE]")
 
