@@ -1,3 +1,4 @@
+cat > run_closedset_adaptvis_first_try.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -6,10 +7,18 @@ OPTION="four"
 MODEL="llava1.5"
 DEVICE="cuda"
 
+# closed-set mode
 export DECISION_MODE="closed_set"
 export CLOSED_SET_SCORING="True"
 export CLOSED_SET_CONFIDENCE_MODE="prob"
 export ADJUST_METHOD="last_query"
+
+# after fixing llava15.py, this should expand <image> placeholder to 576 image tokens
+export NUM_IMAGE_TOKENS="576"
+
+# Avoid PROBE_RUN_TAG making main_aro treat this as a probe-only run.
+# It is okay even if llava15.py already computes its own acc; this keeps behavior explicit.
+export FORCE_DATASET_EVAL="True"
 
 mkdir -p output/closedset_adaptvis_first_try
 
@@ -65,29 +74,35 @@ import json
 import re
 import pandas as pd
 
+expected_tags = [
+    "base_closedset",
+    "scaling_w1p2",
+    "scaling_w1p5",
+    "scaling_w2p0",
+    "adapt_w1_0p5_w2_1p2_th0p3",
+    "adapt_w1_0p5_w2_1p5_th0p3",
+    "adapt_w1_0p8_w2_1p5_th0p3",
+]
+
 rows = []
 
-# main_aro / llava15.py normally writes to ./output/results..._closedset_<tag>scores.json
-for p in sorted(Path("output").glob("*closedset*score*.json")):
+# llava15.py writes files like:
+# output/results1.5_<dataset>_<method>_<weight>_<option>option_<TEST>_closedset_<tag>.json
+paths = sorted(Path("output").glob("*closedset*.json"))
+
+for p in paths:
     try:
         obj = json.loads(p.read_text())
     except Exception:
         continue
 
     tag = obj.get("probe_run_tag", "")
+
     if not tag:
-        m = re.search(r"_closedset_(.*?)scores\.json$", p.name)
+        m = re.search(r"_closedset_(.*?)\.json$", p.name)
         tag = m.group(1) if m else p.stem
 
-    if not any(x in tag for x in [
-        "base_closedset",
-        "scaling_w1p2",
-        "scaling_w1p5",
-        "scaling_w2p0",
-        "adapt_w1_0p5_w2_1p2_th0p3",
-        "adapt_w1_0p5_w2_1p5_th0p3",
-        "adapt_w1_0p8_w2_1p5_th0p3",
-    ]):
+    if tag not in expected_tags:
         continue
 
     rows.append({
@@ -103,15 +118,26 @@ for p in sorted(Path("output").glob("*closedset*score*.json")):
     })
 
 df = pd.DataFrame(rows)
+
 if len(df) == 0:
-    print("[WARN] no closed-set score json found.")
+    print("[WARN] no closed-set json found.")
+    print("[DEBUG] existing closedset json files:")
+    for p in paths[-20:]:
+        print(" ", p)
 else:
-    df = df.sort_values("acc", ascending=False)
+    # Preserve expected order as much as possible
+    order = {tag: i for i, tag in enumerate(expected_tags)}
+    df["order"] = df["tag"].map(order)
+    df = df.sort_values(["acc", "order"], ascending=[False, True]).drop(columns=["order"])
+
     print("\n================ CLOSED-SET ADAPTVIS SUMMARY ================")
     print(df.to_string(index=False))
+
     out = Path("output/closedset_adaptvis_first_try/summary.csv")
     out.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out, index=False)
     print("\n[SAVED]", out)
 PY
 BASH
+
+chmod +x run_closedset_adaptvis_first_try.sh
