@@ -1181,6 +1181,173 @@ def _candidate_answer_token_ids(tokenizer, candidate: str) -> List[int]:
     return [int(x) for x in token_ids]
 
 
+
+def infer_llava_num_image_tokens(model, processor) -> int:
+    """
+    Infer the number of expanded visual tokens used by LLaVA attention.
+
+    For llava-1.5 with 336x336 images and patch_size=14:
+        24 * 24 = 576
+
+    If vision_feature_select_strategy == "full", CLS may be kept, so return 577.
+    You can override with:
+        NUM_IMAGE_TOKENS=576
+    """
+    override = os.getenv("NUM_IMAGE_TOKENS", "").strip()
+    if override:
+        return int(override)
+
+    config = getattr(model, "config", None)
+    vision_config = getattr(config, "vision_config", None)
+
+    image_size = getattr(vision_config, "image_size", None)
+    patch_size = getattr(vision_config, "patch_size", None)
+
+    if image_size is None:
+        image_processor = getattr(processor, "image_processor", None)
+        crop_size = getattr(image_processor, "crop_size", None)
+        size = getattr(image_processor, "size", None)
+
+        if isinstance(crop_size, dict):
+            image_size = int(crop_size.get("height", crop_size.get("width", 336)))
+        elif isinstance(crop_size, int):
+            image_size = int(crop_size)
+        elif isinstance(size, dict):
+            if "height" in size:
+                image_size = int(size["height"])
+            elif "shortest_edge" in size:
+                image_size = int(size["shortest_edge"])
+            else:
+                image_size = 336
+        elif isinstance(size, int):
+            image_size = int(size)
+        else:
+            image_size = 336
+
+    if patch_size is None:
+        patch_size = getattr(processor, "patch_size", 14)
+
+    image_size = int(image_size)
+    patch_size = int(patch_size)
+
+    num_patches = (image_size // patch_size) ** 2
+
+    strategy = getattr(
+        config,
+        "vision_feature_select_strategy",
+        getattr(processor, "vision_feature_select_strategy", "default"),
+    )
+
+    if str(strategy).lower() == "full":
+        return num_patches + 1
+
+    return num_patches
+
+
+def build_expanded_image_keys_from_input_ids(
+    input_ids: torch.Tensor,
+    image_token_id: int,
+    num_image_tokens: int,
+) -> torch.Tensor:
+    """
+    Convert input_ids-level <image> placeholder mask to attention-level image-token mask.
+
+    input_ids normally contains one <image> placeholder, but LLaVA attention sees
+    that placeholder expanded into many image patch tokens.
+
+    Example:
+        [text, <image>, text] -> [0..., 1 repeated num_image_tokens, 0...]
+
+    If input_ids already contains multiple image tokens, fall back to the legacy mask
+    instead of expanding each one again.
+    """
+    image_mask = input_ids == int(image_token_id)
+    raw_count = int(image_mask.sum().item())
+
+    if raw_count == 0:
+        return torch.zeros_like(input_ids, dtype=torch.long)
+
+    if raw_count > 1:
+        # Already expanded or non-standard tokenizer behavior.
+        return image_mask.long()
+
+    out = []
+    for tid in input_ids.detach().tolist():
+        if int(tid) == int(image_token_id):
+            out.extend([1] * int(num_image_tokens))
+        else:
+            out.append(0)
+
+    return torch.tensor(out, dtype=torch.long, device=input_ids.device)
+
+
+def build_adaptvis_keys_from_input_batch(
+    input_ids_batch: torch.Tensor,
+    model,
+    processor,
+    image_token_id: Optional[int] = None,
+    debug_prefix: str = "",
+) -> List[torch.Tensor]:
+    """
+    Build AdaptVis keys for a batch.
+
+    Old behavior:
+        keys mark only the single <image> placeholder in input_ids.
+
+    New behavior:
+        keys mark the expanded image-token range used inside LLaVA attention.
+
+    Env:
+        EXPAND_IMAGE_KEYS=True   # default, use expanded keys
+        EXPAND_IMAGE_KEYS=False  # restore old placeholder-only behavior
+        DEBUG_EXPANDED_KEYS=True # print key length / key sum
+        NUM_IMAGE_TOKENS=576     # optional override
+    """
+    expand = _env_flag("EXPAND_IMAGE_KEYS", "True")
+
+    if image_token_id is None:
+        image_token_id = int(
+            os.getenv(
+                "IMAGE_TOKEN_ID",
+                str(getattr(getattr(model, "config", None), "image_token_index", 32001)),
+            )
+        )
+
+    if not expand:
+        keys = [
+            torch.where(input_id == image_token_id, 1, 0)
+            for input_id in input_ids_batch
+        ]
+    else:
+        num_image_tokens = infer_llava_num_image_tokens(model, processor)
+        keys = [
+            build_expanded_image_keys_from_input_ids(
+                input_ids=input_id,
+                image_token_id=image_token_id,
+                num_image_tokens=num_image_tokens,
+            )
+            for input_id in input_ids_batch
+        ]
+
+    if _env_flag("DEBUG_EXPANDED_KEYS", "False"):
+        num_image_tokens_dbg = infer_llava_num_image_tokens(model, processor)
+        print(f"[DEBUG EXPANDED KEYS] {debug_prefix}")
+        print("  input_ids shape:", tuple(input_ids_batch.shape))
+        print("  image_token_id:", image_token_id)
+        print("  inferred_num_image_tokens:", num_image_tokens_dbg)
+        print("  expand:", expand)
+        for i, input_id in enumerate(input_ids_batch):
+            raw_count = int((input_id == image_token_id).sum().item())
+            key_len = int(keys[i].numel())
+            key_sum = int(keys[i].sum().item())
+            print(
+                f"  idx={i} raw_image_placeholders={raw_count} "
+                f"key_len={key_len} key_sum={key_sum}"
+            )
+
+    return keys
+
+
 def _score_dict_to_prob_dict(
     score_dict: Dict[str, Dict[str, Any]],
     score_key: str = "score",
@@ -1250,16 +1417,24 @@ def score_candidates_closed_set(
 
     # Build keys from the actual closed-set batch, not from the shorter prompt-only
     # batch. This avoids length mismatch when the appended candidate adds tokens.
+    #
+    # Important:
+    #   input_ids usually contains a single <image> placeholder,
+    #   while LLaVA attention sees that placeholder expanded into image patch tokens.
+    #   Therefore AdaptVis keys must be expanded to the attention-level image span.
     image_token_id = int(
         os.getenv(
             "IMAGE_TOKEN_ID",
             str(getattr(getattr(model, "config", None), "image_token_index", 32001)),
         )
     )
-    scoring_keys = [
-        torch.where(input_id == image_token_id, 1, 0)
-        for input_id in inputs["input_ids"]
-    ]
+    scoring_keys = build_adaptvis_keys_from_input_batch(
+        input_ids_batch=inputs["input_ids"],
+        model=model,
+        processor=processor,
+        image_token_id=image_token_id,
+        debug_prefix="closed_set",
+    )
 
     model_kwargs = {
         "return_dict": True,
@@ -1921,10 +2096,13 @@ class LlavaWrapper:
                         max_length=77,
                     ).to(self.device)
 
-                    keys = [
-                        torch.where(input_id == 32001, 1, 0)
-                        for input_id in single_input["input_ids"]
-                    ]
+                    keys = build_adaptvis_keys_from_input_batch(
+                        input_ids_batch=single_input["input_ids"],
+                        model=self.model,
+                        processor=self.processor,
+                        image_token_id=None,
+                        debug_prefix="generation_get_out_scores",
+                    )
 
                     adjust_method_env = os.getenv("ADJUST_METHOD", "last_query")
                     query_pos_env = os.getenv("QUERY_POS", "")
@@ -2440,10 +2618,13 @@ class LlavaWrapper:
                             max_length=77,
                         ).to(self.device)
 
-                        keys = [
-                            torch.where(input_id == 32001, 1, 0)
-                            for input_id in single_input["input_ids"]
-                        ]
+                        keys = build_adaptvis_keys_from_input_batch(
+                            input_ids_batch=single_input["input_ids"],
+                            model=self.model,
+                            processor=self.processor,
+                            image_token_id=None,
+                            debug_prefix="generation_get_scores",
+                        )
 
                         if method == "scaling_vis":
                             change_greedy_to_add_weight()
