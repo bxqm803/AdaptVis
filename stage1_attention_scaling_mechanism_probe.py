@@ -943,7 +943,6 @@ def add_metric_values(row: Dict, prefix: str, metrics: Dict):
     for k, v in metrics.items():
         row[f"{prefix}_{k}"] = float(v)
 
-、
 
 
 def safe_add_delta_values(row: Dict, before_prefix: str, after_prefix: str):
