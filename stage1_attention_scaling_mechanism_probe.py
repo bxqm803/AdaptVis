@@ -73,14 +73,6 @@ def clean_question(q: str) -> str:
     return q
 
 
-def strip_article(x: str) -> str:
-    x = str(x).strip()
-    x = re.sub(r"^(a|an|the)\s+", "", x, flags=re.IGNORECASE)
-    x = re.sub(r"[.?!,:;]+$", "", x)
-    x = re.sub(r"\s+", " ", x).strip()
-    return x
-
-
 def remove_answer_suffix(q: str) -> str:
     q = clean_question(q)
     q = re.sub(r"Answer\s+with\s+.*$", "", q, flags=re.IGNORECASE).strip()
@@ -89,29 +81,36 @@ def remove_answer_suffix(q: str) -> str:
     return q.strip()
 
 
+def strip_article(x: str) -> str:
+    x = str(x).strip()
+    x = re.sub(r"^(a|an|the)\s+", "", x, flags=re.IGNORECASE)
+    x = re.sub(r"[.?!,:;]+$", "", x)
+    x = re.sub(r"\s+", " ", x).strip()
+    return x
+
+
 def parse_two_objects_from_prompt(prompt: str) -> Tuple[Optional[str], Optional[str]]:
     """
     Supports:
       Where is/are X in relation to Y?
       What is/are X in relation to Y?
       Where is/are X relative to Y?
-      What is/are the spatial relation between X and Y?
+      What is/are the spatial relation(s) between X and Y?
+      What is/are the relationship(s) between X and Y?
     """
     q = remove_answer_suffix(prompt)
 
     patterns = [
         r"(?:where|what)\s+(?:is|are)\s+(?:the\s+)?(.+?)\s+in\s+relation\s+to\s+(?:the\s+)?(.+?)\?",
         r"(?:where|what)\s+(?:is|are)\s+(?:the\s+)?(.+?)\s+relative\s+to\s+(?:the\s+)?(.+?)\?",
-        r"(?:what)\s+(?:is|are)\s+(?:the\s+)?spatial\s+relation\s+(?:of|between)\s+(?:the\s+)?(.+?)\s+(?:to|and)\s+(?:the\s+)?(.+?)\?",
-        r"(?:what)\s+(?:is|are)\s+(?:the\s+)?(?:relationship|relation)\s+between\s+(?:the\s+)?(.+?)\s+and\s+(?:the\s+)?(.+?)\?",
+        r"(?:what)\s+(?:is|are)\s+(?:the\s+)?spatial\s+relations?\s+(?:of|between)\s+(?:the\s+)?(.+?)\s+(?:to|and)\s+(?:the\s+)?(.+?)\?",
+        r"(?:what)\s+(?:is|are)\s+(?:the\s+)?(?:relationships?|relations?)\s+between\s+(?:the\s+)?(.+?)\s+and\s+(?:the\s+)?(.+?)\?",
     ]
 
-    for p in patterns:
-        m = re.search(p, q, flags=re.IGNORECASE)
+    for pattern in patterns:
+        m = re.search(pattern, q, flags=re.IGNORECASE)
         if m:
-            obj1 = strip_article(m.group(1))
-            obj2 = strip_article(m.group(2))
-            return obj1, obj2
+            return strip_article(m.group(1)), strip_article(m.group(2))
 
     return None, None
 
@@ -174,7 +173,7 @@ def load_dataset_any_signature(dataset_name: str, root_dir: str, download: bool)
 
 
 # ============================================================
-# LLaVA image preprocessing
+# LLaVA-like preprocessing
 # ============================================================
 
 def get_size_value(size_obj, key: str, default: int) -> int:
@@ -245,7 +244,7 @@ def make_processed_pil_like_llava(
     raw: Image.Image,
     image_processor,
     force_mode: str = "auto",
-) -> Tuple[Image.Image, Dict]:
+) -> Image.Image:
     raw = raw.convert("RGB")
     geom = infer_llava_geometry(image_processor)
 
@@ -264,21 +263,11 @@ def make_processed_pil_like_llava(
         )
         bg = tuple(int(float(x) * 255) for x in mean)
 
-        square, pad_x, pad_y, square_size = expand2square(raw, bg)
+        square, _, _, _ = expand2square(raw, bg)
 
         target_h = geom["crop_h"]
         target_w = geom["crop_w"]
-        processed = square.resize((target_w, target_h), geom["resample"])
-
-        meta = {
-            "mode": "pad",
-            "raw_size": raw.size,
-            "square_size": square_size,
-            "pad_x": pad_x,
-            "pad_y": pad_y,
-            "processed_size": processed.size,
-        }
-        return processed, meta
+        return square.resize((target_w, target_h), geom["resample"])
 
     w, h = raw.size
 
@@ -298,30 +287,14 @@ def make_processed_pil_like_llava(
     left = max(0, int(round((rw - crop_w) / 2)))
     top = max(0, int(round((rh - crop_h) / 2)))
 
-    processed = resized.crop((left, top, left + crop_w, top + crop_h))
-
-    meta = {
-        "mode": "crop",
-        "raw_size": raw.size,
-        "resized_size": resized.size,
-        "crop_left": left,
-        "crop_top": top,
-        "processed_size": processed.size,
-    }
-    return processed, meta
+    return resized.crop((left, top, left + crop_w, top + crop_h))
 
 
 # ============================================================
-# Model loading
+# Model / GroundingDINO loading
 # ============================================================
 
-def load_llava_hf(
-    model_id: str,
-    revision: str,
-    cache_dir: str,
-    device: str,
-    dtype: str,
-):
+def load_llava_hf(model_id: str, revision: str, cache_dir: str, device: str, dtype: str):
     if dtype == "float16":
         torch_dtype = torch.float16
     elif dtype == "bfloat16":
@@ -345,8 +318,7 @@ def load_llava_hf(
             attn_implementation="eager",
         )
     except TypeError:
-        print("[WARN] attn_implementation='eager' not supported.")
-        print("[WARN] output_attentions may be None unless transformers supports eager attention.")
+        print("[WARN] attn_implementation='eager' not supported by this transformers version.")
         model = LlavaModel.from_pretrained(
             model_id,
             revision=revision,
@@ -367,7 +339,6 @@ def load_llava_hf(
 
     model = model.to(device).eval()
     model.config.output_attentions = True
-    model.config.output_hidden_states = True
     model.config.use_cache = False
 
     print("[INFO] loaded LLaVA")
@@ -378,10 +349,6 @@ def load_llava_hf(
 
     return processor, model
 
-
-# ============================================================
-# GroundingDINO
-# ============================================================
 
 @torch.no_grad()
 def detect_one(
@@ -432,7 +399,7 @@ def detect_one(
 # Tokens / boxes / metrics
 # ============================================================
 
-def candidate_text_for_rel(rel: str, form: str = "lower_nospace") -> str:
+def candidate_text_for_rel(rel: str, form: str) -> str:
     if form == "lower_nospace":
         return rel
     if form == "lower_space":
@@ -441,16 +408,16 @@ def candidate_text_for_rel(rel: str, form: str = "lower_nospace") -> str:
         return rel.capitalize()
     if form == "cap_space":
         return " " + rel.capitalize()
-    raise ValueError(form)
+    raise ValueError(f"Unknown relation form: {form}")
 
 
-def build_relation_token_ids(tokenizer, form: str = "lower_nospace") -> torch.Tensor:
+def build_relation_token_ids(tokenizer, form: str) -> torch.Tensor:
     ids = []
     print("\n[INFO] relation token ids")
     for rel in RELATIONS:
         text = candidate_text_for_rel(rel, form)
         tid = tokenizer(text, add_special_tokens=False).input_ids
-        print(f"  {rel:>5s} text={text!r} ids={tid}")
+        print(f"  rel={rel:>5s} text={text!r} ids={tid}")
         if len(tid) != 1:
             print(f"  [WARN] {text!r} has multiple tokens; using first token {tid[0]}")
         ids.append(int(tid[0]))
@@ -474,8 +441,8 @@ def get_image_token_positions(inputs, model, processor) -> torch.Tensor:
 
 def box_to_patch_ids(
     box: Optional[List[float]],
-    image_size: int = 336,
-    patch_size: int = 14,
+    image_size: int,
+    patch_size: int,
 ) -> Tuple[List[int], Optional[Tuple[int, int, int, int]]]:
     if box is None:
         return [], None
@@ -500,14 +467,13 @@ def union_ids(a: List[int], b: List[int]) -> List[int]:
     return sorted(set(a) | set(b))
 
 
-def entropy_metrics(vec: torch.Tensor, eps: float = 1e-12) -> Dict:
+def attention_distribution_metrics(vec: torch.Tensor, eps: float = 1e-12) -> Dict:
     vec = vec.float()
     total = float(vec.sum().item())
 
     if total <= eps:
         return {
             "image_mass": 0.0,
-            "entropy": 0.0,
             "entropy_norm": 0.0,
             "effective_patches": 0.0,
             "top1_in_image": 0.0,
@@ -517,27 +483,24 @@ def entropy_metrics(vec: torch.Tensor, eps: float = 1e-12) -> Dict:
     p = vec / vec.sum()
     ent = float((-(p + eps).log() * p).sum().item())
     n = int(p.numel())
-    ent_norm = ent / math.log(max(n, 2))
-    eff = math.exp(ent)
     topk = torch.topk(p, k=min(5, n)).values
 
     return {
         "image_mass": total,
-        "entropy": ent,
-        "entropy_norm": ent_norm,
-        "effective_patches": eff,
+        "entropy_norm": ent / math.log(max(n, 2)),
+        "effective_patches": math.exp(ent),
         "top1_in_image": float(p.max().item()),
         "top5_in_image": float(topk.sum().item()),
     }
 
 
-def attention_box_metrics(
+def attention_object_metrics(
     att_img_raw: torch.Tensor,
     obj1_ids: List[int],
     obj2_ids: List[int],
     eps: float = 1e-12,
 ) -> Dict:
-    base = entropy_metrics(att_img_raw, eps=eps)
+    base = attention_distribution_metrics(att_img_raw, eps=eps)
     image_mass = base["image_mass"]
 
     n_img = int(att_img_raw.numel())
@@ -556,7 +519,11 @@ def attention_box_metrics(
     pair_mass = sum_ids(pair_ids)
 
     if image_mass <= eps:
-        obj1_ratio = obj2_ratio = pair_ratio = background_ratio = balance = 0.0
+        obj1_ratio = 0.0
+        obj2_ratio = 0.0
+        pair_ratio = 0.0
+        background_ratio = 0.0
+        pair_balance = 0.0
     else:
         obj1_ratio = obj1_mass / image_mass
         obj2_ratio = obj2_mass / image_mass
@@ -564,44 +531,21 @@ def attention_box_metrics(
         background_ratio = max(0.0, 1.0 - pair_ratio)
 
         denom = max(obj1_ratio, obj2_ratio, eps)
-        balance = min(obj1_ratio, obj2_ratio) / denom
+        pair_balance = min(obj1_ratio, obj2_ratio) / denom
 
     base.update(
         {
-            "obj1_mass_raw": obj1_mass,
-            "obj2_mass_raw": obj2_mass,
-            "pair_mass_raw": pair_mass,
             "obj1_ratio_in_image": obj1_ratio,
             "obj2_ratio_in_image": obj2_ratio,
             "pair_ratio_in_image": pair_ratio,
             "background_ratio_in_image": background_ratio,
-            "pair_balance": balance,
+            "pair_balance": pair_balance,
             "obj1_patch_count": len(obj1_ids),
             "obj2_patch_count": len(obj2_ids),
             "pair_patch_count": len(pair_ids),
         }
     )
-
     return base
-
-
-def rel_from_logits(vocab_logits: torch.Tensor, rel_token_ids: torch.Tensor) -> Dict:
-    rel_token_ids = rel_token_ids.to(vocab_logits.device)
-    rel_logits = vocab_logits.index_select(dim=-1, index=rel_token_ids).float()
-    rel_probs = torch.softmax(rel_logits, dim=-1)
-    pred_id = int(rel_probs.argmax().item())
-
-    top2 = torch.topk(rel_probs, k=2)
-    margin = float((top2.values[0] - top2.values[1]).item())
-
-    out = {
-        "pred_id": pred_id,
-        "pred": RELATIONS[pred_id],
-        "margin": margin,
-        "rel_logits": rel_logits.detach().cpu(),
-        "rel_probs": rel_probs.detach().cpu(),
-    }
-    return out
 
 
 def collect_attention_metrics(
@@ -626,16 +570,31 @@ def collect_attention_metrics(
         A_img = A[0, :, last_pos, :].index_select(dim=-1, index=image_positions)
         A_img_mean = A_img.mean(dim=0).detach().float().cpu()
 
-        m = attention_box_metrics(A_img_mean, obj1_ids, obj2_ids)
-        m["attn_layer"] = layer_id
+        m = attention_object_metrics(A_img_mean, obj1_ids, obj2_ids)
         rows.append(m)
 
     if not rows:
         return {}
 
-    df = pd.DataFrame(rows)
-    avg = df.drop(columns=["attn_layer"]).mean(numeric_only=True).to_dict()
-    return avg
+    return pd.DataFrame(rows).mean(numeric_only=True).to_dict()
+
+
+def relation_from_final_logits(vocab_logits: torch.Tensor, rel_token_ids: torch.Tensor) -> Dict:
+    rel_token_ids = rel_token_ids.to(vocab_logits.device)
+    rel_logits = vocab_logits.index_select(dim=-1, index=rel_token_ids).float()
+    rel_probs = torch.softmax(rel_logits, dim=-1)
+    pred_id = int(rel_probs.argmax().item())
+
+    top2 = torch.topk(rel_probs, k=2)
+    margin = float((top2.values[0] - top2.values[1]).item())
+
+    return {
+        "pred": RELATIONS[pred_id],
+        "pred_id": pred_id,
+        "margin": margin,
+        "logits": rel_logits.detach().cpu(),
+        "probs": rel_probs.detach().cpu(),
+    }
 
 
 # ============================================================
@@ -644,33 +603,29 @@ def collect_attention_metrics(
 
 class AttentionScalingController:
     """
-    Post-softmax renormalized attention scaling.
+    Post-softmax scaling + renormalization.
 
     For selected decoder layers and selected query position:
-      A[..., target_key_positions] *= alpha
-      A = A / sum(A)
+      A[..., target_positions] *= alpha
+      A = A / A.sum(-1)
 
-    This directly tests whether boosting/suppressing specific key groups
-    changes final relation logits.
+    This tests whether boosting a target token group changes final relation logits.
     """
     def __init__(
         self,
-        layers_hidden_idx: List[int],
+        hidden_layer_ids: List[int],
         target_positions: torch.Tensor,
         query_position: int,
         alpha: float,
-        heads: Optional[List[int]] = None,
     ):
-        self.layers_hidden_idx = set(int(x) for x in layers_hidden_idx)
+        self.hidden_layer_ids = set(int(x) for x in hidden_layer_ids)
         self.target_positions = target_positions
         self.query_position = int(query_position)
         self.alpha = float(alpha)
-        self.heads = heads
 
     def should_apply(self, decoder_layer_idx: int) -> bool:
-        # decoder layer 0 corresponds to hidden state layer 1
-        hidden_layer_idx = decoder_layer_idx + 1
-        return hidden_layer_idx in self.layers_hidden_idx
+        hidden_layer_id = decoder_layer_idx + 1
+        return hidden_layer_id in self.hidden_layer_ids
 
     def modify(self, decoder_layer_idx: int, attn_probs: torch.Tensor) -> torch.Tensor:
         if not self.should_apply(decoder_layer_idx):
@@ -682,21 +637,12 @@ class AttentionScalingController:
         q = self.query_position
         target = self.target_positions.to(attn_probs.device)
 
-        attn_probs = attn_probs.clone()
-
-        if self.heads is None:
-            slice_q = attn_probs[:, :, q, :]
-            slice_q[:, :, target] = slice_q[:, :, target] * self.alpha
-            slice_q = slice_q / (slice_q.sum(dim=-1, keepdim=True) + 1e-12)
-            attn_probs[:, :, q, :] = slice_q
-        else:
-            heads = torch.tensor(self.heads, dtype=torch.long, device=attn_probs.device)
-            slice_q = attn_probs[:, heads, q, :]
-            slice_q[:, :, target] = slice_q[:, :, target] * self.alpha
-            slice_q = slice_q / (slice_q.sum(dim=-1, keepdim=True) + 1e-12)
-            attn_probs[:, heads, q, :] = slice_q
-
-        return attn_probs
+        out = attn_probs.clone()
+        slice_q = out[:, :, q, :]
+        slice_q[:, :, target] = slice_q[:, :, target] * self.alpha
+        slice_q = slice_q / (slice_q.sum(dim=-1, keepdim=True) + 1e-12)
+        out[:, :, q, :] = slice_q
+        return out
 
 
 def get_decoder_layers(model):
@@ -706,7 +652,6 @@ def get_decoder_layers(model):
         "language_model.layers",
     ]
 
-    cur = None
     for path in candidates:
         obj = model
         ok = True
@@ -716,13 +661,9 @@ def get_decoder_layers(model):
                 break
             obj = getattr(obj, p)
         if ok:
-            cur = obj
-            break
+            return obj
 
-    if cur is None:
-        raise RuntimeError("Cannot find decoder layers in model.")
-
-    return cur
+    raise RuntimeError("Cannot find decoder layers in model.")
 
 
 def make_patched_llama_attention_forward(controller: AttentionScalingController):
@@ -747,27 +688,20 @@ def make_patched_llama_attention_forward(controller: AttentionScalingController)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        num_heads = getattr(self, "num_heads")
-        num_kv_heads = getattr(self, "num_key_value_heads")
-        num_kv_groups = getattr(self, "num_key_value_groups")
-        head_dim = getattr(self, "head_dim")
+        num_heads = self.num_heads
+        num_kv_heads = self.num_key_value_heads
+        num_kv_groups = self.num_key_value_groups
+        head_dim = self.head_dim
 
         query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
 
         if position_embeddings is None:
-            # older/newer transformers compatibility
             try:
                 cos, sin = self.rotary_emb(value_states, position_ids)
             except TypeError:
-                kv_seq_len = key_states.shape[-2]
-                if past_key_value is not None:
-                    try:
-                        kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-                    except Exception:
-                        pass
-                cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+                cos, sin = self.rotary_emb(value_states, seq_len=key_states.shape[-2])
         else:
             cos, sin = position_embeddings
 
@@ -801,26 +735,22 @@ def make_patched_llama_attention_forward(controller: AttentionScalingController)
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
         layer_idx = int(getattr(self, "layer_idx", -1))
-        attn_weights = controller.modify(layer_idx, attn_weights)
+        attn_probs = controller.modify(layer_idx, attn_probs)
 
         dropout_p = float(getattr(self, "attention_dropout", 0.0))
-        attn_weights_drop = F.dropout(attn_weights, p=dropout_p, training=self.training)
+        attn_probs_drop = F.dropout(attn_probs, p=dropout_p, training=self.training)
 
-        attn_output = torch.matmul(attn_weights_drop, value_states)
-
+        attn_output = torch.matmul(attn_probs_drop, value_states)
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
 
-        if not output_attentions:
-            attn_weights_to_return = None
-        else:
-            attn_weights_to_return = attn_weights
-
-        return attn_output, attn_weights_to_return, past_key_value
+        if output_attentions:
+            return attn_output, attn_probs, past_key_value
+        return attn_output, None, past_key_value
 
     return patched_forward
 
@@ -852,24 +782,20 @@ def local_patch_ids_for_target(
     obj1_ids = [i for i in obj1_ids if 0 <= i < n_img]
     obj2_ids = [i for i in obj2_ids if 0 <= i < n_img]
     pair_ids = union_ids(obj1_ids, obj2_ids)
+
     all_ids = list(range(n_img))
     bg_ids = sorted(set(all_ids) - set(pair_ids))
 
     if mode == "global":
         return all_ids
-
     if mode == "object1":
         return obj1_ids
-
     if mode == "object2":
         return obj2_ids
-
     if mode == "object_pair":
         return pair_ids
-
     if mode == "background":
         return bg_ids
-
     if mode == "random":
         k = max(1, len(pair_ids))
         k = min(k, n_img)
@@ -879,7 +805,7 @@ def local_patch_ids_for_target(
 
 
 # ============================================================
-# Forward + collection
+# Forward and row creation
 # ============================================================
 
 @torch.no_grad()
@@ -896,20 +822,21 @@ def run_forward_collect(
     outputs = model(
         **inputs,
         output_attentions=True,
-        output_hidden_states=True,
         return_dict=True,
         use_cache=False,
     )
 
     if outputs.attentions is None:
         raise RuntimeError(
-            "outputs.attentions is None. "
-            "Use attn_implementation='eager' or compatible transformers."
+            "outputs.attentions is None. Use attn_implementation='eager'."
         )
 
-    # Pure final output: exactly the model output logits.
+    # Pure final model output.
     final_vocab_logits = outputs.logits[0, last_pos, :].detach().float()
-    rel = rel_from_logits(final_vocab_logits, rel_token_ids.to(final_vocab_logits.device))
+    rel = relation_from_final_logits(
+        vocab_logits=final_vocab_logits,
+        rel_token_ids=rel_token_ids.to(final_vocab_logits.device),
+    )
 
     attn_metrics = collect_attention_metrics(
         attentions=outputs.attentions,
@@ -922,35 +849,31 @@ def run_forward_collect(
 
     return {
         "rel": rel,
-        "attn_metrics": attn_metrics,
+        "attn": attn_metrics,
     }
 
 
-def add_rel_values(row: Dict, prefix: str, rel_obj: Dict):
-    row[f"{prefix}_pred"] = rel_obj["pred"]
-    row[f"{prefix}_pred_id"] = rel_obj["pred_id"]
-    row[f"{prefix}_margin"] = rel_obj["margin"]
+def add_rel_to_row(row: Dict, prefix: str, rel: Dict):
+    row[f"{prefix}_pred"] = rel["pred"]
+    row[f"{prefix}_pred_id"] = rel["pred_id"]
+    row[f"{prefix}_margin"] = rel["margin"]
 
-    logits = rel_obj["rel_logits"]
-    probs = rel_obj["rel_probs"]
-
-    for i, r in enumerate(RELATIONS):
-        row[f"{prefix}_logit_{r}"] = float(logits[i].item())
-        row[f"{prefix}_prob_{r}"] = float(probs[i].item())
+    for i, name in enumerate(RELATIONS):
+        row[f"{prefix}_logit_{name}"] = float(rel["logits"][i].item())
+        row[f"{prefix}_prob_{name}"] = float(rel["probs"][i].item())
 
 
-def add_metric_values(row: Dict, prefix: str, metrics: Dict):
-    for k, v in metrics.items():
+def add_attn_to_row(row: Dict, prefix: str, attn: Dict):
+    for k, v in attn.items():
         row[f"{prefix}_{k}"] = float(v)
 
 
-
-def safe_add_delta_values(row: Dict, before_prefix: str, after_prefix: str):
+def add_deltas(row: Dict):
     for r in RELATIONS:
-        row[f"delta_logit_{r}"] = row[f"{after_prefix}_logit_{r}"] - row[f"{before_prefix}_logit_{r}"]
-        row[f"delta_prob_{r}"] = row[f"{after_prefix}_prob_{r}"] - row[f"{before_prefix}_prob_{r}"]
+        row[f"delta_logit_{r}"] = row[f"after_logit_{r}"] - row[f"base_logit_{r}"]
+        row[f"delta_prob_{r}"] = row[f"after_prob_{r}"] - row[f"base_prob_{r}"]
 
-    metric_names = [
+    attn_keys = [
         "image_mass",
         "entropy_norm",
         "effective_patches",
@@ -963,33 +886,22 @@ def safe_add_delta_values(row: Dict, before_prefix: str, after_prefix: str):
         "pair_balance",
     ]
 
-    for m in metric_names:
-        b = row.get(f"{before_prefix}_{m}", np.nan)
-        a = row.get(f"{after_prefix}_{m}", np.nan)
-        try:
-            row[f"delta_{m}"] = float(a) - float(b)
-        except Exception:
-            row[f"delta_{m}"] = np.nan
+    for k in attn_keys:
+        b = row.get(f"base_attn_{k}", np.nan)
+        a = row.get(f"after_attn_{k}", np.nan)
+        row[f"delta_{k}"] = float(a) - float(b) if pd.notna(a) and pd.notna(b) else np.nan
 
 
-def parse_experiments(spec: str):
-    """
-    spec example:
-      global:1.5,object_pair:1.5,background:1.5,random:1.5,global:0.7,object_pair:0.7
-    """
-    exps = []
+def parse_experiments(spec: str) -> List[Tuple[str, float]]:
+    out = []
     for item in spec.split(","):
         item = item.strip()
         if not item:
             continue
         mode, alpha = item.split(":")
-        exps.append((mode.strip(), float(alpha)))
-    return exps
+        out.append((mode.strip(), float(alpha)))
+    return out
 
-
-# ============================================================
-# Sample processing
-# ============================================================
 
 @torch.no_grad()
 def process_one_sample(
@@ -1000,7 +912,7 @@ def process_one_sample(
     gdino_model,
     dataset,
     prompt_rows,
-    rel_token_ids,
+    rel_token_ids: torch.Tensor,
     args,
     attn_layers: List[int],
     intervention_layers: List[int],
@@ -1009,13 +921,16 @@ def process_one_sample(
 ):
     prompt = prompt_rows[sid].get("question", "")
     gold = get_gold_from_prompt_row(prompt_rows[sid])
-    obj1, obj2 = parse_two_objects_from_prompt(prompt)
 
+    obj1, obj2 = parse_two_objects_from_prompt(prompt)
     if obj1 is None or obj2 is None:
-        return [], {"parse_fail": 1, "parse_prompt": clean_question(prompt)}
+        return [], {
+            "parse_fail": 1,
+            "prompt": clean_question(prompt),
+        }
 
     raw = get_raw_pil_from_dataset(dataset, sid)
-    processed, _ = make_processed_pil_like_llava(
+    processed = make_processed_pil_like_llava(
         raw=raw,
         image_processor=processor.image_processor,
         force_mode=args.preprocess_mode,
@@ -1031,7 +946,6 @@ def process_one_sample(
         box_threshold=args.box_threshold,
         text_threshold=args.text_threshold,
     )
-
     box2, score2 = detect_one(
         image=processed,
         phrase=obj2,
@@ -1043,16 +957,8 @@ def process_one_sample(
     )
 
     image_size = processed.size[0]
-    obj1_ids, grid_box1 = box_to_patch_ids(
-        box1,
-        image_size=image_size,
-        patch_size=args.patch_size,
-    )
-    obj2_ids, grid_box2 = box_to_patch_ids(
-        box2,
-        image_size=image_size,
-        patch_size=args.patch_size,
-    )
+    obj1_ids, grid_box1 = box_to_patch_ids(box1, image_size, args.patch_size)
+    obj2_ids, grid_box2 = box_to_patch_ids(box2, image_size, args.patch_size)
 
     inputs = processor(
         text=[prompt],
@@ -1096,15 +1002,14 @@ def process_one_sample(
         if len(local_target_ids) == 0:
             continue
 
-        target_local_t = torch.tensor(local_target_ids, dtype=torch.long, device=args.device)
-        target_positions = image_positions.index_select(dim=0, index=target_local_t)
+        target_local_tensor = torch.tensor(local_target_ids, dtype=torch.long, device=args.device)
+        target_positions = image_positions.index_select(dim=0, index=target_local_tensor)
 
         controller = AttentionScalingController(
-            layers_hidden_idx=intervention_layers,
+            hidden_layer_ids=intervention_layers,
             target_positions=target_positions,
             query_position=last_pos,
             alpha=alpha,
-            heads=None,
         )
 
         with patch_llama_attentions(model, controller):
@@ -1147,17 +1052,13 @@ def process_one_sample(
             "pred_changed": bool(base_pred != after_pred),
         }
 
-        add_rel_values(row, "base", base["rel"])
-        add_rel_values(row, "after", after["rel"])
-
-        add_metric_values(row, "base_attn", base["attn_metrics"])
-        add_metric_values(row, "after_attn", after["attn_metrics"])
-
-        safe_add_delta_values(row, "base", "after")
-        safe_add_delta_values(row, "base_attn", "after_attn")
+        add_rel_to_row(row, "base", base["rel"])
+        add_rel_to_row(row, "after", after["rel"])
+        add_attn_to_row(row, "base_attn", base["attn"])
+        add_attn_to_row(row, "after_attn", after["attn"])
+        add_deltas(row)
 
         if gold in REL2ID:
-            gid = REL2ID[gold]
             row["base_gold_logit"] = row[f"base_logit_{gold}"]
             row["after_gold_logit"] = row[f"after_logit_{gold}"]
             row["delta_gold_logit"] = row[f"delta_logit_{gold}"]
@@ -1182,13 +1083,23 @@ def process_one_sample(
 # Summary
 # ============================================================
 
+def pred_ratio_text(series) -> str:
+    vc = series.value_counts(normalize=True).reindex(RELATIONS).fillna(0.0)
+    return " | ".join(f"{r}:{vc[r]:.4f}" for r in RELATIONS)
+
+
 def print_summary(df: pd.DataFrame):
     print("\n================ SUMMARY ================")
     print("rows:", len(df))
     print("unique samples:", df["sample_id"].nunique())
 
+    one_per_sample = df.drop_duplicates("sample_id")
+
     print("\n[base pred ratio]")
-    print(df.drop_duplicates("sample_id")["base_pred"].value_counts(normalize=True).reindex(RELATIONS).fillna(0).to_string())
+    print(pred_ratio_text(one_per_sample["base_pred"]))
+
+    print("\n[base acc]")
+    print(f"{one_per_sample['base_correct'].mean():.6f}")
 
     print("\n[by experiment]")
     cols = [
@@ -1206,18 +1117,17 @@ def print_summary(df: pd.DataFrame):
     ]
     cols = [c for c in cols if c in df.columns]
 
-    g = (
+    exp = (
         df.groupby(["target_mode", "alpha"])[cols]
         .mean()
         .reset_index()
         .sort_values(["after_correct", "corrected"], ascending=False)
     )
-    print(g.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
+    print(exp.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
 
     print("\n[pred ratio after by experiment]")
     for (mode, alpha), sub in df.groupby(["target_mode", "alpha"]):
-        print(f"\n--- target={mode}, alpha={alpha} ---")
-        print(sub["after_pred"].value_counts(normalize=True).reindex(RELATIONS).fillna(0).to_string())
+        print(f"  {mode}:{alpha} -> {pred_ratio_text(sub['after_pred'])}")
 
     print("\n[per gold by experiment]")
     rows = []
@@ -1235,6 +1145,7 @@ def print_summary(df: pd.DataFrame):
             "delta_gold_prob": sub["delta_gold_prob"].mean(),
             "delta_pair_ratio": sub.get("delta_pair_ratio_in_image", pd.Series([np.nan])).mean(),
             "delta_balance": sub.get("delta_pair_balance", pd.Series([np.nan])).mean(),
+            "after_pred_ratio": pred_ratio_text(sub["after_pred"]),
         })
 
     per_gold = pd.DataFrame(rows)
@@ -1243,9 +1154,9 @@ def print_summary(df: pd.DataFrame):
         .to_string(index=False, float_format=lambda x: f"{x:.6f}")
     )
 
-    print("\n[mechanism hint]")
-    print("Grounding-like effect: corrected samples should show delta_pair_ratio > 0, delta_pair_balance > 0, delta_background < 0.")
-    print("Prior-shift effect: one relation logit/prob rises broadly even without pair_ratio improvement; check after pred ratio and delta_logit_*.")
+    print("\n[how to read]")
+    print("Grounding-like: corrected samples should have delta_pair_ratio > 0, delta_pair_balance > 0, delta_background < 0.")
+    print("Prior-shift: after_pred_ratio drifts strongly to one relation while pair_ratio/balance do not improve.")
 
 
 # ============================================================
@@ -1286,21 +1197,16 @@ def main():
     parser.add_argument(
         "--experiments",
         default="global:1.5,object_pair:1.5,background:1.5,random:1.5,global:0.7,object_pair:0.7",
-        help="Comma list like global:1.5,object_pair:1.5,background:1.5,random:1.5",
+        help="Comma list, e.g. global:1.5,object_pair:1.5,background:1.5,random:1.5",
     )
 
     args = parser.parse_args()
 
-    device = args.device
-    if device == "cuda" and not torch.cuda.is_available():
-        device = "cpu"
+    if args.device == "cuda" and not torch.cuda.is_available():
+        args.device = "cpu"
         args.dtype = "float32"
-    args.device = device
 
-    out_dir = Path(
-        args.out_dir
-        or f"output/stage1_attention_scaling_mechanism_{args.dataset}"
-    )
+    out_dir = Path(args.out_dir or f"output/stage1_attention_scaling_mechanism_{args.dataset}_clean")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     attn_layers = [int(x) for x in args.attn_layers.split(",") if x.strip()]
@@ -1314,7 +1220,7 @@ def main():
 
     print("[INFO] dataset:", args.dataset)
     print("[INFO] out_dir:", out_dir)
-    print("[INFO] device:", device)
+    print("[INFO] device:", args.device)
     print("[INFO] attn_layers:", attn_layers)
     print("[INFO] intervention_layers:", intervention_layers)
     print("[INFO] experiments:", experiments)
@@ -1324,7 +1230,7 @@ def main():
         model_id=args.llava_model_id,
         revision=args.llava_revision,
         cache_dir=args.root_dir,
-        device=device,
+        device=args.device,
         dtype=args.dtype,
     )
 
@@ -1335,7 +1241,7 @@ def main():
 
     print("[INFO] loading GroundingDINO")
     gdino_processor = AutoProcessor.from_pretrained(args.grounding_model_id)
-    gdino_model = GroundingDINOModel.from_pretrained(args.grounding_model_id).to(device).eval()
+    gdino_model = GroundingDINOModel.from_pretrained(args.grounding_model_id).to(args.device).eval()
 
     print("[INFO] loading dataset")
     dataset = load_dataset_any_signature(
@@ -1369,6 +1275,7 @@ def main():
     all_rows = []
     parse_fail_examples = []
     parse_fail_n = 0
+    error_examples = []
 
     for sid in tqdm(indices, desc="mechanism probe"):
         try:
@@ -1391,21 +1298,28 @@ def main():
             if meta.get("parse_fail", 0):
                 parse_fail_n += 1
                 if len(parse_fail_examples) < 30:
-                    parse_fail_examples.append((sid, meta.get("parse_prompt", "")))
+                    parse_fail_examples.append((sid, meta.get("prompt", "")))
                 continue
 
             all_rows.extend(rows)
 
         except RuntimeError as e:
-            print(f"\n[ERROR] sid={sid}: {e}")
-            if "out of memory" in str(e).lower() and device.startswith("cuda"):
+            msg = repr(e)
+            print(f"\n[ERROR] sid={sid}: {msg}")
+            if len(error_examples) < 10:
+                error_examples.append((sid, msg))
+            if "out of memory" in str(e).lower() and args.device.startswith("cuda"):
                 torch.cuda.empty_cache()
             continue
+
         except Exception as e:
-            print(f"\n[WARN] sid={sid} skipped: {repr(e)}")
+            msg = repr(e)
+            print(f"\n[WARN] sid={sid} skipped: {msg}")
+            if len(error_examples) < 10:
+                error_examples.append((sid, msg))
             continue
 
-        if device.startswith("cuda"):
+        if args.device.startswith("cuda"):
             torch.cuda.empty_cache()
 
     print("\n[PARSE]")
@@ -1415,6 +1329,11 @@ def main():
         for sid, q in parse_fail_examples:
             print(f"    sid={sid}: {q}")
 
+    if error_examples:
+        print("\n[ERROR EXAMPLES]")
+        for sid, msg in error_examples:
+            print(f"  sid={sid}: {msg}")
+
     if not all_rows:
         raise RuntimeError("No rows collected.")
 
@@ -1422,6 +1341,7 @@ def main():
 
     csv_path = out_dir / "attention_scaling_mechanism_probe.csv"
     df.to_csv(csv_path, index=False)
+
     print("\n[SAVED]", csv_path)
 
     print_summary(df)
