@@ -579,6 +579,135 @@ class LlavaWrapper:
             'logits_position': int(outputs.logits.shape[1] - 1),
         }
 
+
+    @torch.no_grad()
+    def score_closed_set_from_generate_scores(self, output, surfaces, debug=False):
+        """
+        Closed-set scoring using the exact first-step scores returned by generate().
+
+        This is the most apples-to-apples comparison with raw generation:
+            raw generation first token = argmax over the whole vocabulary of output.scores[0]
+            closed-set prediction     = argmax over only left/right/under/on token ids of output.scores[0]
+
+        Therefore closed-set may still differ from raw generation if the global top token is
+        something like "The" or "It", because closed-set restricts the vocabulary.
+        """
+        tokenizer = self.processor.tokenizer
+        scores_tuple = output.scores if hasattr(output, 'scores') else output['scores']
+        sequences = output.sequences if hasattr(output, 'sequences') else output['sequences']
+
+        if scores_tuple is None or len(scores_tuple) == 0:
+            raise ValueError('generate() output has no scores. Set output_scores=True and return_dict_in_generate=True.')
+
+        first_step_scores = scores_tuple[0].float()[0]  # [vocab]
+        first_step_log_probs = F.log_softmax(first_step_scores, dim=-1)
+        first_step_vocab_probs = torch.softmax(first_step_scores, dim=-1)
+
+        first_generated_id = int(sequences[0, -len(scores_tuple)].detach().cpu().item()) if sequences.ndim == 2 else None
+        # More robust: the first generated token is the first token generated after the prompt.
+        # Since output.scores length is new-token count, this indexing works for generate output.
+        try:
+            first_generated_id = int(sequences[0, sequences.shape[1] - len(scores_tuple)].detach().cpu().item())
+        except Exception:
+            pass
+        if first_generated_id is not None:
+            first_generated_text = tokenizer.decode(
+                [first_generated_id],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+            first_generated_logprob = float(first_step_log_probs[first_generated_id].detach().cpu().item())
+            first_generated_vocab_prob = float(first_step_vocab_probs[first_generated_id].detach().cpu().item())
+        else:
+            first_generated_text = ''
+            first_generated_logprob = float('nan')
+            first_generated_vocab_prob = float('nan')
+
+        raw = {}
+        normalized_scores = {}
+        normalized_details = {}
+
+        for surface in surfaces:
+            candidate_text = ' ' + surface
+            candidate_token_ids = tokenizer(candidate_text, add_special_tokens=False).input_ids
+
+            if len(candidate_token_ids) == 0:
+                first_token_id = None
+                first_token_text = ''
+                lp = float('-inf')
+                vocab_prob = 0.0
+            else:
+                # Closed-set first-step comparison: only the first answer token is comparable
+                # to generation's first step.
+                first_token_id = int(candidate_token_ids[0])
+                first_token_text = tokenizer.decode(
+                    [first_token_id],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                lp = float(first_step_log_probs[first_token_id].detach().cpu().item())
+                vocab_prob = float(first_step_vocab_probs[first_token_id].detach().cpu().item())
+
+            norm = self._normalize_relation(surface)
+            detail = {
+                'surface': surface,
+                'normalized': norm,
+                'candidate_text': candidate_text,
+                'avg_logprob': lp,
+                'sum_logprob': lp,
+                'prob': None,
+                'vocab_prob': vocab_prob,
+                'num_tokens_scored': 1 if first_token_id is not None else 0,
+                'candidate_token_ids': [int(x) for x in candidate_token_ids],
+                'scored_token_id': first_token_id,
+                'scored_token_text': first_token_text,
+                'token_logprobs': [lp] if first_token_id is not None else [],
+                'scoring_mode': 'generate_scores_first_step_restricted_vocab',
+            }
+            raw[surface] = detail
+
+            if norm not in normalized_scores or lp > normalized_scores[norm]:
+                normalized_scores[norm] = lp
+                normalized_details[norm] = detail
+
+            if debug:
+                print(
+                    f"[CLOSED-SET FROM GENERATE DEBUG] surface={surface!r} norm={norm!r} "
+                    f"candidate_ids={candidate_token_ids} scored_id={first_token_id} "
+                    f"scored_text={first_token_text!r} logp={lp:.6f} vocab_prob={vocab_prob:.8f}"
+                )
+
+        relation_order = [self._normalize_relation(s) for s in surfaces]
+        relation_order = list(dict.fromkeys(relation_order))
+        score_vec = torch.tensor(
+            [normalized_scores.get(r, float('-inf')) for r in relation_order],
+            dtype=torch.float32,
+        )
+        probs_vec = torch.softmax(score_vec, dim=0)
+        probs = {r: float(probs_vec[i].item()) for i, r in enumerate(relation_order)}
+        for r, prob in probs.items():
+            if r in normalized_details:
+                normalized_details[r]['prob'] = prob
+
+        pred = max(normalized_scores.items(), key=lambda kv: kv[1])[0]
+        confidence = probs.get(pred, 0.0)
+
+        return {
+            'surfaces': surfaces,
+            'relation_order': relation_order,
+            'scores': normalized_scores,
+            'probs': probs,
+            'pred': pred,
+            'confidence': confidence,
+            'raw': raw,
+            'normalized_details': normalized_details,
+            'first_generated_token_id': first_generated_id,
+            'first_generated_token_text': first_generated_text,
+            'first_generated_token_logprob': first_generated_logprob,
+            'first_generated_token_vocab_prob': first_generated_vocab_prob,
+            'scoring_mode': 'generate_scores_first_step_restricted_vocab',
+        }
+
     def _format_closed_set_line(self, tag, closed_result):
         pieces = []
         for rel in closed_result['relation_order']:
@@ -590,6 +719,76 @@ class LlavaWrapper:
             f"conf={closed_result['confidence']:.4f}, "
             + "; ".join(pieces)
         )
+
+    def _classify_alpha_scaling_case(self, base_correct, low_correct, high_correct):
+        """
+        Mutually exclusive case label for alpha-scaling analysis.
+
+        base_correct: closed-set correctness at weight=1.0
+        low_correct:  closed-set correctness at weight1, normally < 1
+        high_correct: closed-set correctness at weight2, normally > 1
+
+        The user's six main categories are:
+            low_wrong_to_correct
+            high_wrong_to_correct
+            always_correct
+            low_correct_to_wrong
+            high_correct_to_wrong
+            always_wrong
+
+        Two extra buckets are kept so every sample is counted exactly once when both
+        low and high scaling flip the base result in the same direction.
+        """
+        base_correct = bool(base_correct)
+        low_correct = bool(low_correct)
+        high_correct = bool(high_correct)
+
+        if base_correct and low_correct and high_correct:
+            return "always_correct"
+        if (not base_correct) and (not low_correct) and (not high_correct):
+            return "always_wrong"
+
+        if (not base_correct) and low_correct and (not high_correct):
+            return "low_wrong_to_correct"
+        if (not base_correct) and (not low_correct) and high_correct:
+            return "high_wrong_to_correct"
+
+        if base_correct and (not low_correct) and high_correct:
+            return "low_correct_to_wrong"
+        if base_correct and low_correct and (not high_correct):
+            return "high_correct_to_wrong"
+
+        if (not base_correct) and low_correct and high_correct:
+            return "both_scalings_wrong_to_correct"
+        if base_correct and (not low_correct) and (not high_correct):
+            return "both_scalings_correct_to_wrong"
+
+        return "unclassified"
+
+    def _new_alpha_effect_stats(self):
+        names = [
+            "low_wrong_to_correct",
+            "high_wrong_to_correct",
+            "always_correct",
+            "low_correct_to_wrong",
+            "high_correct_to_wrong",
+            "always_wrong",
+            "both_scalings_wrong_to_correct",
+            "both_scalings_correct_to_wrong",
+            "unclassified",
+        ]
+        return {name: {"count": 0, "sample_ids": []} for name in names}
+
+    def _record_alpha_effect_case(self, stats, case_name, sample_id):
+        if case_name not in stats:
+            stats[case_name] = {"count": 0, "sample_ids": []}
+        stats[case_name]["count"] += 1
+        stats[case_name]["sample_ids"].append(int(sample_id))
+
+    def _short_closed_pred(self, closed_result):
+        if closed_result is None:
+            return "None"
+        return f"{closed_result['pred']}@{closed_result['confidence']:.4f}"
 
     @torch.no_grad()
     def get_out_scores_wh_batched(self, dataset, joint_loader, method, weight, option, threshold, weight1, weight2):
@@ -652,6 +851,10 @@ class LlavaWrapper:
         lower_surfaces = ["left", "right", "under", "on"]
         upper_surfaces = ["Left", "Right", "Under", "On"]
 
+        # Exclusive 6(+2) case statistics for alpha-scaling analysis.
+        # Base is weight=1.0. Low is weight1, normally <1. High is weight2, normally >1.
+        alpha_effect_stats = self._new_alpha_effect_stats()
+
         results = []  # Store results for each generated sequence
         for batch in tqdm(joint_loader):
             batch_scores = []
@@ -689,6 +892,16 @@ class LlavaWrapper:
                     final_weight = weight
                     lower_closed = None
                     upper_closed = None
+                    base_lower_closed = None
+                    base_upper_closed = None
+                    low_lower_closed = None
+                    low_upper_closed = None
+                    high_lower_closed = None
+                    high_upper_closed = None
+                    alpha_effect_case = None
+                    base_lower_correct = False
+                    low_lower_correct = False
+                    high_lower_correct = False
                     gen_for_original_match = ""
                     eval_pred = ""
 
@@ -751,27 +964,89 @@ class LlavaWrapper:
                         )
                         gen_for_original_match = raw_generation_clean
 
-                        # 4) Closed-set lowercase: read P(" left/right/under/on" | prompt, image) from next-token logits.
-                        lower_closed = self.score_closed_set_spatial(
-                            image=image,
-                            prompt=prompt,
+                        # 4) Closed-set at alpha=1.0, weight1, and weight2 for case statistics.
+                        #    These use generate().scores[0], i.e. the exact first-step distribution.
+                        base_lower_closed = self.score_closed_set_from_generate_scores(
+                            output=base_output,
                             surfaces=lower_surfaces,
-                            weight=final_weight,
                             debug=False,
-                            prepared_inputs=single_input,
                         )
-
-                        # 5) Closed-set capitalized: read P(" Left/Right/Under/On" | prompt, image) from next-token logits.
-                        upper_closed = self.score_closed_set_spatial(
-                            image=image,
-                            prompt=prompt,
+                        base_upper_closed = self.score_closed_set_from_generate_scores(
+                            output=base_output,
                             surfaces=upper_surfaces,
-                            weight=final_weight,
                             debug=False,
-                            prepared_inputs=single_input,
                         )
 
-                        # Main prediction for adapt_vis is the lowercase closed-set result.
+                        # Reuse the full 100-token generation as the selected branch; only run a
+                        # one-token generation for the unselected branch to get first-step scores.
+                        if float(final_weight) == float(weight1):
+                            low_output_for_closed = output
+                            high_output_for_closed = self.model.generate(
+                                **single_input,
+                                keys=keys,
+                                weight=weight2,
+                                max_new_tokens=1,
+                                output_scores=True,
+                                return_dict_in_generate=True,
+                            )
+                        elif float(final_weight) == float(weight2):
+                            high_output_for_closed = output
+                            low_output_for_closed = self.model.generate(
+                                **single_input,
+                                keys=keys,
+                                weight=weight1,
+                                max_new_tokens=1,
+                                output_scores=True,
+                                return_dict_in_generate=True,
+                            )
+                        else:
+                            low_output_for_closed = self.model.generate(
+                                **single_input,
+                                keys=keys,
+                                weight=weight1,
+                                max_new_tokens=1,
+                                output_scores=True,
+                                return_dict_in_generate=True,
+                            )
+                            high_output_for_closed = self.model.generate(
+                                **single_input,
+                                keys=keys,
+                                weight=weight2,
+                                max_new_tokens=1,
+                                output_scores=True,
+                                return_dict_in_generate=True,
+                            )
+
+                        low_lower_closed = self.score_closed_set_from_generate_scores(
+                            output=low_output_for_closed,
+                            surfaces=lower_surfaces,
+                            debug=False,
+                        )
+                        low_upper_closed = self.score_closed_set_from_generate_scores(
+                            output=low_output_for_closed,
+                            surfaces=upper_surfaces,
+                            debug=False,
+                        )
+                        high_lower_closed = self.score_closed_set_from_generate_scores(
+                            output=high_output_for_closed,
+                            surfaces=lower_surfaces,
+                            debug=False,
+                        )
+                        high_upper_closed = self.score_closed_set_from_generate_scores(
+                            output=high_output_for_closed,
+                            surfaces=upper_surfaces,
+                            debug=False,
+                        )
+
+                        # Keep the previous behavior: the main closed-set prediction follows the
+                        # branch selected by AdaptVis thresholding.
+                        if float(final_weight) == float(weight1):
+                            lower_closed = low_lower_closed
+                            upper_closed = low_upper_closed
+                        else:
+                            lower_closed = high_lower_closed
+                            upper_closed = high_upper_closed
+
                         eval_pred = lower_closed['pred']
 
                     else:
@@ -806,6 +1081,17 @@ class LlavaWrapper:
                         upper_correct = bool(upper_closed['pred'] == gold_norm)
 
                     if method == 'adapt_vis':
+                        base_lower_correct = bool(base_lower_closed is not None and base_lower_closed['pred'] == gold_norm)
+                        low_lower_correct = bool(low_lower_closed is not None and low_lower_closed['pred'] == gold_norm)
+                        high_lower_correct = bool(high_lower_closed is not None and high_lower_closed['pred'] == gold_norm)
+                        alpha_effect_case = self._classify_alpha_scaling_case(
+                            base_correct=base_lower_correct,
+                            low_correct=low_lower_correct,
+                            high_correct=high_lower_correct,
+                        )
+                        self._record_alpha_effect_case(alpha_effect_stats, alpha_effect_case, index_of_total)
+
+                    if method == 'adapt_vis':
                         if lower_correct:
                             acc += 1
                             correct_id.append(index_of_total)
@@ -827,11 +1113,26 @@ class LlavaWrapper:
                     print(f"[RAW GENERATION CLEAN | used by original substring match]\n{raw_generation_clean}")
                     if method == 'adapt_vis':
                         print(f"[BASE RAW GENERATION before AdaptVis weight selection]\n{base_raw_generation}")
-                        print(self._format_closed_set_line("[CLOSED-SET lowercase next-token left/right/under/on]", lower_closed))
-                        print(self._format_closed_set_line("[CLOSED-SET Capitalized next-token Left/Right/Under/On]", upper_closed))
                         print(
-                            f"Correctness: lower_closed={lower_correct}, "
-                            f"upper_closed={upper_correct}, raw_generation={raw_correct}"
+                            f"[RAW GENERATION FIRST TOKEN] "
+                            f"id={lower_closed.get('first_generated_token_id')}, "
+                            f"text={lower_closed.get('first_generated_token_text')!r}, "
+                            f"vocab_prob={lower_closed.get('first_generated_token_vocab_prob'):.6f}"
+                        )
+                        print(self._format_closed_set_line("[CLOSED-SET lowercase selected by threshold]", lower_closed))
+                        print(self._format_closed_set_line("[CLOSED-SET Capitalized selected by threshold]", upper_closed))
+                        print(self._format_closed_set_line(f"[ALPHA=1.0 lowercase baseline]", base_lower_closed))
+                        print(self._format_closed_set_line(f"[ALPHA=weight1={weight1} lowercase]", low_lower_closed))
+                        print(self._format_closed_set_line(f"[ALPHA=weight2={weight2} lowercase]", high_lower_closed))
+                        print(
+                            f"[ALPHA EFFECT CASE | lowercase] {alpha_effect_case} | "
+                            f"base@1.0={self._short_closed_pred(base_lower_closed)} correct={base_lower_correct}; "
+                            f"low@{weight1}={self._short_closed_pred(low_lower_closed)} correct={low_lower_correct}; "
+                            f"high@{weight2}={self._short_closed_pred(high_lower_closed)} correct={high_lower_correct}"
+                        )
+                        print(
+                            f"Correctness: lower_closed_selected={lower_correct}, "
+                            f"upper_closed_selected={upper_correct}, raw_generation={raw_correct}"
                         )
                     else:
                         print(f"Correctness: raw_generation={raw_correct}")
@@ -851,6 +1152,19 @@ class LlavaWrapper:
                         "BaseConfidence": base_uncertainty,
                         "Threshold": threshold,
                         "FinalWeight": final_weight,
+                        "AlphaEffectCaseLower": alpha_effect_case,
+                        "AlphaBaseWeight": 1.0,
+                        "AlphaLowWeight": weight1,
+                        "AlphaHighWeight": weight2,
+                        "AlphaBaseLowerPred": base_lower_closed['pred'] if base_lower_closed is not None else None,
+                        "AlphaBaseLowerConfidence": base_lower_closed['confidence'] if base_lower_closed is not None else None,
+                        "AlphaBaseLowerCorrect": base_lower_correct,
+                        "AlphaLowLowerPred": low_lower_closed['pred'] if low_lower_closed is not None else None,
+                        "AlphaLowLowerConfidence": low_lower_closed['confidence'] if low_lower_closed is not None else None,
+                        "AlphaLowLowerCorrect": low_lower_correct,
+                        "AlphaHighLowerPred": high_lower_closed['pred'] if high_lower_closed is not None else None,
+                        "AlphaHighLowerConfidence": high_lower_closed['confidence'] if high_lower_closed is not None else None,
+                        "AlphaHighLowerCorrect": high_lower_correct,
                     }
                     if lower_closed is not None:
                         result.update({
@@ -861,10 +1175,10 @@ class LlavaWrapper:
                             "ClosedSetLowerProbs": lower_closed['probs'],
                             "ClosedSetLowerRaw": lower_closed['raw'],
                             "ClosedSetLowerCorrect": lower_correct,
-                            "ClosedSetImageTokenID": lower_closed['image_token_id'],
-                            "ClosedSetNumImagePatches": lower_closed['num_image_patches'],
-                            "ClosedSetInputSeqLen": lower_closed['input_seq_len'],
-                            "ClosedSetLogitsSeqLen": lower_closed['logits_seq_len'],
+                            "ClosedSetScoringMode": lower_closed.get('scoring_mode'),
+                            "ClosedSetFirstGeneratedTokenID": lower_closed.get('first_generated_token_id'),
+                            "ClosedSetFirstGeneratedTokenText": lower_closed.get('first_generated_token_text'),
+                            "ClosedSetFirstGeneratedTokenVocabProb": lower_closed.get('first_generated_token_vocab_prob'),
                         })
                     if upper_closed is not None:
                         result.update({
@@ -876,6 +1190,32 @@ class LlavaWrapper:
                             "ClosedSetUpperRaw": upper_closed['raw'],
                             "ClosedSetUpperCorrect": upper_correct,
                         })
+                    if method == 'adapt_vis':
+                        if base_lower_closed is not None:
+                            result.update({
+                                "AlphaBaseLowerScores": base_lower_closed['scores'],
+                                "AlphaBaseLowerProbs": base_lower_closed['probs'],
+                                "AlphaBaseUpperPred": base_upper_closed['pred'] if base_upper_closed is not None else None,
+                                "AlphaBaseUpperScores": base_upper_closed['scores'] if base_upper_closed is not None else None,
+                                "AlphaBaseUpperProbs": base_upper_closed['probs'] if base_upper_closed is not None else None,
+                            })
+                        if low_lower_closed is not None:
+                            result.update({
+                                "AlphaLowLowerScores": low_lower_closed['scores'],
+                                "AlphaLowLowerProbs": low_lower_closed['probs'],
+                                "AlphaLowUpperPred": low_upper_closed['pred'] if low_upper_closed is not None else None,
+                                "AlphaLowUpperScores": low_upper_closed['scores'] if low_upper_closed is not None else None,
+                                "AlphaLowUpperProbs": low_upper_closed['probs'] if low_upper_closed is not None else None,
+                            })
+                        if high_lower_closed is not None:
+                            result.update({
+                                "AlphaHighLowerScores": high_lower_closed['scores'],
+                                "AlphaHighLowerProbs": high_lower_closed['probs'],
+                                "AlphaHighUpperPred": high_upper_closed['pred'] if high_upper_closed is not None else None,
+                                "AlphaHighUpperScores": high_upper_closed['scores'] if high_upper_closed is not None else None,
+                                "AlphaHighUpperProbs": high_upper_closed['probs'] if high_upper_closed is not None else None,
+                            })
+
                     results.append(result)
 
                     # Build the score array returned to the ARO evaluator.
@@ -924,6 +1264,7 @@ class LlavaWrapper:
                     f"upper_closed={upper_acc}/{denom}={upper_acc / denom:.6f}, "
                     f"raw_generation={raw_acc}/{denom}={raw_acc / denom:.6f}"
                 )
+                print("running alpha effect cases:", {k: v["count"] for k, v in alpha_effect_stats.items() if v["count"] > 0})
             else:
                 print(f"running acc raw_generation={acc}/{denom}={acc / denom:.6f}")
 
@@ -934,6 +1275,9 @@ class LlavaWrapper:
             print(f"lower closed-set acc: {acc}/{denom}={acc / denom:.6f}")
             print(f"upper closed-set acc: {upper_acc}/{denom}={upper_acc / denom:.6f}")
             print(f"raw generation acc: {raw_acc}/{denom}={raw_acc / denom:.6f}")
+            print("alpha effect case counts:")
+            for case_name, item in alpha_effect_stats.items():
+                print(f"  {case_name}: {item['count']} | sample_ids={item['sample_ids']}")
         else:
             print(f"raw generation acc: {acc}/{denom}={acc / denom:.6f}")
 
@@ -948,7 +1292,39 @@ class LlavaWrapper:
                 "upper_closedset_correct_id": upper_correct_id,
                 "raw_generation_acc": raw_acc / denom,
                 "raw_generation_correct_id": raw_correct_id,
+                "alpha_effect_stats_lower": alpha_effect_stats,
+                "alpha_effect_weights": {
+                    "base": 1.0,
+                    "low": weight1,
+                    "high": weight2,
+                    "threshold": threshold,
+                },
             }, fout, ensure_ascii=False, indent=4)
+
+        if method == 'adapt_vis':
+            alpha_stats_file = output_file_path.replace(".json", "_alpha_effect_stats.json")
+            with open(alpha_stats_file, 'w', encoding='utf-8') as fout:
+                json.dump({
+                    "dataset": dataset,
+                    "option": option,
+                    "method": method,
+                    "weights": {"base": 1.0, "low": weight1, "high": weight2, "threshold": threshold},
+                    "case_definition": {
+                        "base": "lowercase closed-set prediction at weight=1.0",
+                        "low": "lowercase closed-set prediction at weight1, normally <1",
+                        "high": "lowercase closed-set prediction at weight2, normally >1",
+                        "always_correct": "base, low, and high are all correct",
+                        "always_wrong": "base, low, and high are all wrong",
+                        "low_wrong_to_correct": "base is wrong, low becomes correct, high remains wrong",
+                        "high_wrong_to_correct": "base is wrong, high becomes correct, low remains wrong",
+                        "low_correct_to_wrong": "base is correct, low becomes wrong, high remains correct",
+                        "high_correct_to_wrong": "base is correct, high becomes wrong, low remains correct",
+                        "both_scalings_wrong_to_correct": "base is wrong, both low and high become correct",
+                        "both_scalings_correct_to_wrong": "base is correct, both low and high become wrong"
+                    },
+                    "stats": alpha_effect_stats,
+                }, fout, ensure_ascii=False, indent=4)
+            print("alpha effect stats saved to", alpha_stats_file)
 
         # Concatenate all scores and return based on dataset type
         all_scores = np.concatenate(scores, axis=0)  # N x K x L
