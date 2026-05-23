@@ -337,10 +337,11 @@ class LlavaWrapper:
             skip_special_tokens=False,
             clean_up_tokenization_spaces=False,
         )
+        # Match the original repo's generation decode exactly for the clean text:
+        # self.processor.decode(new_tokens, skip_special_tokens=True)
         clean_new = self.processor.decode(
             new_tokens,
             skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
         )
         full_sequence = self.processor.decode(
             seq,
@@ -431,28 +432,38 @@ class LlavaWrapper:
         return new_token_positions
 
     @torch.no_grad()
-    def score_closed_set_spatial(self, image, prompt, surfaces, weight=1.0, debug=False):
+    def score_closed_set_spatial(self, image, prompt, surfaces, weight=1.0, debug=False, prepared_inputs=None):
         """
-        Closed-set scoring:
-            prompt + " left" / " right" / " under" / " on"
-        Then score only the appended candidate tokens.
+        Closed-set scoring aligned with the first step of generation.
 
-        This function handles image-token expansion. It maps candidate token positions
-        from the original input_ids space to the expanded LLaVA sequence space before
-        indexing logits.
+        Important:
+            We do NOT score logits at the appended candidate token position.
+            We run the original prompt-only input, then read outputs.logits[:, -1, :],
+            which is exactly the distribution used by greedy generation for the next token.
+
+        Therefore this scores:
+            P(" left"  | prompt, image)
+            P(" right" | prompt, image)
+            P(" under" | prompt, image)
+            P(" on"    | prompt, image)
+
+        This makes the AdaptVis weight affect the same query/state that generation uses.
         """
         tokenizer = self.processor.tokenizer
-        answer_texts = [" " + s for s in surfaces]
-        full_texts = [prompt + a for a in answer_texts]
-        images = [image] * len(full_texts)
 
-        # Do NOT use max_length=77 here; otherwise the appended candidate can be truncated.
-        inputs = self.processor(
-            text=full_texts,
-            images=images,
-            return_tensors="pt",
-            padding=True,
-        ).to(self.device)
+        # Use the same preprocessed input as the generation branch whenever possible.
+        # This keeps padding=max_length, max_length=77, and image preprocessing identical
+        # to the raw generation code path.
+        if prepared_inputs is None:
+            inputs = self.processor(
+                text=prompt,
+                images=image,
+                padding="max_length",
+                return_tensors="pt",
+                max_length=77,
+            ).to(self.device)
+        else:
+            inputs = prepared_inputs
 
         model_kwargs = dict(inputs)
         if 'Scal' in str(type(self.model)):
@@ -460,97 +471,77 @@ class LlavaWrapper:
         else:
             outputs = self.model(**model_kwargs, return_dict=True)
 
-        input_ids = inputs['input_ids']
-        attention_mask = inputs['attention_mask']
-        image_token_id = self._find_image_token_id(input_ids)
-        num_image_patches = self._infer_num_image_patches(inputs, outputs, image_token_id)
-        expanded_positions = self._compute_expanded_token_positions(
-            input_ids=input_ids,
-            image_token_id=image_token_id,
-            num_image_patches=num_image_patches,
-        )
-
-        log_probs = F.log_softmax(outputs.logits.float(), dim=-1)
+        # This is intentionally the same position used in _add_weight_greedy_search:
+        #     next_token_logits = outputs.logits[:, -1, :]
+        next_token_logits = outputs.logits[:, -1, :]
+        next_token_log_probs = F.log_softmax(next_token_logits.float(), dim=-1)[0]
+        next_token_vocab_probs = torch.softmax(next_token_logits.float(), dim=-1)[0]
 
         raw = {}
         normalized_scores = {}
         normalized_details = {}
 
-        for b, surface in enumerate(surfaces):
-            cand_ids_ref = tokenizer(
-                " " + surface,
+        for surface in surfaces:
+            candidate_text = " " + surface
+            candidate_token_ids = tokenizer(
+                candidate_text,
                 add_special_tokens=False,
             ).input_ids
-            n_tok = len(cand_ids_ref)
 
-            if n_tok == 0:
+            if len(candidate_token_ids) == 0:
+                first_token_id = None
+                first_token_text = ""
                 avg_lp = float('-inf')
                 sum_lp = float('-inf')
-                vals_list = []
-                cand_input_pos_list = []
-                cand_expanded_pos_list = []
-                answer_ids = []
-                answer_text = ""
+                vocab_prob = 0.0
+                token_lps = []
             else:
-                nonpad_positions = torch.nonzero(attention_mask[b], as_tuple=False).squeeze(-1)
-                cand_input_positions = nonpad_positions[-n_tok:]
-                cand_expanded_positions = expanded_positions[b, cand_input_positions]
-                pred_positions = cand_expanded_positions - 1
-
-                valid = (pred_positions >= 0) & (pred_positions < log_probs.shape[1])
-                cand_input_positions = cand_input_positions[valid]
-                cand_expanded_positions = cand_expanded_positions[valid]
-                pred_positions = pred_positions[valid]
-
-                if pred_positions.numel() == 0:
-                    avg_lp = float('-inf')
-                    sum_lp = float('-inf')
-                    vals_list = []
-                    answer_ids = []
-                    answer_text = ""
-                else:
-                    answer_token_ids = input_ids[b, cand_input_positions]
-                    vals = log_probs[b, pred_positions, answer_token_ids]
-                    sum_lp = float(vals.sum().detach().cpu().item())
-                    avg_lp = float(vals.mean().detach().cpu().item())
-                    vals_list = [float(x) for x in vals.detach().cpu().tolist()]
-                    answer_ids = [int(x) for x in answer_token_ids.detach().cpu().tolist()]
-                    answer_text = tokenizer.decode(
-                        answer_ids,
-                        skip_special_tokens=False,
-                        clean_up_tokenization_spaces=False,
-                    )
-
-                cand_input_pos_list = [int(x) for x in cand_input_positions.detach().cpu().tolist()]
-                cand_expanded_pos_list = [int(x) for x in cand_expanded_positions.detach().cpu().tolist()]
+                # For LLaMA tokenizer, " left", " right", " under", " on" are normally
+                # one token. If any surface becomes multiple tokens, we deliberately score
+                # the first next-token only, because this closed set is meant to match the
+                # first generation decision.
+                first_token_id = int(candidate_token_ids[0])
+                first_token_text = tokenizer.decode(
+                    [first_token_id],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                first_lp = float(next_token_log_probs[first_token_id].detach().cpu().item())
+                vocab_prob = float(next_token_vocab_probs[first_token_id].detach().cpu().item())
+                avg_lp = first_lp
+                sum_lp = first_lp
+                token_lps = [first_lp]
 
             norm = self._normalize_relation(surface)
             detail = {
                 'surface': surface,
                 'normalized': norm,
-                'candidate_text': " " + surface,
+                'candidate_text': candidate_text,
                 'avg_logprob': avg_lp,
                 'sum_logprob': sum_lp,
-                'prob': None,
-                'num_tokens': len(vals_list),
-                'candidate_token_ids': answer_ids,
-                'candidate_token_text': answer_text,
-                'candidate_input_positions': cand_input_pos_list,
-                'candidate_expanded_positions': cand_expanded_pos_list,
-                'token_logprobs': vals_list,
+                'prob': None,  # closed-set normalized prob, filled below
+                'vocab_prob': vocab_prob,
+                'num_tokens_scored': len(token_lps),
+                'candidate_token_ids': [int(x) for x in candidate_token_ids],
+                'scored_token_id': first_token_id,
+                'scored_token_text': first_token_text,
+                'token_logprobs': token_lps,
+                'scoring_mode': 'prompt_only_next_token_logits_minus_1_not_appended_candidate_state',
+                'logits_position': int(outputs.logits.shape[1] - 1),
             }
             raw[surface] = detail
 
-            # If two surfaces normalize to the same relation, keep the higher average log-prob.
+            # If two surfaces normalize to the same relation, keep the higher log-prob.
             if norm not in normalized_scores or avg_lp > normalized_scores[norm]:
                 normalized_scores[norm] = avg_lp
                 normalized_details[norm] = detail
 
             if debug:
                 print(
-                    f"[CLOSED-SET DEBUG] surface={surface!r} norm={norm!r} "
-                    f"input_pos={cand_input_pos_list} expanded_pos={cand_expanded_pos_list} "
-                    f"avg_logprob={avg_lp:.6f} text={answer_text!r}"
+                    f"[CLOSED-SET NEXT-TOKEN DEBUG] surface={surface!r} norm={norm!r} "
+                    f"candidate_ids={candidate_token_ids} scored_id={first_token_id} "
+                    f"scored_text={first_token_text!r} logp={avg_lp:.6f} "
+                    f"vocab_prob={vocab_prob:.8f} weight={weight}"
                 )
 
         relation_order = [self._normalize_relation(s) for s in surfaces]
@@ -568,6 +559,9 @@ class LlavaWrapper:
         pred = max(normalized_scores.items(), key=lambda kv: kv[1])[0]
         confidence = probs.get(pred, 0.0)
 
+        image_token_id = self._find_image_token_id(inputs['input_ids'])
+        num_image_patches = self._infer_num_image_patches(inputs, outputs, image_token_id)
+
         return {
             'surfaces': surfaces,
             'relation_order': relation_order,
@@ -580,7 +574,9 @@ class LlavaWrapper:
             'image_token_id': int(image_token_id),
             'num_image_patches': int(num_image_patches),
             'logits_seq_len': int(outputs.logits.shape[1]),
-            'input_seq_len': int(input_ids.shape[1]),
+            'input_seq_len': int(inputs['input_ids'].shape[1]),
+            'scoring_mode': 'prompt_only_next_token',
+            'logits_position': int(outputs.logits.shape[1] - 1),
         }
 
     def _format_closed_set_line(self, tag, closed_result):
@@ -726,7 +722,9 @@ class LlavaWrapper:
                             output_scores=True,
                             return_dict_in_generate=True,
                         )
-                        base_uncertainty = self._first_token_confidence_from_generate(base_output)
+                        base_uncertainty_raw = self._first_token_confidence_from_generate(base_output)
+                        # Match the original repo exactly: it rounds to 2 decimals before comparing with threshold.
+                        base_uncertainty = float(np.round(float(base_uncertainty_raw), 2))
                         base_raw_generation, _, _ = self._decode_generate_output(
                             base_output,
                             input_len=single_input['input_ids'].shape[-1],
@@ -753,22 +751,24 @@ class LlavaWrapper:
                         )
                         gen_for_original_match = raw_generation_clean
 
-                        # 4) Closed-set lowercase: prompt + " left/right/under/on".
+                        # 4) Closed-set lowercase: read P(" left/right/under/on" | prompt, image) from next-token logits.
                         lower_closed = self.score_closed_set_spatial(
                             image=image,
                             prompt=prompt,
                             surfaces=lower_surfaces,
                             weight=final_weight,
                             debug=False,
+                            prepared_inputs=single_input,
                         )
 
-                        # 5) Closed-set capitalized: prompt + " Left/Right/Under/On".
+                        # 5) Closed-set capitalized: read P(" Left/Right/Under/On" | prompt, image) from next-token logits.
                         upper_closed = self.score_closed_set_spatial(
                             image=image,
                             prompt=prompt,
                             surfaces=upper_surfaces,
                             weight=final_weight,
                             debug=False,
+                            prepared_inputs=single_input,
                         )
 
                         # Main prediction for adapt_vis is the lowercase closed-set result.
@@ -827,8 +827,8 @@ class LlavaWrapper:
                     print(f"[RAW GENERATION CLEAN | used by original substring match]\n{raw_generation_clean}")
                     if method == 'adapt_vis':
                         print(f"[BASE RAW GENERATION before AdaptVis weight selection]\n{base_raw_generation}")
-                        print(self._format_closed_set_line("[CLOSED-SET lowercase prompt+ left/right/under/on]", lower_closed))
-                        print(self._format_closed_set_line("[CLOSED-SET Capitalized prompt+ Left/Right/Under/On]", upper_closed))
+                        print(self._format_closed_set_line("[CLOSED-SET lowercase next-token left/right/under/on]", lower_closed))
+                        print(self._format_closed_set_line("[CLOSED-SET Capitalized next-token Left/Right/Under/On]", upper_closed))
                         print(
                             f"Correctness: lower_closed={lower_correct}, "
                             f"upper_closed={upper_correct}, raw_generation={raw_correct}"
