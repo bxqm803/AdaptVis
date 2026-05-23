@@ -1,5 +1,5 @@
 # coding=utf-8
-"""PyTorch LLaMA model with main-style AdaptVis / ScalingVis intervention."""
+"""PyTorch LLaMA model with AdaptVis / ScalingVis decode-step intervention."""
 
 import math
 import os
@@ -168,7 +168,9 @@ class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+        self.variance_epsilon = epsinit__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones
 
     def forward(self, hidden_states):
         variance = hidden_states.to(torch.float32).pow(2).mean(
@@ -295,7 +297,7 @@ class LLaMAMLP(nn.Module):
 
 class LLaMAAttention(nn.Module):
     """
-    Multi-headed attention with main-style AdaptVis / ScalingVis intervention.
+    Multi-headed attention with AdaptVis / ScalingVis intervention.
     """
 
     def __init__(
@@ -370,13 +372,12 @@ class LLaMAAttention(nn.Module):
         object_patch_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """
-        Main-style AdaptVis attention.
+        AdaptVis / ScalingVis attention.
 
         Important behavior:
-            - AdaptVis / ScalingVis is applied only when q_len == kv_seq_len.
-            - This corresponds to the prefill / square-attention stage.
-            - Autoregressive decode steps usually have q_len=1, kv_seq_len>1,
-              so they are skipped.
+            - Applies on both prefill and decode when keys are available.
+            - In decode, q_len is usually 1 and kv_seq_len is prompt_len + generated_len.
+            - The selected query attends to the image-token key span.
         """
 
         if adjust_method is None:
@@ -468,11 +469,15 @@ class LLaMAAttention(nn.Module):
         else:
             should_save_layer = True
 
+        # ----------------------------------------------------
+        # Locate image-token range from keys.
+        # No q_len == kv_seq_len restriction here:
+        # decode-step intervention must remain active.
+        # ----------------------------------------------------
         if (
             idx is not None
             and idx < 32
             and keys is not None
-            and q_len == kv_seq_len
             and weight is not None
         ):
             if isinstance(keys, (list, tuple)):
@@ -521,6 +526,7 @@ class LLaMAAttention(nn.Module):
                 mask[:, :] = True
 
             else:
+                # Keep unknown modes safe and close to default AdaptVis.
                 mask[-1, start_idx:end_idx + 1] = True
 
             if _adaptvis_layer_allowed(idx):
@@ -528,7 +534,7 @@ class LLaMAAttention(nn.Module):
 
                 if os.getenv("ADAPTVIS_LAYER_DEBUG", "False") == "True":
                     print(
-                        f"[ADAPTVIS_APPLY_MAIN_STYLE] layer={idx}, "
+                        f"[ADAPTVIS_APPLY] layer={idx}, "
                         f"q_len={q_len}, kv_seq_len={kv_seq_len}, "
                         f"adjust_method={adjust_method}, weight={weight}, "
                         f"start={start_idx}, end={end_idx}, "
@@ -550,7 +556,7 @@ class LLaMAAttention(nn.Module):
                 and idx == 0
             ):
                 print(
-                    f"[ADAPTVIS_SKIP_MAIN_STYLE] layer={idx}, "
+                    f"[ADAPTVIS_SKIP] layer={idx}, "
                     f"q_len={q_len}, kv_seq_len={kv_seq_len}, "
                     f"keys_is_none={keys is None}, weight={weight}"
                 )
@@ -1136,15 +1142,17 @@ class LLaMAForCausalLMScal(LLaMAPreTrainedModel):
         **kwargs,
     ):
         """
-        Main-style generation input preparation.
+        Generation input preparation with AdaptVis arguments preserved.
 
-        Do not preserve AdaptVis / probe arguments here:
+        Keep:
             keys
             pos
             weight
             caption_length
             adjust_method
             object_patch_mask
+
+        so decode-step intervention can continue across autoregressive steps.
         """
         if past_key_values:
             input_ids = input_ids[:, -1:]
@@ -1159,6 +1167,13 @@ class LLaMAForCausalLMScal(LLaMAPreTrainedModel):
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
+
+                "keys": kwargs.get("keys", None),
+                "pos": kwargs.get("pos", None),
+                "weight": kwargs.get("weight", None),
+                "caption_length": kwargs.get("caption_length", None),
+                "adjust_method": kwargs.get("adjust_method", None),
+                "object_patch_mask": kwargs.get("object_patch_mask", None),
             }
         )
 
