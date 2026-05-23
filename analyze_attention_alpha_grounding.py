@@ -9,7 +9,7 @@ It reads three raw-generation result JSON files:
 
 Then it classifies samples by correctness transition and, for selected samples,
 extracts final-query attention to image tokens for alpha=1.0/0.5/1.5.
-Optionally it runs official GroundingDINO to get boxes for the two objects parsed
+Optionally it runs GroundingDINO (official repo backend or HuggingFace Transformers backend) to get boxes for the two objects parsed
 from prompts like:
   Where is/are the bowl in relation to the armchair? Answer with left, right, on or under only.
 
@@ -430,6 +430,83 @@ class GroundingDINOOfficial:
         return dets
 
 
+
+
+class GroundingDINOHF:
+    """GroundingDINO through HuggingFace Transformers.
+
+    This backend does not require the official groundingdino package or a manually
+    downloaded .pth checkpoint. It downloads/caches the model through HuggingFace.
+    """
+    def __init__(self, model_id: str, device: str, box_threshold: float, text_threshold: float, cache_dir: Optional[str] = None):
+        try:
+            from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+        except Exception as e:
+            raise ImportError(
+                "HuggingFace GroundingDINO backend requires a Transformers version that supports "
+                "AutoModelForZeroShotObjectDetection/GroundingDINO. If this environment is pinned "
+                "to transformers==4.39.1 for AdaptVis, use a separate env or install a newer "
+                "Transformers version for this analysis script. Original error: " + repr(e)
+            )
+
+        self.processor = AutoProcessor.from_pretrained(model_id, cache_dir=cache_dir)
+        self.model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id, cache_dir=cache_dir).to(device).eval()
+        self.device = device
+        self.box_threshold = box_threshold
+        self.text_threshold = text_threshold
+        self.model_id = model_id
+
+    @torch.no_grad()
+    def detect(self, pil_img: Image.Image, obj1: str, obj2: str):
+        # HF docs recommend a list of labels per image. Period-separated labels are
+        # handled internally by post_process_grounded_object_detection.
+        text_labels = [[obj1, obj2]]
+        try:
+            inputs = self.processor(images=pil_img, text=text_labels, return_tensors="pt")
+        except Exception:
+            # Fallback for older processor call signatures.
+            caption = f"{obj1}. {obj2}."
+            inputs = self.processor(images=pil_img, text=caption, return_tensors="pt")
+
+        inputs = inputs.to(self.device)
+        outputs = self.model(**inputs)
+
+        target_sizes = [pil_img.size[::-1]]  # (height, width)
+        try:
+            results = self.processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                threshold=self.box_threshold,
+                text_threshold=self.text_threshold,
+                target_sizes=target_sizes,
+            )
+        except TypeError:
+            # Some versions use keyword-only input_ids.
+            results = self.processor.post_process_grounded_object_detection(
+                outputs=outputs,
+                input_ids=inputs.input_ids,
+                threshold=self.box_threshold,
+                text_threshold=self.text_threshold,
+                target_sizes=target_sizes,
+            )
+
+        result = results[0]
+        dets = []
+        boxes = result.get("boxes", [])
+        scores = result.get("scores", [])
+        labels = result.get("labels", result.get("text_labels", []))
+
+        for box, score, label in zip(boxes, scores, labels):
+            box_list = [float(x) for x in box.detach().cpu().tolist()]
+            score_val = float(score.detach().cpu().item() if torch.is_tensor(score) else score)
+            dets.append({
+                "box_xyxy": box_list,
+                "score": score_val,
+                "phrase": str(label),
+            })
+        return dets
+
+
 # -------------------------
 # Visualization / metrics
 # -------------------------
@@ -527,9 +604,11 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--categories", default="", help="Comma-separated category names. Empty = all exclusive categories.")
 
-    parser.add_argument("--grounding", choices=["none", "official"], default="none")
+    parser.add_argument("--grounding", choices=["none", "official", "hf"], default="none")
     parser.add_argument("--gdino-config", default="")
     parser.add_argument("--gdino-checkpoint", default="")
+    parser.add_argument("--gdino-model", default="IDEA-Research/grounding-dino-tiny")
+    parser.add_argument("--gdino-cache-dir", default="")
     parser.add_argument("--box-threshold", type=float, default=0.25)
     parser.add_argument("--text-threshold", type=float, default=0.25)
 
