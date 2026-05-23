@@ -245,6 +245,17 @@ class LlavaWrapper:
         self.tokenizer = LlamaTokenizerFast.from_pretrained(MODEL, revision='a272c74',cache_dir=root_dir)
         self.processor = AutoProcessor.from_pretrained(MODEL, revision='a272c74',cache_dir=root_dir)
 
+        # HF >= 4.46 warns / errors if these two processor attributes are missing.
+        # Keep them in the processor so LLaVA image-token expansion is explicit.
+        patch_size = getattr(getattr(self.model.config, 'vision_config', None), 'patch_size', 14)
+        vision_feature_select_strategy = getattr(
+            self.model.config,
+            'vision_feature_select_strategy',
+            'default',
+        )
+        self.processor.patch_size = patch_size
+        self.processor.vision_feature_select_strategy = vision_feature_select_strategy
+
         self.device = device
     
     @torch.no_grad()
@@ -283,43 +294,343 @@ class LlavaWrapper:
         return scores
     
     
+    # ============================================================
+    # Closed-set helpers for ARO spatial relations
+    # ============================================================
+    def _get_gold_text(self, answer_entry):
+        if isinstance(answer_entry, list):
+            return str(answer_entry[0]) if len(answer_entry) > 0 else ""
+        return str(answer_entry)
+
+    def _normalize_relation(self, text):
+        s = str(text).strip().lower()
+        if "under" in s:
+            return "under"
+        if "left" in s:
+            return "left"
+        if "right" in s:
+            return "right"
+        # Avoid treating "in front of" as "on".
+        if "front" not in s:
+            padded = " " + s.replace(".", " ").replace(",", " ").replace(":", " ") + " "
+            if " on " in padded or s == "on":
+                return "on"
+        return s
+
+    def _first_token_confidence_from_generate(self, output):
+        """Return max softmax probability of the first generated-token distribution."""
+        try:
+            scores = output.scores if hasattr(output, 'scores') else output['scores']
+            if scores is None or len(scores) == 0:
+                return 0.0
+            return float(torch.softmax(scores[0].float(), dim=-1).max().detach().cpu().item())
+        except Exception:
+            return 0.0
+
+    def _decode_generate_output(self, output, input_len):
+        """Decode generated tokens and full sequence without truncating the raw generation."""
+        sequences = output.sequences if hasattr(output, 'sequences') else output['sequences']
+        seq = sequences[0]
+        new_tokens = seq[input_len:]
+        raw_new = self.processor.decode(
+            new_tokens,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        clean_new = self.processor.decode(
+            new_tokens,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        full_sequence = self.processor.decode(
+            seq,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        return raw_new, clean_new, full_sequence
+
+    def _find_image_token_id(self, input_ids):
+        tokenizer = self.processor.tokenizer
+        candidate_ids = []
+
+        config_id = getattr(self.model.config, 'image_token_index', None)
+        if config_id is not None:
+            candidate_ids.append(int(config_id))
+
+        try:
+            tok_id = tokenizer.convert_tokens_to_ids('<image>')
+            if tok_id is not None and tok_id != tokenizer.unk_token_id:
+                candidate_ids.append(int(tok_id))
+        except Exception:
+            pass
+
+        # The original repo uses 32001 in llava15.py, while HF LLaVA often uses 32000.
+        candidate_ids.extend([32000, 32001])
+
+        seen = set()
+        candidate_ids = [x for x in candidate_ids if not (x in seen or seen.add(x))]
+        for cid in candidate_ids:
+            if bool((input_ids == cid).any().item()):
+                return cid
+        return candidate_ids[0] if candidate_ids else 32000
+
+    def _infer_num_image_patches(self, inputs, outputs, image_token_id):
+        """
+        Infer how many embeddings one <image> token expands into.
+        LLaVA-1.5 default: 336 / 14 = 24, so 24*24 = 576 patches.
+        If logits are not expanded, return 1 so indexing falls back to text positions.
+        """
+        input_ids = inputs['input_ids']
+        out_len = int(outputs.logits.shape[1])
+        in_len = int(input_ids.shape[1])
+        if out_len <= in_len:
+            return 1
+
+        pixel_values = inputs.get('pixel_values', None)
+        if pixel_values is not None:
+            patch_size = getattr(self.processor, 'patch_size', None)
+            if patch_size is None:
+                patch_size = getattr(getattr(self.model.config, 'vision_config', None), 'patch_size', 14)
+            patch_size = int(patch_size)
+            h = int(pixel_values.shape[-2])
+            w = int(pixel_values.shape[-1])
+            n = (h // patch_size) * (w // patch_size)
+            strategy = getattr(self.processor, 'vision_feature_select_strategy', 'default')
+            if strategy == 'full':
+                n += 1
+            return int(n)
+
+        num_image_tokens = int((input_ids == image_token_id).sum(dim=-1).max().item())
+        if num_image_tokens <= 0:
+            return 1
+        return int((out_len - in_len) // num_image_tokens + 1)
+
+    def _compute_expanded_token_positions(self, input_ids, image_token_id, num_image_patches):
+        """
+        Reproduce LLaVA's text-token position shift after <image> expansion.
+        Example with one image token and 576 image patches:
+            text positions after image shift by +575.
+        """
+        special_image_token_mask = (input_ids == image_token_id).long()
+        token_increments = special_image_token_mask * (num_image_patches - 1) + 1
+        new_token_positions = torch.cumsum(token_increments, dim=-1) - 1
+
+        pad_token_id = self.processor.tokenizer.pad_token_id
+        if pad_token_id is None:
+            return new_token_positions
+
+        # Same left-padding compensation logic used in HF LLaVA merge code.
+        left_padding = not torch.sum(input_ids[:, -1] == pad_token_id).item()
+        if left_padding:
+            max_embed_dim = (
+                int(special_image_token_mask.sum(dim=-1).max().item()) * (num_image_patches - 1)
+            ) + input_ids.shape[1]
+            nb_image_pad = max_embed_dim - 1 - new_token_positions[:, -1]
+            new_token_positions = new_token_positions + nb_image_pad[:, None]
+
+        return new_token_positions
+
+    @torch.no_grad()
+    def score_closed_set_spatial(self, image, prompt, surfaces, weight=1.0, debug=False):
+        """
+        Closed-set scoring:
+            prompt + " left" / " right" / " under" / " on"
+        Then score only the appended candidate tokens.
+
+        This function handles image-token expansion. It maps candidate token positions
+        from the original input_ids space to the expanded LLaVA sequence space before
+        indexing logits.
+        """
+        tokenizer = self.processor.tokenizer
+        answer_texts = [" " + s for s in surfaces]
+        full_texts = [prompt + a for a in answer_texts]
+        images = [image] * len(full_texts)
+
+        # Do NOT use max_length=77 here; otherwise the appended candidate can be truncated.
+        inputs = self.processor(
+            text=full_texts,
+            images=images,
+            return_tensors="pt",
+            padding=True,
+        ).to(self.device)
+
+        model_kwargs = dict(inputs)
+        if 'Scal' in str(type(self.model)):
+            outputs = self.model(**model_kwargs, weight=weight, return_dict=True)
+        else:
+            outputs = self.model(**model_kwargs, return_dict=True)
+
+        input_ids = inputs['input_ids']
+        attention_mask = inputs['attention_mask']
+        image_token_id = self._find_image_token_id(input_ids)
+        num_image_patches = self._infer_num_image_patches(inputs, outputs, image_token_id)
+        expanded_positions = self._compute_expanded_token_positions(
+            input_ids=input_ids,
+            image_token_id=image_token_id,
+            num_image_patches=num_image_patches,
+        )
+
+        log_probs = F.log_softmax(outputs.logits.float(), dim=-1)
+
+        raw = {}
+        normalized_scores = {}
+        normalized_details = {}
+
+        for b, surface in enumerate(surfaces):
+            cand_ids_ref = tokenizer(
+                " " + surface,
+                add_special_tokens=False,
+            ).input_ids
+            n_tok = len(cand_ids_ref)
+
+            if n_tok == 0:
+                avg_lp = float('-inf')
+                sum_lp = float('-inf')
+                vals_list = []
+                cand_input_pos_list = []
+                cand_expanded_pos_list = []
+                answer_ids = []
+                answer_text = ""
+            else:
+                nonpad_positions = torch.nonzero(attention_mask[b], as_tuple=False).squeeze(-1)
+                cand_input_positions = nonpad_positions[-n_tok:]
+                cand_expanded_positions = expanded_positions[b, cand_input_positions]
+                pred_positions = cand_expanded_positions - 1
+
+                valid = (pred_positions >= 0) & (pred_positions < log_probs.shape[1])
+                cand_input_positions = cand_input_positions[valid]
+                cand_expanded_positions = cand_expanded_positions[valid]
+                pred_positions = pred_positions[valid]
+
+                if pred_positions.numel() == 0:
+                    avg_lp = float('-inf')
+                    sum_lp = float('-inf')
+                    vals_list = []
+                    answer_ids = []
+                    answer_text = ""
+                else:
+                    answer_token_ids = input_ids[b, cand_input_positions]
+                    vals = log_probs[b, pred_positions, answer_token_ids]
+                    sum_lp = float(vals.sum().detach().cpu().item())
+                    avg_lp = float(vals.mean().detach().cpu().item())
+                    vals_list = [float(x) for x in vals.detach().cpu().tolist()]
+                    answer_ids = [int(x) for x in answer_token_ids.detach().cpu().tolist()]
+                    answer_text = tokenizer.decode(
+                        answer_ids,
+                        skip_special_tokens=False,
+                        clean_up_tokenization_spaces=False,
+                    )
+
+                cand_input_pos_list = [int(x) for x in cand_input_positions.detach().cpu().tolist()]
+                cand_expanded_pos_list = [int(x) for x in cand_expanded_positions.detach().cpu().tolist()]
+
+            norm = self._normalize_relation(surface)
+            detail = {
+                'surface': surface,
+                'normalized': norm,
+                'candidate_text': " " + surface,
+                'avg_logprob': avg_lp,
+                'sum_logprob': sum_lp,
+                'prob': None,
+                'num_tokens': len(vals_list),
+                'candidate_token_ids': answer_ids,
+                'candidate_token_text': answer_text,
+                'candidate_input_positions': cand_input_pos_list,
+                'candidate_expanded_positions': cand_expanded_pos_list,
+                'token_logprobs': vals_list,
+            }
+            raw[surface] = detail
+
+            # If two surfaces normalize to the same relation, keep the higher average log-prob.
+            if norm not in normalized_scores or avg_lp > normalized_scores[norm]:
+                normalized_scores[norm] = avg_lp
+                normalized_details[norm] = detail
+
+            if debug:
+                print(
+                    f"[CLOSED-SET DEBUG] surface={surface!r} norm={norm!r} "
+                    f"input_pos={cand_input_pos_list} expanded_pos={cand_expanded_pos_list} "
+                    f"avg_logprob={avg_lp:.6f} text={answer_text!r}"
+                )
+
+        relation_order = [self._normalize_relation(s) for s in surfaces]
+        relation_order = list(dict.fromkeys(relation_order))
+        score_vec = torch.tensor(
+            [normalized_scores.get(r, float('-inf')) for r in relation_order],
+            dtype=torch.float32,
+        )
+        probs_vec = torch.softmax(score_vec, dim=0)
+        probs = {r: float(probs_vec[i].item()) for i, r in enumerate(relation_order)}
+        for r, p in probs.items():
+            if r in normalized_details:
+                normalized_details[r]['prob'] = p
+
+        pred = max(normalized_scores.items(), key=lambda kv: kv[1])[0]
+        confidence = probs.get(pred, 0.0)
+
+        return {
+            'surfaces': surfaces,
+            'relation_order': relation_order,
+            'scores': normalized_scores,
+            'probs': probs,
+            'pred': pred,
+            'confidence': confidence,
+            'raw': raw,
+            'normalized_details': normalized_details,
+            'image_token_id': int(image_token_id),
+            'num_image_patches': int(num_image_patches),
+            'logits_seq_len': int(outputs.logits.shape[1]),
+            'input_seq_len': int(input_ids.shape[1]),
+        }
+
+    def _format_closed_set_line(self, tag, closed_result):
+        pieces = []
+        for rel in closed_result['relation_order']:
+            lp = closed_result['scores'].get(rel, float('-inf'))
+            p = closed_result['probs'].get(rel, 0.0)
+            pieces.append(f"{rel}: logp={lp:.4f}, prob={p:.4f}")
+        return (
+            f"{tag}: pred={closed_result['pred']}, "
+            f"conf={closed_result['confidence']:.4f}, "
+            + "; ".join(pieces)
+        )
+
     @torch.no_grad()
     def get_out_scores_wh_batched(self, dataset, joint_loader, method, weight, option, threshold, weight1, weight2):
 
-        
         scores = []  # To store scores for each batch
         index_of_total = 0  # Track total number of prompts processed
-        acc = 0  # Track the number of correct predictions
-        correct_id = []  # Track indices of correct predictions
+
+        # For adapt_vis below, acc is based on lowercase closed-set prediction.
+        # Raw generation accuracy is still tracked and printed for comparison.
+        acc = 0
+        raw_acc = 0
+        upper_acc = 0
+        correct_id = []
+        raw_correct_id = []
+        upper_correct_id = []
 
         # Determine the correct question-answer file based on the dataset
         qst_ans_file = f'prompts/{dataset}_with_answer_{option}_options.jsonl'
-        
+
         # Load prompts and answers from the question-answer file
         with open(qst_ans_file, 'r') as file:
             prompt_list = []
             answer_list = []
-            first_prompt_list = []
-            second_prompt_list = []
             for line in file:
                 data = json.loads(line)
-                # Select prompt based on mode
-                
                 prompt_list.append(data["question"])
-                
-                # Store additional prompts if adjustment method is 'sub'
-                
                 answer_list.append(data["answer"])
 
         # Sampling configuration
         SAMPLE = False
         TEST = os.getenv('TEST_MODE', 'False') == 'True'
         total_data_count = len(prompt_list)
-        
+
         # Perform sampling if enabled
         if SAMPLE:
             idx_file_path = f'./output/sampled_idx_{dataset}.npy'
-            
+
             if os.path.exists(idx_file_path):
                 sampled_indices = np.load(idx_file_path).tolist()
             else:
@@ -342,10 +653,13 @@ class LlavaWrapper:
         save_attn_dir = f"./output/{dataset}_weight{weight:.2f}"
         os.makedirs(save_attn_dir, exist_ok=True)
 
+        lower_surfaces = ["left", "right", "under", "on"]
+        upper_surfaces = ["Left", "Right", "Under", "On"]
+
         results = []  # Store results for each generated sequence
         for batch in tqdm(joint_loader):
             batch_scores = []
-            
+
             # Set environment variable for attention map save path
             os.environ['SAVE_ATTN_PATH'] = f'{save_attn_dir}/{index_of_total}/'
             os.makedirs(os.environ['SAVE_ATTN_PATH'], exist_ok=True)
@@ -353,88 +667,242 @@ class LlavaWrapper:
             # Iterate over each image option in the batch
             for i_option in batch["image_options"]:
                 im_scores = []
-                
-                for _ in i_option:
+
+                for image in i_option:
                     prompt = prompt_list[index_of_total]
-                    
-                    # Preprocess input for the model
+                    gold_text = self._get_gold_text(answer_list[index_of_total])
+                    gold_norm = self._normalize_relation(gold_text)
+
+                    # Original generation input is kept unchanged.
                     single_input = self.processor(
-                        text=prompt, images=_, padding="max_length", return_tensors="pt", max_length=77
+                        text=prompt,
+                        images=image,
+                        padding="max_length",
+                        return_tensors="pt",
+                        max_length=77,
                     ).to(self.device)
-                    
-                    # Create key mask for special token
+
+                    # Keep the original key mask construction for the generation branch.
                     keys = [torch.where(input_id == 32001, 1, 0) for input_id in single_input['input_ids']]
+
+                    raw_generation = ""
+                    raw_generation_clean = ""
+                    raw_generation_full_sequence = ""
+                    base_raw_generation = ""
+                    base_uncertainty = 0.0
+                    final_weight = weight
+                    lower_closed = None
+                    upper_closed = None
+                    gen_for_original_match = ""
+                    eval_pred = ""
 
                     # Generate predictions based on specified method
                     if method == 'scaling_vis':
-                        
                         change_greedy_to_add_weight()
                         output = self.model.generate(
-                            **single_input, keys=keys, weight=weight,
-                            max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                            **single_input,
+                            keys=keys,
+                            weight=weight,
+                            max_new_tokens=100,
+                            output_scores=True,
+                            return_dict_in_generate=True,
                         )
-                        uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
-                        gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
-                    
+                        base_uncertainty = self._first_token_confidence_from_generate(output)
+                        raw_generation, raw_generation_clean, raw_generation_full_sequence = self._decode_generate_output(
+                            output,
+                            input_len=single_input['input_ids'].shape[-1],
+                        )
+                        gen_for_original_match = raw_generation_clean
+                        eval_pred = self._normalize_relation(raw_generation_clean)
+
                     elif method == 'adapt_vis':
                         change_greedy_to_add_weight()
-                       
-                        output = self.model.generate(
-                            **single_input,weight=1.0,max_new_tokens=100, output_scores=True, return_dict_in_generate=True
-                        )
-                        uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
-                        print(uncertainty,threshold)
 
-                        # Adjust attention based on uncertainty
-                        if uncertainty < threshold:
-                            output = self.model.generate(
-                                **single_input, keys=keys, weight=weight1, 
-                                max_new_tokens=100, output_scores=True, return_dict_in_generate=True
-                            )
+                        # 1) Original AdaptVis uncertainty probe, unchanged.
+                        base_output = self.model.generate(
+                            **single_input,
+                            weight=1.0,
+                            max_new_tokens=100,
+                            output_scores=True,
+                            return_dict_in_generate=True,
+                        )
+                        base_uncertainty = self._first_token_confidence_from_generate(base_output)
+                        base_raw_generation, _, _ = self._decode_generate_output(
+                            base_output,
+                            input_len=single_input['input_ids'].shape[-1],
+                        )
+
+                        # 2) Original AdaptVis weight selection, unchanged.
+                        if base_uncertainty < threshold:
+                            final_weight = weight1
                         else:
-                            output = self.model.generate(
-                                **single_input, keys=keys, weight=weight2, 
-                                max_new_tokens=100, output_scores=True, return_dict_in_generate=True
-                            )
-                        gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
+                            final_weight = weight2
+
+                        # 3) Traditional generation branch, unchanged except that raw text is saved fully.
+                        output = self.model.generate(
+                            **single_input,
+                            keys=keys,
+                            weight=final_weight,
+                            max_new_tokens=100,
+                            output_scores=True,
+                            return_dict_in_generate=True,
+                        )
+                        raw_generation, raw_generation_clean, raw_generation_full_sequence = self._decode_generate_output(
+                            output,
+                            input_len=single_input['input_ids'].shape[-1],
+                        )
+                        gen_for_original_match = raw_generation_clean
+
+                        # 4) Closed-set lowercase: prompt + " left/right/under/on".
+                        lower_closed = self.score_closed_set_spatial(
+                            image=image,
+                            prompt=prompt,
+                            surfaces=lower_surfaces,
+                            weight=final_weight,
+                            debug=False,
+                        )
+
+                        # 5) Closed-set capitalized: prompt + " Left/Right/Under/On".
+                        upper_closed = self.score_closed_set_spatial(
+                            image=image,
+                            prompt=prompt,
+                            surfaces=upper_surfaces,
+                            weight=final_weight,
+                            debug=False,
+                        )
+
+                        # Main prediction for adapt_vis is the lowercase closed-set result.
+                        eval_pred = lower_closed['pred']
 
                     else:
-                        # Default generation method
+                        # Default generation method, unchanged.
                         output = self.model.generate(
-                            **single_input, max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                            **single_input,
+                            max_new_tokens=100,
+                            output_scores=True,
+                            return_dict_in_generate=True,
                         )
-                        gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
-                        uncertainty = np.round(float(max(output['scores'][0][0])), 2)
+                        base_uncertainty = self._first_token_confidence_from_generate(output)
+                        raw_generation, raw_generation_clean, raw_generation_full_sequence = self._decode_generate_output(
+                            output,
+                            input_len=single_input['input_ids'].shape[-1],
+                        )
+                        gen_for_original_match = raw_generation_clean
+                        eval_pred = self._normalize_relation(raw_generation_clean)
 
-                    # Print prompt, generated text, and expected answer
-                    print(f"Prompt: {prompt}\nGeneration: {gen}\nGolden: {answer_list[index_of_total][0]}")
-                    
-                    result = {
-                        "Prompt": prompt,
-                        "Generation": gen,
-                        "Golden": answer_list[index_of_total][0],
-                    }
-                    results.append(result)
-                    
-                    # Check if the generation matches the expected answer
-                    c_option = batch["caption_options"]
-                    if len(list(c_option)) == 4:
-                        if (answer_list[index_of_total][0] in gen or answer_list[index_of_total][0].lower() in gen.lower()) \
-                                and not (answer_list[index_of_total][0].lower() == 'on' and 'front' in gen.strip().lower()):
+                    # Correctness for raw generation, using the original substring-style rule.
+                    raw_correct = (
+                        (gold_text in gen_for_original_match or gold_text.lower() in gen_for_original_match.lower())
+                        and not (gold_text.lower() == 'on' and 'front' in gen_for_original_match.strip().lower())
+                    )
+                    if raw_correct:
+                        raw_acc += 1
+                        raw_correct_id.append(index_of_total)
+
+                    # Correctness for closed-set branches.
+                    lower_correct = bool(eval_pred == gold_norm)
+                    upper_correct = False
+                    if upper_closed is not None:
+                        upper_correct = bool(upper_closed['pred'] == gold_norm)
+
+                    if method == 'adapt_vis':
+                        if lower_correct:
                             acc += 1
                             correct_id.append(index_of_total)
+                        if upper_correct:
+                            upper_acc += 1
+                            upper_correct_id.append(index_of_total)
+                    else:
+                        if raw_correct:
+                            acc += 1
+                            correct_id.append(index_of_total)
+
+                    print("\n" + "=" * 100)
+                    print(f"Sample ID: {index_of_total}")
+                    print(f"Prompt: {prompt}")
+                    print(f"Golden: {gold_text}  | normalized={gold_norm}")
+                    print(f"Method: {method}")
+                    print(f"AdaptVis base_confidence={base_uncertainty:.4f}, threshold={threshold}, final_weight={final_weight}")
+                    print(f"[RAW GENERATION | new tokens | skip_special_tokens=False]\n{raw_generation}")
+                    print(f"[RAW GENERATION CLEAN | used by original substring match]\n{raw_generation_clean}")
+                    if method == 'adapt_vis':
+                        print(f"[BASE RAW GENERATION before AdaptVis weight selection]\n{base_raw_generation}")
+                        print(self._format_closed_set_line("[CLOSED-SET lowercase prompt+ left/right/under/on]", lower_closed))
+                        print(self._format_closed_set_line("[CLOSED-SET Capitalized prompt+ Left/Right/Under/On]", upper_closed))
+                        print(
+                            f"Correctness: lower_closed={lower_correct}, "
+                            f"upper_closed={upper_correct}, raw_generation={raw_correct}"
+                        )
+                    else:
+                        print(f"Correctness: raw_generation={raw_correct}")
+                    print("=" * 100)
+
+                    result = {
+                        "SampleID": index_of_total,
+                        "Prompt": prompt,
+                        "Golden": gold_text,
+                        "GoldenNormalized": gold_norm,
+                        "Method": method,
+                        "Generation": raw_generation_clean,
+                        "RawGeneration": raw_generation,
+                        "RawGenerationFullSequence": raw_generation_full_sequence,
+                        "RawGenerationCorrect": raw_correct,
+                        "BaseRawGeneration": base_raw_generation,
+                        "BaseConfidence": base_uncertainty,
+                        "Threshold": threshold,
+                        "FinalWeight": final_weight,
+                    }
+                    if lower_closed is not None:
+                        result.update({
+                            "ClosedSetLowerSurfaces": lower_surfaces,
+                            "ClosedSetLowerPred": lower_closed['pred'],
+                            "ClosedSetLowerConfidence": lower_closed['confidence'],
+                            "ClosedSetLowerScores": lower_closed['scores'],
+                            "ClosedSetLowerProbs": lower_closed['probs'],
+                            "ClosedSetLowerRaw": lower_closed['raw'],
+                            "ClosedSetLowerCorrect": lower_correct,
+                            "ClosedSetImageTokenID": lower_closed['image_token_id'],
+                            "ClosedSetNumImagePatches": lower_closed['num_image_patches'],
+                            "ClosedSetInputSeqLen": lower_closed['input_seq_len'],
+                            "ClosedSetLogitsSeqLen": lower_closed['logits_seq_len'],
+                        })
+                    if upper_closed is not None:
+                        result.update({
+                            "ClosedSetUpperSurfaces": upper_surfaces,
+                            "ClosedSetUpperPred": upper_closed['pred'],
+                            "ClosedSetUpperConfidence": upper_closed['confidence'],
+                            "ClosedSetUpperScores": upper_closed['scores'],
+                            "ClosedSetUpperProbs": upper_closed['probs'],
+                            "ClosedSetUpperRaw": upper_closed['raw'],
+                            "ClosedSetUpperCorrect": upper_correct,
+                        })
+                    results.append(result)
+
+                    # Build the score array returned to the ARO evaluator.
+                    c_option = batch["caption_options"]
+                    if len(list(c_option)) == 4:
+                        if method == 'adapt_vis':
+                            is_correct_for_return = lower_correct
+                        else:
+                            is_correct_for_return = raw_correct
+
+                        if is_correct_for_return:
                             answers = [1, 0, 0, 0]
                         else:
                             answers = [0, 0, 1, 0]
-                    
+
                     elif len(list(c_option)) == 2:
-                        if (answer_list[index_of_total][0] in gen or answer_list[index_of_total][0].lower() in gen.lower()) \
-                                and not (answer_list[index_of_total][0].lower() == 'on' and 'front' in gen.strip().lower()):
-                            acc += 1
-                            correct_id.append(index_of_total)
+                        if method == 'adapt_vis':
+                            is_correct_for_return = lower_correct
+                        else:
+                            is_correct_for_return = raw_correct
+
+                        if is_correct_for_return:
                             answers = [1, 0]
                         else:
                             answers = [0, 1]
+                    else:
+                        raise ValueError(f"Unexpected number of caption options: {len(list(c_option))}")
 
                     im_scores.append(np.expand_dims(np.array(answers), -1))
                     index_of_total += 1
@@ -448,20 +916,46 @@ class LlavaWrapper:
             print("Saving results to", output_file_path)
             with open(output_file_path, 'w', encoding='utf-8') as fout:
                 json.dump(results, fout, ensure_ascii=False, indent=4)
-            print(acc, index_of_total, acc / index_of_total)
+
+            denom = max(index_of_total, 1)
+            if method == 'adapt_vis':
+                print(
+                    f"running acc lower_closed={acc}/{denom}={acc / denom:.6f}, "
+                    f"upper_closed={upper_acc}/{denom}={upper_acc / denom:.6f}, "
+                    f"raw_generation={raw_acc}/{denom}={raw_acc / denom:.6f}"
+                )
+            else:
+                print(f"running acc raw_generation={acc}/{denom}={acc / denom:.6f}")
 
         # Save accuracy and correct IDs to file
-        print(acc / index_of_total)
+        denom = max(index_of_total, 1)
+        print("\n[DONE]")
+        if method == 'adapt_vis':
+            print(f"lower closed-set acc: {acc}/{denom}={acc / denom:.6f}")
+            print(f"upper closed-set acc: {upper_acc}/{denom}={upper_acc / denom:.6f}")
+            print(f"raw generation acc: {raw_acc}/{denom}={raw_acc / denom:.6f}")
+        else:
+            print(f"raw generation acc: {acc}/{denom}={acc / denom:.6f}")
+
         output_score_file = output_file_path.replace(".json", "scores.json")
         with open(output_score_file, 'w', encoding='utf-8') as fout:
-            json.dump({"acc": acc / index_of_total, "correct_id": correct_id}, fout, ensure_ascii=False, indent=4)
+            json.dump({
+                "acc": acc / denom,
+                "correct_id": correct_id,
+                "lower_closedset_acc": acc / denom,
+                "lower_closedset_correct_id": correct_id,
+                "upper_closedset_acc": upper_acc / denom,
+                "upper_closedset_correct_id": upper_correct_id,
+                "raw_generation_acc": raw_acc / denom,
+                "raw_generation_correct_id": raw_correct_id,
+            }, fout, ensure_ascii=False, indent=4)
 
         # Concatenate all scores and return based on dataset type
         all_scores = np.concatenate(scores, axis=0)  # N x K x L
         if dataset in ['Controlled_Images_B', 'Controlled_Images_A']:
             return (all_scores, [])
         else:
-            return (acc / index_of_total, correct_id)
+            return (acc / denom, correct_id)
 
     
     
