@@ -12,7 +12,10 @@ from tqdm import tqdm
 import transformers
 from transformers import AutoProcessor, LlamaTokenizerFast, CLIPImageProcessor
 from transformers.generation.logits_process import LogitsProcessorList
-from transformers.generation.stopping_criteria import StoppingCriteriaList, validate_stopping_criteria
+from transformers.generation.stopping_criteria import (
+    StoppingCriteriaList,
+    validate_stopping_criteria,
+)
 from transformers.generation.utils import (
     GenerateEncoderDecoderOutput,
     GenerateDecoderOnlyOutput,
@@ -48,6 +51,7 @@ def load_probe_sample_id_set():
     sample_id_file = os.getenv("PROBE_SAMPLE_IDS_FILE", "").strip()
     if not sample_id_file:
         return None
+
     if not os.path.exists(sample_id_file):
         raise FileNotFoundError(f"PROBE_SAMPLE_IDS_FILE not found: {sample_id_file}")
 
@@ -65,9 +69,11 @@ def load_probe_sample_id_set():
 def make_tagged_output_path(dataset, method, weight, option, test_flag):
     base = f"./output/results1.5_{dataset}_{method}_{weight}_{option}option_{test_flag}"
     tag = os.getenv("PROBE_RUN_TAG", "").strip()
+
     if tag:
         safe_tag = re.sub(r"[^A-Za-z0-9_\-\.]+", "_", tag)
         return f"{base}_{safe_tag}.json"
+
     return f"{base}.json"
 
 
@@ -102,8 +108,7 @@ def build_legacy_image_keys(input_ids_batch: torch.Tensor) -> List[torch.Tensor]
     Original AdaptVis/main-style image key mask.
 
     It marks the single <image> placeholder in input_ids rather than expanding it
-    to 576 patch tokens. This intentionally matches the original main branch
-    behavior in model_zoo/llava15.py.
+    to 576 patch tokens. This intentionally matches the original llava15.py style.
     """
     image_token_id = int(os.getenv("IMAGE_TOKEN_ID", str(IMAGE_TOKEN_ID)))
     return [torch.where(input_id == image_token_id, 1, 0) for input_id in input_ids_batch]
@@ -111,22 +116,29 @@ def build_legacy_image_keys(input_ids_batch: torch.Tensor) -> List[torch.Tensor]
 
 def first_step_confidence_softmax(output) -> float:
     """
-    Main-style confidence used by the original Controlled_Images generation path:
+    Controlled_Images AdaptVis confidence:
     max softmax probability of the first generated-token distribution.
     """
     if output is None or output.get("scores", None) is None or len(output["scores"]) == 0:
         return 0.0
+
     probs = torch.softmax(output["scores"][0].detach().float(), dim=-1)
     return float(np.round(float(probs[0].max().item()), 2))
 
 
 def first_step_confidence_raw(output) -> float:
     """
-    Raw max score variant, kept only for VSR compatibility with the original style.
+    Raw max score variant, kept for VSR compatibility.
     """
     if output is None or output.get("scores", None) is None or len(output["scores"]) == 0:
         return 0.0
-    return float(np.round(float(torch.max(output["scores"][0][0].detach().float()).item()), 2))
+
+    return float(
+        np.round(
+            float(torch.max(output["scores"][0][0].detach().float()).item()),
+            2,
+        )
+    )
 
 
 def decode_generated(processor, output, input_len: int) -> str:
@@ -137,7 +149,7 @@ def decode_generated(processor, output, input_len: int) -> str:
 
 
 # ============================================================
-# Custom greedy search: cleaned main-style version
+# Custom greedy search
 # ============================================================
 
 def _add_weight_greedy_search(
@@ -160,6 +172,21 @@ def _add_weight_greedy_search(
     streamer: Optional["BaseStreamer"] = None,
     **model_kwargs,
 ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
+    """
+    Greedy search with AdaptVis arguments.
+
+    Important:
+        Some model.prepare_inputs_for_generation implementations preserve
+        keys/weight/adjust_method/pos. Some do not.
+
+        To avoid both failure modes:
+            - if model_inputs already has a custom arg, keep it.
+            - if it does not, inject the value from model_kwargs / function args.
+            - call self(**model_inputs) once, without duplicate keyword args.
+
+    This makes w1/w2 effective when modeling_llava_scal.py and
+    modeling_llama_add_attn.py are restored to keep decode-step keys.
+    """
     logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
     stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
 
@@ -175,7 +202,12 @@ def _add_weight_greedy_search(
 
     if isinstance(eos_token_id, int):
         eos_token_id = [eos_token_id]
-    eos_token_id_tensor = torch.tensor(eos_token_id).to(input_ids.device) if eos_token_id is not None else None
+
+    eos_token_id_tensor = (
+        torch.tensor(eos_token_id).to(input_ids.device)
+        if eos_token_id is not None
+        else None
+    )
 
     output_scores = output_scores if output_scores is not None else self.generation_config.output_scores
     output_attentions = output_attentions if output_attentions is not None else self.generation_config.output_attentions
@@ -193,41 +225,59 @@ def _add_weight_greedy_search(
     decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
 
     if return_dict_in_generate and self.config.is_encoder_decoder:
-        encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
-        encoder_hidden_states = model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+        encoder_attentions = (
+            model_kwargs["encoder_outputs"].get("attentions")
+            if output_attentions
+            else None
+        )
+        encoder_hidden_states = (
+            model_kwargs["encoder_outputs"].get("hidden_states")
+            if output_hidden_states
+            else None
+        )
 
     batch_size, cur_len = input_ids.shape
     if "inputs_embeds" in model_kwargs:
         cur_len = model_kwargs["inputs_embeds"].shape[1]
 
     this_peer_finished = False
-    unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
+    unfinished_sequences = torch.ones(
+        batch_size,
+        dtype=torch.long,
+        device=input_ids.device,
+    )
 
     model_kwargs["cache_position"] = torch.arange(cur_len, device=input_ids.device)
 
     while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
         model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
-        # Main-style behavior: do not manually re-inject keys/object masks into
-        # model_inputs here. If the model's prepare_inputs_for_generation keeps
-        # keys, it will use them; otherwise they drop out as in the original main branch.
-        if "Scal" not in str(type(self)):
-            outputs = self(
-                **model_inputs,
-                return_dict=True,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-            )
-        else:
-            outputs = self(
-                **model_inputs,
-                weight=weight,
-                adjust_method=adjust_method,
-                pos=pos,
-                return_dict=True,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-            )
+        # Safely preserve custom AdaptVis args.
+        # Do not pass duplicate keyword arguments to self().
+        custom_args = {
+            "keys": model_kwargs.get("keys", None),
+            "weight": weight if weight is not None else model_kwargs.get("weight", None),
+            "adjust_method": (
+                adjust_method
+                if adjust_method is not None
+                else model_kwargs.get("adjust_method", None)
+            ),
+            "pos": pos if pos is not None else model_kwargs.get("pos", None),
+            "caption_length": model_kwargs.get("caption_length", None),
+            "object_patch_mask": model_kwargs.get("object_patch_mask", None),
+        }
+
+        if "Scal" in str(type(self)):
+            for k, v in custom_args.items():
+                if k not in model_inputs and v is not None:
+                    model_inputs[k] = v
+
+        outputs = self(
+            **model_inputs,
+            return_dict=True,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+        )
 
         if synced_gpus and this_peer_finished:
             continue
@@ -242,7 +292,9 @@ def _add_weight_greedy_search(
                 raw_logits += (next_token_logits,)
             if output_attentions:
                 decoder_attentions += (
-                    (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
+                    (outputs.decoder_attentions,)
+                    if self.config.is_encoder_decoder
+                    else (outputs.attentions,)
                 )
                 if self.config.is_encoder_decoder:
                     cross_attentions += (outputs.cross_attentions,)
@@ -258,7 +310,11 @@ def _add_weight_greedy_search(
         if eos_token_id is not None:
             if pad_token_id is None:
                 raise ValueError("If `eos_token_id` is defined, `pad_token_id` must be defined.")
-            next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+
+            next_tokens = (
+                next_tokens * unfinished_sequences
+                + pad_token_id * (1 - unfinished_sequences)
+            )
 
         input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
 
@@ -270,6 +326,11 @@ def _add_weight_greedy_search(
             model_kwargs,
             is_encoder_decoder=self.config.is_encoder_decoder,
         )
+
+        # Preserve custom AdaptVis args across generation updates.
+        for k, v in custom_args.items():
+            if v is not None:
+                model_kwargs[k] = v
 
         if eos_token_id_tensor is not None:
             unfinished_sequences = unfinished_sequences.mul(
@@ -297,6 +358,7 @@ def _add_weight_greedy_search(
                 decoder_hidden_states=decoder_hidden_states,
                 past_key_values=model_kwargs.get("past_key_values"),
             )
+
         return GenerateDecoderOnlyOutput(
             sequences=input_ids,
             scores=scores,
@@ -418,20 +480,20 @@ class LlavaWrapper:
         qst_ans_file = f"prompts/{dataset}_with_answer_{option}_options.jsonl"
         prompt_list = []
         answer_list = []
+
         with open(qst_ans_file, "r", encoding="utf-8") as file:
             for line in file:
                 data = json.loads(line)
                 prompt_list.append(data["question"])
                 answer_list.append(data["answer"])
 
-        # Clean version defaults to full evaluation. Set SAMPLE=True to reproduce
-        # the original 20% sampled subset behavior.
         SAMPLE = _env_flag("SAMPLE", "False")
         TEST = _env_flag("TEST_MODE", "False")
         total_data_count = len(prompt_list)
 
         if SAMPLE:
             idx_file_path = f"./output/sampled_idx_{dataset}.npy"
+
             if os.path.exists(idx_file_path):
                 sampled_indices = np.load(idx_file_path).tolist()
             else:
@@ -452,6 +514,7 @@ class LlavaWrapper:
             save_attn_dir = f"./output/{dataset}_adapt_th{threshold:.2f}_w1{weight1:.2f}_w2{weight2:.2f}"
         else:
             save_attn_dir = f"./output/{dataset}_{method}"
+
         os.makedirs(save_attn_dir, exist_ok=True)
 
         output_file_path = make_tagged_output_path(
@@ -499,21 +562,23 @@ class LlavaWrapper:
                     if method == "scaling_vis":
                         change_greedy_to_add_weight()
                         selected_weight = float(weight)
+
                         output = self.model.generate(
                             **single_input,
                             keys=keys,
-                            weight=float(weight),
+                            weight=selected_weight,
                             max_new_tokens=100,
                             output_scores=True,
                             return_dict_in_generate=True,
                         )
+
                         uncertainty = first_step_confidence_softmax(output)
 
                     elif method == "adapt_vis":
                         change_greedy_to_add_weight()
 
-                        # Main-style AdaptVis first pass:
-                        # no keys / no adjust_method / no object mask.
+                        # First pass: original/main-style confidence.
+                        # Do not pass keys here.
                         first_output = self.model.generate(
                             **single_input,
                             weight=1.0,
@@ -521,10 +586,13 @@ class LlavaWrapper:
                             output_scores=True,
                             return_dict_in_generate=True,
                         )
+
                         uncertainty = first_step_confidence_softmax(first_output)
                         print(uncertainty, threshold)
 
                         selected_weight = float(weight1) if uncertainty < threshold else float(weight2)
+
+                        # Second pass: actual AdaptVis intervention.
                         output = self.model.generate(
                             **single_input,
                             keys=keys,
@@ -541,6 +609,7 @@ class LlavaWrapper:
                             output_scores=True,
                             return_dict_in_generate=True,
                         )
+
                         uncertainty = first_step_confidence_raw(output)
 
                     gen = decode_generated(self.processor, output, input_len=input_len)
@@ -571,7 +640,11 @@ class LlavaWrapper:
                         "Golden": golden,
                         "Correct": bool(is_correct),
                         "Uncertainty": float(uncertainty) if uncertainty is not None else None,
-                        "selected_weight": selected_weight,
+                        "selected_weight": (
+                            float(selected_weight)
+                            if selected_weight is not None
+                            else None
+                        ),
                         "method": method,
                         "weight": float(weight),
                         "threshold": float(threshold),
@@ -603,6 +676,7 @@ class LlavaWrapper:
 
         denom = processed_count if processed_count > 0 else 1
         final_acc = acc / denom
+
         print(
             f"[FINAL] acc={acc}/{processed_count}={final_acc:.6f}, "
             f"scanned={index_of_total}, skipped={skipped_count}"
@@ -641,6 +715,7 @@ class LlavaWrapper:
 
         if dataset in ["Controlled_Images_B", "Controlled_Images_A"]:
             return all_scores, []
+
         return final_acc, correct_id
 
     @torch.no_grad()
@@ -673,7 +748,10 @@ class LlavaWrapper:
                     )
                     qst = [prompt] * len(list(c_option))
                     end_fix = [" Assistant:"] * len(list(c_option))
-                    concatenated_list = [s1 + s2 + s3 for s1, s2, s3 in zip(qst, c_option, end_fix)]
+                    concatenated_list = [
+                        s1 + s2 + s3
+                        for s1, s2, s3 in zip(qst, c_option, end_fix)
+                    ]
 
                     for idx, text in enumerate(concatenated_list):
                         image = list(i_option)[idx]
@@ -688,12 +766,16 @@ class LlavaWrapper:
                         input_len = len(single_input["input_ids"][-1])
                         keys = build_legacy_image_keys(single_input["input_ids"])
 
+                        selected_weight = None
+
                         if method == "scaling_vis":
                             change_greedy_to_add_weight()
+                            selected_weight = float(weight)
+
                             output = self.model.generate(
                                 **single_input,
                                 keys=keys,
-                                weight=float(weight),
+                                weight=selected_weight,
                                 max_new_tokens=100,
                                 output_scores=True,
                                 return_dict_in_generate=True,
@@ -702,6 +784,7 @@ class LlavaWrapper:
 
                         elif method == "adapt_vis":
                             change_greedy_to_add_weight()
+
                             first_output = self.model.generate(
                                 **single_input,
                                 weight=1.0,
@@ -710,7 +793,9 @@ class LlavaWrapper:
                                 return_dict_in_generate=True,
                             )
                             uncertainty = first_step_confidence_raw(first_output)
+
                             selected_weight = float(weight1) if uncertainty < threshold else float(weight2)
+
                             output = self.model.generate(
                                 **single_input,
                                 keys=keys,
@@ -748,8 +833,14 @@ class LlavaWrapper:
                                 "Generation": gen,
                                 "Golden": gold,
                                 "Uncertainty": float(uncertainty),
+                                "selected_weight": (
+                                    float(selected_weight)
+                                    if selected_weight is not None
+                                    else None
+                                ),
                             }
                         )
+
                         index_of_total += 1
 
         precision = TP / max(TP + FN, 1)
@@ -767,6 +858,7 @@ class LlavaWrapper:
 
         output_file_path = f"./outputs/results_{dataset}_{method}_{weight}.json"
         os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
+
         with open(output_file_path, "w", encoding="utf-8") as fout:
             json.dump(results, fout, ensure_ascii=False, indent=4)
 
