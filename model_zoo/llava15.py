@@ -1852,6 +1852,197 @@ def decide_closed_set_with_method(
 
 
 
+
+def make_case_candidates(candidates: List[str], case_mode: str) -> List[str]:
+    """
+    Build case variants for closed-set scoring.
+
+    lower:
+        left / right / on / under
+
+    cap:
+        Left / Right / On / Under
+        in front -> In front
+    """
+    out = []
+
+    for c in candidates:
+        c = str(c).strip()
+
+        if case_mode == "lower":
+            y = c.lower()
+
+        elif case_mode == "cap":
+            y = c[:1].upper() + c[1:].lower() if c else c
+
+        else:
+            raise ValueError(f"Unknown case_mode={case_mode}")
+
+        out.append(y)
+
+    # Dedupe while preserving order. Use lowercase key so lower/cap variants
+    # do not create duplicates inside one candidate list.
+    deduped = []
+    seen = set()
+
+    for x in out:
+        k = x.lower()
+        if k not in seen:
+            seen.add(k)
+            deduped.append(x)
+
+    return deduped
+
+
+@torch.no_grad()
+def run_full_generation_for_compare(
+    model,
+    processor,
+    single_input,
+    keys,
+    method: str,
+    weight: float,
+    threshold: float,
+    weight1: float,
+    weight2: float,
+    adjust_method: str,
+    pos: Optional[torch.Tensor] = None,
+    object_patch_mask: Optional[torch.Tensor] = None,
+    max_new_tokens: int = 100,
+) -> Dict[str, Any]:
+    """
+    Run real free generation for comparison while main decision mode is closed-set.
+
+    This is only a reporting branch:
+      - closed_lower / closed_cap use teacher-forced closed-set scoring.
+      - full_generation uses model.generate().
+    """
+    input_len = len(single_input["input_ids"][-1])
+    method = str(method)
+
+    selected_weight = None
+    uncertainty = None
+    output = None
+
+    if method == "scaling_vis":
+        change_greedy_to_add_weight()
+        selected_weight = float(weight)
+
+        output = model.generate(
+            **single_input,
+            keys=keys,
+            weight=float(weight),
+            adjust_method=adjust_method,
+            pos=pos,
+            object_patch_mask=object_patch_mask,
+            max_new_tokens=max_new_tokens,
+            output_scores=True,
+            return_dict_in_generate=True,
+        )
+
+        if output.get("scores", None) is not None and len(output["scores"]) > 0:
+            uncertainty = float(
+                np.round(
+                    float(max(torch.nn.functional.softmax(output["scores"][0], dim=-1)[0])),
+                    2,
+                )
+            )
+
+    elif method == "adapt_vis":
+        change_greedy_to_add_weight()
+
+        probe_single_pass = (
+            adjust_method in ["probe_bias", "probe_scale", "probe_add", "var_sink"]
+            or os.getenv("PROBE_SINGLE_PASS", "False") == "True"
+        )
+
+        if probe_single_pass:
+            selected_weight = 1.0
+
+            output = model.generate(
+                **single_input,
+                keys=keys,
+                weight=1.0,
+                adjust_method=adjust_method,
+                pos=pos,
+                object_patch_mask=object_patch_mask,
+                max_new_tokens=max_new_tokens,
+                output_scores=True,
+                return_dict_in_generate=True,
+            )
+
+            if output.get("scores", None) is not None and len(output["scores"]) > 0:
+                uncertainty = float(
+                    np.round(
+                        float(max(torch.nn.functional.softmax(output["scores"][0], dim=-1)[0])),
+                        2,
+                    )
+                )
+
+        else:
+            # First pass: generation confidence at weight=1.0.
+            output_first = model.generate(
+                **single_input,
+                keys=keys,
+                weight=1.0,
+                adjust_method=adjust_method,
+                pos=pos,
+                object_patch_mask=object_patch_mask,
+                max_new_tokens=max_new_tokens,
+                output_scores=True,
+                return_dict_in_generate=True,
+            )
+
+            if output_first.get("scores", None) is not None and len(output_first["scores"]) > 0:
+                uncertainty = float(
+                    np.round(
+                        float(max(torch.nn.functional.softmax(output_first["scores"][0], dim=-1)[0])),
+                        2,
+                    )
+                )
+            else:
+                uncertainty = 0.0
+
+            selected_weight = float(weight1) if uncertainty < threshold else float(weight2)
+
+            # Second pass: selected AdaptVis weight.
+            output = model.generate(
+                **single_input,
+                keys=keys,
+                weight=selected_weight,
+                adjust_method=adjust_method,
+                pos=pos,
+                object_patch_mask=object_patch_mask,
+                max_new_tokens=max_new_tokens,
+                output_scores=True,
+                return_dict_in_generate=True,
+            )
+
+    else:
+        selected_weight = None
+
+        output = model.generate(
+            **single_input,
+            max_new_tokens=max_new_tokens,
+            output_scores=True,
+            return_dict_in_generate=True,
+        )
+
+        if output.get("scores", None) is not None and len(output["scores"]) > 0:
+            uncertainty = float(np.round(float(max(output["scores"][0][0])), 2))
+
+    gen_text = processor.decode(
+        output["sequences"][0][input_len:],
+        skip_special_tokens=True,
+    )
+
+    return {
+        "generation": gen_text,
+        "selected_weight": selected_weight,
+        "uncertainty": uncertainty,
+    }
+
+
 # ============================================================
 # Custom greedy search
 # ============================================================
@@ -2178,6 +2369,13 @@ class LlavaWrapper:
         correct_id = []
         processed_sample_ids = []
 
+        # Extra comparison metrics used only when DECISION_MODE=closed_set.
+        # Main acc remains lower-case closed-set for backward compatibility.
+        acc_closed_lower = 0
+        acc_closed_cap = 0
+        acc_full_generation = 0
+        count_full_generation = 0
+
         sample_id_set = load_probe_sample_id_set()
 
         qst_ans_file = f"prompts/{dataset}_with_answer_{option}_options.jsonl"
@@ -2318,19 +2516,33 @@ class LlavaWrapper:
                     closed_set_info = None
                     output = None
 
+                    # These are populated only in closed-set comparison mode.
+                    closed_set_info_lower = None
+                    closed_set_info_cap = None
+                    closed_lower_gen = None
+                    closed_cap_gen = None
+                    full_generation_text = None
+                    full_generation_selected_weight = None
+                    full_generation_uncertainty = None
+
                     if use_closed_set_scoring_from_env():
-                        candidates = extract_closed_set_candidates(
+                        candidates_raw = extract_closed_set_candidates(
                             prompt=prompt,
                             dataset=dataset,
                             option=option,
                         )
 
-                        closed_set_info = decide_closed_set_with_method(
+                        candidates_lower = make_case_candidates(candidates_raw, "lower")
+                        candidates_cap = make_case_candidates(candidates_raw, "cap")
+
+                        # 1) closed-set lower-case candidates:
+                        #    left / right / on / under
+                        closed_set_info_lower = decide_closed_set_with_method(
                             model=self.model,
                             processor=self.processor,
                             image=image_for_model,
                             prompt=prompt,
-                            candidates=candidates,
+                            candidates=candidates_lower,
                             device=self.device,
                             dataset=dataset,
                             method=method,
@@ -2343,10 +2555,58 @@ class LlavaWrapper:
                             object_patch_mask=object_patch_mask,
                         )
 
-                        gen = closed_set_info["prediction"]
-                        selected_weight = closed_set_info["selected_weight"]
-                        uncertainty = float(closed_set_info["confidence"])
-                        probe_single_pass = bool(closed_set_info["probe_single_pass"])
+                        # 2) closed-set capitalized candidates:
+                        #    Left / Right / On / Under
+                        closed_set_info_cap = decide_closed_set_with_method(
+                            model=self.model,
+                            processor=self.processor,
+                            image=image_for_model,
+                            prompt=prompt,
+                            candidates=candidates_cap,
+                            device=self.device,
+                            dataset=dataset,
+                            method=method,
+                            weight=weight,
+                            threshold=threshold,
+                            weight1=weight1,
+                            weight2=weight2,
+                            adjust_method=adjust_method_env,
+                            pos=query_pos,
+                            object_patch_mask=object_patch_mask,
+                        )
+
+                        # Backward-compatible main result:
+                        # use lower-case closed-set as "Generation".
+                        closed_set_info = closed_set_info_lower
+                        closed_lower_gen = closed_set_info_lower["prediction"]
+                        closed_cap_gen = closed_set_info_cap["prediction"]
+
+                        gen = closed_lower_gen
+                        selected_weight = closed_set_info_lower["selected_weight"]
+                        uncertainty = float(closed_set_info_lower["confidence"])
+                        probe_single_pass = bool(closed_set_info_lower["probe_single_pass"])
+
+                        # 3) real free generation for comparison.
+                        if os.getenv("REPORT_FULL_GENERATION_IN_CLOSED_SET", "True") == "True":
+                            full_generation_info = run_full_generation_for_compare(
+                                model=self.model,
+                                processor=self.processor,
+                                single_input=single_input,
+                                keys=keys,
+                                method=method,
+                                weight=weight,
+                                threshold=threshold,
+                                weight1=weight1,
+                                weight2=weight2,
+                                adjust_method=adjust_method_env,
+                                pos=query_pos,
+                                object_patch_mask=object_patch_mask,
+                                max_new_tokens=int(os.getenv("FULL_GENERATION_MAX_NEW_TOKENS", "100")),
+                            )
+
+                            full_generation_text = full_generation_info["generation"]
+                            full_generation_selected_weight = full_generation_info["selected_weight"]
+                            full_generation_uncertainty = full_generation_info["uncertainty"]
 
                     else:
                         if method == "scaling_vis":
@@ -2497,12 +2757,43 @@ class LlavaWrapper:
                     golden = answer_list[index_of_total][0]
                     is_correct = is_generation_correct(golden, gen)
 
-                    print(
-                        f"Prompt: {prompt}\n"
-                        f"Generation: {gen}\n"
-                        f"Golden: {golden}\n"
-                        f"Correct: {is_correct}"
-                    )
+                    closed_lower_correct = None
+                    closed_cap_correct = None
+                    full_generation_correct = None
+
+                    if use_closed_set_scoring_from_env():
+                        closed_lower_correct = is_generation_correct(golden, closed_lower_gen)
+                        closed_cap_correct = is_generation_correct(golden, closed_cap_gen)
+
+                        if closed_lower_correct:
+                            acc_closed_lower += 1
+
+                        if closed_cap_correct:
+                            acc_closed_cap += 1
+
+                        if full_generation_text is not None:
+                            full_generation_correct = is_generation_correct(golden, full_generation_text)
+                            count_full_generation += 1
+
+                            if full_generation_correct:
+                                acc_full_generation += 1
+
+                        print(
+                            f"Prompt: {prompt}\n"
+                            f"Closed-set lower: {closed_lower_gen} | Correct: {closed_lower_correct}\n"
+                            f"Closed-set cap  : {closed_cap_gen} | Correct: {closed_cap_correct}\n"
+                            f"Full generation : {full_generation_text} | Correct: {full_generation_correct}\n"
+                            f"Golden: {golden}\n"
+                            f"Main Correct(lower): {is_correct}"
+                        )
+
+                    else:
+                        print(
+                            f"Prompt: {prompt}\n"
+                            f"Generation: {gen}\n"
+                            f"Golden: {golden}\n"
+                            f"Correct: {is_correct}"
+                        )
 
                     c_option = batch["caption_options"]
                     num_options = len(list(c_option))
@@ -2587,6 +2878,78 @@ class LlavaWrapper:
                         ),
                         "closed_set_confidence_mode": os.getenv("CLOSED_SET_CONFIDENCE_MODE", "prob"),
 
+                        # Closed-set case comparison.
+                        "closed_set_lower_generation": closed_lower_gen,
+                        "closed_set_lower_correct": (
+                            bool(closed_lower_correct)
+                            if closed_lower_correct is not None else None
+                        ),
+                        "closed_set_lower_candidates": (
+                            list(closed_set_info_lower["scores"].keys())
+                            if closed_set_info_lower is not None else None
+                        ),
+                        "closed_set_lower_scores": (
+                            closed_set_info_lower["scores"]
+                            if closed_set_info_lower is not None else None
+                        ),
+                        "closed_set_lower_probs": (
+                            closed_set_info_lower["probs"]
+                            if closed_set_info_lower is not None else None
+                        ),
+                        "closed_set_lower_confidence": (
+                            float(closed_set_info_lower["confidence"])
+                            if closed_set_info_lower is not None else None
+                        ),
+                        "closed_set_lower_selected_weight": (
+                            float(closed_set_info_lower["selected_weight"])
+                            if closed_set_info_lower is not None
+                            and closed_set_info_lower["selected_weight"] is not None
+                            else None
+                        ),
+
+                        "closed_set_cap_generation": closed_cap_gen,
+                        "closed_set_cap_correct": (
+                            bool(closed_cap_correct)
+                            if closed_cap_correct is not None else None
+                        ),
+                        "closed_set_cap_candidates": (
+                            list(closed_set_info_cap["scores"].keys())
+                            if closed_set_info_cap is not None else None
+                        ),
+                        "closed_set_cap_scores": (
+                            closed_set_info_cap["scores"]
+                            if closed_set_info_cap is not None else None
+                        ),
+                        "closed_set_cap_probs": (
+                            closed_set_info_cap["probs"]
+                            if closed_set_info_cap is not None else None
+                        ),
+                        "closed_set_cap_confidence": (
+                            float(closed_set_info_cap["confidence"])
+                            if closed_set_info_cap is not None else None
+                        ),
+                        "closed_set_cap_selected_weight": (
+                            float(closed_set_info_cap["selected_weight"])
+                            if closed_set_info_cap is not None
+                            and closed_set_info_cap["selected_weight"] is not None
+                            else None
+                        ),
+
+                        # Real free generation comparison.
+                        "full_generation_text": full_generation_text,
+                        "full_generation_correct": (
+                            bool(full_generation_correct)
+                            if full_generation_correct is not None else None
+                        ),
+                        "full_generation_selected_weight": (
+                            float(full_generation_selected_weight)
+                            if full_generation_selected_weight is not None else None
+                        ),
+                        "full_generation_uncertainty": (
+                            float(full_generation_uncertainty)
+                            if full_generation_uncertainty is not None else None
+                        ),
+
                         "adjust_method": os.getenv("ADJUST_METHOD", "last_query"),
 
                         # AdaptVis layer control metadata.
@@ -2657,18 +3020,39 @@ class LlavaWrapper:
                 json.dump(results, fout, ensure_ascii=False, indent=4)
 
             denom = processed_count if processed_count > 0 else 1
-            print(
-                f"[RUNNING] acc={acc}/{processed_count}={acc / denom:.6f}, "
-                f"scanned={index_of_total}, skipped={skipped_count}"
-            )
+
+            if use_closed_set_scoring_from_env():
+                full_denom = count_full_generation if count_full_generation > 0 else 1
+                print(
+                    f"[RUNNING] main_lower_acc={acc}/{processed_count}={acc / denom:.6f}, "
+                    f"closed_lower={acc_closed_lower}/{processed_count}={acc_closed_lower / denom:.6f}, "
+                    f"closed_cap={acc_closed_cap}/{processed_count}={acc_closed_cap / denom:.6f}, "
+                    f"full_generation={acc_full_generation}/{count_full_generation}={acc_full_generation / full_denom:.6f}, "
+                    f"scanned={index_of_total}, skipped={skipped_count}"
+                )
+            else:
+                print(
+                    f"[RUNNING] acc={acc}/{processed_count}={acc / denom:.6f}, "
+                    f"scanned={index_of_total}, skipped={skipped_count}"
+                )
 
         denom = processed_count if processed_count > 0 else 1
         final_acc = acc / denom
 
-        print(
-            f"[FINAL] acc={acc}/{processed_count}={final_acc:.6f}, "
-            f"scanned={index_of_total}, skipped={skipped_count}"
-        )
+        if use_closed_set_scoring_from_env():
+            full_denom = count_full_generation if count_full_generation > 0 else 1
+            print(
+                f"[FINAL] main_lower_acc={acc}/{processed_count}={final_acc:.6f}, "
+                f"closed_lower={acc_closed_lower}/{processed_count}={acc_closed_lower / denom:.6f}, "
+                f"closed_cap={acc_closed_cap}/{processed_count}={acc_closed_cap / denom:.6f}, "
+                f"full_generation={acc_full_generation}/{count_full_generation}={acc_full_generation / full_denom:.6f}, "
+                f"scanned={index_of_total}, skipped={skipped_count}"
+            )
+        else:
+            print(
+                f"[FINAL] acc={acc}/{processed_count}={final_acc:.6f}, "
+                f"scanned={index_of_total}, skipped={skipped_count}"
+            )
 
         output_score_file = output_file_path.replace(".json", "scores.json")
 
@@ -2676,6 +3060,19 @@ class LlavaWrapper:
             json.dump(
                 {
                     "acc": final_acc,
+                    "acc_closed_lower": (
+                        acc_closed_lower / denom
+                        if use_closed_set_scoring_from_env() else None
+                    ),
+                    "acc_closed_cap": (
+                        acc_closed_cap / denom
+                        if use_closed_set_scoring_from_env() else None
+                    ),
+                    "acc_full_generation": (
+                        acc_full_generation / (count_full_generation if count_full_generation > 0 else 1)
+                        if use_closed_set_scoring_from_env() else None
+                    ),
+                    "count_full_generation": count_full_generation,
                     "correct_id": correct_id,
                     "processed_count": processed_count,
                     "skipped_count": skipped_count,
