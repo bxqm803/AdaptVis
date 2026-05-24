@@ -254,6 +254,99 @@ def _raw_generation_correct(gold, gen):
     )
 
 
+
+def _compat_greedy_generate(
+    self_model,
+    input_ids=None,
+    attention_mask=None,
+    pixel_values=None,
+    max_new_tokens=100,
+    output_scores=False,
+    return_dict_in_generate=False,
+    weight=None,
+    keys=None,
+    **kwargs,
+):
+    """
+    Minimal greedy generation for this AdaptVis custom LLaVA model under newer Transformers.
+
+    Newer Transformers may not expose .generate() on the custom
+    LlavaForConditionalGenerationScal class.  This local generator keeps the
+    old evaluation behavior used by this repo: greedy decoding and optional
+    first-step scores, while explicitly forwarding AdaptVis `weight`.
+    """
+    if input_ids is None:
+        raise ValueError("input_ids is required")
+
+    cur_input_ids = input_ids
+    device = cur_input_ids.device
+
+    if attention_mask is None:
+        cur_attention_mask = torch.ones_like(cur_input_ids, device=device)
+    else:
+        cur_attention_mask = attention_mask
+
+    eos_token_id = kwargs.get("eos_token_id", None)
+    if eos_token_id is None:
+        eos_token_id = getattr(getattr(self_model, "generation_config", None), "eos_token_id", None)
+    if eos_token_id is None:
+        eos_token_id = getattr(getattr(self_model, "config", None), "eos_token_id", None)
+
+    if isinstance(eos_token_id, int):
+        eos_ids = torch.tensor([eos_token_id], device=device)
+    elif isinstance(eos_token_id, (list, tuple)) and len(eos_token_id) > 0:
+        eos_ids = torch.tensor(list(eos_token_id), device=device)
+    else:
+        eos_ids = None
+
+    scores = []
+
+    for _step in range(int(max_new_tokens)):
+        forward_kwargs = {
+            "input_ids": cur_input_ids,
+            "attention_mask": cur_attention_mask,
+            "return_dict": True,
+            "use_cache": False,
+        }
+
+        if pixel_values is not None:
+            forward_kwargs["pixel_values"] = pixel_values
+
+        if "Scal" in str(type(self_model)):
+            forward_kwargs["weight"] = weight
+
+        outputs = self_model(**forward_kwargs)
+        next_token_logits = outputs.logits[:, -1, :]
+
+        if output_scores:
+            scores.append(next_token_logits)
+
+        next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
+        cur_input_ids = torch.cat([cur_input_ids, next_tokens], dim=-1)
+        cur_attention_mask = torch.cat(
+            [cur_attention_mask, torch.ones_like(next_tokens, device=device)],
+            dim=-1,
+        )
+
+        if eos_ids is not None:
+            hit_eos = (next_tokens == eos_ids.view(1, -1)).any(dim=-1)
+            if bool(hit_eos.all().item()):
+                break
+
+    if return_dict_in_generate:
+        return GenerateDecoderOnlyOutput(
+            sequences=cur_input_ids,
+            scores=tuple(scores),
+            logits=None,
+            attentions=None,
+            hidden_states=None,
+            past_key_values=None,
+        )
+
+    return cur_input_ids
+
+
 class LlavaWrapper:
     def __init__(self, root_dir, device,method):
         
@@ -268,6 +361,11 @@ class LlavaWrapper:
         self.processor = AutoProcessor.from_pretrained(MODEL, revision='a272c74',cache_dir=root_dir)
 
         self.device = device
+
+        # Newer Transformers may not provide .generate() for this custom model class.
+        # Bind a local greedy generator so AdaptVis can still pass `weight`.
+        import types
+        self.model.generate = types.MethodType(_compat_greedy_generate, self.model)
         # Newer Transformers' LlavaProcessor.__call__ expands <image> tokens.
         # AdaptVis custom LLaVA expects the legacy behavior: keep one <image>
         # token in input_ids and let modeling_llava_scal.py merge/expand image
