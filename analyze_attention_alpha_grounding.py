@@ -251,6 +251,41 @@ def _to_device(inputs, device):
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
 
 
+def make_legacy_llava_inputs(wrapper: LlavaWrapper, image: Image.Image, prompt: str, max_length: int = 77):
+    """
+    Build inputs in the same legacy style used by this AdaptVis repo.
+
+    Newer HuggingFace LlavaProcessor tries to expand <image> tokens using
+    processor.patch_size. This repo's custom LlavaForConditionalGenerationScal
+    expects the old behavior: keep a single <image> token in input_ids and let
+    _merge_input_ids_with_image_features expand it inside the model.
+
+    Therefore we intentionally avoid processor(text=..., images=...) here and
+    call tokenizer + image_processor separately.
+    """
+    processor = wrapper.processor
+
+    text_inputs = processor.tokenizer(
+        text=prompt,
+        padding="max_length",
+        return_tensors="pt",
+        max_length=max_length,
+        truncation=False,
+    )
+
+    if hasattr(processor, "image_processor") and processor.image_processor is not None:
+        image_inputs = processor.image_processor(images=image, return_tensors="pt")
+    elif hasattr(wrapper, "feature_extractor") and wrapper.feature_extractor is not None:
+        image_inputs = wrapper.feature_extractor(images=image, return_tensors="pt")
+    else:
+        raise AttributeError("Cannot find image_processor or feature_extractor for LLaVA inputs.")
+
+    inputs = {}
+    inputs.update(dict(text_inputs))
+    inputs.update(dict(image_inputs))
+    return inputs
+
+
 def infer_num_image_patches(model) -> Tuple[int, int]:
     vc = getattr(model.config, "vision_config", None)
     image_size = int(getattr(vc, "image_size", 336))
@@ -302,13 +337,11 @@ def extract_final_query_image_attention(wrapper: LlavaWrapper, image: Image.Imag
     model = wrapper.model
     device = wrapper.device
 
-    inputs = processor(
-        text=prompt,
-        images=image,
-        padding="max_length",
-        return_tensors="pt",
-        max_length=max_length,
-    )
+    # Build legacy-style inputs. Do NOT call processor(text=..., images=...) here,
+    # because newer HF LlavaProcessor expands <image> tokens and requires
+    # processor.patch_size; this AdaptVis repo expects one <image> token and
+    # expands it inside modeling_llava_scal.py.
+    inputs = make_legacy_llava_inputs(wrapper, image, prompt, max_length=max_length)
     inputs = _to_device(inputs, device)
 
     # The repo's custom LLaMA attention path raises an error when
