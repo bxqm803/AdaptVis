@@ -254,6 +254,295 @@ def _raw_generation_correct(gold, gen):
     )
 
 
+def _feature_alpha_name(alpha):
+    try:
+        a = float(alpha)
+    except Exception:
+        return "unknown"
+    if abs(a - 1.0) < 1e-6:
+        return "base"
+    if abs(a - 0.5) < 1e-6:
+        return "low"
+    if abs(a - 1.5) < 1e-6:
+        return "high"
+    return f"alpha{_safe_float_tag(a)}"
+
+
+def _parse_relation_objects(prompt):
+    """Parse prompts like: Where is/are the bowl in relation to the armchair? ..."""
+    import re
+    p = str(prompt).replace("\n", " ")
+    m = re.search(
+        r"Where\s+(?:is|are)\s+(?:the\s+)?(.+?)\s+in relation to\s+(?:the\s+)?(.+?)\?",
+        p,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return "", ""
+    obj1 = m.group(1).strip()
+    obj2 = m.group(2).strip()
+    # Avoid carrying answer instruction if regex ever over-captures.
+    obj1 = re.sub(r"\s+Answer\s+with.*$", "", obj1, flags=re.IGNORECASE).strip()
+    obj2 = re.sub(r"\s+Answer\s+with.*$", "", obj2, flags=re.IGNORECASE).strip()
+    return obj1, obj2
+
+
+def _find_subsequence(seq, sub):
+    if not sub:
+        return []
+    n, m = len(seq), len(sub)
+    for i in range(n - m + 1):
+        if seq[i:i + m] == sub:
+            return list(range(i, i + m))
+    return []
+
+
+def _locate_object_raw_positions(input_ids_list, valid_positions, tokenizer, obj):
+    """Return raw input_ids positions corresponding to an object phrase, best effort."""
+    if not obj:
+        return []
+    valid_ids = [input_ids_list[p] for p in valid_positions]
+    variants = []
+    obj = str(obj).strip()
+    for v in [obj, " " + obj, "the " + obj, " the " + obj, obj + " "]:
+        if v and v not in variants:
+            variants.append(v)
+    best = []
+    for v in variants:
+        try:
+            ids = tokenizer(v, add_special_tokens=False).input_ids
+        except Exception:
+            ids = []
+        # remove empty / special-only cases
+        ids = [int(x) for x in ids]
+        found = _find_subsequence(valid_ids, ids)
+        if found:
+            best = [valid_positions[i] for i in found]
+            break
+    return best
+
+
+def _parse_saved_attention_span(save_attn_path):
+    """Parse AdaptVis debug file names containing start/end image-token span if available."""
+    import os, re
+    if not save_attn_path or not os.path.isdir(save_attn_path):
+        return None
+    for fn in os.listdir(save_attn_path):
+        m = re.search(r"start(\d+)_end(\d+)", fn)
+        if m:
+            start = int(m.group(1))
+            end = int(m.group(2))
+            # In AdaptVis filenames end is usually inclusive. Make output exclusive.
+            if end >= start:
+                return start, end + 1
+    return None
+
+
+def _extract_first_step_last_hidden(generate_output):
+    """Get final-layer hidden state for the first generation step, i.e. prompt-only forward."""
+    hs = None
+    if hasattr(generate_output, "hidden_states"):
+        hs = generate_output.hidden_states
+    elif isinstance(generate_output, dict) and "hidden_states" in generate_output:
+        hs = generate_output["hidden_states"]
+    if hs is None:
+        raise RuntimeError("generate_output.hidden_states is None. Did you pass output_hidden_states=True?")
+    # Generation output: tuple over generation steps; each step is tuple over layers.
+    first_step = hs[0]
+    last_layer = first_step[-1]
+    # batch size 1
+    return last_layer[0]
+
+
+def _raw_to_merged_positions(raw_positions, valid_positions, raw_image_pos, image_start, num_img_tokens, hidden_len):
+    """Map raw input_ids positions to merged hidden-state positions after <image> expands."""
+    pos_to_order = {int(p): i for i, p in enumerate(valid_positions)}
+    image_order = pos_to_order.get(int(raw_image_pos), None)
+    if image_order is None:
+        return []
+    merged = []
+    for rp in raw_positions:
+        rp = int(rp)
+        if rp not in pos_to_order or rp == raw_image_pos:
+            continue
+        order = pos_to_order[rp]
+        if order < image_order:
+            mp = image_start - image_order + order
+        else:
+            mp = image_start + num_img_tokens + (order - image_order - 1)
+        if 0 <= mp < hidden_len:
+            merged.append(int(mp))
+    return merged
+
+
+def _normalize_rows(x, eps=1e-6):
+    return x / (x.norm(dim=-1, keepdim=True) + eps)
+
+
+def _save_hidden_similarity_from_generate(
+    *,
+    tokenizer,
+    generate_output,
+    single_input,
+    prompt,
+    gold,
+    sample_id,
+    alpha,
+    selected_weight,
+    uncertainty,
+    feature_dir,
+    save_attn_path,
+):
+    """
+    Save last-layer hidden-state features from the first generation forward.
+    This uses the real generation output, so it matches the actual selected alpha branch.
+    """
+    import os
+    os.makedirs(feature_dir, exist_ok=True)
+
+    H = _extract_first_step_last_hidden(generate_output).detach().float().cpu()  # [merged_seq, hidden]
+    hidden_len, hidden_dim = H.shape
+
+    input_ids = single_input["input_ids"][0].detach().cpu().tolist()
+    attention_mask = single_input.get("attention_mask", None)
+    if attention_mask is not None:
+        attention_mask_list = attention_mask[0].detach().cpu().tolist()
+        valid_positions = [i for i, m in enumerate(attention_mask_list) if int(m) == 1]
+    else:
+        pad_id = tokenizer.pad_token_id
+        valid_positions = [i for i, t in enumerate(input_ids) if pad_id is None or int(t) != int(pad_id)]
+
+    image_token_id = 32001
+    image_raw_positions = [i for i in valid_positions if int(input_ids[i]) == image_token_id]
+    if len(image_raw_positions) != 1:
+        raise RuntimeError(f"Expected exactly one <image> token among valid tokens, got {image_raw_positions}")
+    raw_image_pos = image_raw_positions[0]
+
+    # Prefer AdaptVis internal span from saved attention filenames, because it is the same span used for weighting.
+    span = _parse_saved_attention_span(save_attn_path)
+    if span is not None:
+        image_start, image_end = span
+        num_img_tokens = image_end - image_start
+    else:
+        # Fallback for one image: merged_len = valid_text_tokens_without_image + num_img_tokens
+        num_img_tokens = hidden_len - (len(valid_positions) - 1)
+        image_order = valid_positions.index(raw_image_pos)
+        image_start = image_order
+        image_end = image_start + num_img_tokens
+
+    if not (0 <= image_start < image_end <= hidden_len):
+        raise RuntimeError(
+            f"Bad image span start={image_start}, end={image_end}, hidden_len={hidden_len}, "
+            f"valid={len(valid_positions)}"
+        )
+
+    H_img = H[image_start:image_end]
+    if H_img.shape[0] != num_img_tokens:
+        raise RuntimeError(f"H_img length mismatch: {H_img.shape[0]} vs {num_img_tokens}")
+
+    # Text positions in merged sequence.
+    raw_text_positions = [p for p in valid_positions if p != raw_image_pos]
+    text_merged_positions = _raw_to_merged_positions(
+        raw_text_positions, valid_positions, raw_image_pos, image_start, num_img_tokens, hidden_len
+    )
+    H_text = H[text_merged_positions] if text_merged_positions else torch.empty((0, hidden_dim), dtype=H.dtype)
+
+    obj1, obj2 = _parse_relation_objects(prompt)
+    obj1_raw = _locate_object_raw_positions(input_ids, valid_positions, tokenizer, obj1)
+    obj2_raw = _locate_object_raw_positions(input_ids, valid_positions, tokenizer, obj2)
+    obj1_merged = _raw_to_merged_positions(obj1_raw, valid_positions, raw_image_pos, image_start, num_img_tokens, hidden_len)
+    obj2_merged = _raw_to_merged_positions(obj2_raw, valid_positions, raw_image_pos, image_start, num_img_tokens, hidden_len)
+
+    H_obj1 = H[obj1_merged].mean(dim=0) if obj1_merged else torch.zeros((hidden_dim,), dtype=H.dtype)
+    H_obj2 = H[obj2_merged].mean(dim=0) if obj2_merged else torch.zeros((hidden_dim,), dtype=H.dtype)
+    H_last = H[text_merged_positions[-1]] if text_merged_positions else H[-1]
+
+    # Cosine similarities.
+    H_img_n = _normalize_rows(H_img)
+    H_text_n = _normalize_rows(H_text) if H_text.numel() else H_text
+    obj1_n = H_obj1 / (H_obj1.norm() + 1e-6)
+    obj2_n = H_obj2 / (H_obj2.norm() + 1e-6)
+
+    sim_obj1 = torch.matmul(H_img_n, obj1_n).numpy()  # [num_img_tokens]
+    sim_obj2 = torch.matmul(H_img_n, obj2_n).numpy()
+    sim_text_to_img = torch.matmul(H_text_n, H_img_n.T).numpy() if H_text.numel() else np.zeros((0, num_img_tokens), dtype=np.float32)
+
+    # First-step logits for answer distribution.
+    if hasattr(generate_output, "scores") and generate_output.scores is not None and len(generate_output.scores) > 0:
+        first_logits = generate_output.scores[0][0].detach().float().cpu()
+    elif isinstance(generate_output, dict) and generate_output.get("scores", None) is not None and len(generate_output["scores"]) > 0:
+        first_logits = generate_output["scores"][0][0].detach().float().cpu()
+    else:
+        first_logits = torch.empty((0,), dtype=torch.float32)
+
+    # Store a few answer-token logits using leading-space variants as best effort.
+    answer_words = ["left", "right", "on", "under", "Left", "Right", "On", "Under"]
+    answer_token_ids = []
+    answer_token_labels = []
+    for w in answer_words:
+        for txt in [w, " " + w]:
+            ids = tokenizer(txt, add_special_tokens=False).input_ids
+            if len(ids) == 1:
+                answer_token_ids.append(int(ids[0]))
+                answer_token_labels.append(txt)
+    if first_logits.numel():
+        answer_logits = np.array([float(first_logits[i]) for i in answer_token_ids], dtype=np.float32)
+    else:
+        answer_logits = np.zeros((len(answer_token_ids),), dtype=np.float32)
+
+    try:
+        tokens = tokenizer.convert_ids_to_tokens([input_ids[p] for p in raw_text_positions])
+    except Exception:
+        tokens = [str(input_ids[p]) for p in raw_text_positions]
+
+    alpha_name = _feature_alpha_name(alpha)
+    out_path = os.path.join(
+        feature_dir,
+        f"sid{int(sample_id):04d}_{alpha_name}_alpha{_safe_float_tag(alpha)}.npz",
+    )
+
+    np.savez_compressed(
+        out_path,
+        sample_id=np.array(int(sample_id), dtype=np.int32),
+        alpha=np.array(float(alpha), dtype=np.float32),
+        alpha_name=np.array(alpha_name),
+        selected_weight=np.array(float(selected_weight) if selected_weight is not None else np.nan, dtype=np.float32),
+        uncertainty=np.array(float(uncertainty) if uncertainty is not None else np.nan, dtype=np.float32),
+        prompt=np.array(str(prompt)),
+        gold=np.array(str(gold)),
+        obj1=np.array(str(obj1)),
+        obj2=np.array(str(obj2)),
+        hidden_len=np.array(int(hidden_len), dtype=np.int32),
+        hidden_dim=np.array(int(hidden_dim), dtype=np.int32),
+        image_start=np.array(int(image_start), dtype=np.int32),
+        image_end=np.array(int(image_end), dtype=np.int32),
+        num_img_tokens=np.array(int(num_img_tokens), dtype=np.int32),
+        raw_image_pos=np.array(int(raw_image_pos), dtype=np.int32),
+        valid_positions=np.array(valid_positions, dtype=np.int32),
+        raw_text_positions=np.array(raw_text_positions, dtype=np.int32),
+        text_merged_positions=np.array(text_merged_positions, dtype=np.int32),
+        obj1_raw_positions=np.array(obj1_raw, dtype=np.int32),
+        obj2_raw_positions=np.array(obj2_raw, dtype=np.int32),
+        obj1_merged_positions=np.array(obj1_merged, dtype=np.int32),
+        obj2_merged_positions=np.array(obj2_merged, dtype=np.int32),
+        tokens=np.array(tokens),
+        image_hidden=H_img.half().numpy(),
+        text_hidden=H_text.half().numpy(),
+        obj1_hidden=H_obj1.half().numpy(),
+        obj2_hidden=H_obj2.half().numpy(),
+        last_prompt_hidden=H_last.half().numpy(),
+        sim_obj1_to_img=sim_obj1.astype(np.float32),
+        sim_obj2_to_img=sim_obj2.astype(np.float32),
+        sim_text_to_img=sim_text_to_img.astype(np.float32),
+        sim_obj1_top10_idx=np.argsort(-sim_obj1)[:10].astype(np.int32),
+        sim_obj2_top10_idx=np.argsort(-sim_obj2)[:10].astype(np.int32),
+        answer_token_ids=np.array(answer_token_ids, dtype=np.int32),
+        answer_token_labels=np.array(answer_token_labels),
+        answer_logits=answer_logits,
+    )
+    return out_path
+
+
 class LlavaWrapper:
     def __init__(self, root_dir, device,method):
         
@@ -378,6 +667,15 @@ class LlavaWrapper:
         print("[RESULT JSON]", output_file_path)
         print("[SCORE JSON]", output_score_file)
 
+        save_hidden_features = os.getenv("SAVE_HIDDEN_FEATURES", "True") == "True"
+        hidden_feature_dir = os.getenv(
+            "HIDDEN_FEATURE_DIR",
+            f"./output/hidden_features_during_generation/{dataset}_{method}_{run_tag}_{option}option_{TEST}"
+        )
+        if save_hidden_features:
+            os.makedirs(hidden_feature_dir, exist_ok=True)
+            print("[SAVE HIDDEN FEATURES]", hidden_feature_dir)
+
         results = []  # Store results for each generated sequence
         for batch in tqdm(joint_loader):
             batch_scores = []
@@ -410,7 +708,8 @@ class LlavaWrapper:
                         selected_weight = weight
                         output = self.model.generate(
                             **single_input, keys=keys, weight=weight,
-                            max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                            max_new_tokens=100, output_scores=True, output_hidden_states=True,
+                            return_dict_in_generate=True
                         )
                         uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
                         gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
@@ -434,7 +733,8 @@ class LlavaWrapper:
 
                         output = self.model.generate(
                             **single_input, keys=keys, weight=selected_weight,
-                            max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                            max_new_tokens=100, output_scores=True, output_hidden_states=True,
+                            return_dict_in_generate=True
                         )
                         gen = self.processor.decode(
                             output['sequences'][0][len(single_input['input_ids'][-1]):],
@@ -444,12 +744,36 @@ class LlavaWrapper:
                     else:
                         # Default generation method
                         output = self.model.generate(
-                            **single_input, max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                            **single_input, max_new_tokens=100, output_scores=True, output_hidden_states=True,
+                            return_dict_in_generate=True
                         )
                         gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
                         uncertainty = np.round(float(max(output['scores'][0][0])), 2)
 
                     gold = answer_list[index_of_total][0]
+                    feature_path = None
+                    if save_hidden_features:
+                        try:
+                            # Save the hidden states from the actual final generation branch.
+                            # For mixed AdaptVis this is alpha=0.5 or alpha=1.5.
+                            # For base run w1=w2=1.0 this is alpha=1.0.
+                            feature_path = _save_hidden_similarity_from_generate(
+                                tokenizer=self.tokenizer,
+                                generate_output=output,
+                                single_input=single_input,
+                                prompt=prompt,
+                                gold=gold,
+                                sample_id=index_of_total,
+                                alpha=selected_weight if selected_weight is not None else weight,
+                                selected_weight=selected_weight,
+                                uncertainty=uncertainty,
+                                feature_dir=hidden_feature_dir,
+                                save_attn_path=os.environ.get('SAVE_ATTN_PATH', ''),
+                            )
+                            print("[FEATURE SAVED]", feature_path)
+                        except Exception as e:
+                            print("[FEATURE SAVE ERROR]", repr(e))
+
                     is_correct = _raw_generation_correct(gold, gen)
 
                     # Print prompt, generated text, and expected answer/correctness.
@@ -467,6 +791,7 @@ class LlavaWrapper:
                         "Golden": gold,
                         "Correct": is_correct,
                         "RawGenerationCorrect": is_correct,
+                        "FeaturePath": feature_path,
                         "method": method,
                         "weight": float(weight) if weight is not None else None,
                         "weight1": float(weight1) if weight1 is not None else None,
