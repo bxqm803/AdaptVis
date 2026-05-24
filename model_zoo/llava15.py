@@ -268,6 +268,54 @@ class LlavaWrapper:
         self.processor = AutoProcessor.from_pretrained(MODEL, revision='a272c74',cache_dir=root_dir)
 
         self.device = device
+        # Newer Transformers' LlavaProcessor.__call__ expands <image> tokens.
+        # AdaptVis custom LLaVA expects the legacy behavior: keep one <image>
+        # token in input_ids and let modeling_llava_scal.py merge/expand image
+        # features internally.  Therefore all generation code should build
+        # inputs through _build_llava_legacy_inputs() instead of calling
+        # self.processor(text=..., images=...).
+        try:
+            vision_config = getattr(self.model.config, "vision_config", None)
+            self.processor.patch_size = getattr(vision_config, "patch_size", 14)
+            self.processor.vision_feature_select_strategy = getattr(
+                self.model.config,
+                "vision_feature_select_strategy",
+                "default",
+            )
+        except Exception:
+            pass
+
+    def _build_llava_legacy_inputs(self, text, image, max_length=77):
+        """
+        Build LLaVA inputs in the legacy format expected by this AdaptVis repo.
+
+        This intentionally avoids AutoProcessor.__call__(text=..., images=...),
+        because newer Transformers expands the <image> token at processor level.
+        The custom AdaptVis model expects one <image> token and performs
+        image-token expansion inside _merge_input_ids_with_image_features().
+        """
+        text_inputs = self.processor.tokenizer(
+            text=text,
+            padding="max_length",
+            return_tensors="pt",
+            max_length=max_length,
+            truncation=False,
+        )
+
+        image_inputs = self.processor.image_processor(
+            images=image,
+            return_tensors="pt",
+        )
+
+        inputs = {}
+        inputs.update(dict(text_inputs))
+        inputs.update(dict(image_inputs))
+
+        return {
+            k: v.to(self.device) if hasattr(v, "to") else v
+            for k, v in inputs.items()
+        }
+
     
     @torch.no_grad()
     def get_text_embeddings(self, texts, text_batch_size=64, normalize=False):
@@ -394,9 +442,11 @@ class LlavaWrapper:
                     prompt = prompt_list[index_of_total]
                     
                     # Preprocess input for the model
-                    single_input = self.processor(
-                        text=prompt, images=_, padding="max_length", return_tensors="pt", max_length=77
-                    ).to(self.device)
+                    single_input = self._build_llava_legacy_inputs(
+                        text=prompt,
+                        image=_,
+                        max_length=77,
+                    )
                     
                     # Create key mask for special token
                     keys = [torch.where(input_id == 32001, 1, 0) for input_id in single_input['input_ids']]
@@ -574,7 +624,11 @@ class LlavaWrapper:
                     # Generate responses for each concatenated input
                     for idx, text in enumerate(concatenated_list):
                         # Prepare input data for the model
-                        single_input = self.processor(text=text, images=list(i_option)[idx], padding="max_length", return_tensors="pt", max_length=77).to(self.device)
+                        single_input = self._build_llava_legacy_inputs(
+                            text=text,
+                            image=list(i_option)[idx],
+                            max_length=77,
+                        )
                         keys = [torch.where(input_id == 32001, 1, 0) for input_id in single_input['input_ids']]
                         
                         # Apply different attention adjustment methods based on the 'method' argument
