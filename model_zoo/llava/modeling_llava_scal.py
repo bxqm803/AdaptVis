@@ -6,12 +6,6 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 """PyTorch Llava model."""
 
@@ -61,6 +55,20 @@ LLAVA_PRETRAINED_MODEL_ARCHIVE_LIST = [
 class LlavaCausalLMOutputWithPast(ModelOutput):
     """
     Base class for Llava causal language model outputs.
+
+    Args:
+        loss (`torch.FloatTensor` of shape `(1,)`, *optional*):
+            Language modeling loss.
+        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+            Prediction scores before SoftMax.
+        past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*):
+            Cached key/value states for generation.
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*):
+            Hidden states from the language model.
+        attentions (`tuple(torch.FloatTensor)`, *optional*):
+            Attention weights from the language model.
+        image_hidden_states (`tuple(torch.FloatTensor)`, *optional*):
+            Image hidden states from the vision encoder/projector.
     """
 
     loss: Optional[torch.FloatTensor] = None
