@@ -311,6 +311,15 @@ def extract_final_query_image_attention(wrapper: LlavaWrapper, image: Image.Imag
     )
     inputs = _to_device(inputs, device)
 
+    # The repo's custom LLaMA attention path raises an error when
+    # output_attentions=True but SAVE_ATTN_PATH is unset. main_aro.py sets it
+    # during normal runs; this standalone analysis script must set it too.
+    save_attn_path = os.environ.get("SAVE_ATTN_PATH", "")
+    if not save_attn_path:
+        save_attn_path = os.path.join(tempfile.gettempdir(), "adaptvis_attention_extract")
+        os.environ["SAVE_ATTN_PATH"] = save_attn_path
+    os.makedirs(os.environ["SAVE_ATTN_PATH"], exist_ok=True)
+
     outputs = model(
         **inputs,
         weight=float(alpha),
@@ -662,13 +671,22 @@ def main():
     if args.grounding == "official":
         if not args.gdino_config or not args.gdino_checkpoint:
             raise ValueError("--grounding official requires --gdino-config and --gdino-checkpoint")
-        print("\n[LOAD GROUNDINGDINO]")
+        print("\n[LOAD GROUNDINGDINO official]")
         gdino = GroundingDINOOfficial(
             args.gdino_config,
             args.gdino_checkpoint,
             device,
             args.box_threshold,
             args.text_threshold,
+        )
+    elif args.grounding == "hf":
+        print("\n[LOAD GROUNDINGDINO HuggingFace]")
+        gdino = GroundingDINOHF(
+            args.gdino_model,
+            device,
+            args.box_threshold,
+            args.text_threshold,
+            cache_dir=args.root_dir,
         )
 
     summary_rows = []
