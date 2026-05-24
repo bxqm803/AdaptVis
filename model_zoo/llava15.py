@@ -254,99 +254,6 @@ def _raw_generation_correct(gold, gen):
     )
 
 
-
-def _compat_greedy_generate(
-    self_model,
-    input_ids=None,
-    attention_mask=None,
-    pixel_values=None,
-    max_new_tokens=100,
-    output_scores=False,
-    return_dict_in_generate=False,
-    weight=None,
-    keys=None,
-    **kwargs,
-):
-    """
-    Minimal greedy generation for this AdaptVis custom LLaVA model under newer Transformers.
-
-    Newer Transformers may not expose .generate() on the custom
-    LlavaForConditionalGenerationScal class.  This local generator keeps the
-    old evaluation behavior used by this repo: greedy decoding and optional
-    first-step scores, while explicitly forwarding AdaptVis `weight`.
-    """
-    if input_ids is None:
-        raise ValueError("input_ids is required")
-
-    cur_input_ids = input_ids
-    device = cur_input_ids.device
-
-    if attention_mask is None:
-        cur_attention_mask = torch.ones_like(cur_input_ids, device=device)
-    else:
-        cur_attention_mask = attention_mask
-
-    eos_token_id = kwargs.get("eos_token_id", None)
-    if eos_token_id is None:
-        eos_token_id = getattr(getattr(self_model, "generation_config", None), "eos_token_id", None)
-    if eos_token_id is None:
-        eos_token_id = getattr(getattr(self_model, "config", None), "eos_token_id", None)
-
-    if isinstance(eos_token_id, int):
-        eos_ids = torch.tensor([eos_token_id], device=device)
-    elif isinstance(eos_token_id, (list, tuple)) and len(eos_token_id) > 0:
-        eos_ids = torch.tensor(list(eos_token_id), device=device)
-    else:
-        eos_ids = None
-
-    scores = []
-
-    for _step in range(int(max_new_tokens)):
-        forward_kwargs = {
-            "input_ids": cur_input_ids,
-            "attention_mask": cur_attention_mask,
-            "return_dict": True,
-            "use_cache": False,
-        }
-
-        if pixel_values is not None:
-            forward_kwargs["pixel_values"] = pixel_values
-
-        if "Scal" in str(type(self_model)):
-            forward_kwargs["weight"] = weight
-
-        outputs = self_model(**forward_kwargs)
-        next_token_logits = outputs.logits[:, -1, :]
-
-        if output_scores:
-            scores.append(next_token_logits)
-
-        next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-
-        cur_input_ids = torch.cat([cur_input_ids, next_tokens], dim=-1)
-        cur_attention_mask = torch.cat(
-            [cur_attention_mask, torch.ones_like(next_tokens, device=device)],
-            dim=-1,
-        )
-
-        if eos_ids is not None:
-            hit_eos = (next_tokens == eos_ids.view(1, -1)).any(dim=-1)
-            if bool(hit_eos.all().item()):
-                break
-
-    if return_dict_in_generate:
-        return GenerateDecoderOnlyOutput(
-            sequences=cur_input_ids,
-            scores=tuple(scores),
-            logits=None,
-            attentions=None,
-            hidden_states=None,
-            past_key_values=None,
-        )
-
-    return cur_input_ids
-
-
 class LlavaWrapper:
     def __init__(self, root_dir, device,method):
         
@@ -361,59 +268,6 @@ class LlavaWrapper:
         self.processor = AutoProcessor.from_pretrained(MODEL, revision='a272c74',cache_dir=root_dir)
 
         self.device = device
-
-        # Newer Transformers may not provide .generate() for this custom model class.
-        # Bind a local greedy generator so AdaptVis can still pass `weight`.
-        import types
-        self.model.generate = types.MethodType(_compat_greedy_generate, self.model)
-        # Newer Transformers' LlavaProcessor.__call__ expands <image> tokens.
-        # AdaptVis custom LLaVA expects the legacy behavior: keep one <image>
-        # token in input_ids and let modeling_llava_scal.py merge/expand image
-        # features internally.  Therefore all generation code should build
-        # inputs through _build_llava_legacy_inputs() instead of calling
-        # self.processor(text=..., images=...).
-        try:
-            vision_config = getattr(self.model.config, "vision_config", None)
-            self.processor.patch_size = getattr(vision_config, "patch_size", 14)
-            self.processor.vision_feature_select_strategy = getattr(
-                self.model.config,
-                "vision_feature_select_strategy",
-                "default",
-            )
-        except Exception:
-            pass
-
-    def _build_llava_legacy_inputs(self, text, image, max_length=77):
-        """
-        Build LLaVA inputs in the legacy format expected by this AdaptVis repo.
-
-        This intentionally avoids AutoProcessor.__call__(text=..., images=...),
-        because newer Transformers expands the <image> token at processor level.
-        The custom AdaptVis model expects one <image> token and performs
-        image-token expansion inside _merge_input_ids_with_image_features().
-        """
-        text_inputs = self.processor.tokenizer(
-            text=text,
-            padding="max_length",
-            return_tensors="pt",
-            max_length=max_length,
-            truncation=False,
-        )
-
-        image_inputs = self.processor.image_processor(
-            images=image,
-            return_tensors="pt",
-        )
-
-        inputs = {}
-        inputs.update(dict(text_inputs))
-        inputs.update(dict(image_inputs))
-
-        return {
-            k: v.to(self.device) if hasattr(v, "to") else v
-            for k, v in inputs.items()
-        }
-
     
     @torch.no_grad()
     def get_text_embeddings(self, texts, text_batch_size=64, normalize=False):
@@ -540,11 +394,9 @@ class LlavaWrapper:
                     prompt = prompt_list[index_of_total]
                     
                     # Preprocess input for the model
-                    single_input = self._build_llava_legacy_inputs(
-                        text=prompt,
-                        image=_,
-                        max_length=77,
-                    )
+                    single_input = self.processor(
+                        text=prompt, images=_, padding="max_length", return_tensors="pt", max_length=77
+                    ).to(self.device)
                     
                     # Create key mask for special token
                     keys = [torch.where(input_id == 32001, 1, 0) for input_id in single_input['input_ids']]
@@ -722,11 +574,7 @@ class LlavaWrapper:
                     # Generate responses for each concatenated input
                     for idx, text in enumerate(concatenated_list):
                         # Prepare input data for the model
-                        single_input = self._build_llava_legacy_inputs(
-                            text=text,
-                            image=list(i_option)[idx],
-                            max_length=77,
-                        )
+                        single_input = self.processor(text=text, images=list(i_option)[idx], padding="max_length", return_tensors="pt", max_length=77).to(self.device)
                         keys = [torch.where(input_id == 32001, 1, 0) for input_id in single_input['input_ids']]
                         
                         # Apply different attention adjustment methods based on the 'method' argument
