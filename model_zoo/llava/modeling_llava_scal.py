@@ -334,6 +334,9 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
     ) -> Union[Tuple, LlavaCausalLMOutputWithPast]:
         r"""
         Forward pass.
+
+        Returns:
+
         """
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
