@@ -1,13 +1,5 @@
 # coding=utf-8
-# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
-#
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-""" PyTorch LLaMA model."""
+"""PyTorch LLaMA model with AdaptVis attention intervention variants."""
 
 import math
 import os
@@ -20,16 +12,9 @@ from torch import nn
 from torch.nn import CrossEntropyLoss
 
 from transformers.activations import ACT2FN
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
-)
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import (
-    add_start_docstrings,
-    logging,
-    replace_return_docstrings,
-)
+from transformers.utils import add_start_docstrings, logging
 
 from .configuration_llama import LLaMAConfig
 
@@ -81,7 +66,7 @@ def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, past_key_
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
-    Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
+    Expands attention_mask from [bsz, seq_len] to [bsz, 1, tgt_seq_len, src_seq_len].
     """
     bsz, src_len = mask.size()
     tgt_len = tgt_len if tgt_len is not None else src_len
@@ -97,10 +82,11 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
 
 def _adaptvis_variant_name(adjust_method: Optional[str] = None) -> str:
     """
-    Priority:
-      1. ADAPTVIS_ATTENTION_VARIANT env
-      2. adjust_method, if it is one of supported variants
-      3. mul_img
+    Supported variants:
+      mul_img    : original AdaptVis, pre-softmax s_img = weight * s_img
+      add_img    : pre-softmax group suppression, s_img = s_img + weight
+      center_img : pre-softmax centered scaling, s_img = mean + weight * (s_img - mean)
+      prob_img   : post-softmax p_img = weight * p_img, then renormalize
     """
     supported = {"mul_img", "add_img", "center_img", "prob_img"}
 
@@ -126,13 +112,9 @@ def _normalize_keys_to_image_mask(
     device: torch.device,
 ) -> Optional[torch.Tensor]:
     """
-    Convert keys/image_id to bool mask with shape [bsz, kv_seq_len].
-    keys is expected to mark image-token positions in the merged sequence.
+    Convert keys/image-token mask to bool mask with shape [bsz, kv_seq_len].
     """
-    if keys is None:
-        return None
-
-    if not torch.is_tensor(keys):
+    if keys is None or not torch.is_tensor(keys):
         return None
 
     mask = keys
@@ -156,9 +138,9 @@ def _normalize_keys_to_image_mask(
 
 def _get_query_indices(q_len: int, caption_length: Optional[list], device: torch.device) -> torch.Tensor:
     """
-    Original behavior:
-      - no caption_length: only last query row
-      - with caption_length: last len(caption_length[0]) query rows
+    Keep original behavior:
+      - no caption_length: edit only last query row
+      - with caption_length: edit last len(caption_length[0]) query rows
     """
     if caption_length:
         try:
@@ -188,25 +170,17 @@ def _apply_adaptvis_pre_softmax_variant(
 
     attn_logits: [bsz, num_heads, q_len, kv_len]
     image_key_mask: [bsz, kv_len], True for image tokens
-    query_indices: rows to edit, usually only last query row
 
     Variants:
       mul_img:
         s_img_new = alpha * s_img
-        This reproduces original AdaptVis.
-
       add_img:
         s_img_new = s_img + beta
-        beta < 0 means group suppression of image logits.
-        Example: beta = log(0.5) = -0.693147.
-
+        Use beta < 0 for group suppression, e.g. beta=log(0.5)=-0.69314718056.
       center_img:
-        mu = mean(s_img)
-        s_img_new = mu + alpha * (s_img - mu)
-        This suppresses internal extremeness but keeps image mean unchanged.
-
+        s_img_new = mean(s_img) + alpha * (s_img - mean(s_img))
       prob_img:
-        no-op here. Handled after softmax.
+        no-op here; handled post-softmax.
     """
     variant = _adaptvis_variant_name(adjust_method)
 
@@ -220,12 +194,10 @@ def _apply_adaptvis_pre_softmax_variant(
         weight = 1.0
 
     weight = float(weight)
-
     bsz = attn_logits.shape[0]
 
     for b in range(bsz):
         img_idx = image_key_mask[b].to(attn_logits.device).bool()
-
         if img_idx.sum().item() == 0:
             continue
 
@@ -234,25 +206,21 @@ def _apply_adaptvis_pre_softmax_variant(
             s_img = attn_logits[b, :, q_int, img_idx]  # [num_heads, num_img_tokens]
 
             if variant == "mul_img":
-                # 方法1：原始乘法
-                # s_img_new = alpha * s_img
+                # Method 1: original AdaptVis
                 s_img_new = weight * s_img
 
             elif variant == "add_img":
-                # 方法2：整体压低 image logits
-                # s_img_new = s_img + beta
-                # beta < 0.
+                # Method 2: group suppression of image logits
                 s_img_new = s_img + weight
 
             elif variant == "center_img":
-                # 方法3：只压 image 内部极端程度，不改变 image logits 均值
-                # s_img_new = mu + alpha * (s_img - mu)
+                # Method 3: reduce image-internal extremeness while preserving image mean
                 mu = s_img.mean(dim=-1, keepdim=True)
                 s_img_new = mu + weight * (s_img - mu)
 
             else:
                 raise ValueError(
-                    f"Unknown AdaptVis variant: {variant}. "
+                    f"Unknown AdaptVis variant={variant}. "
                     f"Use mul_img/add_img/center_img/prob_img."
                 )
 
@@ -269,19 +237,12 @@ def _apply_adaptvis_post_softmax_variant(
     adjust_method: Optional[str] = None,
 ) -> torch.Tensor:
     """
-    Apply image-token intervention after attention softmax.
-
-    Only used for variant=prob_img.
+    Apply post-softmax image probability intervention.
 
     prob_img:
-      p_img_new = gamma * p_img
-      p_text_new = p_text
-      p_new = normalize([p_img_new, p_text_new])
-
-    This is equivalent to pre-softmax:
-      s_img += log(gamma)
-    but not equivalent to original:
-      s_img *= alpha
+      p_img_new = gamma * p_img, then normalize the full key row.
+    This is equivalent to pre-softmax s_img += log(gamma),
+    but NOT equivalent to original s_img *= alpha.
     """
     variant = _adaptvis_variant_name(adjust_method)
 
@@ -295,18 +256,15 @@ def _apply_adaptvis_post_softmax_variant(
         weight = 1.0
 
     gamma = float(weight)
-
     bsz = attn_probs.shape[0]
 
     for b in range(bsz):
         img_idx = image_key_mask[b].to(attn_probs.device).bool()
-
         if img_idx.sum().item() == 0:
             continue
 
         for q in query_indices:
             q_int = int(q.item())
-
             attn_probs[b, :, q_int, img_idx] = gamma * attn_probs[b, :, q_int, img_idx]
 
             denom = attn_probs[b, :, q_int, :].sum(dim=-1, keepdim=True).clamp_min(1e-12)
@@ -337,11 +295,9 @@ class RMSNorm(nn.Module):
 class RotaryEmbedding(torch.nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
-
         inv_freq = 1.0 / (
             base ** (torch.arange(0, dim, 2).float().to(device) / dim)
         )
-
         self.register_buffer("inv_freq", inv_freq)
 
         self.max_seq_len_cached = max_position_embeddings
@@ -395,14 +351,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, offset: int = 0):
 
 
 class LLaMAMLP(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-    ):
+    def __init__(self, hidden_size: int, intermediate_size: int, hidden_act: str):
         super().__init__()
-
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
@@ -417,14 +367,8 @@ class LLaMAAttention(nn.Module):
     Multi-headed causal self-attention.
     """
 
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        oproj_bias: bool = False,
-    ):
+    def __init__(self, hidden_size: int, num_heads: int, oproj_bias: bool = False):
         super().__init__()
-
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
@@ -435,40 +379,24 @@ class LLaMAAttention(nn.Module):
                 f"(got hidden_size={self.hidden_size}, num_heads={num_heads})."
             )
 
-        self.q_proj = nn.Linear(
-            hidden_size,
-            num_heads * self.head_dim,
-            bias=False,
-        )
-        self.k_proj = nn.Linear(
-            hidden_size,
-            num_heads * self.head_dim,
-            bias=False,
-        )
-        self.v_proj = nn.Linear(
-            hidden_size,
-            num_heads * self.head_dim,
-            bias=False,
-        )
+        self.q_proj = nn.Linear(hidden_size, num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, num_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, num_heads * self.head_dim, bias=False)
 
         self.att_out = nn.Identity()
         self.value_out = nn.Identity()
         self.head_out = nn.Identity()
 
-        self.o_proj = nn.Linear(
-            num_heads * self.head_dim,
-            hidden_size,
-            bias=oproj_bias,
-        )
-
+        self.o_proj = nn.Linear(num_heads * self.head_dim, hidden_size, bias=oproj_bias)
         self.rotary_emb = RotaryEmbedding(self.head_dim)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-        return (
-            tensor.view(bsz, seq_len, self.num_heads, self.head_dim)
-            .transpose(1, 2)
-            .contiguous()
-        )
+        return tensor.view(
+            bsz,
+            seq_len,
+            self.num_heads,
+            self.head_dim,
+        ).transpose(1, 2).contiguous()
 
     def forward(
         self,
@@ -489,24 +417,28 @@ class LLaMAAttention(nn.Module):
         """
         Input shape: [batch, time, channel]
         """
-
         bsz, q_len, _ = hidden_states.size()
 
-        query_states = (
-            self.q_proj(hidden_states)
-            .view(bsz, q_len, self.num_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-        key_states = (
-            self.k_proj(hidden_states)
-            .view(bsz, q_len, self.num_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-        value_states = (
-            self.v_proj(hidden_states)
-            .view(bsz, q_len, self.num_heads, self.head_dim)
-            .transpose(1, 2)
-        )
+        query_states = self.q_proj(hidden_states).view(
+            bsz,
+            q_len,
+            self.num_heads,
+            self.head_dim,
+        ).transpose(1, 2)
+
+        key_states = self.k_proj(hidden_states).view(
+            bsz,
+            q_len,
+            self.num_heads,
+            self.head_dim,
+        ).transpose(1, 2)
+
+        value_states = self.v_proj(hidden_states).view(
+            bsz,
+            q_len,
+            self.num_heads,
+            self.head_dim,
+        ).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
         offset = 0
@@ -545,27 +477,21 @@ class LLaMAAttention(nn.Module):
         unchanged_attn_weights = attn_weights.clone()
 
         # ------------------------------------------------------------------
-        # AdaptVis intervention.
+        # AdaptVis intervention variants.
         #
-        # This block only edits full prompt forward where q_len == kv_seq_len.
-        # It does not edit cached decoding steps where q_len != kv_seq_len.
+        # Scope is kept close to original:
+        #   - only layers idx < 32
+        #   - only full prompt forward where q_len == kv_seq_len
+        #   - normally only last query row
         #
-        # Supported variants:
-        #   ADAPTVIS_ATTENTION_VARIANT=mul_img
-        #       s_img_new = weight * s_img
+        # Select variant with:
+        #   export ADAPTVIS_ATTENTION_VARIANT=mul_img/add_img/center_img/prob_img
         #
-        #   ADAPTVIS_ATTENTION_VARIANT=add_img
-        #       s_img_new = s_img + weight
-        #       weight should be beta < 0, e.g. -0.693147
-        #
-        #   ADAPTVIS_ATTENTION_VARIANT=center_img
-        #       s_img_new = mu + weight * (s_img - mu)
-        #
-        #   ADAPTVIS_ATTENTION_VARIANT=prob_img
-        #       post-softmax p_img *= weight, then renormalize
-        #
-        # Only last query row is edited by default.
-        # If caption_length is provided, last len(caption_length[0]) rows are edited.
+        # weight meaning:
+        #   mul_img    : alpha, e.g. 0.5
+        #   add_img    : beta, e.g. -0.69314718056
+        #   center_img : alpha, e.g. 0.5
+        #   prob_img   : gamma, e.g. 0.5
         # ------------------------------------------------------------------
         start_idx, end_idx, square_size = -1, -1, -1
         image_key_mask = None
@@ -624,7 +550,6 @@ class LLaMAAttention(nn.Module):
             )
             attn_weights = torch.max(attn_weights, min_value)
 
-        # upcast attention to fp32
         attn_weights = nn.functional.softmax(
             attn_weights,
             dim=-1,
@@ -647,7 +572,6 @@ class LLaMAAttention(nn.Module):
                 adjust_method=adjust_method,
             )
 
-        # Optional save original attention logits/probs.
         returned_attn_weights = None
 
         if SAVE_ATTN or output_attentions:
@@ -655,6 +579,7 @@ class LLaMAAttention(nn.Module):
 
             if attention_mask is not None:
                 unchanged = unchanged + attention_mask
+
                 min_value = torch.tensor(
                     torch.finfo(unchanged.dtype).min,
                     dtype=unchanged.dtype,
@@ -708,7 +633,6 @@ class LLaMAAttention(nn.Module):
 class LLaMADecoderLayer(nn.Module):
     def __init__(self, config: LLaMAConfig):
         super().__init__()
-
         self.hidden_size = config.hidden_size
 
         self.self_attn = LLaMAAttention(
@@ -781,7 +705,7 @@ LLAMA_START_DOCSTRING = r"""
 
 
 @add_start_docstrings(
-    "The bare OPT Model outputting raw hidden-states without any specific head on top.",
+    "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
     LLAMA_START_DOCSTRING,
 )
 class LLaMAPreTrainedModel(PreTrainedModel):
@@ -809,27 +733,6 @@ class LLaMAPreTrainedModel(PreTrainedModel):
             module.gradient_checkpointing = value
 
 
-LLAMA_INPUTS_DOCSTRING = r"""
-    Args:
-        input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-            Input token ids.
-        attention_mask (`torch.Tensor`, *optional*):
-            Attention mask.
-        past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*):
-            Cached key values.
-        inputs_embeds (`torch.FloatTensor`, *optional*):
-            Input embeddings.
-        use_cache (`bool`, *optional*):
-            Whether to use cache.
-        output_attentions (`bool`, *optional*):
-            Whether to output attention.
-        output_hidden_states (`bool`, *optional*):
-            Whether to output hidden states.
-        return_dict (`bool`, *optional*):
-            Whether to return ModelOutput.
-"""
-
-
 @add_start_docstrings(
     "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
     LLAMA_START_DOCSTRING,
@@ -846,4 +749,11 @@ class LLaMAModel(LLaMAPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(
-            config.vocab_size
+            config.vocab_size,
+            config.hidden_size,
+            self.padding_idx,
+        )
+
+        self.layers = nn.ModuleList(
+            [LLaMADecoderLayer(config) for _ in range(config.num_hidden_layers)]
+       
