@@ -242,21 +242,77 @@ def token_positions_for_span(offsets, attention_mask, span: Optional[Tuple[int, 
     return pos
 
 
-def map_premerge_to_merged_positions(token_positions: List[int], image_pos: int, num_img_tokens: int) -> List[int]:
+def get_num_image_tokens_from_inputs(wrapper, inputs) -> int:
+    """Infer the number of visual patch tokens used by LLaVA.
+
+    For LLaVA-1.5 this is normally 24*24=576. We compute it from
+    pixel_values and the vision patch size instead of inferring it from
+    merged sequence length, because padding side / processor behavior can
+    make that inference unstable.
+    """
+    pixel_values = inputs.get("pixel_values", None)
+    if pixel_values is not None and hasattr(pixel_values, "shape"):
+        h = int(pixel_values.shape[-2])
+        w = int(pixel_values.shape[-1])
+        patch_size = None
+        cfg = getattr(wrapper.model, "config", None)
+        vcfg = getattr(cfg, "vision_config", None)
+        if vcfg is not None:
+            patch_size = getattr(vcfg, "patch_size", None)
+        if patch_size is None:
+            # CLIP-L/336 in LLaVA-1.5 uses 14x14 patches.
+            patch_size = 14
+        n = (h // int(patch_size)) * (w // int(patch_size))
+        # LLaVA-1.5 default selects patches without CLS, so no +1.
+        return int(n)
+    return 576
+
+
+def nonpad_positions_from_mask(attention_mask) -> List[int]:
+    return [i for i, m in enumerate(attention_mask) if int(m) == 1]
+
+
+def image_start_after_merge(attention_mask, image_pos: int) -> int:
+    """Position where image patch tokens start in merged hidden states.
+
+    The custom LLaVA merge removes padding and replaces one <image> token by
+    N visual tokens. Therefore the start index is not necessarily image_pos
+    from the padded input_ids; it is the number of non-pad tokens before image_pos.
+    """
+    nonpad = nonpad_positions_from_mask(attention_mask)
+    if image_pos not in nonpad:
+        # Fallback: count nonpad positions before image_pos.
+        return sum(1 for p in nonpad if p < image_pos)
+    return nonpad.index(image_pos)
+
+
+def map_premerge_to_merged_positions(token_positions: List[int], attention_mask, image_pos: int, num_img_tokens: int) -> List[int]:
+    """Map tokenizer positions before image merge to merged hidden-state positions.
+
+    Works for either left or right padding. Only non-pad token positions are kept.
+    """
+    nonpad = nonpad_positions_from_mask(attention_mask)
+    rank = {p: i for i, p in enumerate(nonpad)}
+    if image_pos not in rank:
+        image_rank = sum(1 for p in nonpad if p < image_pos)
+    else:
+        image_rank = rank[image_pos]
+
     out = []
-    shift = num_img_tokens - 1
     for p in token_positions:
-        if p < image_pos:
-            out.append(p)
-        elif p > image_pos:
-            out.append(p + shift)
-        # p == image_pos is the image placeholder, not a text token
+        if p == image_pos or p not in rank:
+            continue
+        r = rank[p]
+        if r < image_rank:
+            out.append(r)
+        elif r > image_rank:
+            out.append(r - 1 + num_img_tokens)
     return out
 
 
 def nonpad_text_positions(attention_mask, image_pos: int, num_img_tokens: int) -> Tuple[List[int], List[int]]:
     pre = [i for i, m in enumerate(attention_mask) if int(m) == 1 and i != image_pos]
-    merged = map_premerge_to_merged_positions(pre, image_pos, num_img_tokens)
+    merged = map_premerge_to_merged_positions(pre, attention_mask, image_pos, num_img_tokens)
     return pre, merged
 
 
@@ -418,15 +474,20 @@ def main():
                         last_hidden = hidden_states[-1][0]  # [merged_seq_len, hidden_dim]
                         logits_last = outputs.logits[0, -1]
 
-                        num_text_nonpad = int(attention_mask_1d.sum().item())
                         merged_len = int(last_hidden.shape[0])
-                        num_img_tokens = merged_len - (num_text_nonpad - 1)
-                        if num_img_tokens <= 0:
-                            raise RuntimeError(
-                                f"Bad num_img_tokens={num_img_tokens}; merged_len={merged_len}, text_nonpad={num_text_nonpad}"
-                            )
-                        image_start = int(image_pos)
+                        # Use fixed visual patch count and padding-aware merge mapping.
+                        # Do not infer num_img_tokens from merged_len, because left padding can
+                        # make image_pos in padded input_ids differ from the merged position.
+                        num_img_tokens = get_num_image_tokens_from_inputs(wrapper, inputs)
+                        image_start = image_start_after_merge(tok_attention_mask, image_pos)
                         image_end = int(image_start + num_img_tokens)
+
+                        if image_end > merged_len:
+                            raise RuntimeError(
+                                f"Image range exceeds merged hidden length: start={image_start}, "
+                                f"end={image_end}, merged_len={merged_len}, num_img_tokens={num_img_tokens}, "
+                                f"image_pos={image_pos}, nonpad={sum(int(m) for m in tok_attention_mask)}"
+                            )
 
                         H_img = last_hidden[image_start:image_end]
                         if H_img.shape[0] != num_img_tokens:
@@ -438,8 +499,8 @@ def main():
                         text_pre_pos_valid = text_pre_pos[:len(text_merged_pos)]
                         H_text = last_hidden[torch.tensor(text_merged_pos, device=last_hidden.device)] if text_merged_pos else last_hidden[:0]
 
-                        obj1_merged_pos = map_premerge_to_merged_positions(obj1_pre_pos, image_pos, num_img_tokens)
-                        obj2_merged_pos = map_premerge_to_merged_positions(obj2_pre_pos, image_pos, num_img_tokens)
+                        obj1_merged_pos = map_premerge_to_merged_positions(obj1_pre_pos, tok_attention_mask, image_pos, num_img_tokens)
+                        obj2_merged_pos = map_premerge_to_merged_positions(obj2_pre_pos, tok_attention_mask, image_pos, num_img_tokens)
                         obj1_merged_pos = [p for p in obj1_merged_pos if 0 <= p < merged_len]
                         obj2_merged_pos = [p for p in obj2_merged_pos if 0 <= p < merged_len]
 
@@ -448,7 +509,7 @@ def main():
 
                         # Last non-pad text token position after merge.
                         last_pre_pos = max([i for i, m in enumerate(tok_attention_mask) if int(m) == 1 and i != image_pos])
-                        last_merged_pos = map_premerge_to_merged_positions([last_pre_pos], image_pos, num_img_tokens)[0]
+                        last_merged_pos = map_premerge_to_merged_positions([last_pre_pos], tok_attention_mask, image_pos, num_img_tokens)[0]
                         H_last_prompt = last_hidden[last_merged_pos]
 
                         arrays = {
