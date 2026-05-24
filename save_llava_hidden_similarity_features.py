@@ -398,6 +398,13 @@ def main():
                             continue
 
                         # Forward prompt only. No generation answer tokens are appended.
+                        # AdaptVis custom LLaMA attention code expects SAVE_ATTN_PATH to exist
+                        # even when we only need hidden states. Set a per-sample/per-alpha temp path
+                        # to avoid ValueError: SAVE_ATTN_PATH not set.
+                        attn_tmp_dir = out_dir / "_tmp_attn_forward" / f"sid{sid:04d}_{alpha_name}"
+                        attn_tmp_dir.mkdir(parents=True, exist_ok=True)
+                        os.environ["SAVE_ATTN_PATH"] = str(attn_tmp_dir) + "/"
+
                         forward_kwargs = dict(inputs)
                         forward_kwargs.update({
                             "weight": float(alpha),
