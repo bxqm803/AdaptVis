@@ -400,6 +400,14 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
             else self.config.vision_feature_select_strategy
         )
 
+        # AdaptVis: keep an exact copy of the merged image-token mask and
+        # attention mask from the most recent full prompt forward. Analysis
+        # scripts use these fields to avoid guessing image/text positions from
+        # padded pre-merge input_ids.
+        image_id = keys
+        self._adaptvis_last_image_id = None
+        self._adaptvis_last_attention_mask = None
+
         if inputs_embeds is None:
             # 1. Extra the input embeddings
             inputs_embeds = self.get_input_embeddings()(input_ids)
@@ -420,9 +428,18 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
                     )
 
                 image_features = self.multi_modal_projector(selected_image_feature)
-                inputs_embeds, attention_mask, position_ids,image_id = self._merge_input_ids_with_image_features(
+                inputs_embeds, attention_mask, position_ids, image_id = self._merge_input_ids_with_image_features(
                     image_features, inputs_embeds, input_ids, attention_mask, position_ids
                 )
+
+                # AdaptVis analysis support: `image_id` is the exact boolean
+                # mask used as `keys` in the language model, after LLaVA has
+                # expanded the single <image> token into visual patch tokens.
+                # `attention_mask` is the matching valid-token mask in the same
+                # merged sequence coordinate system.
+                self._adaptvis_last_image_id = image_id.detach().cpu()
+                self._adaptvis_last_attention_mask = attention_mask.detach().cpu()
+
                 if labels is None:
                     labels = torch.full_like(attention_mask, self.config.ignore_index).to(torch.long)
             else:
