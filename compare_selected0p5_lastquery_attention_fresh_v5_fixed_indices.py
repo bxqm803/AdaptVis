@@ -635,6 +635,61 @@ def safe_float_tag_local(x):
     return f"{float(x):g}".replace("-", "m").replace(".", "p")
 
 
+
+def get_exact_image_text_indices_from_wrapper(wrapper, merged_len, device):
+    """Return exact merged image/text indices saved by LlavaForConditionalGenerationScal.
+
+    This is more reliable than reconstructing image_start/image_end from tokenizer
+    positions, because LLaVA's merge can put image patches between text tokens
+    after left padding. The AdaptVis code uses the same image_id mask when it
+    modifies attention, so this gives the positions actually used by the model.
+    """
+    import torch
+
+    candidates = []
+    if hasattr(wrapper, "model"):
+        candidates.append(wrapper.model)
+        for name in ["model", "language_model"]:
+            obj = getattr(wrapper.model, name, None)
+            if obj is not None:
+                candidates.append(obj)
+
+    image_mask = None
+    valid_mask = None
+    for obj in candidates:
+        image_mask = getattr(obj, "_adaptvis_last_image_id", None)
+        valid_mask = getattr(obj, "_adaptvis_last_attention_mask", None)
+        if image_mask is not None:
+            break
+
+    if image_mask is None:
+        return None, None
+
+    image_mask = image_mask.detach().cpu().bool()
+    if image_mask.dim() == 2:
+        image_mask = image_mask[0]
+    elif image_mask.dim() > 2:
+        image_mask = image_mask.view(-1)
+
+    if int(image_mask.numel()) != int(merged_len):
+        return None, None
+
+    if valid_mask is not None:
+        valid_mask = valid_mask.detach().cpu().bool()
+        if valid_mask.dim() == 2:
+            valid_mask = valid_mask[0]
+        elif valid_mask.dim() > 2:
+            valid_mask = valid_mask.view(-1)
+        if int(valid_mask.numel()) != int(merged_len):
+            valid_mask = torch.ones_like(image_mask, dtype=torch.bool)
+    else:
+        valid_mask = torch.ones_like(image_mask, dtype=torch.bool)
+
+    text_mask = valid_mask & (~image_mask)
+    img_idx = torch.where(image_mask)[0].to(device)
+    text_idx = torch.where(text_mask)[0].to(device)
+    return img_idx.long(), text_idx.long()
+
 def npz_has_attention(path, args):
     if path is None or not os.path.exists(path):
         return False
@@ -644,11 +699,26 @@ def npz_has_attention(path, args):
         x = np.load(path, allow_pickle=True)
         has_img = args.attn_img_key in x.files or "attn_last_to_img_last_layer_heads" in x.files
         has_txt = args.attn_text_key in x.files or "attn_last_to_text_last_layer_heads" in x.files
+
+        # Old/wrong files may have attention keys but use an image-patch query
+        # because last_merged_position was reconstructed incorrectly. Treat those
+        # as stale unless the saved query is explicitly aligned to the logits row
+        # or to the last text index.
+        query_ok = False
+        try:
+            if "logits_query_position" in x.files and "last_merged_position" in x.files:
+                query_ok = int(x["logits_query_position"]) == int(x["last_merged_position"])
+            elif "attn_text_indices" in x.files and "last_merged_position" in x.files:
+                text_idx = np.asarray(x["attn_text_indices"]).reshape(-1)
+                query_ok = len(text_idx) > 0 and int(x["last_merged_position"]) == int(text_idx[-1])
+        except Exception:
+            query_ok = False
+
         try:
             x.close()
         except Exception:
             pass
-        return bool(has_img and has_txt)
+        return bool(has_img and has_txt and query_ok)
     except Exception:
         return False
 
@@ -852,50 +922,127 @@ def generate_missing_attention_features(args, selected_sids, selected_info=None)
                             logits_last = outputs.logits[0, -1]
 
                             merged_len = int(last_hidden.shape[0])
-                            num_img_tokens = sf.get_num_image_tokens_from_inputs(wrapper, inputs)
-                            image_start = sf.image_start_after_merge(tok_attention_mask, image_pos)
-                            image_end = int(image_start + num_img_tokens)
+                            logits_query_pos = int(outputs.logits.shape[1] - 1)
 
-                            if image_end > merged_len:
-                                raise RuntimeError(
-                                    f"Image range exceeds merged hidden length: start={image_start}, "
-                                    f"end={image_end}, merged_len={merged_len}, num_img_tokens={num_img_tokens}, "
-                                    f"sid={sid}, image_pos={image_pos}"
+                            # Prefer the exact merged image/text masks saved by
+                            # LlavaForConditionalGenerationScal during the forward.
+                            # These are the same positions used by AdaptVis when it
+                            # passes keys=image_id into the language model.
+                            exact_img_idx, exact_text_idx = get_exact_image_text_indices_from_wrapper(
+                                wrapper,
+                                merged_len=merged_len,
+                                device=last_hidden.device,
+                            )
+
+                            if exact_img_idx is not None and exact_text_idx is not None and exact_img_idx.numel() > 0:
+                                img_idx = exact_img_idx.long()
+                                text_idx = exact_text_idx.long()
+
+                                num_img_tokens = int(img_idx.numel())
+                                image_start = int(img_idx.min().item())
+                                image_end = int(img_idx.max().item()) + 1
+                                H_img = last_hidden[img_idx]
+
+                                # Map tokenizer/pre-merge text positions to exact merged text positions by order.
+                                # This keeps token labels readable and avoids the old wrong image_start-based map.
+                                text_pre_candidates = [
+                                    int(i) for i, m in enumerate(tok_attention_mask)
+                                    if int(m) == 1 and int(i) != int(image_pos)
+                                ]
+                                text_merged_pos = [int(v) for v in text_idx.detach().cpu().tolist()]
+
+                                if len(text_pre_candidates) == len(text_merged_pos):
+                                    text_pre_pos_valid = text_pre_candidates
+                                else:
+                                    # Fallback for tokenizer/processor drift. Labels may degrade, but attention
+                                    # positions remain correct because text_merged_pos comes from exact_text_idx.
+                                    text_pre_pos_valid = list(range(len(text_merged_pos)))
+
+                                H_text = last_hidden[text_idx] if len(text_merged_pos) else last_hidden[:0]
+                                pre_to_merged = {
+                                    int(p): int(m)
+                                    for p, m in zip(text_pre_pos_valid, text_merged_pos)
+                                }
+
+                                obj1_merged_pos = [
+                                    pre_to_merged[int(p)] for p in obj1_pre_pos
+                                    if int(p) in pre_to_merged
+                                ]
+                                obj2_merged_pos = [
+                                    pre_to_merged[int(p)] for p in obj2_pre_pos
+                                    if int(p) in pre_to_merged
+                                ]
+
+                                # Critical fix: use the logits/query row, normally merged_len - 1.
+                                # The old code mapped the last tokenizer token to 605 in cases where 605 was
+                                # actually an image patch. AdaptVis edits q_len-1, so save that row.
+                                if logits_query_pos in set(text_merged_pos):
+                                    last_merged_pos = logits_query_pos
+                                    try:
+                                        last_pre_pos = text_pre_pos_valid[text_merged_pos.index(logits_query_pos)]
+                                    except Exception:
+                                        last_pre_pos = text_pre_pos_valid[-1] if text_pre_pos_valid else -1
+                                else:
+                                    last_merged_pos = int(text_merged_pos[-1]) if text_merged_pos else logits_query_pos
+                                    last_pre_pos = text_pre_pos_valid[-1] if text_pre_pos_valid else -1
+
+                                attention_index_source = "exact_adaptvis_mask"
+
+                            else:
+                                # Fallback to the old reconstruction logic if the exact mask is unavailable.
+                                # This branch is less reliable for left-padded LLaVA inputs.
+                                num_img_tokens = sf.get_num_image_tokens_from_inputs(wrapper, inputs)
+                                image_start = sf.image_start_after_merge(tok_attention_mask, image_pos)
+                                image_end = int(image_start + num_img_tokens)
+
+                                if image_end > merged_len:
+                                    raise RuntimeError(
+                                        f"Image range exceeds merged hidden length: start={image_start}, "
+                                        f"end={image_end}, merged_len={merged_len}, num_img_tokens={num_img_tokens}, "
+                                        f"sid={sid}, image_pos={image_pos}"
+                                    )
+
+                                H_img = last_hidden[image_start:image_end]
+                                text_pre_pos, text_merged_pos = sf.nonpad_text_positions(
+                                    tok_attention_mask,
+                                    image_pos,
+                                    num_img_tokens,
+                                )
+                                pairs = [
+                                    (pre, merged)
+                                    for pre, merged in zip(text_pre_pos, text_merged_pos)
+                                    if 0 <= int(merged) < merged_len
+                                ]
+                                text_pre_pos_valid = [int(p) for p, _ in pairs]
+                                text_merged_pos = [int(m) for _, m in pairs]
+                                H_text = (
+                                    last_hidden[torch.tensor(text_merged_pos, device=last_hidden.device)]
+                                    if text_merged_pos
+                                    else last_hidden[:0]
                                 )
 
-                            H_img = last_hidden[image_start:image_end]
-                            text_pre_pos, text_merged_pos = sf.nonpad_text_positions(
-                                tok_attention_mask,
-                                image_pos,
-                                num_img_tokens,
-                            )
-                            pairs = [
-                                (pre, merged)
-                                for pre, merged in zip(text_pre_pos, text_merged_pos)
-                                if 0 <= int(merged) < merged_len
-                            ]
-                            text_pre_pos_valid = [int(p) for p, _ in pairs]
-                            text_merged_pos = [int(m) for _, m in pairs]
-                            H_text = (
-                                last_hidden[torch.tensor(text_merged_pos, device=last_hidden.device)]
-                                if text_merged_pos
-                                else last_hidden[:0]
-                            )
+                                obj1_merged_pos = sf.map_premerge_to_merged_positions(
+                                    obj1_pre_pos,
+                                    tok_attention_mask,
+                                    image_pos,
+                                    num_img_tokens,
+                                )
+                                obj2_merged_pos = sf.map_premerge_to_merged_positions(
+                                    obj2_pre_pos,
+                                    tok_attention_mask,
+                                    image_pos,
+                                    num_img_tokens,
+                                )
+                                obj1_merged_pos = [p for p in obj1_merged_pos if 0 <= p < merged_len]
+                                obj2_merged_pos = [p for p in obj2_merged_pos if 0 <= p < merged_len]
 
-                            obj1_merged_pos = sf.map_premerge_to_merged_positions(
-                                obj1_pre_pos,
-                                tok_attention_mask,
-                                image_pos,
-                                num_img_tokens,
-                            )
-                            obj2_merged_pos = sf.map_premerge_to_merged_positions(
-                                obj2_pre_pos,
-                                tok_attention_mask,
-                                image_pos,
-                                num_img_tokens,
-                            )
-                            obj1_merged_pos = [p for p in obj1_merged_pos if 0 <= p < merged_len]
-                            obj2_merged_pos = [p for p in obj2_merged_pos if 0 <= p < merged_len]
+                                last_pre_pos = max([
+                                    i for i, m in enumerate(tok_attention_mask)
+                                    if int(m) == 1 and i != image_pos
+                                ])
+                                # Prefer the logits query row even in fallback mode.
+                                last_merged_pos = logits_query_pos
+                                attention_index_source = "fallback_logits_query"
 
                             H_obj1 = (
                                 last_hidden[torch.tensor(obj1_merged_pos, device=last_hidden.device)].mean(dim=0)
@@ -908,16 +1055,6 @@ def generate_missing_attention_features(args, selected_sids, selected_info=None)
                                 else torch.full((last_hidden.shape[-1],), float("nan"), device=last_hidden.device)
                             )
 
-                            last_pre_pos = max([
-                                i for i, m in enumerate(tok_attention_mask)
-                                if int(m) == 1 and i != image_pos
-                            ])
-                            last_merged_pos = sf.map_premerge_to_merged_positions(
-                                [last_pre_pos],
-                                tok_attention_mask,
-                                image_pos,
-                                num_img_tokens,
-                            )[0]
                             H_last_prompt = last_hidden[last_merged_pos]
 
                             arrays = {
@@ -945,6 +1082,8 @@ def generate_missing_attention_features(args, selected_sids, selected_info=None)
                                 "obj2_merged_positions": np.array(obj2_merged_pos, dtype=np.int32),
                                 "last_pre_position": np.array(last_pre_pos, dtype=np.int32),
                                 "last_merged_position": np.array(last_merged_pos, dtype=np.int32),
+                                "logits_query_position": np.array(logits_query_pos, dtype=np.int32),
+                                "attention_index_source": np.array(attention_index_source),
                                 "image_hidden": sf.to_numpy_dtype(H_img, args.feature_dtype),
                                 "text_hidden": sf.to_numpy_dtype(H_text, args.feature_dtype),
                                 "obj1_hidden": sf.to_numpy_dtype(H_obj1, args.feature_dtype),
@@ -987,6 +1126,9 @@ def generate_missing_attention_features(args, selected_sids, selected_info=None)
                                 "num_img_tokens": num_img_tokens,
                                 "merged_len": merged_len,
                                 "hidden_dim": int(last_hidden.shape[-1]),
+                                "last_merged_position": int(last_merged_pos),
+                                "logits_query_position": int(logits_query_pos),
+                                "attention_index_source": str(attention_index_source),
                                 "attn_keys": True,
                             }
                             if selected_info and int(sid) in selected_info:
