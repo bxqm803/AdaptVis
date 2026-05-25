@@ -5,6 +5,7 @@ import math
 import csv
 import random
 import argparse
+from pathlib import Path
 from collections import OrderedDict
 
 import numpy as np
@@ -82,6 +83,33 @@ def parse_args():
         "--no-save-combined",
         action="store_false",
         dest="save_combined",
+    )
+
+    # Optional integrated feature extraction.
+    # When enabled, this script first generates missing post-softmax attention .npz
+    # for selected_weight=0.5 samples, then performs the same acc grouping/plotting.
+    parser.add_argument(
+        "--generate-features",
+        action="store_true",
+        help="Generate missing base/low attention feature npz files inside this script before analysis.",
+    )
+    parser.add_argument("--model-name", default="llava1.5")
+    parser.add_argument("--method", default="adapt_vis")
+    parser.add_argument("--root-dir", default="data")
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--download", action="store_true")
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--max-length", type=int, default=77)
+    parser.add_argument("--feature-dtype", default="float16", choices=["float16", "float32"])
+    parser.add_argument("--compress-features", action="store_true")
+    parser.add_argument("--overwrite-generated-features", action="store_true")
+    parser.add_argument("--save-all-layers-attn", action="store_true")
+    parser.add_argument(
+        "--generate-limit",
+        type=int,
+        default=-1,
+        help="Debug only: generate features for at most this many selected sids.",
     )
 
     return parser.parse_args()
@@ -180,6 +208,383 @@ def feature_file(feature_dir, sid, kind):
 
     hits = sorted(set(hits))
     return hits[0] if hits else None
+
+
+
+def selected0p5_sids_for_generation(base, mixed, max_items=-1):
+    """Return unique sample ids where mixed selected_weight is 0.5."""
+    sids = []
+    for i in range(min(len(base), len(mixed))):
+        sw = selected_weight(mixed[i])
+        if sw is None or abs(sw - 0.5) > 1e-6:
+            continue
+        sids.append(sid_of(i, base[i]))
+
+    sids = sorted(set(int(x) for x in sids))
+    if max_items is not None and max_items > 0:
+        sids = sids[:max_items]
+    return sids
+
+
+def expected_feature_path(feature_dir, sid, alpha):
+    """Use the same naming convention as save_llava_hidden_similarity_features.py."""
+    alpha = float(alpha)
+    alpha_name = {1.0: "base", 0.5: "low", 1.5: "high"}.get(
+        alpha,
+        f"alpha{safe_float_tag_local(alpha)}",
+    )
+    return Path(feature_dir) / f"sid{sid:04d}_{alpha_name}_alpha{safe_float_tag_local(alpha)}.npz"
+
+
+def safe_float_tag_local(x):
+    return f"{float(x):g}".replace("-", "m").replace(".", "p")
+
+
+def npz_has_attention(path, args):
+    if path is None or not os.path.exists(path):
+        return False
+    if args.score_type != "attention":
+        return True
+    try:
+        x = np.load(path, allow_pickle=True)
+        has_img = args.attn_img_key in x.files or "attn_last_to_img_last_layer_heads" in x.files
+        has_txt = args.attn_text_key in x.files or "attn_last_to_text_last_layer_heads" in x.files
+        try:
+            x.close()
+        except Exception:
+            pass
+        return bool(has_img and has_txt)
+    except Exception:
+        return False
+
+
+def generate_missing_attention_features(args, selected_sids):
+    """Generate base alpha=1.0 and low alpha=0.5 attention npz for selected sids.
+
+    This keeps compare_selected0p5_lastquery_attention.py as a one-command script:
+    it loads the existing eval JSONs for acc/grouping, generates missing attention
+    features only for selected_weight=0.5 samples, then plots/analyzes them.
+
+    Requires the modified save_llava_hidden_similarity_features.py to be present in
+    the repo root, because we reuse its tokenizer/merge/attention extraction helpers.
+    Also requires the modified modeling_llama_add_attn.py, so outputs.attentions are
+    final post-softmax attentions actually used by AdaptVis forward.
+    """
+    if not args.generate_features:
+        return
+
+    if args.score_type != "attention":
+        print("[GENERATE] --generate-features is intended for --score-type attention; skipping.")
+        return
+
+    selected_sids = sorted(set(int(s) for s in selected_sids))
+    if not selected_sids:
+        print("[GENERATE] no selected_weight=0.5 sids; nothing to generate.")
+        return
+
+    # Decide which sid/alpha files are missing or stale.
+    plan = [
+        (1.0, Path(args.base_feature_dir)),
+        (0.5, Path(args.mixed_feature_dir)),
+    ]
+    pending = {}
+    for sid in selected_sids:
+        for alpha, out_dir in plan:
+            out_path = expected_feature_path(out_dir, sid, alpha)
+            if args.overwrite_generated_features or not npz_has_attention(out_path, args):
+                pending.setdefault(sid, []).append((float(alpha), out_dir, out_path))
+
+    if not pending:
+        print("[GENERATE] all selected attention feature files already exist with attention keys.")
+        return
+
+    print(f"[GENERATE] selected sids: {len(selected_sids)}")
+    print(f"[GENERATE] pending sids: {len(pending)}")
+    print(f"[GENERATE] base feature dir:  {args.base_feature_dir}")
+    print(f"[GENERATE] mixed feature dir: {args.mixed_feature_dir}")
+
+    import torch
+    from torch.utils.data import DataLoader
+    from tqdm import tqdm
+    from model_zoo import get_model
+    from dataset_zoo import get_dataset
+    try:
+        from misc import _default_collate
+    except Exception:
+        _default_collate = None
+
+    import save_llava_hidden_similarity_features as sf
+
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    print("[GENERATE LOAD MODEL]", args.model_name, args.method, args.device)
+    wrapper, image_preprocess = get_model(
+        args.model_name,
+        args.device,
+        args.method,
+        root_dir=args.root_dir,
+    )
+    wrapper.model.eval()
+
+    print("[GENERATE LOAD DATASET]", args.dataset)
+    dataset = get_dataset(args.dataset, image_preprocess=image_preprocess, download=args.download)
+    collate_fn = _default_collate if image_preprocess is None else None
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_fn,
+    )
+
+    prompts, answers = sf.load_prompts(args.dataset, args.option)
+    token_id_map = sf.closed_set_token_ids(wrapper)
+
+    # Metadata is written per output dir for easier debugging/resume.
+    meta_handles = {}
+    for _, out_dir in plan:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if out_dir not in meta_handles:
+            meta_handles[out_dir] = (out_dir / "metadata_generated_by_compare.jsonl").open("a", encoding="utf-8")
+
+    max_needed_sid = max(pending.keys())
+    generated = 0
+    global_idx = 0
+
+    def close_meta_handles():
+        for f in meta_handles.values():
+            try:
+                f.close()
+            except Exception:
+                pass
+
+    try:
+        with torch.no_grad():
+            pbar = tqdm(loader, desc="generating attention features")
+            for batch in pbar:
+                for i_option in batch["image_options"]:
+                    for image in i_option:
+                        sid = global_idx
+                        global_idx += 1
+
+                        if sid > max_needed_sid and len(pending) == 0:
+                            close_meta_handles()
+                            print("[GENERATE DONE] written npz files:", generated)
+                            return
+
+                        if sid not in pending:
+                            continue
+
+                        prompt = prompts[sid]
+                        gold = answers[sid]
+                        obj1, obj2, obj1_span, obj2_span = sf.parse_objects_with_spans(prompt)
+
+                        inputs = sf.build_inputs(wrapper, prompt, image, args.max_length, args.device)
+                        input_ids_1d = inputs["input_ids"][0]
+                        image_pos, image_token_id = sf.find_image_token_pos(input_ids_1d, wrapper)
+
+                        tok_input_ids, offsets, tok_attention_mask, tokens = sf.tokenizer_offsets(
+                            wrapper,
+                            prompt,
+                            args.max_length,
+                        )
+                        obj1_pre_pos = sf.token_positions_for_span(
+                            offsets,
+                            tok_attention_mask,
+                            obj1_span,
+                            exclude_pos=image_pos,
+                        )
+                        obj2_pre_pos = sf.token_positions_for_span(
+                            offsets,
+                            tok_attention_mask,
+                            obj2_span,
+                            exclude_pos=image_pos,
+                        )
+
+                        for alpha, out_dir, save_path in list(pending[sid]):
+                            if save_path.exists() and not args.overwrite_generated_features and npz_has_attention(save_path, args):
+                                continue
+
+                            alpha_name = {1.0: "base", 0.5: "low", 1.5: "high"}.get(
+                                float(alpha),
+                                f"alpha{sf.safe_float_tag(alpha)}",
+                            )
+
+                            attn_tmp_dir = Path(args.out_dir) / "_tmp_attn_forward" / f"sid{sid:04d}_{alpha_name}"
+                            attn_tmp_dir.mkdir(parents=True, exist_ok=True)
+                            os.environ["SAVE_ATTN_PATH"] = str(attn_tmp_dir) + "/"
+
+                            forward_kwargs = dict(inputs)
+                            forward_kwargs.update({
+                                "weight": float(alpha),
+                                "output_hidden_states": True,
+                                "output_attentions": True,
+                                "return_dict": True,
+                                "use_cache": False,
+                            })
+
+                            outputs = wrapper.model(**forward_kwargs)
+                            hidden_states = sf.get_hidden_states_from_outputs(outputs)
+                            last_hidden = hidden_states[-1][0]
+                            logits_last = outputs.logits[0, -1]
+
+                            merged_len = int(last_hidden.shape[0])
+                            num_img_tokens = sf.get_num_image_tokens_from_inputs(wrapper, inputs)
+                            image_start = sf.image_start_after_merge(tok_attention_mask, image_pos)
+                            image_end = int(image_start + num_img_tokens)
+
+                            if image_end > merged_len:
+                                raise RuntimeError(
+                                    f"Image range exceeds merged hidden length: start={image_start}, "
+                                    f"end={image_end}, merged_len={merged_len}, num_img_tokens={num_img_tokens}, "
+                                    f"sid={sid}, image_pos={image_pos}"
+                                )
+
+                            H_img = last_hidden[image_start:image_end]
+                            text_pre_pos, text_merged_pos = sf.nonpad_text_positions(
+                                tok_attention_mask,
+                                image_pos,
+                                num_img_tokens,
+                            )
+                            pairs = [
+                                (pre, merged)
+                                for pre, merged in zip(text_pre_pos, text_merged_pos)
+                                if 0 <= int(merged) < merged_len
+                            ]
+                            text_pre_pos_valid = [int(p) for p, _ in pairs]
+                            text_merged_pos = [int(m) for _, m in pairs]
+                            H_text = (
+                                last_hidden[torch.tensor(text_merged_pos, device=last_hidden.device)]
+                                if text_merged_pos
+                                else last_hidden[:0]
+                            )
+
+                            obj1_merged_pos = sf.map_premerge_to_merged_positions(
+                                obj1_pre_pos,
+                                tok_attention_mask,
+                                image_pos,
+                                num_img_tokens,
+                            )
+                            obj2_merged_pos = sf.map_premerge_to_merged_positions(
+                                obj2_pre_pos,
+                                tok_attention_mask,
+                                image_pos,
+                                num_img_tokens,
+                            )
+                            obj1_merged_pos = [p for p in obj1_merged_pos if 0 <= p < merged_len]
+                            obj2_merged_pos = [p for p in obj2_merged_pos if 0 <= p < merged_len]
+
+                            H_obj1 = (
+                                last_hidden[torch.tensor(obj1_merged_pos, device=last_hidden.device)].mean(dim=0)
+                                if obj1_merged_pos
+                                else torch.full((last_hidden.shape[-1],), float("nan"), device=last_hidden.device)
+                            )
+                            H_obj2 = (
+                                last_hidden[torch.tensor(obj2_merged_pos, device=last_hidden.device)].mean(dim=0)
+                                if obj2_merged_pos
+                                else torch.full((last_hidden.shape[-1],), float("nan"), device=last_hidden.device)
+                            )
+
+                            last_pre_pos = max([
+                                i for i, m in enumerate(tok_attention_mask)
+                                if int(m) == 1 and i != image_pos
+                            ])
+                            last_merged_pos = sf.map_premerge_to_merged_positions(
+                                [last_pre_pos],
+                                tok_attention_mask,
+                                image_pos,
+                                num_img_tokens,
+                            )[0]
+                            H_last_prompt = last_hidden[last_merged_pos]
+
+                            arrays = {
+                                "sample_id": np.array(sid, dtype=np.int32),
+                                "alpha": np.array(float(alpha), dtype=np.float32),
+                                "alpha_name": np.array(alpha_name),
+                                "gold": np.array(gold),
+                                "prompt": np.array(prompt),
+                                "obj1": np.array(obj1),
+                                "obj2": np.array(obj2),
+                                "image_token_id": np.array(image_token_id, dtype=np.int32),
+                                "image_start": np.array(image_start, dtype=np.int32),
+                                "image_end": np.array(image_end, dtype=np.int32),
+                                "num_img_tokens": np.array(num_img_tokens, dtype=np.int32),
+                                "merged_len": np.array(merged_len, dtype=np.int32),
+                                "hidden_dim": np.array(last_hidden.shape[-1], dtype=np.int32),
+                                "input_ids": np.array(tok_input_ids, dtype=np.int64),
+                                "attention_mask": np.array(tok_attention_mask, dtype=np.int64),
+                                "tokens": np.array(tokens, dtype=object),
+                                "text_pre_positions": np.array(text_pre_pos_valid, dtype=np.int32),
+                                "text_merged_positions": np.array(text_merged_pos, dtype=np.int32),
+                                "obj1_pre_positions": np.array(obj1_pre_pos, dtype=np.int32),
+                                "obj2_pre_positions": np.array(obj2_pre_pos, dtype=np.int32),
+                                "obj1_merged_positions": np.array(obj1_merged_pos, dtype=np.int32),
+                                "obj2_merged_positions": np.array(obj2_merged_pos, dtype=np.int32),
+                                "last_pre_position": np.array(last_pre_pos, dtype=np.int32),
+                                "last_merged_position": np.array(last_merged_pos, dtype=np.int32),
+                                "image_hidden": sf.to_numpy_dtype(H_img, args.feature_dtype),
+                                "text_hidden": sf.to_numpy_dtype(H_text, args.feature_dtype),
+                                "obj1_hidden": sf.to_numpy_dtype(H_obj1, args.feature_dtype),
+                                "obj2_hidden": sf.to_numpy_dtype(H_obj2, args.feature_dtype),
+                                "last_prompt_hidden": sf.to_numpy_dtype(H_last_prompt, args.feature_dtype),
+                            }
+
+                            cls_logits = sf.best_closed_set_logits(logits_last, token_id_map)
+                            arrays["closed_set_words"] = np.array(list(cls_logits.keys()), dtype=object)
+                            arrays["closed_set_logits"] = np.array(
+                                [cls_logits[k] for k in cls_logits.keys()],
+                                dtype=np.float32,
+                            )
+
+                            sf.add_attention_arrays(
+                                arrays=arrays,
+                                outputs=outputs,
+                                wrapper=wrapper,
+                                merged_len=merged_len,
+                                last_merged_pos=last_merged_pos,
+                                image_start=image_start,
+                                image_end=image_end,
+                                text_merged_pos=text_merged_pos,
+                                save_all_layers_attn=args.save_all_layers_attn,
+                            )
+
+                            sf.save_npz(save_path, args.compress_features, **arrays)
+                            generated += 1
+
+                            meta = {
+                                "sample_id": sid,
+                                "alpha": float(alpha),
+                                "alpha_name": alpha_name,
+                                "path": str(save_path),
+                                "gold": gold,
+                                "obj1": obj1,
+                                "obj2": obj2,
+                                "image_start": image_start,
+                                "image_end": image_end,
+                                "num_img_tokens": num_img_tokens,
+                                "merged_len": merged_len,
+                                "hidden_dim": int(last_hidden.shape[-1]),
+                                "attn_keys": True,
+                            }
+                            meta_f = meta_handles[out_dir]
+                            meta_f.write(json.dumps(meta, ensure_ascii=False) + "\n")
+                            meta_f.flush()
+
+                            print(f"[GENERATED] sid={sid:04d} alpha={alpha} -> {save_path}")
+
+                        pending.pop(sid, None)
+                        pbar.set_postfix({"sid": sid, "pending": len(pending), "written": generated})
+
+                        if len(pending) == 0:
+                            close_meta_handles()
+                            print("[GENERATE DONE] written npz files:", generated)
+                            return
+    finally:
+        close_meta_handles()
+
+    if pending:
+        print("[GENERATE WARN] some selected sids were not found/generated:", sorted(pending.keys())[:50])
+    print("[GENERATE DONE] written npz files:", generated)
 
 
 def as_float(x):
@@ -807,6 +1212,14 @@ def main():
 
     base = load_json(base_json)
     mixed = load_json(mixed_json)
+
+    if args.generate_features:
+        sids_to_generate = selected0p5_sids_for_generation(
+            base,
+            mixed,
+            max_items=args.generate_limit,
+        )
+        generate_missing_attention_features(args, sids_to_generate)
 
     groups = OrderedDict(
         [
