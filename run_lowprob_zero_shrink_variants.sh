@@ -9,17 +9,22 @@ GPU="${GPU:-0}"
 BASE_JSON="${BASE_JSON:-output/results1.5_Controlled_Images_A_adapt_vis_w1_w11_w21_thr0p4_fouroption_True.json}"
 THRESHOLD="${THRESHOLD:-0.4}"
 
-LOWPROB_IDS="${LOWPROB_IDS:-lowprob_lt0p4_ids.json}"
-RESULT_DIR="${RESULT_DIR:-attention_variant_lowprob_zero_shrink_results}"
+LOWPROB_IDS_ALL="${LOWPROB_IDS_ALL:-lowprob_lt0p4_ids_all.json}"
+LOWPROB_IDS="${LOWPROB_IDS:-lowprob_lt0p4_ids_3samples.json}"
+SMOKE_N="${SMOKE_N:-3}"
+
+RESULT_DIR="${RESULT_DIR:-attention_variant_lowprob_zero_shrink_3samples}"
 mkdir -p "${RESULT_DIR}"
 
-echo "[1] make low-probability ids from base json"
+echo "[1] make first ${SMOKE_N} low-probability ids from base json"
 python3 - <<PY
 import json
 
 base_json = "${BASE_JSON}"
 threshold = float("${THRESHOLD}")
+out_all = "${LOWPROB_IDS_ALL}"
 out = "${LOWPROB_IDS}"
+n = int("${SMOKE_N}")
 
 with open(base_json, "r", encoding="utf-8") as f:
     data = json.load(f)
@@ -34,7 +39,7 @@ prob_keys = [
     "Uncertainty",
 ]
 
-ids = []
+ids_all = []
 used_key = None
 missing = 0
 
@@ -58,25 +63,32 @@ for i, item in enumerate(data):
     used_key = used_key or k_used
 
     if p < threshold:
-        ids.append(i)
-
-print("[BASE_JSON]", base_json)
-print("[PROB_KEY]", used_key)
-print("[THRESHOLD]", threshold)
-print("[TOTAL]", len(data))
-print("[SELECTED]", len(ids))
-print("[MISSING_PROB]", missing)
-print("[FIRST 50 IDS]", ids[:50])
+        ids_all.append(i)
 
 if used_key is None:
     print("[ERROR] Cannot find probability/confidence key. First item keys:")
     print(list(data[0].keys()))
     raise SystemExit(1)
 
+ids = ids_all[:n]
+
+print("[BASE_JSON]", base_json)
+print("[PROB_KEY]", used_key)
+print("[THRESHOLD]", threshold)
+print("[TOTAL]", len(data))
+print("[LOWPROB_TOTAL]", len(ids_all))
+print("[SMOKE_SELECTED]", len(ids))
+print("[IDS]", ids)
+print("[MISSING_PROB]", missing)
+
+with open(out_all, "w", encoding="utf-8") as f:
+    json.dump(ids_all, f, indent=2)
+
 with open(out, "w", encoding="utf-8") as f:
     json.dump(ids, f, indent=2)
 
-print("[SAVED]", out)
+print("[SAVED ALL]", out_all)
+print("[SAVED SMOKE]", out)
 PY
 
 echo
@@ -89,7 +101,7 @@ export TOKENIZERS_PARALLELISM=false
 export SAVE_ATTN=False
 export TEST_MODE=False
 
-# 关键：只跑 probability < threshold 的样本
+# 关键：只跑前 3 个 probability < threshold 的样本
 export RUN_SAMPLE_IDS_FILE="${LOWPROB_IDS}"
 
 run_one () {
@@ -99,7 +111,7 @@ run_one () {
 
   echo
   echo "================================================"
-  echo "[RUN LOWPROB] variant=${variant}, weight1=${weight1}, out=${out_name}"
+  echo "[RUN 3 LOWPROB] variant=${variant}, weight1=${weight1}, out=${out_name}"
   echo "================================================"
 
   export ADAPTVIS_ATTENTION_VARIANT="${variant}"
@@ -139,12 +151,12 @@ print("[CHECK]", path, "num_records=", len(data), "expected=", len(ids))
 if len(data) != len(ids):
     print("[WARNING] result length != lowprob ids length")
 
-for i, r in enumerate(data[:5]):
+for i, r in enumerate(data):
     sid = ids[i] if i < len(ids) else None
     gen = r.get("RawGeneration", r.get("Generation", ""))
     gold = r.get("Golden", r.get("gold", ""))
     corr = r.get("RawGenerationCorrect", r.get("Correct", r.get("correct", None)))
-    print(f"  local={i}, sid={sid}: correct={corr}, gold={gold}, gen={str(gen)[:80]}")
+    print(f"  local={i}, sid={sid}: correct={corr}, gold={gold}, gen={str(gen)[:100]}")
 PY
 }
 
@@ -164,124 +176,7 @@ run_one "softsign_img" "0.5" "softsign_img_lam0p5"
 run_one "softsign_img" "1.0" "softsign_img_lam1p0"
 
 echo
-echo "[3] summarize variants against base"
-python3 - <<PY
-import os
-import json
-import glob
-import csv
-
-base_json = "${BASE_JSON}"
-ids_json = "${LOWPROB_IDS}"
-variant_dir = "${RESULT_DIR}"
-out_csv = os.path.join(variant_dir, "summary.csv")
-
-def correct(item):
-    for k in ["RawGenerationCorrect", "Correct", "correct"]:
-        if k in item:
-            return bool(item[k])
-
-    gold = str(item.get("Golden", item.get("gold", ""))).strip()
-    gen = str(item.get("RawGeneration", item.get("Generation", ""))).strip()
-
-    ok = (gold in gen) or (gold.lower() in gen.lower())
-    if gold.lower() == "on" and "front" in gen.lower():
-        ok = False
-    return bool(ok)
-
-with open(base_json, "r", encoding="utf-8") as f:
-    base = json.load(f)
-
-with open(ids_json, "r", encoding="utf-8") as f:
-    ids = [int(x) for x in json.load(f)]
-
-base_correct = sum(correct(base[sid]) for sid in ids)
-
-print()
-print("[BASE SUBSET]")
-print(f"base on selected ids: {base_correct}/{len(ids)} = {base_correct / len(ids):.6f}")
-
-rows = []
-
-for path in sorted(glob.glob(os.path.join(variant_dir, "*.json"))):
-    name = os.path.splitext(os.path.basename(path))[0]
-
-    with open(path, "r", encoding="utf-8") as f:
-        var = json.load(f)
-
-    if len(var) != len(ids):
-        print(f"[SKIP LENGTH MISMATCH] {name}: {len(var)} vs {len(ids)}")
-        continue
-
-    w2c, c2w, c2c, w2w = [], [], [], []
-
-    for j, sid in enumerate(ids):
-        b_corr = correct(base[sid])
-        v_corr = correct(var[j])
-
-        if (not b_corr) and v_corr:
-            w2c.append(sid)
-        elif b_corr and (not v_corr):
-            c2w.append(sid)
-        elif b_corr and v_corr:
-            c2c.append(sid)
-        else:
-            w2w.append(sid)
-
-    final_correct = len(w2c) + len(c2c)
-
-    row = {
-        "variant": name,
-        "n": len(ids),
-        "final_correct": final_correct,
-        "acc": final_correct / len(ids),
-        "wrong_to_correct": len(w2c),
-        "correct_to_wrong": len(c2w),
-        "correct_to_correct": len(c2c),
-        "wrong_to_wrong": len(w2w),
-        "net_gain": len(w2c) - len(c2w),
-        "result_json": path,
-    }
-    rows.append(row)
-
-rows = sorted(rows, key=lambda r: (r["acc"], r["net_gain"]), reverse=True)
-
-with open(out_csv, "w", newline="", encoding="utf-8") as f:
-    fieldnames = [
-        "variant",
-        "n",
-        "final_correct",
-        "acc",
-        "wrong_to_correct",
-        "correct_to_wrong",
-        "correct_to_correct",
-        "wrong_to_wrong",
-        "net_gain",
-        "result_json",
-    ]
-    w = csv.DictWriter(f, fieldnames=fieldnames)
-    w.writeheader()
-    for r in rows:
-        w.writerow(r)
-
-print()
-print("[RANKED]")
-for r in rows:
-    print(
-        f"{r['variant']:25s} "
-        f"acc={r['acc']:.6f} "
-        f"w2c={r['wrong_to_correct']:3d} "
-        f"c2w={r['correct_to_wrong']:3d} "
-        f"net={r['net_gain']:3d}"
-    )
-
-print()
-print("[SAVED]", out_csv)
-PY
-
-echo
 echo "[DONE]"
-echo "Lowprob ids: ${LOWPROB_IDS}"
+echo "Smoke lowprob ids: ${LOWPROB_IDS}"
 echo "Results copied to: ${RESULT_DIR}/"
-echo "Summary: ${RESULT_DIR}/summary.csv"
 ls -lh "${RESULT_DIR}"
