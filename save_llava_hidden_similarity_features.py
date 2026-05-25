@@ -21,6 +21,19 @@ Default saves per sample per alpha:
   sim_obj2_to_img:       [num_image_tokens] float16, if parsed
   closed_set_logits:     left/right/on/under token logits, best-effort
 
+Optional saves when --save-attn is enabled:
+  attn_last_to_img_last_layer_heads: [num_heads, num_image_tokens] float32
+  attn_last_to_img_last_layer_mean:  [num_image_tokens]            float32
+  attn_last_to_text_last_layer_heads:[num_heads, num_text_tokens]  float32
+  attn_last_to_text_last_layer_mean: [num_text_tokens]             float32
+  attn_last_to_img_mass_per_head:    [num_heads]                   float32
+  attn_last_to_text_mass_per_head:   [num_heads]                   float32
+
+Important:
+  These attention arrays are true post-softmax attention probabilities only if
+  model_zoo/llama/modeling_llama_add_attn.py has been modified so that
+  output_attentions returns the final attention used in the forward pass.
+
 Run from AdaptVis repo root, e.g.:
   export TOKENIZERS_PARALLELISM=false
   python3 save_llava_hidden_similarity_features.py \
@@ -84,6 +97,23 @@ def parse_args():
     p.add_argument("--no-save-sim", action="store_false", dest="save_sim")
     p.add_argument("--dtype", default="float16", choices=["float16", "float32"])
     p.add_argument("--print-every", type=int, default=20)
+    p.add_argument(
+        "--save-attn",
+        action="store_true",
+        help=(
+            "Save true post-softmax attention maps from outputs.attentions. "
+            "Requires the modified modeling_llama_add_attn.py that returns final attention."
+        ),
+    )
+    p.add_argument(
+        "--save-all-layers-attn",
+        action="store_true",
+        help=(
+            "When --save-attn is set, also save last-query attention to image/text tokens "
+            "for all layers. This is more memory intensive because output_attentions=True "
+            "returns full attention matrices."
+        ),
+    )
     return p.parse_args()
 
 
@@ -331,6 +361,216 @@ def get_hidden_states_from_outputs(outputs):
                 return obj["hidden_states"]
     raise RuntimeError("Forward output does not contain hidden_states. Make sure output_hidden_states=True is supported.")
 
+def get_attentions_from_outputs(outputs):
+    """Return outputs.attentions from HF/custom model outputs."""
+    if hasattr(outputs, "attentions") and outputs.attentions is not None:
+        return outputs.attentions
+    if isinstance(outputs, dict) and outputs.get("attentions", None) is not None:
+        return outputs["attentions"]
+
+    for name in ["language_model_outputs", "decoder_outputs"]:
+        obj = getattr(outputs, name, None)
+        if obj is not None:
+            if hasattr(obj, "attentions") and obj.attentions is not None:
+                return obj.attentions
+            if isinstance(obj, dict) and obj.get("attentions", None) is not None:
+                return obj["attentions"]
+
+    raise RuntimeError(
+        "Forward output does not contain attentions. "
+        "Make sure output_attentions=True is passed and the model supports it."
+    )
+
+
+def _get_attr_from_candidates(candidates, attr: str):
+    for obj in candidates:
+        if obj is not None and hasattr(obj, attr):
+            val = getattr(obj, attr)
+            if val is not None:
+                return val
+    return None
+
+
+def get_exact_image_text_indices_from_adaptvis(
+    wrapper,
+    merged_len: int,
+    device: torch.device,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Get the exact visual-token mask saved by the AdaptVis LLaVA forward.
+
+    In the custom Scal LLaVA implementation, image_id/keys is the same mask used
+    by the attention intervention. If available, this is more reliable than
+    reconstructing image_start:image_end from tokenizer positions.
+    """
+    model = getattr(wrapper, "model", None)
+    candidates = [
+        model,
+        getattr(model, "model", None),
+        getattr(model, "language_model", None),
+        getattr(getattr(model, "model", None), "language_model", None),
+    ]
+
+    image_mask = _get_attr_from_candidates(candidates, "_adaptvis_last_image_id")
+    valid_mask = _get_attr_from_candidates(candidates, "_adaptvis_last_attention_mask")
+
+    if image_mask is None or not torch.is_tensor(image_mask):
+        return None, None
+
+    image_mask = image_mask.detach().cpu().bool()
+    if image_mask.dim() == 2:
+        image_mask = image_mask[0]
+    elif image_mask.dim() > 2:
+        image_mask = image_mask.reshape(-1)
+
+    if int(image_mask.numel()) != int(merged_len):
+        return None, None
+
+    if valid_mask is not None and torch.is_tensor(valid_mask):
+        valid_mask = valid_mask.detach().cpu().bool()
+        if valid_mask.dim() == 2:
+            valid_mask = valid_mask[0]
+        elif valid_mask.dim() > 2:
+            valid_mask = valid_mask.reshape(-1)
+        if int(valid_mask.numel()) != int(merged_len):
+            valid_mask = torch.ones_like(image_mask, dtype=torch.bool)
+    else:
+        valid_mask = torch.ones_like(image_mask, dtype=torch.bool)
+
+    text_mask = valid_mask & (~image_mask)
+
+    image_idx = torch.where(image_mask)[0].to(device=device, dtype=torch.long)
+    text_idx = torch.where(text_mask)[0].to(device=device, dtype=torch.long)
+
+    if image_idx.numel() == 0:
+        return None, None
+
+    return image_idx, text_idx
+
+
+def attention_tensor_to_float32_numpy(x: torch.Tensor) -> np.ndarray:
+    """Detach attention tensor without any normalization; values remain true probabilities."""
+    return x.detach().float().cpu().numpy().astype(np.float32)
+
+
+def add_attention_arrays(
+    arrays: Dict[str, np.ndarray],
+    outputs,
+    wrapper,
+    merged_len: int,
+    last_merged_pos: int,
+    image_start: int,
+    image_end: int,
+    text_merged_pos: List[int],
+    save_all_layers_attn: bool,
+):
+    """Add post-softmax attention arrays to arrays.
+
+    Expected attention shape per layer:
+      [batch, num_heads, target_seq_len, source_seq_len]
+
+    With the modified modeling_llama_add_attn.py, this is the final attention
+    distribution actually used by the forward pass.
+    """
+    attentions = get_attentions_from_outputs(outputs)
+
+    if attentions is None or len(attentions) == 0:
+        raise RuntimeError("outputs.attentions is empty.")
+
+    last_layer = attentions[-1]
+    if last_layer is None:
+        raise RuntimeError("The last layer attention is None.")
+
+    # [batch, num_heads, tgt_len, src_len] -> [num_heads, tgt_len, src_len]
+    last_layer_attn = last_layer[0].detach().float()
+    src_len = int(last_layer_attn.shape[-1])
+    tgt_len = int(last_layer_attn.shape[-2])
+
+    if not (0 <= int(last_merged_pos) < tgt_len):
+        raise RuntimeError(
+            f"last_merged_pos={last_merged_pos} outside attention target length {tgt_len}."
+        )
+
+    exact_img_idx, exact_text_idx = get_exact_image_text_indices_from_adaptvis(
+        wrapper=wrapper,
+        merged_len=src_len,
+        device=last_layer_attn.device,
+    )
+
+    if exact_img_idx is not None:
+        img_idx = exact_img_idx
+        text_idx = exact_text_idx if exact_text_idx is not None else torch.empty(0, dtype=torch.long, device=last_layer_attn.device)
+        image_index_source = "adaptvis_mask"
+    else:
+        img_idx = torch.arange(int(image_start), int(image_end), device=last_layer_attn.device, dtype=torch.long)
+        text_idx = torch.tensor(text_merged_pos, device=last_layer_attn.device, dtype=torch.long)
+        image_index_source = "reconstructed_span"
+
+    img_idx = img_idx[(img_idx >= 0) & (img_idx < src_len)]
+    text_idx = text_idx[(text_idx >= 0) & (text_idx < src_len)]
+
+    if img_idx.numel() == 0:
+        raise RuntimeError("No valid image token indices for attention extraction.")
+
+    attn_last_to_all = last_layer_attn[:, int(last_merged_pos), :]  # [num_heads, src_len]
+    attn_last_to_img = attn_last_to_all[:, img_idx]                 # [num_heads, num_img_tokens]
+    attn_last_to_text = attn_last_to_all[:, text_idx] if text_idx.numel() > 0 else attn_last_to_all[:, :0]
+
+    arrays["attn_image_index_source"] = np.array(image_index_source)
+    arrays["attn_image_indices"] = img_idx.detach().cpu().numpy().astype(np.int32)
+    arrays["attn_text_indices"] = text_idx.detach().cpu().numpy().astype(np.int32)
+
+    arrays["attn_last_to_img_last_layer_heads"] = attention_tensor_to_float32_numpy(attn_last_to_img)
+    arrays["attn_last_to_img_last_layer_mean"] = attention_tensor_to_float32_numpy(attn_last_to_img.mean(dim=0))
+
+    arrays["attn_last_to_text_last_layer_heads"] = attention_tensor_to_float32_numpy(attn_last_to_text)
+    arrays["attn_last_to_text_last_layer_mean"] = attention_tensor_to_float32_numpy(attn_last_to_text.mean(dim=0))
+
+    arrays["attn_last_to_img_mass_per_head"] = attention_tensor_to_float32_numpy(attn_last_to_img.sum(dim=-1))
+    arrays["attn_last_to_text_mass_per_head"] = attention_tensor_to_float32_numpy(attn_last_to_text.sum(dim=-1))
+
+    arrays["attn_last_to_img_mass_mean"] = np.array(
+        float(attn_last_to_img.sum(dim=-1).mean().detach().cpu()),
+        dtype=np.float32,
+    )
+    arrays["attn_last_to_text_mass_mean"] = np.array(
+        float(attn_last_to_text.sum(dim=-1).mean().detach().cpu()) if text_idx.numel() > 0 else 0.0,
+        dtype=np.float32,
+    )
+
+    # A simple sanity number: the total probability mass over all source tokens
+    # should be near 1 for every head at the queried row.
+    arrays["attn_last_to_all_mass_per_head"] = attention_tensor_to_float32_numpy(attn_last_to_all.sum(dim=-1))
+
+    if save_all_layers_attn:
+        all_img = []
+        all_text = []
+        all_img_mass = []
+        all_text_mass = []
+
+        for layer_attn in attentions:
+            if layer_attn is None:
+                continue
+            layer_attn = layer_attn[0].detach().float()
+            if int(last_merged_pos) >= int(layer_attn.shape[-2]):
+                raise RuntimeError(
+                    f"last_merged_pos={last_merged_pos} outside layer attention target length {layer_attn.shape[-2]}."
+                )
+
+            layer_last_to_all = layer_attn[:, int(last_merged_pos), :]
+            layer_img = layer_last_to_all[:, img_idx]
+            layer_text = layer_last_to_all[:, text_idx] if text_idx.numel() > 0 else layer_last_to_all[:, :0]
+
+            all_img.append(attention_tensor_to_float32_numpy(layer_img))
+            all_text.append(attention_tensor_to_float32_numpy(layer_text))
+            all_img_mass.append(attention_tensor_to_float32_numpy(layer_img.sum(dim=-1)))
+            all_text_mass.append(attention_tensor_to_float32_numpy(layer_text.sum(dim=-1)))
+
+        arrays["attn_last_to_img_all_layers_heads"] = np.stack(all_img, axis=0)
+        arrays["attn_last_to_text_all_layers_heads"] = np.stack(all_text, axis=0)
+        arrays["attn_last_to_img_mass_all_layers_heads"] = np.stack(all_img_mass, axis=0)
+        arrays["attn_last_to_text_mass_all_layers_heads"] = np.stack(all_text_mass, axis=0)
+
+
 
 def closed_set_token_ids(wrapper) -> Dict[str, List[int]]:
     tok = wrapper.tokenizer if hasattr(wrapper, "tokenizer") else wrapper.processor.tokenizer
@@ -398,7 +638,12 @@ def main():
     meta_path = out_dir / "metadata.jsonl"
 
     print("[LOAD MODEL]", args.model_name, args.method, device)
-    wrapper, image_preprocess = get_model(args.model_name, device, args.method)
+    wrapper, image_preprocess = get_model(
+        args.model_name,
+        device,
+        args.method,
+        root_dir=args.root_dir,
+    )
     wrapper.model.eval()
 
     print("[LOAD DATASET]", args.dataset)
@@ -465,6 +710,7 @@ def main():
                         forward_kwargs.update({
                             "weight": float(alpha),
                             "output_hidden_states": True,
+                            "output_attentions": bool(args.save_attn),
                             "return_dict": True,
                             "use_cache": False,
                         })
@@ -495,8 +741,13 @@ def main():
 
                         text_pre_pos, text_merged_pos = nonpad_text_positions(tok_attention_mask, image_pos, num_img_tokens)
                         # Guard against tokenizer offsets and processor ids drifting.
-                        text_merged_pos = [p for p in text_merged_pos if 0 <= p < merged_len]
-                        text_pre_pos_valid = text_pre_pos[:len(text_merged_pos)]
+                        text_pairs = [
+                            (pre, merged)
+                            for pre, merged in zip(text_pre_pos, text_merged_pos)
+                            if 0 <= merged < merged_len
+                        ]
+                        text_pre_pos_valid = [pre for pre, _ in text_pairs]
+                        text_merged_pos = [merged for _, merged in text_pairs]
                         H_text = last_hidden[torch.tensor(text_merged_pos, device=last_hidden.device)] if text_merged_pos else last_hidden[:0]
 
                         obj1_merged_pos = map_premerge_to_merged_positions(obj1_pre_pos, tok_attention_mask, image_pos, num_img_tokens)
@@ -548,6 +799,19 @@ def main():
                         arrays["closed_set_words"] = np.array(list(cls_logits.keys()), dtype=object)
                         arrays["closed_set_logits"] = np.array([cls_logits[k] for k in cls_logits.keys()], dtype=np.float32)
 
+                        if args.save_attn:
+                            add_attention_arrays(
+                                arrays=arrays,
+                                outputs=outputs,
+                                wrapper=wrapper,
+                                merged_len=merged_len,
+                                last_merged_pos=last_merged_pos,
+                                image_start=image_start,
+                                image_end=image_end,
+                                text_merged_pos=text_merged_pos,
+                                save_all_layers_attn=args.save_all_layers_attn,
+                            )
+
                         if args.save_sim:
                             H_img_n = normalize_rows(H_img)
                             H_text_n = normalize_rows(H_text) if H_text.shape[0] > 0 else H_text.float()
@@ -585,6 +849,7 @@ def main():
                             "num_img_tokens": num_img_tokens,
                             "merged_len": merged_len,
                             "hidden_dim": int(last_hidden.shape[-1]),
+                            "save_attn": bool(args.save_attn),
                         }
                         meta_f.write(json.dumps(meta, ensure_ascii=False) + "\n")
                         meta_f.flush()
