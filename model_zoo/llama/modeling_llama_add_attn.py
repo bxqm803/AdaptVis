@@ -67,8 +67,11 @@ def _adaptvis_variant_name(adjust_method: Optional[str] = None) -> str:
       add_img    : pre-softmax group suppression, s_img = s_img + weight
       center_img : pre-softmax centered scaling, s_img = mean + weight * (s_img - mean)
       prob_img   : post-softmax image mass suppression, p_img = weight * p_img then renorm
+      clip_img   : hard amplitude clipping toward zero, clamp(s_img, -a, a)
+      tanh_img   : smooth amplitude clipping toward zero, a * tanh(s_img / a)
+      softsign_img: softsign shrink toward zero, s_img / (1 + lambda * |s_img|)
     """
-    supported = {"mul_img", "add_img", "center_img", "prob_img"}
+    supported = {"mul_img", "add_img", "center_img", "prob_img", "clip_img", "tanh_img", "softsign_img"}
 
     env_variant = os.environ.get("ADAPTVIS_ATTENTION_VARIANT", "").strip()
     if env_variant:
@@ -167,6 +170,15 @@ def _apply_adaptvis_pre_softmax_variant(
 
     prob_img:
       no-op here. It is handled after softmax.
+
+    clip_img:
+      s_img_new = clamp(s_img, -a, a)
+
+    tanh_img:
+      s_img_new = a * tanh(s_img / a)
+
+    softsign_img:
+      s_img_new = s_img / (1 + lambda * |s_img|)
     """
     variant = _adaptvis_variant_name(adjust_method)
 
@@ -201,10 +213,31 @@ def _apply_adaptvis_pre_softmax_variant(
                 mu = s_img.mean(dim=-1, keepdim=True)
                 s_img_new = mu + weight * (s_img - mu)
 
+            elif variant == "clip_img":
+                # Hard amplitude shrinkage toward zero:
+                # s_img_new = clamp(s_img, -a, a)
+                # weight is a > 0.
+                a = max(abs(float(weight)), 1e-6)
+                s_img_new = torch.clamp(s_img, min=-a, max=a)
+
+            elif variant == "tanh_img":
+                # Smooth amplitude shrinkage toward zero:
+                # s_img_new = a * tanh(s_img / a)
+                # weight is a > 0.
+                a = max(abs(float(weight)), 1e-6)
+                s_img_new = a * torch.tanh(s_img / a)
+
+            elif variant == "softsign_img":
+                # Softsign amplitude shrinkage toward zero:
+                # s_img_new = s_img / (1 + lambda * |s_img|)
+                # weight is lambda >= 0.
+                lam = abs(float(weight))
+                s_img_new = s_img / (1.0 + lam * s_img.abs())
+
             else:
                 raise ValueError(
                     f"Unknown AdaptVis variant={variant}. "
-                    f"Use mul_img/add_img/center_img/prob_img."
+                    f"Use mul_img/add_img/center_img/prob_img/clip_img/tanh_img/softsign_img."
                 )
 
             attn_logits[b, :, q_int, img_idx] = s_img_new
@@ -484,7 +517,7 @@ class LLaMAAttention(nn.Module):
         #   - normally only last query row
         #
         # Variant is selected by:
-        #   export ADAPTVIS_ATTENTION_VARIANT=mul_img/add_img/center_img/prob_img
+        #   export ADAPTVIS_ATTENTION_VARIANT=mul_img/add_img/center_img/prob_img/clip_img/tanh_img/softsign_img
         # ------------------------------------------------------------------
         start_idx, end_idx, square_size = -1, -1, -1
         image_key_mask = None
