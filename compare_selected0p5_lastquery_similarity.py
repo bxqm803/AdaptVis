@@ -43,6 +43,47 @@ def parse_args():
     parser.add_argument("--num-vis", type=int, default=5)
     parser.add_argument("--seed", type=int, default=7)
 
+    # New: choose what this script compares.
+    # attention: use post-softmax attention saved by save_llava_hidden_similarity_features.py
+    # hidden_similarity: original behavior, cosine(last_prompt_hidden, token_hidden)
+    parser.add_argument(
+        "--score-type",
+        default="attention",
+        choices=["attention", "hidden_similarity"],
+        help="attention uses saved post-softmax attention; hidden_similarity keeps the old cosine-feature analysis.",
+    )
+    parser.add_argument(
+        "--attn-img-key",
+        default="attn_last_to_img_last_layer_mean",
+        help="NPZ key for last-token -> image-token post-softmax attention.",
+    )
+    parser.add_argument(
+        "--attn-text-key",
+        default="attn_last_to_text_last_layer_mean",
+        help="NPZ key for last-token -> text-token post-softmax attention.",
+    )
+    parser.add_argument(
+        "--allow-fallback-hidden",
+        action="store_true",
+        help="If attention keys are missing, fall back to hidden similarity instead of raising an error.",
+    )
+    parser.add_argument(
+        "--visual-normalize",
+        action="store_true",
+        help="Only affects display. If set, normalize base/low heatmaps to 0-1. Default keeps true attention values.",
+    )
+    parser.add_argument(
+        "--save-combined",
+        action="store_true",
+        default=True,
+        help="Save one combined figure with visual maps and text curves, similar to the previous debug figure.",
+    )
+    parser.add_argument(
+        "--no-save-combined",
+        action="store_false",
+        dest="save_combined",
+    )
+
     return parser.parse_args()
 
 
@@ -174,14 +215,32 @@ def softmax_np(x):
     return e / (np.sum(e) + EPS)
 
 
-def entropy_from_scores(x):
-    p = softmax_np(x)
+def prob_dist(x):
+    """Normalize nonnegative attention values into a conditional distribution."""
+    x = as_float(x).reshape(-1)
+    x = np.maximum(x, 0.0)
+    s = float(np.sum(x))
+    if s <= EPS:
+        if len(x) == 0:
+            return x
+        return np.ones_like(x, dtype=np.float32) / float(len(x))
+    return x / s
+
+
+def dist_from_values(x, score_type):
+    if score_type == "attention":
+        return prob_dist(x)
+    return softmax_np(x)
+
+
+def entropy_from_values(x, score_type):
+    p = dist_from_values(x, score_type)
     return float(-np.sum(p * np.log(p + EPS)))
 
 
-def js_divergence(a, b):
-    p = softmax_np(a)
-    q = softmax_np(b)
+def js_divergence_values(a, b, score_type):
+    p = dist_from_values(a, score_type)
+    q = dist_from_values(b, score_type)
     m = 0.5 * (p + q)
     return float(
         0.5 * np.sum(p * (np.log(p + EPS) - np.log(m + EPS)))
@@ -189,9 +248,9 @@ def js_divergence(a, b):
     )
 
 
-def tv_distance(a, b):
-    p = softmax_np(a)
-    q = softmax_np(b)
+def tv_distance_values(a, b, score_type):
+    p = dist_from_values(a, score_type)
+    q = dist_from_values(b, score_type)
     return float(0.5 * np.sum(np.abs(p - q)))
 
 
@@ -203,8 +262,8 @@ def jaccard(a, b):
     return len(a & b) / max(len(a | b), 1)
 
 
-def weighted_center(scores):
-    p = softmax_np(scores)
+def weighted_center(scores, score_type):
+    p = dist_from_values(scores, score_type)
     n = len(p)
     side = int(round(math.sqrt(n)))
 
@@ -221,9 +280,9 @@ def weighted_center(scores):
     return cx, cy
 
 
-def center_shift(a, b):
-    ax, ay = weighted_center(a)
-    bx, by = weighted_center(b)
+def center_shift(a, b, score_type):
+    ax, ay = weighted_center(a, score_type)
+    bx, by = weighted_center(b, score_type)
     return float(math.sqrt((ax - bx) ** 2 + (ay - by) ** 2))
 
 
@@ -278,39 +337,103 @@ def clean_token(tok):
     return tok
 
 
-def get_tokens(x):
-    if "tokens" in x.files:
-        return [clean_token(t) for t in x["tokens"].tolist()]
+def npz_has(x, key):
+    return key in getattr(x, "files", [])
 
-    T = int(x["text_hidden"].shape[0])
+
+def read_attention_vector(x, key, heads_key):
+    """Read mean attention vector. If only per-head attention exists, average heads."""
+    if npz_has(x, key):
+        return as_float(x[key]).reshape(-1)
+    if npz_has(x, heads_key):
+        arr = as_float(x[heads_key])
+        # Expected [num_heads, num_tokens]
+        if arr.ndim == 2:
+            return arr.mean(axis=0).reshape(-1)
+        # Expected [num_layers, num_heads, num_tokens]
+        if arr.ndim == 3:
+            return arr[-1].mean(axis=0).reshape(-1)
+    return None
+
+
+def get_tokens_full(x):
+    if "tokens" not in x.files:
+        return []
+    return [clean_token(t) for t in x["tokens"].tolist()]
+
+
+def get_text_tokens_from_feature(x, T, prefer_attn=True):
+    """Return labels aligned to text scores.
+
+    For attention vectors, the NPZ may contain merged indices. We map merged text
+    positions back to tokenizer pre-merge positions using text_merged_positions
+    and text_pre_positions when possible.
+    """
+    tokens_full = get_tokens_full(x)
+
+    if not tokens_full:
+        return [f"tok{i}" for i in range(T)]
+
+    # If tokens were already saved in text-score order.
+    if len(tokens_full) == T:
+        return tokens_full
+
+    # Attention path: attn_text_indices are merged-sequence indices.
+    if prefer_attn and npz_has(x, "attn_text_indices") and npz_has(x, "text_merged_positions") and npz_has(x, "text_pre_positions"):
+        attn_text_indices = [int(v) for v in np.asarray(x["attn_text_indices"]).reshape(-1).tolist()]
+        text_merged = [int(v) for v in np.asarray(x["text_merged_positions"]).reshape(-1).tolist()]
+        text_pre = [int(v) for v in np.asarray(x["text_pre_positions"]).reshape(-1).tolist()]
+        merged_to_pre = {m: p for p, m in zip(text_pre, text_merged)}
+
+        labels = []
+        for m in attn_text_indices:
+            p = merged_to_pre.get(m, None)
+            if p is not None and 0 <= p < len(tokens_full):
+                labels.append(tokens_full[p])
+            else:
+                labels.append(f"m{m}")
+
+        if len(labels) == T:
+            return labels
+
+    # Hidden-sim path: text_pre_positions indexes into tokens_full.
+    if npz_has(x, "text_pre_positions"):
+        text_pre = [int(v) for v in np.asarray(x["text_pre_positions"]).reshape(-1).tolist()]
+        if len(text_pre) == T:
+            labels = []
+            for p in text_pre:
+                labels.append(tokens_full[p] if 0 <= p < len(tokens_full) else f"p{p}")
+            return labels
+
     return [f"tok{i}" for i in range(T)]
 
 
-def get_text_sims(xb, xl):
-    Hb = as_float(xb["text_hidden"])
-    Hl = as_float(xl["text_hidden"])
-
-    sim_b = sim_vec_to_tokens(xb["last_prompt_hidden"], Hb)
-    sim_l = sim_vec_to_tokens(xl["last_prompt_hidden"], Hl)
-
-    tokens_b = get_tokens(xb)
-    tokens_l = get_tokens(xl)
-
-    if len(sim_b) != len(sim_l):
-        raise RuntimeError(
-            f"text sim length mismatch: base={len(sim_b)} low={len(sim_l)}"
+def get_visual_scores(xb, xl, args):
+    if args.score_type == "attention":
+        sim_b = read_attention_vector(
+            xb,
+            args.attn_img_key,
+            "attn_last_to_img_last_layer_heads",
+        )
+        sim_l = read_attention_vector(
+            xl,
+            args.attn_img_key,
+            "attn_last_to_img_last_layer_heads",
         )
 
-    if len(tokens_b) != len(sim_b):
-        tokens_b = [f"tok{i}" for i in range(len(sim_b))]
+        if sim_b is not None and sim_l is not None:
+            return sim_b, sim_l
 
-    if len(tokens_l) != len(sim_l):
-        tokens_l = [f"tok{i}" for i in range(len(sim_l))]
+        if not args.allow_fallback_hidden:
+            raise KeyError(
+                "Attention keys are missing from one or both feature files. "
+                f"Expected {args.attn_img_key} or attn_last_to_img_last_layer_heads. "
+                "Run save_llava_hidden_similarity_features.py with --save-attn, "
+                "and use the modified modeling_llama_add_attn.py."
+            )
 
-    return sim_b, sim_l, tokens_b, tokens_l
+        print("[WARN] attention image keys missing; fallback to hidden similarity.")
 
-
-def get_visual_sims(xb, xl):
     H_img_b = as_float(xb["image_hidden"])
     H_img_l = as_float(xl["image_hidden"])
 
@@ -320,8 +443,116 @@ def get_visual_sims(xb, xl):
     return sim_b, sim_l
 
 
-def save_visual_heatmap(rec, xb, xl, out_path):
-    sim_b, sim_l = get_visual_sims(xb, xl)
+def get_text_scores(xb, xl, args):
+    prefer_attn = args.score_type == "attention"
+
+    if args.score_type == "attention":
+        sim_b = read_attention_vector(
+            xb,
+            args.attn_text_key,
+            "attn_last_to_text_last_layer_heads",
+        )
+        sim_l = read_attention_vector(
+            xl,
+            args.attn_text_key,
+            "attn_last_to_text_last_layer_heads",
+        )
+
+        if sim_b is not None and sim_l is not None:
+            if len(sim_b) != len(sim_l):
+                raise RuntimeError(
+                    f"text attention length mismatch: base={len(sim_b)} low={len(sim_l)}"
+                )
+            tokens_b = get_text_tokens_from_feature(xb, len(sim_b), prefer_attn=True)
+            tokens_l = get_text_tokens_from_feature(xl, len(sim_l), prefer_attn=True)
+            return sim_b, sim_l, tokens_b, tokens_l
+
+        if not args.allow_fallback_hidden:
+            raise KeyError(
+                "Attention text keys are missing from one or both feature files. "
+                f"Expected {args.attn_text_key} or attn_last_to_text_last_layer_heads. "
+                "Run save_llava_hidden_similarity_features.py with --save-attn."
+            )
+
+        print("[WARN] attention text keys missing; fallback to hidden similarity.")
+        prefer_attn = False
+
+    Hb = as_float(xb["text_hidden"])
+    Hl = as_float(xl["text_hidden"])
+
+    sim_b = sim_vec_to_tokens(xb["last_prompt_hidden"], Hb)
+    sim_l = sim_vec_to_tokens(xl["last_prompt_hidden"], Hl)
+
+    if len(sim_b) != len(sim_l):
+        raise RuntimeError(
+            f"text sim length mismatch: base={len(sim_b)} low={len(sim_l)}"
+        )
+
+    tokens_b = get_text_tokens_from_feature(xb, len(sim_b), prefer_attn=prefer_attn)
+    tokens_l = get_text_tokens_from_feature(xl, len(sim_l), prefer_attn=prefer_attn)
+
+    return sim_b, sim_l, tokens_b, tokens_l
+
+
+def score_label(args):
+    return "attention prob" if args.score_type == "attention" else "cosine sim"
+
+
+def visual_title_prefix(args):
+    if args.score_type == "attention":
+        return "last query post-softmax attention → visual tokens"
+    return "last query ↔ visual tokens"
+
+
+def text_title_prefix(args):
+    if args.score_type == "attention":
+        return "last query post-softmax attention → text tokens"
+    return "last query ↔ text tokens"
+
+
+def image_text_mass(xb, xl, args):
+    """Return raw attention mass for image/text if attention vectors are available."""
+    if args.score_type != "attention":
+        return {}
+
+    out = {}
+    vb = read_attention_vector(xb, args.attn_img_key, "attn_last_to_img_last_layer_heads")
+    vl = read_attention_vector(xl, args.attn_img_key, "attn_last_to_img_last_layer_heads")
+    tb = read_attention_vector(xb, args.attn_text_key, "attn_last_to_text_last_layer_heads")
+    tl = read_attention_vector(xl, args.attn_text_key, "attn_last_to_text_last_layer_heads")
+
+    if vb is not None and vl is not None:
+        out["visual_mass_base"] = float(np.sum(np.maximum(vb, 0.0)))
+        out["visual_mass_low"] = float(np.sum(np.maximum(vl, 0.0)))
+        out["visual_mass_delta"] = out["visual_mass_low"] - out["visual_mass_base"]
+
+    if tb is not None and tl is not None:
+        out["text_mass_base"] = float(np.sum(np.maximum(tb, 0.0)))
+        out["text_mass_low"] = float(np.sum(np.maximum(tl, 0.0)))
+        out["text_mass_delta"] = out["text_mass_low"] - out["text_mass_base"]
+
+    return out
+
+
+def plot_heatmap_panel(ax, arr, title, args, vmin=None, vmax=None, diff=False):
+    if diff:
+        vmax_abs = np.max(np.abs(arr)) if vmax is None else vmax
+        vmax_abs = max(float(vmax_abs), 1e-12)
+        im = ax.imshow(arr, vmin=-vmax_abs, vmax=vmax_abs)
+    else:
+        if args.score_type == "attention" and not args.visual_normalize:
+            im = ax.imshow(arr, vmin=vmin, vmax=vmax)
+        else:
+            im = ax.imshow(normalize_view(arr))
+
+    ax.set_title(title)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    return im
+
+
+def save_visual_heatmap(rec, xb, xl, out_path, args):
+    sim_b, sim_l = get_visual_scores(xb, xl, args)
     diff = sim_l - sim_b
 
     gb = score_grid(sim_b)
@@ -330,31 +561,42 @@ def save_visual_heatmap(rec, xb, xl, out_path):
 
     fig, axes = plt.subplots(1, 3, figsize=(13, 4))
 
+    mass_extra = ""
+    if args.score_type == "attention":
+        mass_extra = (
+            f", img_mass_base={rec.get('visual_mass_base', float('nan')):.6g}, "
+            f"img_mass_low={rec.get('visual_mass_low', float('nan')):.6g}"
+        )
+
     fig.suptitle(
-        f"last query ↔ visual tokens | sid={rec['sid']} | {rec['group']} | gold={rec['gold']}\n"
+        f"{visual_title_prefix(args)} | sid={rec['sid']} | {rec['group']} | gold={rec['gold']}\n"
         f"JS={rec['visual_js']:.6f}, TV={rec['visual_tv']:.6f}, "
         f"top10_jaccard={rec['visual_top10_jaccard']:.3f}, "
-        f"center_shift={rec['visual_center_shift']:.3f}",
+        f"center_shift={rec['visual_center_shift']:.3f}{mass_extra}",
         fontsize=11,
     )
 
+    vmax = max(float(np.max(gb)), float(np.max(gl)), 1e-12)
+    diff_vmax = max(float(np.max(np.abs(gd))), 1e-12)
+
     panels = [
-        (gb, "base"),
-        (gl, "low alpha=0.5"),
-        (gd, "diff low-base"),
+        (gb, "visual base" if args.score_type == "attention" else "base", False),
+        (gl, "visual low alpha=0.5" if args.score_type == "attention" else "low alpha=0.5", False),
+        (gd, "visual diff low-base" if args.score_type == "attention" else "diff low-base", True),
     ]
 
-    for ax, (arr, title) in zip(axes, panels):
-        if "diff" in title:
-            vmax = np.percentile(np.abs(arr), 99)
-            vmax = max(float(vmax), 1e-6)
-            im = ax.imshow(arr, vmin=-vmax, vmax=vmax)
-        else:
-            im = ax.imshow(normalize_view(arr))
-
-        ax.set_title(title)
-        ax.set_xticks([])
-        ax.set_yticks([])
+    for ax, (arr, title, is_diff) in zip(axes, panels):
+        im = plot_heatmap_panel(
+            ax,
+            arr,
+            title,
+            args,
+            vmin=0.0,
+            vmax=vmax,
+            diff=is_diff,
+        )
+        if is_diff:
+            im.set_clim(-diff_vmax, diff_vmax)
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     plt.tight_layout()
@@ -362,8 +604,8 @@ def save_visual_heatmap(rec, xb, xl, out_path):
     plt.close(fig)
 
 
-def save_text_csv(rec, xb, xl, out_path):
-    sim_b, sim_l, tokens_b, tokens_l = get_text_sims(xb, xl)
+def save_text_csv(rec, xb, xl, out_path, args):
+    sim_b, sim_l, tokens_b, tokens_l = get_text_scores(xb, xl, args)
     diff = sim_l - sim_b
 
     order_abs = np.argsort(-np.abs(diff))
@@ -379,11 +621,12 @@ def save_text_csv(rec, xb, xl, out_path):
                 "sample_id",
                 "group",
                 "gold",
+                "score_type",
                 "token_index",
                 "token_base",
                 "token_low",
-                "sim_base",
-                "sim_low",
+                "score_base",
+                "score_low",
                 "diff_low_minus_base",
                 "abs_diff_rank",
             ]
@@ -395,9 +638,10 @@ def save_text_csv(rec, xb, xl, out_path):
                     rec["sid"],
                     rec["group"],
                     rec["gold"],
+                    args.score_type,
                     i,
-                    tokens_b[i],
-                    tokens_l[i],
+                    tokens_b[i] if i < len(tokens_b) else f"tok{i}",
+                    tokens_l[i] if i < len(tokens_l) else f"tok{i}",
                     float(sim_b[i]),
                     float(sim_l[i]),
                     float(diff[i]),
@@ -406,13 +650,13 @@ def save_text_csv(rec, xb, xl, out_path):
             )
 
 
-def save_text_plot(rec, xb, xl, out_path, max_tokens=90):
-    sim_b, sim_l, tokens_b, _ = get_text_sims(xb, xl)
+def save_text_plot(rec, xb, xl, out_path, args, max_tokens=90):
+    sim_b, sim_l, tokens_b, _ = get_text_scores(xb, xl, args)
     diff = sim_l - sim_b
 
     T = len(sim_b)
     idx = np.arange(min(T, max_tokens))
-    labels = [tokens_b[i] for i in idx]
+    labels = [tokens_b[i] if i < len(tokens_b) else f"tok{i}" for i in idx]
 
     fig, axes = plt.subplots(
         2,
@@ -421,16 +665,23 @@ def save_text_plot(rec, xb, xl, out_path, max_tokens=90):
         sharex=True,
     )
 
+    mass_extra = ""
+    if args.score_type == "attention":
+        mass_extra = (
+            f", text_mass_base={rec.get('text_mass_base', float('nan')):.6g}, "
+            f"text_mass_low={rec.get('text_mass_low', float('nan')):.6g}"
+        )
+
     fig.suptitle(
-        f"last query ↔ text tokens | sid={rec['sid']} | {rec['group']} | gold={rec['gold']}\n"
+        f"{text_title_prefix(args)} | sid={rec['sid']} | {rec['group']} | gold={rec['gold']}\n"
         f"text_JS={rec['text_js']:.6f}, text_TV={rec['text_tv']:.6f}, "
-        f"text_top10_jaccard={rec['text_top10_jaccard']:.3f}",
+        f"text_top10_jaccard={rec['text_top10_jaccard']:.3f}{mass_extra}",
         fontsize=11,
     )
 
     axes[0].plot(idx, sim_b[idx], marker="o", linewidth=1, label="base")
     axes[0].plot(idx, sim_l[idx], marker="o", linewidth=1, label="low alpha=0.5")
-    axes[0].set_ylabel("cosine sim")
+    axes[0].set_ylabel(score_label(args))
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
@@ -439,6 +690,72 @@ def save_text_plot(rec, xb, xl, out_path, max_tokens=90):
     axes[1].set_xticks(idx)
     axes[1].set_xticklabels(labels, rotation=70, ha="right", fontsize=8)
     axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def save_combined_plot(rec, xb, xl, out_path, args, max_tokens=90):
+    visual_b, visual_l = get_visual_scores(xb, xl, args)
+    text_b, text_l, tokens_b, _ = get_text_scores(xb, xl, args)
+
+    visual_diff = visual_l - visual_b
+    text_diff = text_l - text_b
+
+    gb = score_grid(visual_b)
+    gl = score_grid(visual_l)
+    gd = score_grid(visual_diff)
+
+    T = len(text_b)
+    idx = np.arange(min(T, max_tokens))
+    labels = [tokens_b[i] if i < len(tokens_b) else f"tok{i}" for i in idx]
+
+    fig = plt.figure(figsize=(16, 10))
+    gs = fig.add_gridspec(3, 3, height_ratios=[1.0, 1.0, 1.0])
+
+    base_gen = rec.get("base_generation", "")
+    low_gen = rec.get("low_generation", "")
+    if len(base_gen) > 80:
+        base_gen = base_gen[:77] + "..."
+    if len(low_gen) > 80:
+        low_gen = low_gen[:77] + "..."
+
+    title_score = "post-softmax attention" if args.score_type == "attention" else "hidden cosine similarity"
+    fig.suptitle(
+        f"sid={rec['sid']} | {rec['group']} | gold={rec['gold']} | {title_score}\n"
+        f"base={base_gen} | low={low_gen}",
+        fontsize=12,
+    )
+
+    vmax = max(float(np.max(gb)), float(np.max(gl)), 1e-12)
+    diff_vmax = max(float(np.max(np.abs(gd))), 1e-12)
+
+    ax0 = fig.add_subplot(gs[0, 0])
+    ax1 = fig.add_subplot(gs[0, 1])
+    ax2 = fig.add_subplot(gs[0, 2])
+
+    im0 = plot_heatmap_panel(ax0, gb, "visual base", args, vmin=0.0, vmax=vmax)
+    im1 = plot_heatmap_panel(ax1, gl, "visual low", args, vmin=0.0, vmax=vmax)
+    im2 = plot_heatmap_panel(ax2, gd, "visual diff", args, diff=True, vmax=diff_vmax)
+
+    plt.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
+    plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+    plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+
+    ax3 = fig.add_subplot(gs[1, :])
+    ax3.plot(idx, text_b[idx], marker="o", linewidth=1, label="text base")
+    ax3.plot(idx, text_l[idx], marker="o", linewidth=1, label="text low")
+    ax3.set_ylabel(score_label(args))
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+
+    ax4 = fig.add_subplot(gs[2, :], sharex=ax3)
+    ax4.bar(idx, text_diff[idx])
+    ax4.set_ylabel("text low-base")
+    ax4.set_xticks(idx)
+    ax4.set_xticklabels(labels, rotation=70, ha="right", fontsize=8)
+    ax4.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=180)
@@ -454,11 +771,13 @@ def main():
     visual_dir = os.path.join(args.out_dir, "visual_heatmaps")
     text_csv_dir = os.path.join(args.out_dir, "text_similarity_csv")
     text_plot_dir = os.path.join(args.out_dir, "text_similarity_plots")
+    combined_dir = os.path.join(args.out_dir, "combined_plots")
 
     os.makedirs(args.out_dir, exist_ok=True)
     os.makedirs(visual_dir, exist_ok=True)
     os.makedirs(text_csv_dir, exist_ok=True)
     os.makedirs(text_plot_dir, exist_ok=True)
+    os.makedirs(combined_dir, exist_ok=True)
 
     base_json = args.base_json
     mixed_json = args.mixed_json
@@ -531,8 +850,8 @@ def main():
         xb = np.load(bf, allow_pickle=True)
         xl = np.load(lf, allow_pickle=True)
 
-        sim_visual_b, sim_visual_l = get_visual_sims(xb, xl)
-        sim_text_b, sim_text_l, tokens_b, _ = get_text_sims(xb, xl)
+        sim_visual_b, sim_visual_l = get_visual_scores(xb, xl, args)
+        sim_text_b, sim_text_l, tokens_b, _ = get_text_scores(xb, xl, args)
 
         visual_diff = sim_visual_l - sim_visual_b
         text_diff = sim_text_l - sim_text_b
@@ -541,6 +860,7 @@ def main():
             "sid": sid,
             "group": group,
             "gold": gold,
+            "score_type": args.score_type,
             "base_correct": bool(b_corr),
             "low_correct": bool(l_corr),
             "base_generation": gen_text(base[i]),
@@ -551,14 +871,14 @@ def main():
             "last_prompt_cosdist": cosine_dist(
                 xb["last_prompt_hidden"],
                 xl["last_prompt_hidden"],
-            ),
+            ) if "last_prompt_hidden" in xb.files and "last_prompt_hidden" in xl.files else None,
 
-            "visual_js": js_divergence(sim_visual_b, sim_visual_l),
-            "visual_tv": tv_distance(sim_visual_b, sim_visual_l),
-            "visual_entropy_base": entropy_from_scores(sim_visual_b),
-            "visual_entropy_low": entropy_from_scores(sim_visual_l),
-            "visual_entropy_delta": entropy_from_scores(sim_visual_l)
-            - entropy_from_scores(sim_visual_b),
+            "visual_js": js_divergence_values(sim_visual_b, sim_visual_l, args.score_type),
+            "visual_tv": tv_distance_values(sim_visual_b, sim_visual_l, args.score_type),
+            "visual_entropy_base": entropy_from_values(sim_visual_b, args.score_type),
+            "visual_entropy_low": entropy_from_values(sim_visual_l, args.score_type),
+            "visual_entropy_delta": entropy_from_values(sim_visual_l, args.score_type)
+            - entropy_from_values(sim_visual_b, args.score_type),
             "visual_top5_jaccard": jaccard(
                 topk_set(sim_visual_b, 5),
                 topk_set(sim_visual_l, 5),
@@ -571,16 +891,16 @@ def main():
                 topk_set(sim_visual_b, 20),
                 topk_set(sim_visual_l, 20),
             ),
-            "visual_center_shift": center_shift(sim_visual_b, sim_visual_l),
+            "visual_center_shift": center_shift(sim_visual_b, sim_visual_l, args.score_type),
             "visual_mean_abs_diff": float(np.mean(np.abs(visual_diff))),
             "visual_max_abs_diff": float(np.max(np.abs(visual_diff))),
 
-            "text_js": js_divergence(sim_text_b, sim_text_l),
-            "text_tv": tv_distance(sim_text_b, sim_text_l),
-            "text_entropy_base": entropy_from_scores(sim_text_b),
-            "text_entropy_low": entropy_from_scores(sim_text_l),
-            "text_entropy_delta": entropy_from_scores(sim_text_l)
-            - entropy_from_scores(sim_text_b),
+            "text_js": js_divergence_values(sim_text_b, sim_text_l, args.score_type),
+            "text_tv": tv_distance_values(sim_text_b, sim_text_l, args.score_type),
+            "text_entropy_base": entropy_from_values(sim_text_b, args.score_type),
+            "text_entropy_low": entropy_from_values(sim_text_l, args.score_type),
+            "text_entropy_delta": entropy_from_values(sim_text_l, args.score_type)
+            - entropy_from_values(sim_text_b, args.score_type),
             "text_top5_jaccard": jaccard(
                 topk_set(sim_text_b, 5),
                 topk_set(sim_text_l, 5),
@@ -593,13 +913,15 @@ def main():
             "text_max_abs_diff": float(np.max(np.abs(text_diff))),
         }
 
+        rec.update(image_text_mass(xb, xl, args))
+
         top_text_change = np.argsort(-np.abs(text_diff))[:10]
         rec["top_text_change"] = [
             {
                 "token_index": int(j),
-                "token": str(tokens_b[j]),
-                "sim_base": float(sim_text_b[j]),
-                "sim_low": float(sim_text_l[j]),
+                "token": str(tokens_b[j]) if j < len(tokens_b) else f"tok{j}",
+                "score_base": float(sim_text_b[j]),
+                "score_low": float(sim_text_l[j]),
                 "diff_low_minus_base": float(text_diff[j]),
             }
             for j in top_text_change
@@ -613,6 +935,7 @@ def main():
     print("mixed json:", len(mixed), mixed_json)
     print("base feature dir:", args.base_feature_dir)
     print("mixed feature dir:", args.mixed_feature_dir)
+    print("score type:", args.score_type)
 
     print("\n[GROUP COUNTS | selected weight = 0.5]")
     for k, v in groups.items():
@@ -649,9 +972,20 @@ def main():
         "text_max_abs_diff",
     ]
 
+    if args.score_type == "attention":
+        metrics += [
+            "visual_mass_base",
+            "visual_mass_low",
+            "visual_mass_delta",
+            "text_mass_base",
+            "text_mass_low",
+            "text_mass_delta",
+        ]
+
     summary = {
         "dataset": args.dataset,
         "option": args.option,
+        "score_type": args.score_type,
         "base_json": base_json,
         "mixed_json": mixed_json,
         "base_feature_dir": args.base_feature_dir,
@@ -667,7 +1001,7 @@ def main():
         summary["metrics"][g] = {}
 
         for m in metrics:
-            vals = [r[m] for r in rs]
+            vals = [r.get(m, None) for r in rs]
             mean_v = safe_mean(vals)
             median_v = safe_median(vals)
 
@@ -688,8 +1022,8 @@ def main():
     summary["direct_contrast_AminusB"] = {}
 
     for m in metrics:
-        av = safe_mean([r[m] for r in A])
-        bv = safe_mean([r[m] for r in B])
+        av = safe_mean([r.get(m, None) for r in A])
+        bv = safe_mean([r.get(m, None) for r in B])
         diff = None if av is None or bv is None else av - bv
 
         print(f"{m:26s} A={fmt(av)} B={fmt(bv)} A-B={fmt(diff)}")
@@ -702,11 +1036,11 @@ def main():
 
     records_path = os.path.join(
         args.out_dir,
-        "selected0p5_lastquery_similarity_records.json",
+        "selected0p5_lastquery_attention_records.json" if args.score_type == "attention" else "selected0p5_lastquery_similarity_records.json",
     )
     summary_path = os.path.join(
         args.out_dir,
-        "selected0p5_lastquery_similarity_summary.json",
+        "selected0p5_lastquery_attention_summary.json" if args.score_type == "attention" else "selected0p5_lastquery_similarity_summary.json",
     )
 
     with open(records_path, "w", encoding="utf-8") as f:
@@ -734,26 +1068,36 @@ def main():
             xb = np.load(r["base_feature_file"], allow_pickle=True)
             xl = np.load(r["low_feature_file"], allow_pickle=True)
 
+            suffix = "attention" if args.score_type == "attention" else "lastquery"
+
             visual_path = os.path.join(
                 visual_dir,
-                f"{label}_sid{r['sid']:04d}_lastquery_visual.png",
+                f"{label}_sid{r['sid']:04d}_{suffix}_visual.png",
             )
-            save_visual_heatmap(r, xb, xl, visual_path)
+            save_visual_heatmap(r, xb, xl, visual_path, args)
             print("[VISUAL FIG SAVED]", visual_path)
 
             text_csv_path = os.path.join(
                 text_csv_dir,
-                f"{label}_sid{r['sid']:04d}_lastquery_text.csv",
+                f"{label}_sid{r['sid']:04d}_{suffix}_text.csv",
             )
-            save_text_csv(r, xb, xl, text_csv_path)
+            save_text_csv(r, xb, xl, text_csv_path, args)
             print("[TEXT CSV SAVED]", text_csv_path)
 
             text_plot_path = os.path.join(
                 text_plot_dir,
-                f"{label}_sid{r['sid']:04d}_lastquery_text.png",
+                f"{label}_sid{r['sid']:04d}_{suffix}_text.png",
             )
-            save_text_plot(r, xb, xl, text_plot_path)
+            save_text_plot(r, xb, xl, text_plot_path, args)
             print("[TEXT PLOT SAVED]", text_plot_path)
+
+            if args.save_combined:
+                combined_path = os.path.join(
+                    combined_dir,
+                    f"{label}_sid{r['sid']:04d}_{suffix}_combined.png",
+                )
+                save_combined_plot(r, xb, xl, combined_path, args)
+                print("[COMBINED FIG SAVED]", combined_path)
 
     print("\n[DONE]")
 
