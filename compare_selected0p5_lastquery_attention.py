@@ -5,6 +5,7 @@ import math
 import csv
 import random
 import argparse
+from datetime import datetime
 from pathlib import Path
 from collections import OrderedDict
 
@@ -112,6 +113,55 @@ def parse_args():
         help="Debug only: generate features for at most this many selected sids.",
     )
 
+    parser.add_argument(
+        "--print-selected-info",
+        action="store_true",
+        default=True,
+        help="Print selected sid group/correctness/generation while generating attention features.",
+    )
+    parser.add_argument(
+        "--no-print-selected-info",
+        action="store_false",
+        dest="print_selected_info",
+    )
+    parser.add_argument(
+        "--gen-text-max-chars",
+        type=int,
+        default=180,
+        help="Max generation characters to print per sample when --print-selected-info is enabled.",
+    )
+
+    # Fresh end-to-end rerun. If enabled, this script does NOT read existing
+    # base/mixed eval JSONs. It re-generates base and mixed outputs first,
+    # computes correctness from the fresh generations, writes fresh JSONs, then
+    # generates attention features/figures from those fresh records.
+    parser.add_argument(
+        "--fresh-run",
+        action="store_true",
+        help="Re-run base/mixed generation inside this script instead of reading existing eval JSONs.",
+    )
+    parser.add_argument(
+        "--fresh-output-dir",
+        default=None,
+        help="Where to save fresh eval JSONs. Default: <out-dir>/fresh_eval_json.",
+    )
+    parser.add_argument("--fresh-tag", default="", help="Optional tag for fresh eval JSON filenames.")
+    parser.add_argument("--fresh-limit", type=int, default=-1, help="Debug: evaluate only first N samples.")
+    parser.add_argument("--max-new-tokens", type=int, default=100)
+    parser.add_argument("--threshold", type=float, default=0.4)
+    parser.add_argument("--base-weight", type=float, default=1.0)
+    parser.add_argument("--base-weight1", type=float, default=1.0)
+    parser.add_argument("--base-weight2", type=float, default=1.0)
+    parser.add_argument("--mixed-weight", type=float, default=1.0)
+    parser.add_argument("--mixed-weight1", type=float, default=0.5)
+    parser.add_argument("--mixed-weight2", type=float, default=1.5)
+    parser.add_argument(
+        "--print-fresh-every",
+        type=int,
+        default=1,
+        help="Print fresh generation/correctness every N samples. Use 0 to disable per-sample printing.",
+    )
+
     return parser.parse_args()
 
 
@@ -174,6 +224,23 @@ def correct(item):
     return bool(ok)
 
 
+def group_from_correctness(base_correct, low_correct):
+    if (not base_correct) and low_correct:
+        return "selected0p5_wrong_to_correct"
+    if base_correct and (not low_correct):
+        return "selected0p5_correct_to_wrong"
+    if base_correct and low_correct:
+        return "selected0p5_correct_to_correct"
+    return "selected0p5_wrong_to_wrong"
+
+
+def short_text(x, max_chars=180):
+    x = str(x).replace("\n", " ").replace("\r", " ").strip()
+    if max_chars is not None and max_chars > 0 and len(x) > max_chars:
+        return x[:max_chars] + "..."
+    return x
+
+
 def selected_weight(item):
     for k in ["selected_weight", "SelectedWeight", "FinalWeight", "final_weight"]:
         if k in item and item[k] not in [None, ""]:
@@ -211,19 +278,347 @@ def feature_file(feature_dir, sid, kind):
 
 
 
-def selected0p5_sids_for_generation(base, mixed, max_items=-1):
-    """Return unique sample ids where mixed selected_weight is 0.5."""
-    sids = []
+
+def raw_generation_correct(gold, gen):
+    gold = norm_gold(gold)
+    gen = str(gen)
+    ok = (gold in gen) or (gold.lower() in gen.lower())
+    if gold.lower() == "on" and "front" in gen.strip().lower():
+        ok = False
+    return bool(ok)
+
+
+def generation_scores(output):
+    if hasattr(output, "scores"):
+        return output.scores
+    if isinstance(output, dict):
+        return output.get("scores", None)
+    try:
+        return output["scores"]
+    except Exception:
+        return None
+
+
+def generation_sequences(output):
+    if hasattr(output, "sequences"):
+        return output.sequences
+    if isinstance(output, dict):
+        return output.get("sequences", None)
+    try:
+        return output["sequences"]
+    except Exception:
+        return None
+
+
+def first_step_confidence(output):
+    import torch
+    scores = generation_scores(output)
+    if scores is None or len(scores) == 0:
+        return None
+    s0 = scores[0]
+    # scores[0]: [batch, vocab]
+    prob = torch.nn.functional.softmax(s0, dim=-1)
+    return float(torch.max(prob[0]).detach().float().cpu())
+
+
+def decode_generated(processor, output, prompt_len):
+    seq = generation_sequences(output)
+    if seq is None:
+        return ""
+    return processor.decode(
+        seq[0][int(prompt_len):],
+        skip_special_tokens=True,
+    )
+
+
+def make_keys_from_input_ids(single_input, model=None):
+    import torch
+    image_token_index = getattr(getattr(model, "config", None), "image_token_index", None)
+    if image_token_index is None:
+        image_token_index = 32001
+    return [torch.where(input_id == int(image_token_index), 1, 0) for input_id in single_input["input_ids"]]
+
+
+def generate_with_optional_weight(model, single_input, keys=None, weight=None, max_new_tokens=100):
+    kwargs = dict(single_input)
+    kwargs.update({
+        "max_new_tokens": int(max_new_tokens),
+        "output_scores": True,
+        "return_dict_in_generate": True,
+    })
+    if keys is not None:
+        kwargs["keys"] = keys
+    if weight is not None:
+        kwargs["weight"] = float(weight)
+    return model.generate(**kwargs)
+
+
+def fresh_eval_json_paths(args):
+    fresh_dir = Path(args.fresh_output_dir) if args.fresh_output_dir else Path(args.out_dir) / "fresh_eval_json"
+    fresh_dir.mkdir(parents=True, exist_ok=True)
+    if args.fresh_tag.strip():
+        tag = args.fresh_tag.strip()
+    else:
+        tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    prefix = f"fresh_{args.dataset}_{args.method}_{args.option}option_thr{safe_float_tag_local(args.threshold)}_{tag}"
+    return (
+        fresh_dir / f"{prefix}_base_w1{safe_float_tag_local(args.base_weight1)}_w2{safe_float_tag_local(args.base_weight2)}.json",
+        fresh_dir / f"{prefix}_mixed_w1{safe_float_tag_local(args.mixed_weight1)}_w2{safe_float_tag_local(args.mixed_weight2)}.json",
+        fresh_dir / f"{prefix}_scores.json",
+    )
+
+
+def run_fresh_eval(args):
+    """Freshly run base/mixed generation and compute correctness.
+
+    This deliberately does not read existing eval JSONs. It creates new JSONs
+    from the model outputs produced in the current process, then the rest of
+    this script uses those in-memory records for selected_weight=0.5 grouping.
+    """
+    import torch
+    from torch.utils.data import DataLoader
+    from tqdm import tqdm
+    from model_zoo import get_model
+    from dataset_zoo import get_dataset
+    try:
+        from misc import _default_collate
+    except Exception:
+        _default_collate = None
+    try:
+        from model_zoo.llava15 import change_greedy_to_add_weight
+        change_greedy_to_add_weight()
+    except Exception as e:
+        print("[FRESH WARN] could not patch greedy search with weight support:", repr(e))
+
+    import save_llava_hidden_similarity_features as sf
+
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    base_json_path, mixed_json_path, score_json_path = fresh_eval_json_paths(args)
+
+    print("[FRESH LOAD MODEL]", args.model_name, args.method, args.device)
+    wrapper, image_preprocess = get_model(
+        args.model_name,
+        args.device,
+        args.method,
+        root_dir=args.root_dir,
+    )
+    wrapper.model.eval()
+
+    print("[FRESH LOAD DATASET]", args.dataset)
+    dataset = get_dataset(args.dataset, image_preprocess=image_preprocess, download=args.download)
+    collate_fn = _default_collate if image_preprocess is None else None
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_fn,
+    )
+
+    prompts, answers = sf.load_prompts(args.dataset, args.option)
+    base_records = []
+    mixed_records = []
+    base_correct_count = 0
+    mixed_correct_count = 0
+    selected0p5_count = 0
+    sid = 0
+
+    print("[FRESH RUN] not reading base/mixed JSON; generating now")
+    print(
+        f"[FRESH CONFIG] threshold={args.threshold} | "
+        f"base w1={args.base_weight1},w2={args.base_weight2} | "
+        f"mixed w1={args.mixed_weight1},w2={args.mixed_weight2}"
+    )
+
+    with torch.no_grad():
+        pbar = tqdm(loader, desc="fresh generation")
+        stop = False
+        for batch in pbar:
+            for i_option in batch["image_options"]:
+                for image in i_option:
+                    if args.fresh_limit > 0 and sid >= args.fresh_limit:
+                        stop = True
+                        break
+
+                    prompt = prompts[sid]
+                    gold = norm_gold(answers[sid])
+                    single_input = wrapper.processor(
+                        text=prompt,
+                        images=image,
+                        padding="max_length",
+                        return_tensors="pt",
+                        max_length=args.max_length,
+                    ).to(args.device)
+                    keys = make_keys_from_input_ids(single_input, wrapper.model)
+                    prompt_len = len(single_input["input_ids"][-1])
+
+                    # Base run: equivalent to w1=w2=1.0, but generated freshly here.
+                    base_output = generate_with_optional_weight(
+                        wrapper.model,
+                        single_input,
+                        keys=keys,
+                        weight=args.base_weight,
+                        max_new_tokens=args.max_new_tokens,
+                    )
+                    base_gen = decode_generated(wrapper.processor, base_output, prompt_len)
+                    base_conf = first_step_confidence(base_output)
+                    base_corr = raw_generation_correct(gold, base_gen)
+                    base_correct_count += int(base_corr)
+
+                    # Mixed/adaptive run: select 0.5 or 1.5 from the fresh base confidence.
+                    # This mirrors the repo's AdaptVis rule: uncertainty < threshold => weight1, else weight2.
+                    uncertainty = base_conf if base_conf is not None else 0.0
+                    selected_w = float(args.mixed_weight1) if float(uncertainty) < float(args.threshold) else float(args.mixed_weight2)
+                    if abs(selected_w - 0.5) <= 1e-6:
+                        selected0p5_count += 1
+
+                    mixed_output = generate_with_optional_weight(
+                        wrapper.model,
+                        single_input,
+                        keys=keys,
+                        weight=selected_w,
+                        max_new_tokens=args.max_new_tokens,
+                    )
+                    mixed_gen = decode_generated(wrapper.processor, mixed_output, prompt_len)
+                    mixed_corr = raw_generation_correct(gold, mixed_gen)
+                    mixed_correct_count += int(mixed_corr)
+
+                    base_rec = {
+                        "sample_id": int(sid),
+                        "Prompt": prompt,
+                        "Generation": base_gen,
+                        "RawGeneration": base_gen,
+                        "Golden": gold,
+                        "Correct": bool(base_corr),
+                        "RawGenerationCorrect": bool(base_corr),
+                        "method": args.method,
+                        "weight": float(args.base_weight),
+                        "weight1": float(args.base_weight1),
+                        "weight2": float(args.base_weight2),
+                        "threshold": float(args.threshold),
+                        "selected_weight": float(args.base_weight),
+                        "uncertainty": float(base_conf) if base_conf is not None else None,
+                        "fresh_run": True,
+                    }
+                    mixed_rec = {
+                        "sample_id": int(sid),
+                        "Prompt": prompt,
+                        "Generation": mixed_gen,
+                        "RawGeneration": mixed_gen,
+                        "Golden": gold,
+                        "Correct": bool(mixed_corr),
+                        "RawGenerationCorrect": bool(mixed_corr),
+                        "method": args.method,
+                        "weight": float(args.mixed_weight),
+                        "weight1": float(args.mixed_weight1),
+                        "weight2": float(args.mixed_weight2),
+                        "threshold": float(args.threshold),
+                        "selected_weight": float(selected_w),
+                        "uncertainty": float(uncertainty),
+                        "fresh_run": True,
+                    }
+                    base_records.append(base_rec)
+                    mixed_records.append(mixed_rec)
+
+                    group = group_from_correctness(base_corr, mixed_corr) if abs(selected_w - 0.5) <= 1e-6 else "not_selected0p5"
+                    if args.print_fresh_every > 0 and (sid % args.print_fresh_every == 0 or abs(selected_w - 0.5) <= 1e-6):
+                        print(
+                            f"\n[FRESH SAMPLE] sid={sid:04d} | selected_weight={selected_w} | "
+                            f"group={group} | gold={gold} | base_correct={base_corr} | mixed_correct={mixed_corr} | "
+                            f"conf={uncertainty:.6f}"
+                        )
+                        print("  base_generation :", short_text(base_gen, args.gen_text_max_chars))
+                        print("  mixed_generation:", short_text(mixed_gen, args.gen_text_max_chars))
+
+                    total = sid + 1
+                    pbar.set_postfix({
+                        "sid": sid,
+                        "base_acc": f"{base_correct_count / total:.3f}",
+                        "mixed_acc": f"{mixed_correct_count / total:.3f}",
+                        "sel0p5": selected0p5_count,
+                    })
+                    sid += 1
+
+                if stop:
+                    break
+            if stop:
+                break
+
+    with open(base_json_path, "w", encoding="utf-8") as f:
+        json.dump(base_records, f, ensure_ascii=False, indent=2)
+    with open(mixed_json_path, "w", encoding="utf-8") as f:
+        json.dump(mixed_records, f, ensure_ascii=False, indent=2)
+
+    n = max(len(base_records), 1)
+    score_summary = {
+        "fresh_run": True,
+        "base_json": str(base_json_path),
+        "mixed_json": str(mixed_json_path),
+        "num_total": len(base_records),
+        "base_acc": base_correct_count / n,
+        "mixed_acc": mixed_correct_count / n,
+        "base_num_correct": base_correct_count,
+        "mixed_num_correct": mixed_correct_count,
+        "selected0p5_count": selected0p5_count,
+        "threshold": float(args.threshold),
+        "base_weight": float(args.base_weight),
+        "mixed_weight1": float(args.mixed_weight1),
+        "mixed_weight2": float(args.mixed_weight2),
+    }
+    with open(score_json_path, "w", encoding="utf-8") as f:
+        json.dump(score_summary, f, ensure_ascii=False, indent=2)
+
+    print("\n[FRESH SAVED]")
+    print("base json:", base_json_path)
+    print("mixed json:", mixed_json_path)
+    print("score json:", score_json_path)
+    print(
+        f"[FRESH ACC] base={score_summary['base_acc']:.6f} "
+        f"mixed={score_summary['mixed_acc']:.6f} "
+        f"selected0p5={selected0p5_count}/{len(base_records)}"
+    )
+
+    return str(base_json_path), str(mixed_json_path), base_records, mixed_records
+
+def selected0p5_info_for_generation(base, mixed, max_items=-1):
+    """Return ordered sid -> info for samples where mixed selected_weight is 0.5."""
+    info = OrderedDict()
+
     for i in range(min(len(base), len(mixed))):
         sw = selected_weight(mixed[i])
         if sw is None or abs(sw - 0.5) > 1e-6:
             continue
-        sids.append(sid_of(i, base[i]))
 
-    sids = sorted(set(int(x) for x in sids))
+        sid = sid_of(i, base[i])
+        b_corr = correct(base[i])
+        l_corr = correct(mixed[i])
+        gold = norm_gold(base[i].get("Golden", base[i].get("gold", "")))
+        group = group_from_correctness(b_corr, l_corr)
+
+        info[int(sid)] = {
+            "sid": int(sid),
+            "group": group,
+            "gold": gold,
+            "selected_weight": float(sw),
+            "base_correct": bool(b_corr),
+            "low_correct": bool(l_corr),
+            "base_generation": gen_text(base[i]),
+            "low_generation": gen_text(mixed[i]),
+        }
+
     if max_items is not None and max_items > 0:
-        sids = sids[:max_items]
-    return sids
+        limited = OrderedDict()
+        for sid in list(info.keys())[:max_items]:
+            limited[sid] = info[sid]
+        info = limited
+
+    return info
+
+
+def selected0p5_sids_for_generation(base, mixed, max_items=-1):
+    """Return unique sample ids where mixed selected_weight is 0.5."""
+    return list(selected0p5_info_for_generation(base, mixed, max_items=max_items).keys())
 
 
 def expected_feature_path(feature_dir, sid, alpha):
@@ -258,7 +653,7 @@ def npz_has_attention(path, args):
         return False
 
 
-def generate_missing_attention_features(args, selected_sids):
+def generate_missing_attention_features(args, selected_sids, selected_info=None):
     """Generate base alpha=1.0 and low alpha=0.5 attention npz for selected sids.
 
     This keeps compare_selected0p5_lastquery_attention.py as a one-command script:
@@ -278,6 +673,7 @@ def generate_missing_attention_features(args, selected_sids):
         return
 
     selected_sids = sorted(set(int(s) for s in selected_sids))
+    selected_info = selected_info or {}
     if not selected_sids:
         print("[GENERATE] no selected_weight=0.5 sids; nothing to generate.")
         return
@@ -302,6 +698,15 @@ def generate_missing_attention_features(args, selected_sids):
     print(f"[GENERATE] pending sids: {len(pending)}")
     print(f"[GENERATE] base feature dir:  {args.base_feature_dir}")
     print(f"[GENERATE] mixed feature dir: {args.mixed_feature_dir}")
+
+    if args.print_selected_info and selected_info:
+        group_counts = OrderedDict()
+        for sid in selected_sids:
+            g = selected_info.get(int(sid), {}).get("group", "unknown")
+            group_counts[g] = group_counts.get(g, 0) + 1
+        print("[GENERATE SELECTED GROUP COUNTS]")
+        for g, n in group_counts.items():
+            print(f"  {g}: {n}")
 
     import torch
     from torch.utils.data import DataLoader
@@ -374,6 +779,24 @@ def generate_missing_attention_features(args, selected_sids):
 
                         if sid not in pending:
                             continue
+
+                        if args.print_selected_info and selected_info and int(sid) in selected_info:
+                            info = selected_info[int(sid)]
+                            print(
+                                f"\n[SELECTED] sid={sid:04d} | group={info.get('group')} | "
+                                f"gold={info.get('gold')} | "
+                                f"base_correct={info.get('base_correct')} | "
+                                f"low_correct={info.get('low_correct')} | "
+                                f"selected_weight={info.get('selected_weight')}"
+                            )
+                            print(
+                                "  base_generation:",
+                                short_text(info.get("base_generation", ""), args.gen_text_max_chars),
+                            )
+                            print(
+                                "  low_generation :",
+                                short_text(info.get("low_generation", ""), args.gen_text_max_chars),
+                            )
 
                         prompt = prompts[sid]
                         gold = answers[sid]
@@ -566,6 +989,14 @@ def generate_missing_attention_features(args, selected_sids):
                                 "hidden_dim": int(last_hidden.shape[-1]),
                                 "attn_keys": True,
                             }
+                            if selected_info and int(sid) in selected_info:
+                                meta.update({
+                                    "group": selected_info[int(sid)].get("group"),
+                                    "base_correct": selected_info[int(sid)].get("base_correct"),
+                                    "low_correct": selected_info[int(sid)].get("low_correct"),
+                                    "base_generation": selected_info[int(sid)].get("base_generation"),
+                                    "low_generation": selected_info[int(sid)].get("low_generation"),
+                                })
                             meta_f = meta_handles[out_dir]
                             meta_f.write(json.dumps(meta, ensure_ascii=False) + "\n")
                             meta_f.flush()
@@ -1187,39 +1618,49 @@ def main():
     base_json = args.base_json
     mixed_json = args.mixed_json
 
-    if base_json is None:
-        base_json = find_one(
-            "BASE w1=w2=1",
-            [
-                f"output/*{args.dataset}*adapt_vis*w1_w11_w21_thr0p4_{args.option}option_{args.test_tag}.json",
-                f"output/*{args.dataset}*adapt_vis*w1_w11p0_w21p0_thr0p4_{args.option}option_{args.test_tag}.json",
-            ],
-        )
+    if args.fresh_run:
+        # Re-run generation now and use the freshly produced in-memory records.
+        # No existing base/mixed JSON is read in this branch.
+        base_json, mixed_json, base, mixed = run_fresh_eval(args)
+    else:
+        if base_json is None:
+            base_json = find_one(
+                "BASE w1=w2=1",
+                [
+                    f"output/*{args.dataset}*adapt_vis*w1_w11_w21_thr0p4_{args.option}option_{args.test_tag}.json",
+                    f"output/*{args.dataset}*adapt_vis*w1_w11p0_w21p0_thr0p4_{args.option}option_{args.test_tag}.json",
+                ],
+            )
 
-    if mixed_json is None:
-        mixed_json = find_one(
-            "MIXED w1=0.5,w2=1.5",
-            [
-                f"output/*{args.dataset}*adapt_vis*w1_w10p5_w21p5_thr0p4_{args.option}option_{args.test_tag}.json",
-            ],
-            exclude=(
-                "w1_w10p5_w20p5",
-                "w1_w11p5_w21p5",
-                "w1_w11_w21",
-                "w1_w11p0_w21p0",
-            ),
-        )
+        if mixed_json is None:
+            mixed_json = find_one(
+                "MIXED w1=0.5,w2=1.5",
+                [
+                    f"output/*{args.dataset}*adapt_vis*w1_w10p5_w21p5_thr0p4_{args.option}option_{args.test_tag}.json",
+                ],
+                exclude=(
+                    "w1_w10p5_w20p5",
+                    "w1_w11p5_w21p5",
+                    "w1_w11_w21",
+                    "w1_w11p0_w21p0",
+                ),
+            )
 
-    base = load_json(base_json)
-    mixed = load_json(mixed_json)
+        base = load_json(base_json)
+        mixed = load_json(mixed_json)
 
     if args.generate_features:
-        sids_to_generate = selected0p5_sids_for_generation(
+        selected_info = selected0p5_info_for_generation(
             base,
             mixed,
             max_items=args.generate_limit,
         )
-        generate_missing_attention_features(args, sids_to_generate)
+        sids_to_generate = list(selected_info.keys())
+        generate_missing_attention_features(
+            args,
+            sids_to_generate,
+            selected_info=selected_info,
+        )
 
     groups = OrderedDict(
         [
