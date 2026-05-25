@@ -55,6 +55,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return default
     return str(v).lower() in ["1", "true", "yes", "y", "on"]
 
+def _env_float(name: str, default: float) -> float:
+    v = os.environ.get(name, None)
+    if v is None or str(v).strip() == "":
+        return float(default)
+    return float(v)
+
+
 
 SAVE_ATTN = _env_bool("SAVE_ATTN", False)
 SAVE_ORI = _env_bool("SAVE_ORI", True)
@@ -62,16 +69,47 @@ SAVE_ORI = _env_bool("SAVE_ORI", True)
 
 def _adaptvis_variant_name(adjust_method: Optional[str] = None) -> str:
     """
-    Variants:
-      mul_img    : original, pre-softmax s_img = weight * s_img
-      add_img    : pre-softmax group suppression, s_img = s_img + weight
-      center_img : pre-softmax centered scaling, s_img = mean + weight * (s_img - mean)
-      prob_img   : post-softmax image mass suppression, p_img = weight * p_img then renorm
-      clip_img   : hard amplitude clipping toward zero, clamp(s_img, -a, a)
-      tanh_img   : smooth amplitude clipping toward zero, a * tanh(s_img / a)
-      softsign_img: softsign shrink toward zero, s_img / (1 + lambda * |s_img|)
+    Variant selection.
+
+    Safe default:
+      - no env set: mul_img, exactly original AdaptVis behavior.
+
+    Optional zero-shrink test:
+      export ZERO_SHRINK_VARIANT=tanh      # mul / clip / tanh / softsign
+      export ZERO_SHRINK_A=10.0            # for clip/tanh, larger = milder
+      export ZERO_SHRINK_LAMBDA=0.05       # for softsign, smaller = milder
+
+    ADAPTVIS_ATTENTION_VARIANT is still supported:
+      mul_img / add_img / center_img / prob_img / clip_img / tanh_img / softsign_img
     """
-    supported = {"mul_img", "add_img", "center_img", "prob_img", "clip_img", "tanh_img", "softsign_img"}
+    supported = {
+        "mul_img",
+        "add_img",
+        "center_img",
+        "prob_img",
+        "clip_img",
+        "tanh_img",
+        "softsign_img",
+    }
+
+    zero_variant = os.environ.get("ZERO_SHRINK_VARIANT", "").strip().lower()
+    if zero_variant:
+        alias = {
+            "mul": "mul_img",
+            "mul_img": "mul_img",
+            "clip": "clip_img",
+            "clip_img": "clip_img",
+            "tanh": "tanh_img",
+            "tanh_img": "tanh_img",
+            "softsign": "softsign_img",
+            "softsign_img": "softsign_img",
+        }
+        if zero_variant not in alias:
+            raise ValueError(
+                f"Unknown ZERO_SHRINK_VARIANT={zero_variant}. "
+                f"Use mul/clip/tanh/softsign."
+            )
+        return alias[zero_variant]
 
     env_variant = os.environ.get("ADAPTVIS_ATTENTION_VARIANT", "").strip()
     if env_variant:
@@ -214,24 +252,32 @@ def _apply_adaptvis_pre_softmax_variant(
                 s_img_new = mu + weight * (s_img - mu)
 
             elif variant == "clip_img":
-                # Hard amplitude shrinkage toward zero:
+                # Safe hard amplitude shrinkage toward zero:
                 # s_img_new = clamp(s_img, -a, a)
-                # weight is a > 0.
-                a = max(abs(float(weight)), 1e-6)
+                #
+                # IMPORTANT:
+                #   a is read from ZERO_SHRINK_A, not from weight1.
+                #   This avoids accidentally using weight1=0.5 as a very strong clip.
+                #   Larger a = milder intervention. Start with a=10.0.
+                a = max(abs(_env_float("ZERO_SHRINK_A", 10.0)), 1e-6)
                 s_img_new = torch.clamp(s_img, min=-a, max=a)
 
             elif variant == "tanh_img":
-                # Smooth amplitude shrinkage toward zero:
+                # Safe smooth amplitude shrinkage toward zero:
                 # s_img_new = a * tanh(s_img / a)
-                # weight is a > 0.
-                a = max(abs(float(weight)), 1e-6)
+                #
+                # a is read from ZERO_SHRINK_A, not from weight1.
+                # Larger a = milder intervention. Start with a=10.0.
+                a = max(abs(_env_float("ZERO_SHRINK_A", 10.0)), 1e-6)
                 s_img_new = a * torch.tanh(s_img / a)
 
             elif variant == "softsign_img":
-                # Softsign amplitude shrinkage toward zero:
+                # Safe softsign amplitude shrinkage toward zero:
                 # s_img_new = s_img / (1 + lambda * |s_img|)
-                # weight is lambda >= 0.
-                lam = abs(float(weight))
+                #
+                # lambda is read from ZERO_SHRINK_LAMBDA, not from weight1.
+                # Smaller lambda = milder intervention. Start with lambda=0.05.
+                lam = max(abs(_env_float("ZERO_SHRINK_LAMBDA", 0.05)), 0.0)
                 s_img_new = s_img / (1.0 + lam * s_img.abs())
 
             else:
