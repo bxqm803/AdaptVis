@@ -49,8 +49,297 @@ logger = logging.get_logger(__name__)
 _CHECKPOINT_FOR_DOC = "llama-7b"
 _CONFIG_FOR_DOC = "LLaMAConfig"
 
-SAVE_ATTN=True
-SAVE_ORI=True
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name, None)
+    if v is None:
+        return default
+    return str(v).lower() in ["1", "true", "yes", "y", "on"]
+
+def _env_float(name: str, default: float) -> float:
+    v = os.environ.get(name, None)
+    if v is None or str(v).strip() == "":
+        return float(default)
+    return float(v)
+
+
+
+SAVE_ATTN = _env_bool("SAVE_ATTN", False)
+SAVE_ORI = _env_bool("SAVE_ORI", True)
+
+
+def _adaptvis_variant_name(adjust_method: Optional[str] = None) -> str:
+    """
+    Variant selection.
+
+    Safe default:
+      - no env set: mul_img, exactly original AdaptVis behavior.
+
+    Optional zero-shrink test:
+      export ZERO_SHRINK_VARIANT=tanh      # mul / clip / tanh / softsign
+      export ZERO_SHRINK_A=10.0            # for clip/tanh, larger = milder
+      export ZERO_SHRINK_LAMBDA=0.05       # for softsign, smaller = milder
+
+    ADAPTVIS_ATTENTION_VARIANT is still supported:
+      mul_img / add_img / center_img / prob_img / clip_img / tanh_img / softsign_img
+    """
+    supported = {
+        "mul_img",
+        "add_img",
+        "center_img",
+        "prob_img",
+        "clip_img",
+        "tanh_img",
+        "softsign_img",
+    }
+
+    zero_variant = os.environ.get("ZERO_SHRINK_VARIANT", "").strip().lower()
+    if zero_variant:
+        alias = {
+            "mul": "mul_img",
+            "mul_img": "mul_img",
+            "clip": "clip_img",
+            "clip_img": "clip_img",
+            "tanh": "tanh_img",
+            "tanh_img": "tanh_img",
+            "softsign": "softsign_img",
+            "softsign_img": "softsign_img",
+        }
+        if zero_variant not in alias:
+            raise ValueError(
+                f"Unknown ZERO_SHRINK_VARIANT={zero_variant}. "
+                f"Use mul/clip/tanh/softsign."
+            )
+        return alias[zero_variant]
+
+    env_variant = os.environ.get("ADAPTVIS_ATTENTION_VARIANT", "").strip()
+    if env_variant:
+        if env_variant not in supported:
+            raise ValueError(
+                f"Unknown ADAPTVIS_ATTENTION_VARIANT={env_variant}. "
+                f"Supported variants: {sorted(supported)}"
+            )
+        return env_variant
+
+    if adjust_method in supported:
+        return adjust_method
+
+    return "mul_img"
+
+
+def _normalize_keys_to_image_mask(
+    keys: Optional[torch.Tensor],
+    bsz: int,
+    kv_seq_len: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """
+    Normalize keys/image mask to shape [bsz, kv_seq_len].
+    keys marks image-token positions in the merged sequence.
+    """
+    if keys is None or not torch.is_tensor(keys):
+        return None
+
+    mask = keys
+
+    if mask.dim() == 1:
+        mask = mask.unsqueeze(0)
+    elif mask.dim() > 2:
+        mask = mask.view(mask.shape[0], -1)
+
+    if mask.shape[-1] != kv_seq_len:
+        return None
+
+    if mask.shape[0] == 1 and bsz > 1:
+        mask = mask.expand(bsz, -1)
+
+    if mask.shape[0] != bsz:
+        return None
+
+    return mask.to(device=device).bool()
+
+
+def _get_query_indices(q_len: int, caption_length: Optional[list], device: torch.device) -> torch.Tensor:
+    """
+    Keep original behavior:
+      - no caption_length: edit only last query row
+      - with caption_length: edit last len(caption_length[0]) query rows
+    """
+    if caption_length:
+        try:
+            first = caption_length[0]
+            if isinstance(first, (list, tuple)):
+                n_query = len(first)
+            else:
+                n_query = int(first)
+        except Exception:
+            n_query = 1
+
+        n_query = max(1, min(int(n_query), q_len))
+        return torch.arange(q_len - n_query, q_len, device=device, dtype=torch.long)
+
+    return torch.tensor([q_len - 1], device=device, dtype=torch.long)
+
+
+def _apply_adaptvis_pre_softmax_variant(
+    attn_logits: torch.Tensor,
+    image_key_mask: Optional[torch.Tensor],
+    query_indices: torch.Tensor,
+    weight: Optional[float],
+    adjust_method: Optional[str] = None,
+) -> torch.Tensor:
+    """
+    attn_logits: [bsz, num_heads, q_len, kv_len], pre-softmax attention logits.
+    image_key_mask: [bsz, kv_len], True for image tokens.
+    query_indices: query rows to modify.
+
+    mul_img:
+      s_img_new = alpha * s_img
+      This is original AdaptVis.
+
+    add_img:
+      s_img_new = s_img + beta
+      beta < 0 means group suppression of image logits.
+      Example: beta = log(0.5) = -0.69314718056.
+
+    center_img:
+      mu = mean(s_img)
+      s_img_new = mu + alpha * (s_img - mu)
+      This suppresses image-internal extremeness while keeping image mean unchanged.
+
+    prob_img:
+      no-op here. It is handled after softmax.
+
+    clip_img:
+      s_img_new = clamp(s_img, -a, a)
+
+    tanh_img:
+      s_img_new = a * tanh(s_img / a)
+
+    softsign_img:
+      s_img_new = s_img / (1 + lambda * |s_img|)
+    """
+    variant = _adaptvis_variant_name(adjust_method)
+
+    if variant == "prob_img":
+        return attn_logits
+
+    if image_key_mask is None:
+        return attn_logits
+
+    if weight is None:
+        weight = 1.0
+
+    weight = float(weight)
+    bsz = attn_logits.shape[0]
+
+    for b in range(bsz):
+        img_idx = image_key_mask[b].to(attn_logits.device).bool()
+        if img_idx.sum().item() == 0:
+            continue
+
+        for q in query_indices:
+            q_int = int(q.item())
+            s_img = attn_logits[b, :, q_int, img_idx]  # [num_heads, num_img_tokens]
+
+            if variant == "mul_img":
+                s_img_new = weight * s_img
+
+            elif variant == "add_img":
+                s_img_new = s_img + weight
+
+            elif variant == "center_img":
+                mu = s_img.mean(dim=-1, keepdim=True)
+                s_img_new = mu + weight * (s_img - mu)
+
+            elif variant == "clip_img":
+                # Safe hard amplitude shrinkage toward zero:
+                # s_img_new = clamp(s_img, -a, a)
+                #
+                # IMPORTANT:
+                #   a is read from ZERO_SHRINK_A, not from weight1.
+                #   This avoids accidentally using weight1=0.5 as a very strong clip.
+                #   Larger a = milder intervention. Start with a=10.0.
+                a = max(abs(_env_float("ZERO_SHRINK_A", 10.0)), 1e-6)
+                s_img_new = torch.clamp(s_img, min=-a, max=a)
+
+            elif variant == "tanh_img":
+                # Safe smooth amplitude shrinkage toward zero:
+                # s_img_new = a * tanh(s_img / a)
+                #
+                # a is read from ZERO_SHRINK_A, not from weight1.
+                # Larger a = milder intervention. Start with a=10.0.
+                a = max(abs(_env_float("ZERO_SHRINK_A", 10.0)), 1e-6)
+                s_img_new = a * torch.tanh(s_img / a)
+
+            elif variant == "softsign_img":
+                # Safe softsign amplitude shrinkage toward zero:
+                # s_img_new = s_img / (1 + lambda * |s_img|)
+                #
+                # lambda is read from ZERO_SHRINK_LAMBDA, not from weight1.
+                # Smaller lambda = milder intervention. Start with lambda=0.05.
+                lam = max(abs(_env_float("ZERO_SHRINK_LAMBDA", 0.05)), 0.0)
+                s_img_new = s_img / (1.0 + lam * s_img.abs())
+
+            else:
+                raise ValueError(
+                    f"Unknown AdaptVis variant={variant}. "
+                    f"Use mul_img/add_img/center_img/prob_img/clip_img/tanh_img/softsign_img."
+                )
+
+            attn_logits[b, :, q_int, img_idx] = s_img_new
+
+    return attn_logits
+
+
+def _apply_adaptvis_post_softmax_variant(
+    attn_probs: torch.Tensor,
+    image_key_mask: Optional[torch.Tensor],
+    query_indices: torch.Tensor,
+    weight: Optional[float],
+    adjust_method: Optional[str] = None,
+) -> torch.Tensor:
+    """
+    Only used for prob_img.
+
+    prob_img:
+      p_img_new = gamma * p_img
+      p_text_new = p_text
+      p_new = normalize([p_img_new, p_text_new])
+
+    This is equivalent to pre-softmax:
+      s_img += log(gamma)
+
+    It is NOT equivalent to original:
+      s_img *= alpha
+    """
+    variant = _adaptvis_variant_name(adjust_method)
+
+    if variant != "prob_img":
+        return attn_probs
+
+    if image_key_mask is None:
+        return attn_probs
+
+    if weight is None:
+        weight = 1.0
+
+    gamma = float(weight)
+    bsz = attn_probs.shape[0]
+
+    for b in range(bsz):
+        img_idx = image_key_mask[b].to(attn_probs.device).bool()
+        if img_idx.sum().item() == 0:
+            continue
+
+        for q in query_indices:
+            q_int = int(q.item())
+            attn_probs[b, :, q_int, img_idx] = gamma * attn_probs[b, :, q_int, img_idx]
+
+            denom = attn_probs[b, :, q_int, :].sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            attn_probs[b, :, q_int, :] = attn_probs[b, :, q_int, :] / denom
+
+    return attn_probs
+
 
 def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, past_key_values_length: int = 0):
     """
@@ -265,30 +554,57 @@ class LLaMAAttention(nn.Module):
         # pdb.set_trace()
         unchanged_attn_weights = attn_weights.clone()
 
-        ######ATTENTION#######
-        if idx<32:
-            if attn_weights.size()[2]==attn_weights.size()[3]:
-                true_indices = torch.where(keys)[True]
-                if len(true_indices) == 0:
-                    print("No True values found in index.")
+        # ------------------------------------------------------------------
+        # AdaptVis intervention variants.
+        #
+        # This keeps the original scope:
+        #   - only layers idx < 32
+        #   - only full prompt forward where q_len == kv_seq_len
+        #   - normally only last query row
+        #
+        # Variant is selected by:
+        #   export ADAPTVIS_ATTENTION_VARIANT=mul_img/add_img/center_img/prob_img/clip_img/tanh_img/softsign_img
+        # ------------------------------------------------------------------
+        start_idx, end_idx, square_size = -1, -1, -1
+        image_key_mask = None
+        query_indices = None
+
+        if idx is not None and idx < 32 and keys is not None and weight is not None:
+            if attn_weights.size()[2] == attn_weights.size()[3]:
+                image_key_mask = _normalize_keys_to_image_mask(
+                    keys=keys,
+                    bsz=bsz,
+                    kv_seq_len=kv_seq_len,
+                    device=attn_weights.device,
+                )
+
+                if image_key_mask is None:
+                    print("[AdaptVis] image_key_mask is None or shape mismatch; skipping.")
                 else:
-                    # pdb.set_trace()
-                    start_idx = true_indices[0].item()
-                    end_idx = true_indices[-1].item()
-                    square_size = end_idx - start_idx + 1
-                    mask = torch.zeros((attn_weights.size()[2], attn_weights.size()[2]), dtype=torch.bool)
-                    if caption_length:
-                        mask[-len(caption_length[0]):,start_idx:start_idx + square_size+1] = True
+                    true_indices = torch.where(image_key_mask[0])[0]
+
+                    if len(true_indices) == 0:
+                        print("[AdaptVis] No True values found in image_key_mask; skipping.")
                     else:
-                        mask[-1,start_idx:start_idx + square_size] = True
-                        # mask[start_idx:start_idx + square_size,start_idx:start_idx + square_size] = True
-                    # pdb.set_trace()
-                    # pdb.set_trace()
-                    attn_weights[:, :, mask] *= weight
-                    
+                        start_idx = true_indices[0].item()
+                        end_idx = true_indices[-1].item()
+                        square_size = end_idx - start_idx + 1
+
+                        query_indices = _get_query_indices(
+                            q_len=q_len,
+                            caption_length=caption_length,
+                            device=attn_weights.device,
+                        )
+
+                        attn_weights = _apply_adaptvis_pre_softmax_variant(
+                            attn_logits=attn_weights,
+                            image_key_mask=image_key_mask,
+                            query_indices=query_indices,
+                            weight=weight,
+                            adjust_method=adjust_method,
+                        )
             else:
-                # print("Not a square matrix, skipping. got size", attn_weights.size())
-                start_idx,end_idx,square_size = -1,-1,-1
+                start_idx, end_idx, square_size = -1, -1, -1
 
         if attention_mask is not None:
             if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
@@ -298,21 +614,90 @@ class LLaMAAttention(nn.Module):
             attn_weights = attn_weights + attention_mask
             attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        if SAVE_ATTN : # save the change in attention weights for analysis
+        # ------------------------------------------------------------------
+        # Convert logits to post-softmax attention probabilities.
+        #
+        # IMPORTANT:
+        #   `attn_weights` below is the FINAL attention actually used by the
+        #   forward pass:
+        #       1) optional AdaptVis pre-softmax intervention
+        #       2) causal / padding mask
+        #       3) softmax
+        #       4) optional AdaptVis post-softmax intervention for prob_img
+        #
+        # Therefore, when output_attentions=True, we return this final
+        # post-softmax attention instead of the unchanged/original attention.
+        # ------------------------------------------------------------------
+        attn_weights = nn.functional.softmax(
+            attn_weights,
+            dim=-1,
+            dtype=torch.float32,
+        ).to(query_states.dtype)
+
+        if (
+            idx is not None
+            and idx < 32
+            and keys is not None
+            and weight is not None
+            and image_key_mask is not None
+            and query_indices is not None
+        ):
+            attn_weights = _apply_adaptvis_post_softmax_variant(
+                attn_probs=attn_weights,
+                image_key_mask=image_key_mask,
+                query_indices=query_indices,
+                weight=weight,
+                adjust_method=adjust_method,
+            )
+
+        # This tensor is the post-softmax attention probability that will be
+        # used for value aggregation. It is the "true" attention map for the
+        # current forward pass.
+        final_postsoftmax_attn_weights = attn_weights
+
+        returned_attn_weights = final_postsoftmax_attn_weights if output_attentions else None
+
+        if SAVE_ATTN:
             save_path = os.getenv("SAVE_ATTN_PATH")
             if not save_path:
                 raise ValueError("SAVE_ATTN_PATH not set.")
-            unchanged_attn_weights = unchanged_attn_weights + attention_mask
-            unchanged_attn_weights = torch.max(unchanged_attn_weights, torch.tensor(torch.finfo(unchanged_attn_weights.dtype).min))
-            if SAVE_ORI:
-                ori=unchanged_attn_weights[:,:,-1,:]
-                # pdb.set_trace()
-                np.save(f"{save_path}diff_{idx}_start{start_idx}_end{end_idx}.npy", ori.cpu().detach().numpy())
 
-            unchanged_attn_weights = nn.functional.softmax(unchanged_attn_weights, dim=-1, dtype=torch.float32).to(
-                query_states.dtype)
+            os.makedirs(save_path, exist_ok=True)
+
+            # Save the final AdaptVis/ScalingVis attention used by this forward.
+            # Shape: [bsz, num_heads, kv_seq_len] for the last query row.
+            final_last_query = final_postsoftmax_attn_weights[:, :, -1, :].detach().float().cpu().numpy()
+            np.save(
+                os.path.join(save_path, f"final_postsoftmax_{idx}_start{start_idx}_end{end_idx}.npy"),
+                final_last_query,
+            )
+
+            if SAVE_ORI:
+                # Save the original post-softmax attention without AdaptVis
+                # intervention, for comparison only. This is NOT the attention
+                # used by the modified forward when weight != 1.
+                unchanged = unchanged_attn_weights
+
+                if attention_mask is not None:
+                    unchanged = unchanged + attention_mask
+                    min_value = torch.tensor(
+                        torch.finfo(unchanged.dtype).min,
+                        dtype=unchanged.dtype,
+                        device=unchanged.device,
+                    )
+                    unchanged = torch.max(unchanged, min_value)
+
+                ori_postsoftmax_attn_weights = nn.functional.softmax(
+                    unchanged,
+                    dim=-1,
+                    dtype=torch.float32,
+                ).to(query_states.dtype)
+
+                ori_last_query = ori_postsoftmax_attn_weights[:, :, -1, :].detach().float().cpu().numpy()
+                np.save(
+                    os.path.join(save_path, f"ori_postsoftmax_{idx}_start{start_idx}_end{end_idx}.npy"),
+                    ori_last_query,
+                )
 
         attn_weights = self.att_out(attn_weights)       
         value_states = self.value_out(value_states)
@@ -331,9 +716,9 @@ class LLaMAAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
-            attn_weights = None
+            returned_attn_weights = None
 
-        return attn_output, unchanged_attn_weights, past_key_value
+        return attn_output, returned_attn_weights, past_key_value
 
 
 class LLaMADecoderLayer(nn.Module):
