@@ -614,7 +614,20 @@ class LLaMAAttention(nn.Module):
             attn_weights = attn_weights + attention_mask
             attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
 
-        # upcast attention to fp32
+        # ------------------------------------------------------------------
+        # Convert logits to post-softmax attention probabilities.
+        #
+        # IMPORTANT:
+        #   `attn_weights` below is the FINAL attention actually used by the
+        #   forward pass:
+        #       1) optional AdaptVis pre-softmax intervention
+        #       2) causal / padding mask
+        #       3) softmax
+        #       4) optional AdaptVis post-softmax intervention for prob_img
+        #
+        # Therefore, when output_attentions=True, we return this final
+        # post-softmax attention instead of the unchanged/original attention.
+        # ------------------------------------------------------------------
         attn_weights = nn.functional.softmax(
             attn_weights,
             dim=-1,
@@ -637,39 +650,54 @@ class LLaMAAttention(nn.Module):
                 adjust_method=adjust_method,
             )
 
-        returned_attn_weights = None
+        # This tensor is the post-softmax attention probability that will be
+        # used for value aggregation. It is the "true" attention map for the
+        # current forward pass.
+        final_postsoftmax_attn_weights = attn_weights
 
-        if SAVE_ATTN or output_attentions:
-            unchanged = unchanged_attn_weights
+        returned_attn_weights = final_postsoftmax_attn_weights if output_attentions else None
 
-            if attention_mask is not None:
-                unchanged = unchanged + attention_mask
-                min_value = torch.tensor(
-                    torch.finfo(unchanged.dtype).min,
-                    dtype=unchanged.dtype,
-                    device=unchanged.device,
-                )
-                unchanged = torch.max(unchanged, min_value)
+        if SAVE_ATTN:
+            save_path = os.getenv("SAVE_ATTN_PATH")
+            if not save_path:
+                raise ValueError("SAVE_ATTN_PATH not set.")
 
-            if SAVE_ATTN:
-                save_path = os.getenv("SAVE_ATTN_PATH")
-                if not save_path:
-                    raise ValueError("SAVE_ATTN_PATH not set.")
+            os.makedirs(save_path, exist_ok=True)
 
-                os.makedirs(save_path, exist_ok=True)
+            # Save the final AdaptVis/ScalingVis attention used by this forward.
+            # Shape: [bsz, num_heads, kv_seq_len] for the last query row.
+            final_last_query = final_postsoftmax_attn_weights[:, :, -1, :].detach().float().cpu().numpy()
+            np.save(
+                os.path.join(save_path, f"final_postsoftmax_{idx}_start{start_idx}_end{end_idx}.npy"),
+                final_last_query,
+            )
 
-                if SAVE_ORI:
-                    ori = unchanged[:, :, -1, :]
-                    np.save(
-                        f"{save_path}diff_{idx}_start{start_idx}_end{end_idx}.npy",
-                        ori.cpu().detach().numpy(),
+            if SAVE_ORI:
+                # Save the original post-softmax attention without AdaptVis
+                # intervention, for comparison only. This is NOT the attention
+                # used by the modified forward when weight != 1.
+                unchanged = unchanged_attn_weights
+
+                if attention_mask is not None:
+                    unchanged = unchanged + attention_mask
+                    min_value = torch.tensor(
+                        torch.finfo(unchanged.dtype).min,
+                        dtype=unchanged.dtype,
+                        device=unchanged.device,
                     )
+                    unchanged = torch.max(unchanged, min_value)
 
-            returned_attn_weights = nn.functional.softmax(
-                unchanged,
-                dim=-1,
-                dtype=torch.float32,
-            ).to(query_states.dtype)
+                ori_postsoftmax_attn_weights = nn.functional.softmax(
+                    unchanged,
+                    dim=-1,
+                    dtype=torch.float32,
+                ).to(query_states.dtype)
+
+                ori_last_query = ori_postsoftmax_attn_weights[:, :, -1, :].detach().float().cpu().numpy()
+                np.save(
+                    os.path.join(save_path, f"ori_postsoftmax_{idx}_start{start_idx}_end{end_idx}.npy"),
+                    ori_last_query,
+                )
 
         attn_weights = self.att_out(attn_weights)       
         value_states = self.value_out(value_states)
