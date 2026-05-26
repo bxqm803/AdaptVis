@@ -62,6 +62,19 @@ def _env_float(name: str, default: float) -> float:
     return float(v)
 
 
+def _env_int_set(name: str):
+    """Parse a comma-separated integer set from an environment variable.
+
+    Empty / unset means None, which is used as "no filtering".
+    Example:
+      SAVE_IMG_LOGITS_LAYERS=0,1,2
+    """
+    v = os.environ.get(name, "").strip()
+    if not v:
+        return None
+    return {int(x) for x in v.split(",") if x.strip() != ""}
+
+
 def _adaptvis_layer_selected(idx: Optional[int]) -> bool:
     """Select which decoder layers receive the AdaptVis intervention.
 
@@ -111,6 +124,17 @@ def _adaptvis_layer_selected(idx: Optional[int]) -> bool:
 
 SAVE_ATTN = _env_bool("SAVE_ATTN", False)
 SAVE_ORI = _env_bool("SAVE_ORI", True)
+
+# Optional debug dump of pre-softmax image logits for selected layers.
+# This is useful for finding which image patches have negative attention logits
+# before / after AdaptVis-style interventions.
+#
+# Environment variables:
+#   SAVE_IMG_LOGITS=1
+#   SAVE_IMG_LOGITS_PATH=output/img_logits_raw_npz
+#   SAVE_IMG_LOGITS_LAYERS=0,1,2
+#   SAVE_IMG_LOGITS_TAG=sid0000_w1p0
+SAVE_IMG_LOGITS = _env_bool("SAVE_IMG_LOGITS", False)
 
 
 def _adaptvis_variant_name(adjust_method: Optional[str] = None) -> str:
@@ -754,6 +778,72 @@ class LLaMAAttention(nn.Module):
                             weight=weight,
                             adjust_method=adjust_method,
                         )
+
+                        # Optional: save pre-softmax image logits for debugging.
+                        #
+                        # ori_img_logits:
+                        #   image-token logits before AdaptVis intervention.
+                        #
+                        # edited_img_logits:
+                        #   image-token logits after the selected pre-softmax
+                        #   variant, before mask and softmax.
+                        #
+                        # Shape:
+                        #   [batch, num_heads, num_img_tokens]
+                        #
+                        # For current LLaVA-1.5 settings this is usually:
+                        #   [1, 32, 576]
+                        if SAVE_IMG_LOGITS and idx is not None:
+                            save_layers = _env_int_set("SAVE_IMG_LOGITS_LAYERS")
+                            if save_layers is None or int(idx) in save_layers:
+                                save_path = os.environ.get("SAVE_IMG_LOGITS_PATH", "")
+                                if save_path:
+                                    os.makedirs(save_path, exist_ok=True)
+
+                                    tag = os.environ.get("SAVE_IMG_LOGITS_TAG", "sample")
+                                    q_int = int(query_indices[-1].item())
+                                    img_indices = torch.where(
+                                        image_key_mask[0].to(attn_weights.device).bool()
+                                    )[0]
+
+                                    ori_img_logits = (
+                                        unchanged_attn_weights[:, :, q_int, img_indices]
+                                        .detach()
+                                        .float()
+                                        .cpu()
+                                        .numpy()
+                                    )
+
+                                    edited_img_logits = (
+                                        attn_weights[:, :, q_int, img_indices]
+                                        .detach()
+                                        .float()
+                                        .cpu()
+                                        .numpy()
+                                    )
+
+                                    np.savez_compressed(
+                                        os.path.join(
+                                            save_path,
+                                            f"{tag}_layer{int(idx):02d}_img_logits.npz",
+                                        ),
+                                        layer=np.array(int(idx), dtype=np.int32),
+                                        query_position=np.array(q_int, dtype=np.int32),
+                                        image_start=np.array(start_idx, dtype=np.int32),
+                                        image_end=np.array(end_idx + 1, dtype=np.int32),
+                                        num_img_tokens=np.array(
+                                            int(img_indices.numel()), dtype=np.int32
+                                        ),
+                                        image_indices=img_indices
+                                        .detach()
+                                        .cpu()
+                                        .numpy()
+                                        .astype(np.int32),
+                                        ori_img_logits=ori_img_logits.astype(np.float32),
+                                        edited_img_logits=edited_img_logits.astype(np.float32),
+                                        variant=np.array(_adaptvis_variant_name(adjust_method)),
+                                        weight=np.array(float(weight), dtype=np.float32),
+                                    )
             else:
                 start_idx, end_idx, square_size = -1, -1, -1
 
