@@ -44,7 +44,7 @@ def parse_args():
     # full: all layers
     # end=30: use layers 0..30, disable layer31
     # end=29: use layers 0..29, disable layer30..31
-    p.add_argument("--start-end-layer", type=int, default=1)
+    p.add_argument("--start-end-layer", type=int, default=13)
     p.add_argument("--stop-end-layer", type=int, default=0)
 
     p.add_argument(
