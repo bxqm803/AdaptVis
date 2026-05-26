@@ -128,6 +128,8 @@ def _adaptvis_variant_name(adjust_method: Optional[str] = None) -> str:
     ADAPTVIS_ATTENTION_VARIANT is still supported:
       mul_img / add_img / center_img / prob_img / clip_img / tanh_img / softsign_img
       posneg_mean_img / posneg_median_img
+      posonly_mean_img / posonly_median_img
+      negonly_mean_img / negonly_median_img
     """
     supported = {
         "mul_img",
@@ -139,6 +141,10 @@ def _adaptvis_variant_name(adjust_method: Optional[str] = None) -> str:
         "softsign_img",
         "posneg_mean_img",
         "posneg_median_img",
+        "posonly_mean_img",
+        "posonly_median_img",
+        "negonly_mean_img",
+        "negonly_median_img",
     }
 
     zero_variant = os.environ.get("ZERO_SHRINK_VARIANT", "").strip().lower()
@@ -335,21 +341,33 @@ def _apply_adaptvis_pre_softmax_variant(
                 lam = max(abs(_env_float("ZERO_SHRINK_LAMBDA", 0.05)), 0.0)
                 s_img_new = s_img / (1.0 + lam * s_img.abs())
 
-            elif variant in ["posneg_mean_img", "posneg_median_img"]:
-                # Per-sample, per-head, per-query sign-aware adaptive shrinkage.
+            elif variant in [
+                "posneg_mean_img",
+                "posneg_median_img",
+                "posonly_mean_img",
+                "posonly_median_img",
+                "negonly_mean_img",
+                "negonly_median_img",
+            ]:
+                # Per-sample, per-head, per-query adaptive shrinkage.
                 #
                 # Motivation:
                 #   Test whether the useful mechanism is "move image-token logits
                 #   toward zero" rather than the exact multiplicative rule
                 #   s_img_new = alpha * s_img.
                 #
-                # For positive image logits:
-                #   s_new = s - scale * stat_pos
+                # posneg_*:
+                #   positive image logits: s_new = s - scale * stat_pos
+                #   negative image logits: s_new = s - scale * stat_neg
+                #   Since stat_neg < 0, subtracting stat_neg moves negatives upward.
                 #
-                # For negative image logits:
-                #   s_new = s - scale * stat_neg
+                # posonly_*:
+                #   apply only the positive branch. This tests whether suppressing
+                #   over-positive visual peaks is sufficient.
                 #
-                # Since stat_neg < 0, subtracting stat_neg moves negative logits upward.
+                # negonly_*:
+                #   apply only the negative branch. This tests whether lifting
+                #   very negative visual logits toward zero is sufficient.
                 #
                 # scale = 1 - weight:
                 #   weight=1.0 -> scale=0, no-op for base
@@ -358,15 +376,20 @@ def _apply_adaptvis_pre_softmax_variant(
                 #
                 # Extra strength:
                 #   ADAPTVIS_POSNEG_STRENGTH=1.0 by default.
-                #   If weight=0.5 and strength=2.0, positives subtract about one full
-                #   positive statistic and negatives add about one full negative magnitude.
+                #   If weight=0.5 and strength=2.0, the active branch subtracts
+                #   about one full mean/median statistic.
                 #
                 # Clamp:
-                #   ADAPTVIS_POSNEG_CLAMP_ZERO=True by default, so shrinkage will not
-                #   cross zero. Set ADAPTVIS_POSNEG_CLAMP_ZERO=0 to test raw subtraction.
+                #   ADAPTVIS_POSNEG_CLAMP_ZERO=True by default, so shrinkage will
+                #   not cross zero. Set ADAPTVIS_POSNEG_CLAMP_ZERO=0 to test raw
+                #   subtraction.
                 strength = max(abs(_env_float("ADAPTVIS_POSNEG_STRENGTH", 1.0)), 0.0)
                 scale = (1.0 - float(weight)) * strength
                 clamp_zero = _env_bool("ADAPTVIS_POSNEG_CLAMP_ZERO", True)
+
+                use_mean = variant.endswith("mean_img")
+                do_pos = variant.startswith("posneg_") or variant.startswith("posonly_")
+                do_neg = variant.startswith("posneg_") or variant.startswith("negonly_")
 
                 s_img_new = s_img.clone()
 
@@ -378,12 +401,9 @@ def _apply_adaptvis_pre_softmax_variant(
                     pos_mask = v > 0
                     neg_mask = v < 0
 
-                    if pos_mask.any():
+                    if do_pos and pos_mask.any():
                         pos_vals = v[pos_mask]
-                        if variant == "posneg_mean_img":
-                            pos_stat = pos_vals.mean()
-                        else:
-                            pos_stat = pos_vals.median()
+                        pos_stat = pos_vals.mean() if use_mean else pos_vals.median()
 
                         out[pos_mask] = v[pos_mask] - scale * pos_stat
 
@@ -392,12 +412,9 @@ def _apply_adaptvis_pre_softmax_variant(
                         if clamp_zero and scale > 0:
                             out[pos_mask] = torch.clamp(out[pos_mask], min=0.0)
 
-                    if neg_mask.any():
+                    if do_neg and neg_mask.any():
                         neg_vals = v[neg_mask]
-                        if variant == "posneg_mean_img":
-                            neg_stat = neg_vals.mean()
-                        else:
-                            neg_stat = neg_vals.median()
+                        neg_stat = neg_vals.mean() if use_mean else neg_vals.median()
 
                         out[neg_mask] = v[neg_mask] - scale * neg_stat
 
@@ -412,7 +429,9 @@ def _apply_adaptvis_pre_softmax_variant(
                 raise ValueError(
                     f"Unknown AdaptVis variant={variant}. "
                     f"Use mul_img/add_img/center_img/prob_img/clip_img/tanh_img/"
-                    f"softsign_img/posneg_mean_img/posneg_median_img."
+                    f"softsign_img/posneg_mean_img/posneg_median_img/"
+                    f"posonly_mean_img/posonly_median_img/"
+                    f"negonly_mean_img/negonly_median_img."
                 )
 
             attn_logits[b, :, q_int, img_idx] = s_img_new
@@ -694,6 +713,8 @@ class LLaMAAttention(nn.Module):
         # Variant is selected by:
         #   export ADAPTVIS_ATTENTION_VARIANT=mul_img/add_img/center_img/prob_img/clip_img/tanh_img/softsign_img
         #   export ADAPTVIS_ATTENTION_VARIANT=posneg_mean_img/posneg_median_img
+        #   export ADAPTVIS_ATTENTION_VARIANT=posonly_mean_img/posonly_median_img
+        #   export ADAPTVIS_ATTENTION_VARIANT=negonly_mean_img/negonly_median_img
         # ------------------------------------------------------------------
         start_idx, end_idx, square_size = -1, -1, -1
         image_key_mask = None
