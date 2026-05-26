@@ -121,6 +121,69 @@ def _adaptvis_layer_selected(idx: Optional[int]) -> bool:
     raise ValueError(f"Unknown ADAPTVIS_LAYER_MODE={mode}")
 
 
+def _adaptvis_parse_head_pairs(spec: str):
+    """Parse ADAPTVIS_HEADS like "0:7,1:12,2:3" into {(0,7), ...}."""
+    pairs = set()
+    spec = (spec or "").strip()
+    if not spec:
+        return pairs
+
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(
+                f"Invalid ADAPTVIS_HEADS item={item!r}. "
+                "Expected format layer:head, e.g. 0:7,1:12."
+            )
+        layer_s, head_s = item.split(":", 1)
+        pairs.add((int(layer_s), int(head_s)))
+
+    return pairs
+
+
+def _adaptvis_head_selected(layer_idx: Optional[int], head_idx: int) -> bool:
+    """Select which layer/head pairs receive the AdaptVis intervention.
+
+    Default behavior is unchanged: every head in selected layers is edited.
+
+    Environment controls:
+      ADAPTVIS_HEAD_MODE=all       # default, all heads
+      ADAPTVIS_HEAD_MODE=only      # only pairs in ADAPTVIS_HEADS
+      ADAPTVIS_HEAD_MODE=except    # all except pairs in ADAPTVIS_HEADS
+
+    ADAPTVIS_HEADS format:
+      "0:7,1:12,2:3" means layer0-head7, layer1-head12, layer2-head3.
+    """
+    if layer_idx is None:
+        return True
+
+    mode = os.environ.get("ADAPTVIS_HEAD_MODE", "all").strip().lower()
+    if mode == "all" or mode == "":
+        return True
+
+    pairs = _adaptvis_parse_head_pairs(os.environ.get("ADAPTVIS_HEADS", ""))
+    pair = (int(layer_idx), int(head_idx))
+
+    if mode == "only":
+        return pair in pairs
+
+    if mode == "except":
+        return pair not in pairs
+
+    raise ValueError(f"Unknown ADAPTVIS_HEAD_MODE={mode}")
+
+
+def _adaptvis_head_mask(layer_idx: Optional[int], num_heads: int, device: torch.device) -> torch.Tensor:
+    """Boolean mask of shape [num_heads] for selected heads."""
+    return torch.tensor(
+        [_adaptvis_head_selected(layer_idx, h) for h in range(int(num_heads))],
+        dtype=torch.bool,
+        device=device,
+    )
+
+
 
 SAVE_ATTN = _env_bool("SAVE_ATTN", False)
 SAVE_ORI = _env_bool("SAVE_ORI", True)
@@ -265,6 +328,7 @@ def _apply_adaptvis_pre_softmax_variant(
     query_indices: torch.Tensor,
     weight: Optional[float],
     adjust_method: Optional[str] = None,
+    layer_idx: Optional[int] = None,
 ) -> torch.Tensor:
     """
     attn_logits: [bsz, num_heads, q_len, kv_len], pre-softmax attention logits.
@@ -325,6 +389,13 @@ def _apply_adaptvis_pre_softmax_variant(
         for q in query_indices:
             q_int = int(q.item())
             s_img = attn_logits[b, :, q_int, img_idx]  # [num_heads, num_img_tokens]
+            head_mask = _adaptvis_head_mask(
+                layer_idx=layer_idx,
+                num_heads=s_img.shape[0],
+                device=s_img.device,
+            )
+            if not bool(head_mask.any().item()):
+                continue
 
             if variant == "mul_img":
                 s_img_new = weight * s_img
@@ -419,6 +490,8 @@ def _apply_adaptvis_pre_softmax_variant(
 
                 # s_img: [num_heads, num_img_tokens]
                 for h in range(s_img.shape[0]):
+                    if not bool(head_mask[h].item()):
+                        continue
                     v = s_img[h]
                     out = v.clone()
 
@@ -458,6 +531,12 @@ def _apply_adaptvis_pre_softmax_variant(
                     f"negonly_mean_img/negonly_median_img."
                 )
 
+            # Keep unselected heads unchanged. This makes head ablations causal:
+            # ADAPTVIS_HEAD_MODE=except with ADAPTVIS_HEADS=l:h removes only that
+            # layer/head pair from the intervention, without changing other heads.
+            if not bool(head_mask.all().item()):
+                s_img_new = torch.where(head_mask[:, None], s_img_new, s_img)
+
             attn_logits[b, :, q_int, img_idx] = s_img_new
 
     return attn_logits
@@ -469,6 +548,7 @@ def _apply_adaptvis_post_softmax_variant(
     query_indices: torch.Tensor,
     weight: Optional[float],
     adjust_method: Optional[str] = None,
+    layer_idx: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Only used for prob_img.
@@ -503,12 +583,20 @@ def _apply_adaptvis_post_softmax_variant(
         if img_idx.sum().item() == 0:
             continue
 
+        head_mask = _adaptvis_head_mask(
+            layer_idx=layer_idx,
+            num_heads=attn_probs.shape[1],
+            device=attn_probs.device,
+        )
+        if not bool(head_mask.any().item()):
+            continue
+
         for q in query_indices:
             q_int = int(q.item())
-            attn_probs[b, :, q_int, img_idx] = gamma * attn_probs[b, :, q_int, img_idx]
+            attn_probs[b, head_mask, q_int, img_idx] = gamma * attn_probs[b, head_mask, q_int, img_idx]
 
-            denom = attn_probs[b, :, q_int, :].sum(dim=-1, keepdim=True).clamp_min(1e-12)
-            attn_probs[b, :, q_int, :] = attn_probs[b, :, q_int, :] / denom
+            denom = attn_probs[b, head_mask, q_int, :].sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            attn_probs[b, head_mask, q_int, :] = attn_probs[b, head_mask, q_int, :] / denom
 
     return attn_probs
 
@@ -739,6 +827,12 @@ class LLaMAAttention(nn.Module):
         #   export ADAPTVIS_ATTENTION_VARIANT=posneg_mean_img/posneg_median_img
         #   export ADAPTVIS_ATTENTION_VARIANT=posonly_mean_img/posonly_median_img
         #   export ADAPTVIS_ATTENTION_VARIANT=negonly_mean_img/negonly_median_img
+        #
+        # Head ablation controls:
+        #   export ADAPTVIS_HEAD_MODE=all       # default
+        #   export ADAPTVIS_HEAD_MODE=only      # only layer:head pairs in ADAPTVIS_HEADS
+        #   export ADAPTVIS_HEAD_MODE=except    # all except layer:head pairs in ADAPTVIS_HEADS
+        #   export ADAPTVIS_HEADS=0:7,1:12
         # ------------------------------------------------------------------
         start_idx, end_idx, square_size = -1, -1, -1
         image_key_mask = None
@@ -777,6 +871,7 @@ class LLaMAAttention(nn.Module):
                             query_indices=query_indices,
                             weight=weight,
                             adjust_method=adjust_method,
+                            layer_idx=idx,
                         )
 
                         # Optional: save pre-softmax image logits for debugging.
@@ -888,6 +983,7 @@ class LLaMAAttention(nn.Module):
                 query_indices=query_indices,
                 weight=weight,
                 adjust_method=adjust_method,
+                layer_idx=idx,
             )
 
         # This tensor is the post-softmax attention probability that will be
