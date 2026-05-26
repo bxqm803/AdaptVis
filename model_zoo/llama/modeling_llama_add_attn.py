@@ -62,6 +62,52 @@ def _env_float(name: str, default: float) -> float:
     return float(v)
 
 
+def _adaptvis_layer_selected(idx: Optional[int]) -> bool:
+    """Select which decoder layers receive the AdaptVis intervention.
+
+    Default behavior is unchanged: all 32 layers are edited.
+
+    Environment controls:
+      ADAPTVIS_LAYER_MODE=all          # layers [0, num_layers-1], default
+      ADAPTVIS_LAYER_MODE=no_last      # layers [0, num_layers-2]
+      ADAPTVIS_LAYER_MODE=except_last  # alias of no_last
+      ADAPTVIS_LAYER_MODE=last         # only the last layer
+      ADAPTVIS_LAYER_MODE=range        # ADAPTVIS_LAYER_START..ADAPTVIS_LAYER_END inclusive
+      ADAPTVIS_LAYER_MODE=list         # comma list in ADAPTVIS_LAYERS, e.g. 0,4,12,31
+
+    Optional:
+      ADAPTVIS_NUM_LAYERS=32
+      ADAPTVIS_LAST_LAYER=31           # used by mode=last
+    """
+    if idx is None:
+        return False
+
+    mode = os.environ.get("ADAPTVIS_LAYER_MODE", "all").strip().lower()
+    num_layers = int(os.environ.get("ADAPTVIS_NUM_LAYERS", "32"))
+
+    if mode == "all":
+        return 0 <= int(idx) < num_layers
+
+    if mode in ["no_last", "except_last"]:
+        return 0 <= int(idx) < max(num_layers - 1, 0)
+
+    if mode == "last":
+        last_layer = int(os.environ.get("ADAPTVIS_LAST_LAYER", str(num_layers - 1)))
+        return int(idx) == last_layer
+
+    if mode == "range":
+        start = int(os.environ.get("ADAPTVIS_LAYER_START", "0"))
+        end = int(os.environ.get("ADAPTVIS_LAYER_END", str(num_layers - 1)))
+        return start <= int(idx) <= end
+
+    if mode == "list":
+        layers = os.environ.get("ADAPTVIS_LAYERS", "")
+        selected = {int(x) for x in layers.split(",") if x.strip() != ""}
+        return int(idx) in selected
+
+    raise ValueError(f"Unknown ADAPTVIS_LAYER_MODE={mode}")
+
+
 
 SAVE_ATTN = _env_bool("SAVE_ATTN", False)
 SAVE_ORI = _env_bool("SAVE_ORI", True)
@@ -558,7 +604,7 @@ class LLaMAAttention(nn.Module):
         # AdaptVis intervention variants.
         #
         # This keeps the original scope:
-        #   - only layers idx < 32
+        #   - selected by ADAPTVIS_LAYER_MODE; default is all 32 layers
         #   - only full prompt forward where q_len == kv_seq_len
         #   - normally only last query row
         #
@@ -569,7 +615,7 @@ class LLaMAAttention(nn.Module):
         image_key_mask = None
         query_indices = None
 
-        if idx is not None and idx < 32 and keys is not None and weight is not None:
+        if _adaptvis_layer_selected(idx) and keys is not None and weight is not None:
             if attn_weights.size()[2] == attn_weights.size()[3]:
                 image_key_mask = _normalize_keys_to_image_mask(
                     keys=keys,
@@ -635,8 +681,7 @@ class LLaMAAttention(nn.Module):
         ).to(query_states.dtype)
 
         if (
-            idx is not None
-            and idx < 32
+            _adaptvis_layer_selected(idx)
             and keys is not None
             and weight is not None
             and image_key_mask is not None
