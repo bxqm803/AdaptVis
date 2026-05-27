@@ -17,14 +17,133 @@ except Exception:
 import save_llava_hidden_similarity_features as sf
 
 
-COMBOS = [
-    ("except", "13", "except_13"),
-    ("except", "13,14,15", "except_13_14_15"),
-    ("except", "12,13,14,15", "except_12_13_14_15"),
-    ("except", "9,10,12,13,14,15", "except_9_10_12_13_14_15"),
-    ("only", "0,1,2,3,6,7", "only_0_1_2_3_6_7"),
-    ("only", "0,1,2,3,7", "only_0_1_2_3_7"),
-]
+def _block_id(r, c, grid=4):
+    return r * grid + c
+
+
+def _blocks(rows, cols, grid=4):
+    return ",".join(str(_block_id(r, c, grid)) for r in rows for c in cols)
+
+
+def _add_combo(combos, mode, blocks, name):
+    combos.append((mode, blocks, name))
+
+
+def build_combos(grid=4):
+    """
+    Build systematic patch-block combinations for a 4x4 block grid.
+
+    mode="only": only blocks in ADAPTVIS_PATCH_BLOCKS receive intervention.
+    mode="except": all blocks receive intervention except listed blocks.
+
+    4x4 block layout:
+        00 01 02 03
+        04 05 06 07
+        08 09 10 11
+        12 13 14 15
+    """
+    if grid != 4:
+        raise ValueError("This combo generator currently expects --patch-grid 4.")
+
+    combos = []
+
+    # Rows
+    for r, name in [(0, "row0_top"), (1, "row1"), (2, "row2"), (3, "row3_bottom")]:
+        bs = _blocks([r], [0, 1, 2, 3], grid)
+        _add_combo(combos, "only", bs, f"only_{name}")
+        _add_combo(combos, "except", bs, f"except_{name}")
+
+    # Columns
+    for c, name in [(0, "col0_left"), (1, "col1"), (2, "col2"), (3, "col3_right")]:
+        bs = _blocks([0, 1, 2, 3], [c], grid)
+        _add_combo(combos, "only", bs, f"only_{name}")
+        _add_combo(combos, "except", bs, f"except_{name}")
+
+    # Halves
+    half_specs = [
+        ("upper_half", [0, 1], [0, 1, 2, 3]),
+        ("lower_half", [2, 3], [0, 1, 2, 3]),
+        ("left_half", [0, 1, 2, 3], [0, 1]),
+        ("right_half", [0, 1, 2, 3], [2, 3]),
+    ]
+    for name, rows, cols in half_specs:
+        bs = _blocks(rows, cols, grid)
+        _add_combo(combos, "only", bs, f"only_{name}")
+        _add_combo(combos, "except", bs, f"except_{name}")
+
+    # Quadrants
+    quad_specs = [
+        ("upper_left", [0, 1], [0, 1]),
+        ("upper_right", [0, 1], [2, 3]),
+        ("lower_left", [2, 3], [0, 1]),
+        ("lower_right", [2, 3], [2, 3]),
+    ]
+    for name, rows, cols in quad_specs:
+        bs = _blocks(rows, cols, grid)
+        _add_combo(combos, "only", bs, f"only_{name}")
+        _add_combo(combos, "except", bs, f"except_{name}")
+
+    # Center / border / corners
+    special_specs = [
+        ("center_2x2", "5,6,9,10"),
+        ("corners", "0,3,12,15"),
+        ("border", "0,1,2,3,4,7,8,11,12,13,14,15"),
+    ]
+    for name, bs in special_specs:
+        _add_combo(combos, "only", bs, f"only_{name}")
+        _add_combo(combos, "except", bs, f"except_{name}")
+
+    # All contiguous 2x2 blocks
+    for r in range(3):
+        for c in range(3):
+            bs = _blocks([r, r + 1], [c, c + 1], grid)
+            _add_combo(combos, "only", bs, f"only_2x2_r{r}_c{c}")
+            _add_combo(combos, "except", bs, f"except_2x2_r{r}_c{c}")
+
+    # Horizontal 2-row bands and vertical 2-column bands
+    for r in range(3):
+        bs = _blocks([r, r + 1], [0, 1, 2, 3], grid)
+        _add_combo(combos, "only", bs, f"only_2row_band_r{r}_{r + 1}")
+        _add_combo(combos, "except", bs, f"except_2row_band_r{r}_{r + 1}")
+
+    for c in range(3):
+        bs = _blocks([0, 1, 2, 3], [c, c + 1], grid)
+        _add_combo(combos, "only", bs, f"only_2col_band_c{c}_{c + 1}")
+        _add_combo(combos, "except", bs, f"except_2col_band_c{c}_{c + 1}")
+
+    # 3x3 large regions
+    for r in range(2):
+        for c in range(2):
+            bs = _blocks([r, r + 1, r + 2], [c, c + 1, c + 2], grid)
+            _add_combo(combos, "only", bs, f"only_3x3_r{r}_c{c}")
+            _add_combo(combos, "except", bs, f"except_3x3_r{r}_c{c}")
+
+    # Diagonal / anti-diagonal
+    diagonal_specs = [
+        ("main_diag", "0,5,10,15"),
+        ("anti_diag", "3,6,9,12"),
+    ]
+    for name, bs in diagonal_specs:
+        _add_combo(combos, "only", bs, f"only_{name}")
+        _add_combo(combos, "except", bs, f"except_{name}")
+
+    # Asymmetric sparse groups worth probing
+    manual_specs = [
+        ("top_center_pair", "1,2"),
+        ("upper_center_2x2", "1,2,5,6"),
+        ("upper_right_center", "1,2,6,7"),
+        ("toprow_plus_right_mid", "0,1,2,3,6,7"),
+        ("upper_two_rows", "0,1,2,3,4,5,6,7"),
+        ("bottom_row", "12,13,14,15"),
+        ("lower_center_and_bottom", "9,10,11,12,13,14,15"),
+        ("lower_two_rows", "8,9,10,11,12,13,14,15"),
+        ("lower_center_bottom_no_edges", "9,10,12,13,14,15"),
+    ]
+    for name, bs in manual_specs:
+        _add_combo(combos, "only", bs, f"only_{name}")
+        _add_combo(combos, "except", bs, f"except_{name}")
+
+    return combos
 
 
 def parse_args():
@@ -49,7 +168,7 @@ def parse_args():
     p.add_argument("--max-new-tokens", type=int, default=100)
     p.add_argument("--fresh-limit", type=int, default=-1)
 
-    p.add_argument("--out-csv", default="output/block_combo_once_summary.csv")
+    p.add_argument("--out-csv", default="output/block_combo_once_expanded_summary.csv")
     return p.parse_args()
 
 
@@ -233,6 +352,7 @@ def compare_groups(base_records, mixed_records):
     for r in mixed_records:
         sid = int(r["sample_id"])
         b = base_by_sid[sid]
+
         b_corr = bool(b["correct"])
         m_corr = bool(r["correct"])
         sw = float(r["selected_weight"])
@@ -265,8 +385,14 @@ def compare_groups(base_records, mixed_records):
 def main():
     args = parse_args()
     os.makedirs(os.path.dirname(args.out_csv), exist_ok=True)
-
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    combos = build_combos(args.patch_grid)
+    print("[NUM COMBOS]", len(combos))
+    print("[VARIANT]", args.variant)
+    print("[LAYERS]", args.layers)
+    print("[PATCH_GRID]", args.patch_grid)
+    print("[OUT CSV]", args.out_csv)
 
     change_greedy_to_add_weight()
 
@@ -294,25 +420,32 @@ def main():
 
     prompts, answers = sf.load_prompts(args.dataset, args.option)
 
-    # base only once
+    # Base only once. selected_w=1.0, so AdaptVis variants should be no-op.
     set_env_for_mode(args, patch_mode="all", patch_blocks="")
     base_summary, base_records = run_pass(
-        args, wrapper, make_loader(), prompts, answers,
+        args,
+        wrapper,
+        make_loader(),
+        prompts,
+        answers,
         mode_name="base",
         base_records=None,
     )
 
-    # full all blocks once
+    # Full all-block intervention once.
     set_env_for_mode(args, patch_mode="all", patch_blocks="")
     full_summary, full_records = run_pass(
-        args, wrapper, make_loader(), prompts, answers,
+        args,
+        wrapper,
+        make_loader(),
+        prompts,
+        answers,
         mode_name="full_all_blocks",
         base_records=base_records,
     )
     full_stats = compare_groups(base_records, full_records)
 
     rows = []
-
     rows.append({
         "mode": "base",
         "patch_mode": "",
@@ -355,12 +488,16 @@ def main():
         "drop_selected0p5_net_gain_from_full": 0,
     })
 
-    # combos: no base rerun
-    for patch_mode, patch_blocks, name in COMBOS:
+    # Combos: no base rerun.
+    for patch_mode, patch_blocks, name in combos:
         set_env_for_mode(args, patch_mode=patch_mode, patch_blocks=patch_blocks)
 
         combo_summary, combo_records = run_pass(
-            args, wrapper, make_loader(), prompts, answers,
+            args,
+            wrapper,
+            make_loader(),
+            prompts,
+            answers,
             mode_name=name,
             base_records=base_records,
         )
@@ -384,7 +521,9 @@ def main():
             "drop_net_gain_from_full": full_stats["net_gain"] - combo_stats["net_gain"],
             "full_selected0p5_net_gain": full_stats["selected0p5_net_gain"],
             "combo_selected0p5_net_gain": combo_stats["selected0p5_net_gain"],
-            "drop_selected0p5_net_gain_from_full": full_stats["selected0p5_net_gain"] - combo_stats["selected0p5_net_gain"],
+            "drop_selected0p5_net_gain_from_full": (
+                full_stats["selected0p5_net_gain"] - combo_stats["selected0p5_net_gain"]
+            ),
         }
         rows.append(row)
         print("[ROW]", row)
