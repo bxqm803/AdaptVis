@@ -184,6 +184,85 @@ def _adaptvis_head_mask(layer_idx: Optional[int], num_heads: int, device: torch.
     )
 
 
+def _adaptvis_parse_int_set(spec: str):
+    """Parse comma-separated integers, e.g. "0,3,15"."""
+    vals = set()
+    spec = (spec or "").strip()
+    if not spec:
+        return vals
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        vals.add(int(item))
+    return vals
+
+
+def _adaptvis_patch_block_mask(num_img_tokens: int, device: torch.device) -> torch.Tensor:
+    """Boolean mask over image patch positions that should receive intervention.
+
+    This is for patch/block ablations on the image-token dimension.
+
+    Environment controls:
+      ADAPTVIS_PATCH_BLOCK_MODE=all       # default, all patches active
+      ADAPTVIS_PATCH_BLOCK_MODE=only      # only blocks in ADAPTVIS_PATCH_BLOCKS active
+      ADAPTVIS_PATCH_BLOCK_MODE=except    # all except blocks in ADAPTVIS_PATCH_BLOCKS active
+
+    Blocks are defined on a square image-token grid.
+      ADAPTVIS_PATCH_GRID=4 means 4x4 blocks, i.e. 16 blocks.
+      For 576 image tokens, side=24, each block is 6x6.
+
+    Block id:
+      block_id = block_row * grid + block_col
+      with block ids 0..grid*grid-1.
+    """
+    mode = os.environ.get("ADAPTVIS_PATCH_BLOCK_MODE", "all").strip().lower()
+    if mode == "" or mode == "all":
+        return torch.ones(int(num_img_tokens), dtype=torch.bool, device=device)
+
+    grid = int(os.environ.get("ADAPTVIS_PATCH_GRID", "4"))
+    blocks = _adaptvis_parse_int_set(os.environ.get("ADAPTVIS_PATCH_BLOCKS", ""))
+
+    if grid <= 0:
+        raise ValueError(f"ADAPTVIS_PATCH_GRID must be positive, got {grid}")
+
+    side = int(round(float(num_img_tokens) ** 0.5))
+    if side * side != int(num_img_tokens):
+        raise ValueError(
+            f"Patch block ablation expects square image tokens, got num_img_tokens={num_img_tokens}."
+        )
+    if side % grid != 0:
+        raise ValueError(
+            f"Image grid side={side} is not divisible by ADAPTVIS_PATCH_GRID={grid}."
+        )
+
+    block_size = side // grid
+    patch_ids = torch.arange(int(num_img_tokens), device=device)
+    rows = patch_ids // side
+    cols = patch_ids % side
+    block_rows = rows // block_size
+    block_cols = cols // block_size
+    block_ids = block_rows * grid + block_cols
+
+    if blocks:
+        selected = torch.zeros(int(num_img_tokens), dtype=torch.bool, device=device)
+        for b in blocks:
+            if b < 0 or b >= grid * grid:
+                raise ValueError(
+                    f"Invalid block id {b}; valid range is 0..{grid*grid-1} for grid={grid}."
+                )
+            selected |= (block_ids == int(b))
+    else:
+        selected = torch.zeros(int(num_img_tokens), dtype=torch.bool, device=device)
+
+    if mode == "only":
+        return selected
+    if mode == "except":
+        return ~selected
+
+    raise ValueError(f"Unknown ADAPTVIS_PATCH_BLOCK_MODE={mode}")
+
+
 
 SAVE_ATTN = _env_bool("SAVE_ATTN", False)
 SAVE_ORI = _env_bool("SAVE_ORI", True)
@@ -397,6 +476,13 @@ def _apply_adaptvis_pre_softmax_variant(
             if not bool(head_mask.any().item()):
                 continue
 
+            patch_mask = _adaptvis_patch_block_mask(
+                num_img_tokens=s_img.shape[-1],
+                device=s_img.device,
+            )
+            if not bool(patch_mask.any().item()):
+                continue
+
             if variant == "mul_img":
                 s_img_new = weight * s_img
 
@@ -495,30 +581,36 @@ def _apply_adaptvis_pre_softmax_variant(
                     v = s_img[h]
                     out = v.clone()
 
-                    pos_mask = v > 0
-                    neg_mask = v < 0
+                    # Sign statistics are computed on all positive/negative image logits
+                    # in the head. The patch/block mask only decides where to apply the
+                    # intervention. This avoids changing the mean/median statistic when
+                    # a block is held out, making leave-one-block-out cleaner.
+                    pos_stat_mask = v > 0
+                    neg_stat_mask = v < 0
+                    pos_apply_mask = pos_stat_mask & patch_mask
+                    neg_apply_mask = neg_stat_mask & patch_mask
 
-                    if do_pos and pos_mask.any():
-                        pos_vals = v[pos_mask]
+                    if do_pos and pos_stat_mask.any() and pos_apply_mask.any():
+                        pos_vals = v[pos_stat_mask]
                         pos_stat = pos_vals.mean() if use_mean else pos_vals.median()
 
-                        out[pos_mask] = v[pos_mask] - scale * pos_stat
+                        out[pos_apply_mask] = v[pos_apply_mask] - scale * pos_stat
 
                         # When scale > 0, this is shrink-to-zero. Do not cross zero
                         # unless explicitly disabled.
                         if clamp_zero and scale > 0:
-                            out[pos_mask] = torch.clamp(out[pos_mask], min=0.0)
+                            out[pos_apply_mask] = torch.clamp(out[pos_apply_mask], min=0.0)
 
-                    if do_neg and neg_mask.any():
-                        neg_vals = v[neg_mask]
+                    if do_neg and neg_stat_mask.any() and neg_apply_mask.any():
+                        neg_vals = v[neg_stat_mask]
                         neg_stat = neg_vals.mean() if use_mean else neg_vals.median()
 
-                        out[neg_mask] = v[neg_mask] - scale * neg_stat
+                        out[neg_apply_mask] = v[neg_apply_mask] - scale * neg_stat
 
                         # When scale > 0, this is shrink-to-zero. Do not cross zero
                         # unless explicitly disabled.
                         if clamp_zero and scale > 0:
-                            out[neg_mask] = torch.clamp(out[neg_mask], max=0.0)
+                            out[neg_apply_mask] = torch.clamp(out[neg_apply_mask], max=0.0)
 
                     s_img_new[h] = out
 
@@ -530,6 +622,12 @@ def _apply_adaptvis_pre_softmax_variant(
                     f"posonly_mean_img/posonly_median_img/"
                     f"negonly_mean_img/negonly_median_img."
                 )
+
+            # Keep unselected patch blocks unchanged. This makes block ablations causal:
+            # ADAPTVIS_PATCH_BLOCK_MODE=except with ADAPTVIS_PATCH_BLOCKS=b removes
+            # only that spatial block from the intervention, without changing other patches.
+            if not bool(patch_mask.all().item()):
+                s_img_new = torch.where(patch_mask[None, :], s_img_new, s_img)
 
             # Keep unselected heads unchanged. This makes head ablations causal:
             # ADAPTVIS_HEAD_MODE=except with ADAPTVIS_HEADS=l:h removes only that
@@ -591,9 +689,21 @@ def _apply_adaptvis_post_softmax_variant(
         if not bool(head_mask.any().item()):
             continue
 
+        patch_mask = _adaptvis_patch_block_mask(
+            num_img_tokens=int(img_idx.sum().item()),
+            device=attn_probs.device,
+        )
+        if not bool(patch_mask.any().item()):
+            continue
+
+        img_token_indices = torch.where(img_idx)[0]
+        active_img_token_indices = img_token_indices[patch_mask]
+
         for q in query_indices:
             q_int = int(q.item())
-            attn_probs[b, head_mask, q_int, img_idx] = gamma * attn_probs[b, head_mask, q_int, img_idx]
+            attn_probs[b, head_mask, q_int, active_img_token_indices] = (
+                gamma * attn_probs[b, head_mask, q_int, active_img_token_indices]
+            )
 
             denom = attn_probs[b, head_mask, q_int, :].sum(dim=-1, keepdim=True).clamp_min(1e-12)
             attn_probs[b, head_mask, q_int, :] = attn_probs[b, head_mask, q_int, :] / denom
