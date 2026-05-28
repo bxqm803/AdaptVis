@@ -5,6 +5,31 @@ import argparse
 from typing import List, Tuple, Dict, Any, Optional
 
 import torch
+
+
+def _patch_torchvision_nms_import_error():
+    """
+    Work around torch/torchvision version mismatch where importing torchvision
+    fails at fake registration with:
+        RuntimeError: operator torchvision::nms does not exist
+
+    This defines the missing operator schema before torchvision is imported.
+    It is only for import-time compatibility; this script does not call NMS.
+    """
+    try:
+        from torch.library import Library
+        try:
+            lib = Library("torchvision", "DEF")
+            lib.define("nms(Tensor dets, Tensor scores, float iou_threshold) -> Tensor")
+        except Exception:
+            # Already defined, or torch version does not support this path.
+            pass
+    except Exception:
+        pass
+
+
+_patch_torchvision_nms_import_error()
+
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
@@ -89,16 +114,16 @@ def iter_samples(loader):
 
 def load_grounding_dino(model_id: str, device: str):
     try:
-        from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+        from transformers import AutoProcessor, GroundingDinoForObjectDetection
     except Exception as e:
         raise RuntimeError(
-            "This script uses HuggingFace GroundingDINO. Install/upgrade transformers first, e.g.\n"
-            "  pip install -U transformers accelerate\n"
-            "or change this script to use your local groundingdino package."
+            "This script uses HuggingFace GroundingDINO. A compatible setup is usually:\n"
+            "  transformers==4.47.1 with a torch/torchvision pair that can import torchvision.\n"
+            "This joint script also patches the common torchvision::nms import-time error."
         ) from e
 
     processor = AutoProcessor.from_pretrained(model_id)
-    model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device).eval()
+    model = GroundingDinoForObjectDetection.from_pretrained(model_id).to(device).eval()
     return processor, model
 
 
