@@ -216,6 +216,34 @@ def _adaptvis_patch_block_mask(num_img_tokens: int, device: torch.device) -> tor
       block_id = block_row * grid + block_col
       with block ids 0..grid*grid-1.
     """
+    # Optional exact patch-id selector. This is used for object-box masks
+    # produced by GroundingDINO or other detectors. It has priority over
+    # block mode when ADAPTVIS_PATCH_ID_MODE is set.
+    #
+    # Environment controls:
+    #   ADAPTVIS_PATCH_ID_MODE=only    # only listed patch ids active
+    #   ADAPTVIS_PATCH_ID_MODE=except  # all except listed patch ids active
+    #   ADAPTVIS_PATCH_IDS=12,13,37    # patch ids in 0..num_img_tokens-1
+    id_mode = os.environ.get("ADAPTVIS_PATCH_ID_MODE", "").strip().lower()
+    if id_mode:
+        patch_ids = _adaptvis_parse_int_set(os.environ.get("ADAPTVIS_PATCH_IDS", ""))
+        selected = torch.zeros(int(num_img_tokens), dtype=torch.bool, device=device)
+        for pid in patch_ids:
+            if 0 <= int(pid) < int(num_img_tokens):
+                selected[int(pid)] = True
+            else:
+                raise ValueError(
+                    f"Invalid patch id {pid}; valid range is 0..{int(num_img_tokens)-1}."
+                )
+
+        if id_mode == "only":
+            return selected
+        if id_mode == "except":
+            return ~selected
+        if id_mode == "all":
+            return torch.ones(int(num_img_tokens), dtype=torch.bool, device=device)
+        raise ValueError(f"Unknown ADAPTVIS_PATCH_ID_MODE={id_mode}")
+
     mode = os.environ.get("ADAPTVIS_PATCH_BLOCK_MODE", "all").strip().lower()
     if mode == "" or mode == "all":
         return torch.ones(int(num_img_tokens), dtype=torch.bool, device=device)
@@ -292,13 +320,14 @@ def _adaptvis_variant_name(adjust_method: Optional[str] = None) -> str:
       export ZERO_SHRINK_LAMBDA=0.05       # for softsign, smaller = milder
 
     ADAPTVIS_ATTENTION_VARIANT is still supported:
-      mul_img / add_img / center_img / prob_img / clip_img / tanh_img / softsign_img
+      mul_img / neg_mul_img / add_img / center_img / prob_img / clip_img / tanh_img / softsign_img
       posneg_mean_img / posneg_median_img
       posonly_mean_img / posonly_median_img
       negonly_mean_img / negonly_median_img
     """
     supported = {
         "mul_img",
+        "neg_mul_img",
         "add_img",
         "center_img",
         "prob_img",
@@ -486,6 +515,12 @@ def _apply_adaptvis_pre_softmax_variant(
             if variant == "mul_img":
                 s_img_new = weight * s_img
 
+            elif variant == "neg_mul_img":
+                # Only multiply negative image-token logits. Positive logits are unchanged.
+                # With weight=0.5: -8 -> -4, -2 -> -1, while + logits stay fixed.
+                # The final patch/head masks below restrict this to selected object-box patches.
+                s_img_new = torch.where(s_img < 0, weight * s_img, s_img)
+
             elif variant == "add_img":
                 s_img_new = s_img + weight
 
@@ -617,7 +652,7 @@ def _apply_adaptvis_pre_softmax_variant(
             else:
                 raise ValueError(
                     f"Unknown AdaptVis variant={variant}. "
-                    f"Use mul_img/add_img/center_img/prob_img/clip_img/tanh_img/"
+                    f"Use mul_img/neg_mul_img/add_img/center_img/prob_img/clip_img/tanh_img/"
                     f"softsign_img/posneg_mean_img/posneg_median_img/"
                     f"posonly_mean_img/posonly_median_img/"
                     f"negonly_mean_img/negonly_median_img."
@@ -933,7 +968,7 @@ class LLaMAAttention(nn.Module):
         #   - normally only last query row
         #
         # Variant is selected by:
-        #   export ADAPTVIS_ATTENTION_VARIANT=mul_img/add_img/center_img/prob_img/clip_img/tanh_img/softsign_img
+        #   export ADAPTVIS_ATTENTION_VARIANT=mul_img/neg_mul_img/add_img/center_img/prob_img/clip_img/tanh_img/softsign_img
         #   export ADAPTVIS_ATTENTION_VARIANT=posneg_mean_img/posneg_median_img
         #   export ADAPTVIS_ATTENTION_VARIANT=posonly_mean_img/posonly_median_img
         #   export ADAPTVIS_ATTENTION_VARIANT=negonly_mean_img/negonly_median_img
