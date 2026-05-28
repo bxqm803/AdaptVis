@@ -17,164 +17,69 @@ except Exception:
 import save_llava_hidden_similarity_features as sf
 
 
-def _block_id(r, c, grid=4):
-    return r * grid + c
+def parse_block_order(s: str):
+    blocks = []
+    for x in str(s).split(','):
+        x = x.strip()
+        if not x:
+            continue
+        b = int(x)
+        if b not in blocks:
+            blocks.append(b)
+    return blocks
 
 
-def _blocks(rows, cols, grid=4):
-    return ",".join(str(_block_id(r, c, grid)) for r in rows for c in cols)
+def build_cumulative_combos(block_order):
+    """Build cumulative leave-block-out combos.
 
+    full_all_blocks:
+        all patch blocks receive intervention.
 
-def _add_combo(combos, mode, blocks, name):
-    combos.append((mode, blocks, name))
+    except_cum_08:
+        block 8 does NOT receive intervention; all other blocks do.
 
-
-def build_combos(grid=4):
+    except_cum_08_11:
+        blocks 8 and 11 do NOT receive intervention; all other blocks do.
     """
-    Build systematic patch-block combinations for a 4x4 block grid.
-
-    mode="only": only blocks in ADAPTVIS_PATCH_BLOCKS receive intervention.
-    mode="except": all blocks receive intervention except listed blocks.
-
-    4x4 block layout:
-        00 01 02 03
-        04 05 06 07
-        08 09 10 11
-        12 13 14 15
-    """
-    if grid != 4:
-        raise ValueError("This combo generator currently expects --patch-grid 4.")
-
     combos = []
-
-    # Rows
-    for r, name in [(0, "row0_top"), (1, "row1"), (2, "row2"), (3, "row3_bottom")]:
-        bs = _blocks([r], [0, 1, 2, 3], grid)
-        _add_combo(combos, "only", bs, f"only_{name}")
-        _add_combo(combos, "except", bs, f"except_{name}")
-
-    # Columns
-    for c, name in [(0, "col0_left"), (1, "col1"), (2, "col2"), (3, "col3_right")]:
-        bs = _blocks([0, 1, 2, 3], [c], grid)
-        _add_combo(combos, "only", bs, f"only_{name}")
-        _add_combo(combos, "except", bs, f"except_{name}")
-
-    # Halves
-    half_specs = [
-        ("upper_half", [0, 1], [0, 1, 2, 3]),
-        ("lower_half", [2, 3], [0, 1, 2, 3]),
-        ("left_half", [0, 1, 2, 3], [0, 1]),
-        ("right_half", [0, 1, 2, 3], [2, 3]),
-    ]
-    for name, rows, cols in half_specs:
-        bs = _blocks(rows, cols, grid)
-        _add_combo(combos, "only", bs, f"only_{name}")
-        _add_combo(combos, "except", bs, f"except_{name}")
-
-    # Quadrants
-    quad_specs = [
-        ("upper_left", [0, 1], [0, 1]),
-        ("upper_right", [0, 1], [2, 3]),
-        ("lower_left", [2, 3], [0, 1]),
-        ("lower_right", [2, 3], [2, 3]),
-    ]
-    for name, rows, cols in quad_specs:
-        bs = _blocks(rows, cols, grid)
-        _add_combo(combos, "only", bs, f"only_{name}")
-        _add_combo(combos, "except", bs, f"except_{name}")
-
-    # Center / border / corners
-    special_specs = [
-        ("center_2x2", "5,6,9,10"),
-        ("corners", "0,3,12,15"),
-        ("border", "0,1,2,3,4,7,8,11,12,13,14,15"),
-    ]
-    for name, bs in special_specs:
-        _add_combo(combos, "only", bs, f"only_{name}")
-        _add_combo(combos, "except", bs, f"except_{name}")
-
-    # All contiguous 2x2 blocks
-    for r in range(3):
-        for c in range(3):
-            bs = _blocks([r, r + 1], [c, c + 1], grid)
-            _add_combo(combos, "only", bs, f"only_2x2_r{r}_c{c}")
-            _add_combo(combos, "except", bs, f"except_2x2_r{r}_c{c}")
-
-    # Horizontal 2-row bands and vertical 2-column bands
-    for r in range(3):
-        bs = _blocks([r, r + 1], [0, 1, 2, 3], grid)
-        _add_combo(combos, "only", bs, f"only_2row_band_r{r}_{r + 1}")
-        _add_combo(combos, "except", bs, f"except_2row_band_r{r}_{r + 1}")
-
-    for c in range(3):
-        bs = _blocks([0, 1, 2, 3], [c, c + 1], grid)
-        _add_combo(combos, "only", bs, f"only_2col_band_c{c}_{c + 1}")
-        _add_combo(combos, "except", bs, f"except_2col_band_c{c}_{c + 1}")
-
-    # 3x3 large regions
-    for r in range(2):
-        for c in range(2):
-            bs = _blocks([r, r + 1, r + 2], [c, c + 1, c + 2], grid)
-            _add_combo(combos, "only", bs, f"only_3x3_r{r}_c{c}")
-            _add_combo(combos, "except", bs, f"except_3x3_r{r}_c{c}")
-
-    # Diagonal / anti-diagonal
-    diagonal_specs = [
-        ("main_diag", "0,5,10,15"),
-        ("anti_diag", "3,6,9,12"),
-    ]
-    for name, bs in diagonal_specs:
-        _add_combo(combos, "only", bs, f"only_{name}")
-        _add_combo(combos, "except", bs, f"except_{name}")
-
-    # Asymmetric sparse groups worth probing
-    manual_specs = [
-        ("top_center_pair", "1,2"),
-        ("upper_center_2x2", "1,2,5,6"),
-        ("upper_right_center", "1,2,6,7"),
-        ("toprow_plus_right_mid", "0,1,2,3,6,7"),
-        ("upper_two_rows", "0,1,2,3,4,5,6,7"),
-        ("bottom_row", "12,13,14,15"),
-        ("lower_center_and_bottom", "9,10,11,12,13,14,15"),
-        ("lower_two_rows", "8,9,10,11,12,13,14,15"),
-        ("lower_center_bottom_no_edges", "9,10,12,13,14,15"),
-    ]
-    for name, bs in manual_specs:
-        _add_combo(combos, "only", bs, f"only_{name}")
-        _add_combo(combos, "except", bs, f"except_{name}")
-
+    cumulative = []
+    for b in block_order:
+        cumulative.append(int(b))
+        blocks = ','.join(str(x) for x in cumulative)
+        name = 'except_cum_' + '_'.join(f'{x:02d}' for x in cumulative)
+        combos.append(('except', blocks, name, int(b), len(cumulative)))
     return combos
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset", default="Controlled_Images_A")
-    p.add_argument("--option", default="four")
-    p.add_argument("--model-name", default="llava1.5")
-    p.add_argument("--method", default="adapt_vis")
-    p.add_argument("--root-dir", default="data")
-    p.add_argument("--device", default="cuda")
+    p.add_argument('--dataset', default='Controlled_Images_A')
+    p.add_argument('--option', default='four')
+    p.add_argument('--model-name', default='llava1.5')
+    p.add_argument('--method', default='adapt_vis')
+    p.add_argument('--root-dir', default='data')
+    p.add_argument('--device', default='cuda')
 
-    p.add_argument("--variant", default="negonly_mean_img")
-    p.add_argument("--layers", default="0,1,2,3,4")
-    p.add_argument("--patch-grid", type=int, default=4)
-    p.add_argument("--posneg-strength", type=float, default=1.0)
+    p.add_argument('--variant', default='negonly_mean_img')
+    p.add_argument('--layers', default='0,1,2,3,4')
+    p.add_argument('--patch-grid', type=int, default=4)
+    p.add_argument('--posneg-strength', type=float, default=1.0)
+    p.add_argument('--block-order', default='8,11,12,15,9,10,13,14')
 
-    p.add_argument("--threshold", type=float, default=0.4)
-    p.add_argument("--weight1", type=float, default=0.5)
-    p.add_argument("--weight2", type=float, default=1.5)
+    p.add_argument('--threshold', type=float, default=0.4)
+    p.add_argument('--weight1', type=float, default=0.5)
+    p.add_argument('--weight2', type=float, default=1.5)
 
-    p.add_argument("--max-length", type=int, default=77)
-    p.add_argument("--max-new-tokens", type=int, default=100)
-    p.add_argument("--fresh-limit", type=int, default=-1)
-
-    p.add_argument("--out-csv", default="output/block_combo_once_expanded_summary.csv")
+    p.add_argument('--max-length', type=int, default=77)
+    p.add_argument('--max-new-tokens', type=int, default=100)
+    p.add_argument('--fresh-limit', type=int, default=-1)
+    p.add_argument('--out-csv', default='output/cumulative_block_ablation_summary.csv')
     return p.parse_args()
 
 
 def norm_gold(x):
     if isinstance(x, list):
-        return str(x[0]).strip() if x else ""
+        return str(x[0]).strip() if x else ''
     return str(x).strip()
 
 
@@ -182,35 +87,35 @@ def raw_generation_correct(gold, gen):
     gold = norm_gold(gold)
     gen = str(gen)
     ok = (gold in gen) or (gold.lower() in gen.lower())
-    if gold.lower() == "on" and "front" in gen.strip().lower():
+    if gold.lower() == 'on' and 'front' in gen.strip().lower():
         ok = False
     return bool(ok)
 
 
 def make_keys_from_input_ids(single_input, model=None):
-    image_token_index = getattr(getattr(model, "config", None), "image_token_index", None)
+    image_token_index = getattr(getattr(model, 'config', None), 'image_token_index', None)
     if image_token_index is None:
         image_token_index = 32001
     return [
         torch.where(input_id == int(image_token_index), 1, 0)
-        for input_id in single_input["input_ids"]
+        for input_id in single_input['input_ids']
     ]
 
 
 def generation_scores(output):
-    if hasattr(output, "scores"):
+    if hasattr(output, 'scores'):
         return output.scores
     if isinstance(output, dict):
-        return output.get("scores", None)
-    return output["scores"]
+        return output.get('scores', None)
+    return output['scores']
 
 
 def generation_sequences(output):
-    if hasattr(output, "sequences"):
+    if hasattr(output, 'sequences'):
         return output.sequences
     if isinstance(output, dict):
-        return output.get("sequences", None)
-    return output["sequences"]
+        return output.get('sequences', None)
+    return output['sequences']
 
 
 def first_step_confidence(output):
@@ -229,23 +134,21 @@ def decode_generated(processor, output, prompt_len):
 def iter_samples(loader):
     sid = 0
     for batch in loader:
-        for i_option in batch["image_options"]:
+        for i_option in batch['image_options']:
             for image in i_option:
                 yield sid, image
                 sid += 1
 
 
 def set_env_for_mode(args, patch_mode, patch_blocks):
-    os.environ["ADAPTVIS_ATTENTION_VARIANT"] = args.variant
-    os.environ["ADAPTVIS_POSNEG_STRENGTH"] = str(args.posneg_strength)
-
-    os.environ["ADAPTVIS_LAYER_MODE"] = "list"
-    os.environ["ADAPTVIS_LAYERS"] = args.layers
-    os.environ["ADAPTVIS_NUM_LAYERS"] = "32"
-
-    os.environ["ADAPTVIS_PATCH_GRID"] = str(args.patch_grid)
-    os.environ["ADAPTVIS_PATCH_BLOCK_MODE"] = patch_mode
-    os.environ["ADAPTVIS_PATCH_BLOCKS"] = patch_blocks
+    os.environ['ADAPTVIS_ATTENTION_VARIANT'] = args.variant
+    os.environ['ADAPTVIS_POSNEG_STRENGTH'] = str(args.posneg_strength)
+    os.environ['ADAPTVIS_LAYER_MODE'] = 'list'
+    os.environ['ADAPTVIS_LAYERS'] = args.layers
+    os.environ['ADAPTVIS_NUM_LAYERS'] = '32'
+    os.environ['ADAPTVIS_PATCH_GRID'] = str(args.patch_grid)
+    os.environ['ADAPTVIS_PATCH_BLOCK_MODE'] = patch_mode
+    os.environ['ADAPTVIS_PATCH_BLOCKS'] = patch_blocks
 
 
 def run_pass(args, wrapper, loader, prompts, answers, mode_name, base_records=None):
@@ -254,14 +157,14 @@ def run_pass(args, wrapper, loader, prompts, answers, mode_name, base_records=No
     selected_05 = 0
     selected_15 = 0
 
-    print("\n" + "=" * 80)
-    print("[RUN]", mode_name)
-    print("[VARIANT]", os.environ.get("ADAPTVIS_ATTENTION_VARIANT"))
-    print("[LAYERS]", os.environ.get("ADAPTVIS_LAYERS"))
-    print("[PATCH_GRID]", os.environ.get("ADAPTVIS_PATCH_GRID"))
-    print("[PATCH_BLOCK_MODE]", os.environ.get("ADAPTVIS_PATCH_BLOCK_MODE"))
-    print("[PATCH_BLOCKS]", os.environ.get("ADAPTVIS_PATCH_BLOCKS"))
-    print("=" * 80)
+    print('\n' + '=' * 80)
+    print('[RUN]', mode_name)
+    print('[VARIANT]', os.environ.get('ADAPTVIS_ATTENTION_VARIANT'))
+    print('[LAYERS]', os.environ.get('ADAPTVIS_LAYERS'))
+    print('[PATCH_GRID]', os.environ.get('ADAPTVIS_PATCH_GRID'))
+    print('[PATCH_BLOCK_MODE]', os.environ.get('ADAPTVIS_PATCH_BLOCK_MODE'))
+    print('[PATCH_BLOCKS]', os.environ.get('ADAPTVIS_PATCH_BLOCKS'))
+    print('=' * 80)
 
     with torch.no_grad():
         pbar = tqdm(iter_samples(loader), desc=mode_name)
@@ -275,18 +178,18 @@ def run_pass(args, wrapper, loader, prompts, answers, mode_name, base_records=No
             single_input = wrapper.processor(
                 text=prompt,
                 images=image,
-                padding="max_length",
-                return_tensors="pt",
+                padding='max_length',
+                return_tensors='pt',
                 max_length=args.max_length,
             ).to(args.device)
 
             keys = make_keys_from_input_ids(single_input, wrapper.model)
-            prompt_len = len(single_input["input_ids"][-1])
+            prompt_len = len(single_input['input_ids'][-1])
 
             if base_records is None:
                 selected_w = 1.0
             else:
-                conf = float(base_records[sid]["confidence"])
+                conf = float(base_records[sid]['confidence'])
                 selected_w = args.weight1 if conf < args.threshold else args.weight2
 
             if abs(selected_w - 0.5) <= 1e-6:
@@ -306,78 +209,76 @@ def run_pass(args, wrapper, loader, prompts, answers, mode_name, base_records=No
             gen = decode_generated(wrapper.processor, output, prompt_len)
             corr = raw_generation_correct(gold, gen)
             conf = first_step_confidence(output)
-
             correct += int(corr)
 
             records.append({
-                "sample_id": int(sid),
-                "gold": gold,
-                "generation": gen,
-                "correct": bool(corr),
-                "confidence": float(conf),
-                "selected_weight": float(selected_w),
+                'sample_id': int(sid),
+                'gold': gold,
+                'generation': gen,
+                'correct': bool(corr),
+                'confidence': float(conf),
+                'selected_weight': float(selected_w),
             })
 
             pbar.set_postfix({
-                "sid": sid,
-                "acc": f"{correct / max(len(records), 1):.3f}",
-                "w0.5": selected_05,
-                "w1.5": selected_15,
+                'sid': sid,
+                'acc': f'{correct / max(len(records), 1):.3f}',
+                'w0.5': selected_05,
+                'w1.5': selected_15,
             })
 
     summary = {
-        "mode": mode_name,
-        "num_total": len(records),
-        "acc": correct / max(len(records), 1),
-        "num_correct": correct,
-        "selected_0p5_count": selected_05,
-        "selected_1p5_count": selected_15,
+        'mode': mode_name,
+        'num_total': len(records),
+        'acc': correct / max(len(records), 1),
+        'num_correct': correct,
+        'selected_0p5_count': selected_05,
+        'selected_1p5_count': selected_15,
     }
     return summary, records
 
 
 def compare_groups(base_records, mixed_records):
-    base_by_sid = {int(r["sample_id"]): r for r in base_records}
+    base_by_sid = {int(r['sample_id']): r for r in base_records}
     stats = {
-        "wrong_to_correct": 0,
-        "correct_to_wrong": 0,
-        "correct_to_correct": 0,
-        "wrong_to_wrong": 0,
-        "selected0p5_wrong_to_correct": 0,
-        "selected0p5_correct_to_wrong": 0,
-        "selected0p5_correct_to_correct": 0,
-        "selected0p5_wrong_to_wrong": 0,
+        'wrong_to_correct': 0,
+        'correct_to_wrong': 0,
+        'correct_to_correct': 0,
+        'wrong_to_wrong': 0,
+        'selected0p5_wrong_to_correct': 0,
+        'selected0p5_correct_to_wrong': 0,
+        'selected0p5_correct_to_correct': 0,
+        'selected0p5_wrong_to_wrong': 0,
     }
 
     for r in mixed_records:
-        sid = int(r["sample_id"])
+        sid = int(r['sample_id'])
         b = base_by_sid[sid]
-
-        b_corr = bool(b["correct"])
-        m_corr = bool(r["correct"])
-        sw = float(r["selected_weight"])
+        b_corr = bool(b['correct'])
+        m_corr = bool(r['correct'])
+        sw = float(r['selected_weight'])
 
         if (not b_corr) and m_corr:
-            stats["wrong_to_correct"] += 1
+            stats['wrong_to_correct'] += 1
             if abs(sw - 0.5) <= 1e-6:
-                stats["selected0p5_wrong_to_correct"] += 1
+                stats['selected0p5_wrong_to_correct'] += 1
         elif b_corr and (not m_corr):
-            stats["correct_to_wrong"] += 1
+            stats['correct_to_wrong'] += 1
             if abs(sw - 0.5) <= 1e-6:
-                stats["selected0p5_correct_to_wrong"] += 1
+                stats['selected0p5_correct_to_wrong'] += 1
         elif b_corr and m_corr:
-            stats["correct_to_correct"] += 1
+            stats['correct_to_correct'] += 1
             if abs(sw - 0.5) <= 1e-6:
-                stats["selected0p5_correct_to_correct"] += 1
+                stats['selected0p5_correct_to_correct'] += 1
         else:
-            stats["wrong_to_wrong"] += 1
+            stats['wrong_to_wrong'] += 1
             if abs(sw - 0.5) <= 1e-6:
-                stats["selected0p5_wrong_to_wrong"] += 1
+                stats['selected0p5_wrong_to_wrong'] += 1
 
-    stats["net_gain"] = stats["wrong_to_correct"] - stats["correct_to_wrong"]
-    stats["selected0p5_net_gain"] = (
-        stats["selected0p5_wrong_to_correct"]
-        - stats["selected0p5_correct_to_wrong"]
+    stats['net_gain'] = stats['wrong_to_correct'] - stats['correct_to_wrong']
+    stats['selected0p5_net_gain'] = (
+        stats['selected0p5_wrong_to_correct']
+        - stats['selected0p5_correct_to_wrong']
     )
     return stats
 
@@ -385,18 +286,21 @@ def compare_groups(base_records, mixed_records):
 def main():
     args = parse_args()
     os.makedirs(os.path.dirname(args.out_csv), exist_ok=True)
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 
-    combos = build_combos(args.patch_grid)
-    print("[NUM COMBOS]", len(combos))
-    print("[VARIANT]", args.variant)
-    print("[LAYERS]", args.layers)
-    print("[PATCH_GRID]", args.patch_grid)
-    print("[OUT CSV]", args.out_csv)
+    block_order = parse_block_order(args.block_order)
+    combos = build_cumulative_combos(block_order)
+
+    print('[CUMULATIVE BLOCK ORDER]', block_order)
+    print('[NUM COMBOS]', len(combos))
+    print('[VARIANT]', args.variant)
+    print('[LAYERS]', args.layers)
+    print('[PATCH_GRID]', args.patch_grid)
+    print('[OUT CSV]', args.out_csv)
 
     change_greedy_to_add_weight()
 
-    print("[LOAD MODEL]", args.model_name, args.method, args.device)
+    print('[LOAD MODEL]', args.model_name, args.method, args.device)
     wrapper, image_preprocess = get_model(
         args.model_name,
         args.device,
@@ -405,7 +309,7 @@ def main():
     )
     wrapper.model.eval()
 
-    print("[LOAD DATASET]", args.dataset)
+    print('[LOAD DATASET]', args.dataset)
     dataset = get_dataset(args.dataset, image_preprocess=image_preprocess, download=False)
     collate_fn = _default_collate if image_preprocess is None else None
 
@@ -421,143 +325,152 @@ def main():
     prompts, answers = sf.load_prompts(args.dataset, args.option)
 
     # Base only once. selected_w=1.0, so AdaptVis variants should be no-op.
-    set_env_for_mode(args, patch_mode="all", patch_blocks="")
+    set_env_for_mode(args, patch_mode='all', patch_blocks='')
     base_summary, base_records = run_pass(
-        args,
-        wrapper,
-        make_loader(),
-        prompts,
-        answers,
-        mode_name="base",
-        base_records=None,
+        args, wrapper, make_loader(), prompts, answers,
+        mode_name='base', base_records=None,
     )
 
     # Full all-block intervention once.
-    set_env_for_mode(args, patch_mode="all", patch_blocks="")
+    set_env_for_mode(args, patch_mode='all', patch_blocks='')
     full_summary, full_records = run_pass(
-        args,
-        wrapper,
-        make_loader(),
-        prompts,
-        answers,
-        mode_name="full_all_blocks",
-        base_records=base_records,
+        args, wrapper, make_loader(), prompts, answers,
+        mode_name='full_all_blocks', base_records=base_records,
     )
     full_stats = compare_groups(base_records, full_records)
 
     rows = []
     rows.append({
-        "mode": "base",
-        "patch_mode": "",
-        "patch_blocks": "",
-        "num_total": base_summary["num_total"],
-        "base_acc": base_summary["acc"],
-        "full_acc": "",
-        "combo_acc": "",
-        "base_num_correct": base_summary["num_correct"],
-        "full_num_correct": "",
-        "combo_num_correct": "",
-        "drop_acc_from_full": "",
-        "drop_correct_from_full": "",
-        "full_net_gain": "",
-        "combo_net_gain": "",
-        "drop_net_gain_from_full": "",
-        "full_selected0p5_net_gain": "",
-        "combo_selected0p5_net_gain": "",
-        "drop_selected0p5_net_gain_from_full": "",
+        'mode': 'base',
+        'patch_mode': '',
+        'patch_blocks': '',
+        'cumulative_step': '',
+        'newly_excluded_block': '',
+        'num_total': base_summary['num_total'],
+        'base_acc': base_summary['acc'],
+        'full_acc': '',
+        'combo_acc': '',
+        'base_num_correct': base_summary['num_correct'],
+        'full_num_correct': '',
+        'combo_num_correct': '',
+        'drop_acc_from_full': '',
+        'drop_correct_from_full': '',
+        'incremental_acc_drop_from_prev': '',
+        'incremental_correct_drop_from_prev': '',
+        'full_net_gain': '',
+        'combo_net_gain': '',
+        'drop_net_gain_from_full': '',
+        'full_selected0p5_net_gain': '',
+        'combo_selected0p5_net_gain': '',
+        'drop_selected0p5_net_gain_from_full': '',
     })
 
     rows.append({
-        "mode": "full_all_blocks",
-        "patch_mode": "all",
-        "patch_blocks": "",
-        "num_total": full_summary["num_total"],
-        "base_acc": base_summary["acc"],
-        "full_acc": full_summary["acc"],
-        "combo_acc": full_summary["acc"],
-        "base_num_correct": base_summary["num_correct"],
-        "full_num_correct": full_summary["num_correct"],
-        "combo_num_correct": full_summary["num_correct"],
-        "drop_acc_from_full": 0.0,
-        "drop_correct_from_full": 0,
-        "full_net_gain": full_stats["net_gain"],
-        "combo_net_gain": full_stats["net_gain"],
-        "drop_net_gain_from_full": 0,
-        "full_selected0p5_net_gain": full_stats["selected0p5_net_gain"],
-        "combo_selected0p5_net_gain": full_stats["selected0p5_net_gain"],
-        "drop_selected0p5_net_gain_from_full": 0,
+        'mode': 'full_all_blocks',
+        'patch_mode': 'all',
+        'patch_blocks': '',
+        'cumulative_step': 0,
+        'newly_excluded_block': '',
+        'num_total': full_summary['num_total'],
+        'base_acc': base_summary['acc'],
+        'full_acc': full_summary['acc'],
+        'combo_acc': full_summary['acc'],
+        'base_num_correct': base_summary['num_correct'],
+        'full_num_correct': full_summary['num_correct'],
+        'combo_num_correct': full_summary['num_correct'],
+        'drop_acc_from_full': 0.0,
+        'drop_correct_from_full': 0,
+        'incremental_acc_drop_from_prev': 0.0,
+        'incremental_correct_drop_from_prev': 0,
+        'full_net_gain': full_stats['net_gain'],
+        'combo_net_gain': full_stats['net_gain'],
+        'drop_net_gain_from_full': 0,
+        'full_selected0p5_net_gain': full_stats['selected0p5_net_gain'],
+        'combo_selected0p5_net_gain': full_stats['selected0p5_net_gain'],
+        'drop_selected0p5_net_gain_from_full': 0,
     })
 
-    # Combos: no base rerun.
-    for patch_mode, patch_blocks, name in combos:
-        set_env_for_mode(args, patch_mode=patch_mode, patch_blocks=patch_blocks)
+    prev_acc = full_summary['acc']
+    prev_correct = full_summary['num_correct']
 
+    # Cumulative combos: no base rerun.
+    for patch_mode, patch_blocks, name, newly_excluded_block, cumulative_step in combos:
+        set_env_for_mode(args, patch_mode=patch_mode, patch_blocks=patch_blocks)
         combo_summary, combo_records = run_pass(
-            args,
-            wrapper,
-            make_loader(),
-            prompts,
-            answers,
-            mode_name=name,
-            base_records=base_records,
+            args, wrapper, make_loader(), prompts, answers,
+            mode_name=name, base_records=base_records,
         )
         combo_stats = compare_groups(base_records, combo_records)
 
+        incremental_acc_drop = prev_acc - combo_summary['acc']
+        incremental_correct_drop = prev_correct - combo_summary['num_correct']
+
         row = {
-            "mode": name,
-            "patch_mode": patch_mode,
-            "patch_blocks": patch_blocks,
-            "num_total": combo_summary["num_total"],
-            "base_acc": base_summary["acc"],
-            "full_acc": full_summary["acc"],
-            "combo_acc": combo_summary["acc"],
-            "base_num_correct": base_summary["num_correct"],
-            "full_num_correct": full_summary["num_correct"],
-            "combo_num_correct": combo_summary["num_correct"],
-            "drop_acc_from_full": full_summary["acc"] - combo_summary["acc"],
-            "drop_correct_from_full": full_summary["num_correct"] - combo_summary["num_correct"],
-            "full_net_gain": full_stats["net_gain"],
-            "combo_net_gain": combo_stats["net_gain"],
-            "drop_net_gain_from_full": full_stats["net_gain"] - combo_stats["net_gain"],
-            "full_selected0p5_net_gain": full_stats["selected0p5_net_gain"],
-            "combo_selected0p5_net_gain": combo_stats["selected0p5_net_gain"],
-            "drop_selected0p5_net_gain_from_full": (
-                full_stats["selected0p5_net_gain"] - combo_stats["selected0p5_net_gain"]
+            'mode': name,
+            'patch_mode': patch_mode,
+            'patch_blocks': patch_blocks,
+            'cumulative_step': cumulative_step,
+            'newly_excluded_block': newly_excluded_block,
+            'num_total': combo_summary['num_total'],
+            'base_acc': base_summary['acc'],
+            'full_acc': full_summary['acc'],
+            'combo_acc': combo_summary['acc'],
+            'base_num_correct': base_summary['num_correct'],
+            'full_num_correct': full_summary['num_correct'],
+            'combo_num_correct': combo_summary['num_correct'],
+            'drop_acc_from_full': full_summary['acc'] - combo_summary['acc'],
+            'drop_correct_from_full': full_summary['num_correct'] - combo_summary['num_correct'],
+            'incremental_acc_drop_from_prev': incremental_acc_drop,
+            'incremental_correct_drop_from_prev': incremental_correct_drop,
+            'full_net_gain': full_stats['net_gain'],
+            'combo_net_gain': combo_stats['net_gain'],
+            'drop_net_gain_from_full': full_stats['net_gain'] - combo_stats['net_gain'],
+            'full_selected0p5_net_gain': full_stats['selected0p5_net_gain'],
+            'combo_selected0p5_net_gain': combo_stats['selected0p5_net_gain'],
+            'drop_selected0p5_net_gain_from_full': (
+                full_stats['selected0p5_net_gain'] - combo_stats['selected0p5_net_gain']
             ),
         }
         rows.append(row)
-        print("[ROW]", row)
+        print('[ROW]', row)
+
+        prev_acc = combo_summary['acc']
+        prev_correct = combo_summary['num_correct']
 
     fieldnames = [
-        "mode",
-        "patch_mode",
-        "patch_blocks",
-        "num_total",
-        "base_acc",
-        "full_acc",
-        "combo_acc",
-        "base_num_correct",
-        "full_num_correct",
-        "combo_num_correct",
-        "drop_acc_from_full",
-        "drop_correct_from_full",
-        "full_net_gain",
-        "combo_net_gain",
-        "drop_net_gain_from_full",
-        "full_selected0p5_net_gain",
-        "combo_selected0p5_net_gain",
-        "drop_selected0p5_net_gain_from_full",
+        'mode',
+        'patch_mode',
+        'patch_blocks',
+        'cumulative_step',
+        'newly_excluded_block',
+        'num_total',
+        'base_acc',
+        'full_acc',
+        'combo_acc',
+        'base_num_correct',
+        'full_num_correct',
+        'combo_num_correct',
+        'drop_acc_from_full',
+        'drop_correct_from_full',
+        'incremental_acc_drop_from_prev',
+        'incremental_correct_drop_from_prev',
+        'full_net_gain',
+        'combo_net_gain',
+        'drop_net_gain_from_full',
+        'full_selected0p5_net_gain',
+        'combo_selected0p5_net_gain',
+        'drop_selected0p5_net_gain_from_full',
     ]
 
-    with open(args.out_csv, "w", newline="", encoding="utf-8") as f:
+    with open(args.out_csv, 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in rows:
             w.writerow(r)
 
-    print("\n[DONE]")
-    print("[CSV SAVED]", args.out_csv)
+    print('\n[DONE]')
+    print('[CSV SAVED]', args.out_csv)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
