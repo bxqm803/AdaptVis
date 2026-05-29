@@ -28,22 +28,33 @@ def parse_args():
     p.add_argument("--device", default="cuda")
 
     # Key setting for this experiment.
-    p.add_argument("--variant", default="neg_mul_img", help="Use neg_mul_img: only negative image logits are multiplied.")
+    p.add_argument(
+        "--variant",
+        default="neg_mul_img",
+        help="Use neg_mul_img: only negative image logits are multiplied.",
+    )
     p.add_argument("--layers", default="0,1,2,3,4")
     p.add_argument("--object-patch-json", required=True)
-    p.add_argument("--missing-mask-mode", default="none", choices=["none", "all"],
-                   help="If a sample has no detected object patches: none=no intervention; all=all patches active.")
+    p.add_argument(
+        "--missing-mask-mode",
+        default="none",
+        choices=["none", "all"],
+        help="If a sample has no detected object patches: none=no intervention; all=all patches active.",
+    )
 
-    # To literally test x0.5 on object-box negative logits, keep both 0.5.
+    # AdaptVis threshold rule:
+    # base confidence < threshold -> weight1, otherwise weight2.
+    # For original AdaptVis-style mixed run, use --weight1 0.5 --weight2 1.5.
     p.add_argument("--threshold", type=float, default=0.4)
     p.add_argument("--weight1", type=float, default=0.5)
-    p.add_argument("--weight2", type=float, default=0.5)
+    p.add_argument("--weight2", type=float, default=1.5)
 
     p.add_argument("--max-length", type=int, default=77)
     p.add_argument("--max-new-tokens", type=int, default=100)
     p.add_argument("--fresh-limit", type=int, default=-1)
     p.add_argument("--out-csv", default="output/objectbox_negpatch_summary.csv")
     p.add_argument("--save-records", default="")
+    p.add_argument("--debug-first", type=int, default=0)
     return p.parse_args()
 
 
@@ -113,6 +124,15 @@ def iter_samples(loader):
 def load_patch_json(path):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
+
+    # Accept both:
+    #   {"0": {"patch_ids": [...]}, ...}
+    # and:
+    #   [{"sample_id": 0, "patch_ids": [...]}, ...]
+    if isinstance(data, list):
+        data = {str(int(x["sample_id"])): x for x in data}
+    if not isinstance(data, dict):
+        raise TypeError(f"Unsupported object patch json type: {type(data)}")
     return data
 
 
@@ -144,6 +164,12 @@ def set_patch_env_for_sample(patch_ids, missing_mode="none"):
         else:
             os.environ["ADAPTVIS_PATCH_ID_MODE"] = "only"
             os.environ["ADAPTVIS_PATCH_IDS"] = ""
+
+
+def set_weight_env_for_sample(selected_w):
+    # Some generate() paths drop custom kwargs such as weight before reaching LLaMAAttention.
+    # modeling_llama_add_attn.py should read ADAPTVIS_WEIGHT as fallback.
+    os.environ["ADAPTVIS_WEIGHT"] = str(float(selected_w))
 
 
 def run_pass(args, wrapper, loader, prompts, answers, mode_name, mask_data=None, base_records=None):
@@ -193,10 +219,25 @@ def run_pass(args, wrapper, loader, prompts, answers, mode_name, mask_data=None,
                 conf = float(base_records[sid]["confidence"])
                 selected_w = args.weight1 if conf < args.threshold else args.weight2
 
+            set_weight_env_for_sample(selected_w)
+
             if abs(selected_w - 0.5) <= 1e-6:
                 selected_05 += 1
             elif abs(selected_w - 1.5) <= 1e-6:
                 selected_15 += 1
+
+            # Tag optional SAVE_IMG_LOGITS dumps so base/object files are distinguishable.
+            os.environ["SAVE_IMG_LOGITS_TAG"] = (
+                f"{mode_name}_sid{sid:04d}_w{str(float(selected_w)).replace('.', 'p')}"
+            )
+
+            if args.debug_first > 0 and sid < args.debug_first:
+                print(
+                    f"[RUN DEBUG] mode={mode_name} sid={sid} selected_w={selected_w} "
+                    f"patch_mode={os.environ.get('ADAPTVIS_PATCH_ID_MODE')} "
+                    f"npatch={len(patch_ids)} first10={patch_ids[:10]} "
+                    f"ADAPTVIS_WEIGHT={os.environ.get('ADAPTVIS_WEIGHT')}"
+                )
 
             output = wrapper.model.generate(
                 **single_input,
@@ -289,20 +330,16 @@ def main():
 
     prompts, answers = sf.load_prompts(args.dataset, args.option)
 
-    # Base once.
+    # Base once. ADAPTVIS_WEIGHT=1.0 is a no-op, but keeps debug behavior consistent.
     base_summary, base_records = run_pass(
         args, wrapper, make_loader(), prompts, answers,
-        mode_name="base",
-        mask_data=None,
-        base_records=None,
+        mode_name="base", mask_data=None, base_records=None,
     )
 
     # Object-box-only negative-logit multiply.
     obj_summary, obj_records = run_pass(
         args, wrapper, make_loader(), prompts, answers,
-        mode_name="object_box_negpatch",
-        mask_data=mask_data,
-        base_records=base_records,
+        mode_name="object_box_negpatch", mask_data=mask_data, base_records=base_records,
     )
     stats = compare_groups(base_records, obj_records)
 
