@@ -320,7 +320,7 @@ def _adaptvis_variant_name(adjust_method: Optional[str] = None) -> str:
       export ZERO_SHRINK_LAMBDA=0.05       # for softsign, smaller = milder
 
     ADAPTVIS_ATTENTION_VARIANT is still supported:
-      mul_img / neg_mul_img / add_img / center_img / prob_img / clip_img / tanh_img / softsign_img
+      mul_img / neg_mul_img / neg_zero_img / add_img / center_img / prob_img / clip_img / tanh_img / softsign_img
       posneg_mean_img / posneg_median_img
       posonly_mean_img / posonly_median_img
       negonly_mean_img / negonly_median_img
@@ -328,6 +328,7 @@ def _adaptvis_variant_name(adjust_method: Optional[str] = None) -> str:
     supported = {
         "mul_img",
         "neg_mul_img",
+        "neg_zero_img",
         "add_img",
         "center_img",
         "prob_img",
@@ -447,6 +448,14 @@ def _apply_adaptvis_pre_softmax_variant(
       s_img_new = alpha * s_img
       This is original AdaptVis.
 
+    neg_mul_img:
+      s_img_new = weight * s_img for negative image logits only.
+      Positive image logits are unchanged.
+
+    neg_zero_img:
+      if weight == 1.0, no-op; otherwise set selected negative image logits to 0.
+      Positive image logits are unchanged. This tests a hard lift-to-zero rule.
+
     add_img:
       s_img_new = s_img + beta
       beta < 0 means group suppression of image logits.
@@ -520,6 +529,24 @@ def _apply_adaptvis_pre_softmax_variant(
                 # With weight=0.5: -8 -> -4, -2 -> -1, while + logits stay fixed.
                 # The final patch/head masks below restrict this to selected object-box patches.
                 s_img_new = torch.where(s_img < 0, weight * s_img, s_img)
+
+            elif variant == "neg_zero_img":
+                # Only set negative image-token logits to zero. Positive logits are unchanged.
+                #
+                # IMPORTANT:
+                #   The base pass normally uses weight=1.0. Therefore weight=1.0
+                #   must remain a no-op; otherwise the base run would also be edited.
+                #
+                #   In the intervention pass, any weight != 1.0 triggers the hard
+                #   lift-to-zero rule. The magnitude of weight is ignored here:
+                #       -8 -> 0, -2 -> 0, while positive logits stay fixed.
+                #
+                # The final patch/head masks below restrict this to selected
+                # object-box patches / selected heads.
+                if abs(float(weight) - 1.0) <= 1e-12:
+                    s_img_new = s_img
+                else:
+                    s_img_new = torch.where(s_img < 0, torch.zeros_like(s_img), s_img)
 
             elif variant == "add_img":
                 s_img_new = s_img + weight
@@ -652,7 +679,7 @@ def _apply_adaptvis_pre_softmax_variant(
             else:
                 raise ValueError(
                     f"Unknown AdaptVis variant={variant}. "
-                    f"Use mul_img/neg_mul_img/add_img/center_img/prob_img/clip_img/tanh_img/"
+                    f"Use mul_img/neg_mul_img/neg_zero_img/add_img/center_img/prob_img/clip_img/tanh_img/"
                     f"softsign_img/posneg_mean_img/posneg_median_img/"
                     f"posonly_mean_img/posonly_median_img/"
                     f"negonly_mean_img/negonly_median_img."
@@ -968,7 +995,7 @@ class LLaMAAttention(nn.Module):
         #   - normally only last query row
         #
         # Variant is selected by:
-        #   export ADAPTVIS_ATTENTION_VARIANT=mul_img/neg_mul_img/add_img/center_img/prob_img/clip_img/tanh_img/softsign_img
+        #   export ADAPTVIS_ATTENTION_VARIANT=mul_img/neg_mul_img/neg_zero_img/add_img/center_img/prob_img/clip_img/tanh_img/softsign_img
         #   export ADAPTVIS_ATTENTION_VARIANT=posneg_mean_img/posneg_median_img
         #   export ADAPTVIS_ATTENTION_VARIANT=posonly_mean_img/posonly_median_img
         #   export ADAPTVIS_ATTENTION_VARIANT=negonly_mean_img/negonly_median_img
