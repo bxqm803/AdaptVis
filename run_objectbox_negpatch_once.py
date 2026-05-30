@@ -31,7 +31,12 @@ def parse_args():
     p.add_argument(
         "--variant",
         default="neg_mul_img",
-        help="Use neg_mul_img: only negative image logits are multiplied.",
+        help=(
+            "Attention intervention variant passed to ADAPTVIS_ATTENTION_VARIANT. "
+            "neg_mul_img: selected negative image logits are multiplied by weight. "
+            "neg_zero_img: selected negative image logits are set to 0 when weight != 1.0. "
+            "Other supported variants depend on modeling_llama_add_attn.py."
+        ),
     )
     p.add_argument("--layers", default="0,1,2,3,4")
     p.add_argument("--object-patch-json", required=True)
@@ -255,6 +260,8 @@ def run_pass(args, wrapper, loader, prompts, answers, mode_name, mask_data=None,
             correct += int(corr)
             records.append({
                 "sample_id": int(sid),
+                "variant": str(args.variant),
+                "sample_mode": str(mode_name),
                 "gold": gold,
                 "generation": gen,
                 "correct": bool(corr),
@@ -274,6 +281,7 @@ def run_pass(args, wrapper, loader, prompts, answers, mode_name, mask_data=None,
 
     summary = {
         "mode": mode_name,
+        "variant": str(args.variant),
         "num_total": len(records),
         "acc": correct / max(len(records), 1),
         "num_correct": correct,
@@ -307,9 +315,15 @@ def compare_groups(base_records, mixed_records):
     return stats
 
 
+
+def _safe_makedirs_for_file(path):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
 def main():
     args = parse_args()
-    os.makedirs(os.path.dirname(args.out_csv), exist_ok=True)
+    _safe_makedirs_for_file(args.out_csv)
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     mask_data = load_patch_json(args.object_patch_json)
@@ -336,16 +350,20 @@ def main():
         mode_name="base", mask_data=None, base_records=None,
     )
 
-    # Object-box-only negative-logit multiply.
+    # Object-box-only intervention.
+    # The exact behavior is controlled by --variant, for example:
+    #   neg_mul_img  : selected negative image logits *= selected_weight
+    #   neg_zero_img : selected negative image logits -> 0 when selected_weight != 1.0
     obj_summary, obj_records = run_pass(
         args, wrapper, make_loader(), prompts, answers,
-        mode_name="object_box_negpatch", mask_data=mask_data, base_records=base_records,
+        mode_name=f"object_box_{args.variant}", mask_data=mask_data, base_records=base_records,
     )
     stats = compare_groups(base_records, obj_records)
 
     rows = [
         {
             "mode": "base",
+            "variant": args.variant,
             "num_total": base_summary["num_total"],
             "acc": base_summary["acc"],
             "num_correct": base_summary["num_correct"],
@@ -360,7 +378,8 @@ def main():
             "selected_1p5_count": "",
         },
         {
-            "mode": "object_box_negpatch",
+            "mode": f"object_box_{args.variant}",
+            "variant": args.variant,
             "num_total": obj_summary["num_total"],
             "acc": obj_summary["acc"],
             "num_correct": obj_summary["num_correct"],
@@ -377,7 +396,7 @@ def main():
     ]
 
     fieldnames = [
-        "mode", "num_total", "acc", "num_correct",
+        "mode", "variant", "num_total", "acc", "num_correct",
         "base_acc", "mixed_acc", "base_num_correct", "mixed_num_correct",
         "wrong_to_correct", "correct_to_wrong", "net_gain",
         "selected_0p5_count", "selected_1p5_count",
@@ -389,9 +408,9 @@ def main():
             w.writerow(r)
 
     if args.save_records:
-        os.makedirs(os.path.dirname(args.save_records), exist_ok=True)
+        _safe_makedirs_for_file(args.save_records)
         with open(args.save_records, "w", encoding="utf-8") as f:
-            json.dump({"base": base_records, "object_box_negpatch": obj_records}, f, ensure_ascii=False, indent=2)
+            json.dump({"base": base_records, f"object_box_{args.variant}": obj_records}, f, ensure_ascii=False, indent=2)
 
     print("\n[DONE]")
     print("[CSV SAVED]", args.out_csv)
