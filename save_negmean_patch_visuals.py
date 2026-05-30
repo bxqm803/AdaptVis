@@ -165,14 +165,16 @@ def set_weight_env_for_sample(selected_w):
 
 
 def clear_debug_env():
+    # Do not delete SAVE_IMG_LOGITS / SAVE_ATTN / SAVE_ORI here.
+    # In modeling_llama_add_attn.py these flags are read at import time,
+    # so they must stay conceptually enabled for the whole visualization run.
+    #
+    # Per-sample paths/tags are reset in run_one_sample().
     for k in [
-        "SAVE_IMG_LOGITS",
         "SAVE_IMG_LOGITS_PATH",
         "SAVE_IMG_LOGITS_LAYERS",
         "SAVE_IMG_LOGITS_TAG",
-        "SAVE_ATTN",
         "SAVE_ATTN_PATH",
-        "SAVE_ORI",
     ]:
         if k in os.environ:
             del os.environ[k]
@@ -296,7 +298,13 @@ def load_layer_npz(logit_dir, sid, layer):
     patt = os.path.join(logit_dir, f"sid{sid:04d}_layer{layer:02d}_img_logits.npz")
     files = glob.glob(patt)
     if len(files) == 0:
-        raise FileNotFoundError(f"Cannot find {patt}")
+        existing = sorted(os.listdir(logit_dir)) if os.path.exists(logit_dir) else []
+        raise FileNotFoundError(
+            f"Cannot find {patt}\n"
+            f"logit_dir={logit_dir}\n"
+            f"existing_files={existing[:20]}\n"
+            f"Hint: SAVE_IMG_LOGITS must be set before modeling_llama_add_attn.py is imported."
+        )
     return np.load(files[0])
 
 
@@ -304,7 +312,12 @@ def load_layer_attn(attn_dir, layer):
     ori_files = glob.glob(os.path.join(attn_dir, f"ori_postsoftmax_{layer}_start*_end*.npy"))
     fin_files = glob.glob(os.path.join(attn_dir, f"final_postsoftmax_{layer}_start*_end*.npy"))
     if len(ori_files) == 0 or len(fin_files) == 0:
-        raise FileNotFoundError(f"Cannot find attn files for layer={layer} in {attn_dir}")
+        existing = sorted(os.listdir(attn_dir)) if os.path.exists(attn_dir) else []
+        raise FileNotFoundError(
+            f"Cannot find attn files for layer={layer} in {attn_dir}\n"
+            f"existing_files={existing[:20]}\n"
+            f"Hint: SAVE_ATTN must be set before modeling_llama_add_attn.py is imported."
+        )
     ori = np.load(ori_files[0])   # [1, H, kv_len]
     fin = np.load(fin_files[0])   # [1, H, kv_len]
     return ori, fin
@@ -664,6 +677,13 @@ def main():
         },
         os.path.join(args.out_dir, "selected_sids.json"),
     )
+
+    # These flags MUST be set before change_greedy_to_add_weight() / get_model().
+    # modeling_llama_add_attn.py reads SAVE_IMG_LOGITS / SAVE_ATTN at import time.
+    # Per-sample paths and tags are still set later inside run_one_sample().
+    os.environ["SAVE_IMG_LOGITS"] = "1"
+    os.environ["SAVE_ATTN"] = "1"
+    os.environ["SAVE_ORI"] = "1"
 
     change_greedy_to_add_weight()
 
