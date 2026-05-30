@@ -1,10 +1,10 @@
 import os
+import re
 import json
 import glob
-import math
 import random
+import shutil
 import argparse
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -26,9 +26,6 @@ except Exception:
 import save_llava_hidden_similarity_features as sf
 
 
-# -----------------------------
-# basic helpers
-# -----------------------------
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -110,9 +107,6 @@ def decode_generated(processor, output, prompt_len):
     return processor.decode(seq[0][int(prompt_len):], skip_special_tokens=True)
 
 
-# -----------------------------
-# selection
-# -----------------------------
 def select_sids(records_json, n_per_group=5, random_pick=False, seed=0):
     data = load_json(records_json)
     obj_key = get_object_key(data)
@@ -144,9 +138,6 @@ def select_sids(records_json, n_per_group=5, random_pick=False, seed=0):
     }
 
 
-# -----------------------------
-# env setup
-# -----------------------------
 def set_common_env(layers, variant):
     os.environ["ADAPTVIS_ATTENTION_VARIANT"] = variant
     os.environ["ADAPTVIS_LAYER_MODE"] = "list"
@@ -165,28 +156,18 @@ def set_weight_env_for_sample(selected_w):
 
 
 def clear_debug_env():
-    # Do not delete SAVE_IMG_LOGITS / SAVE_ATTN / SAVE_ORI here.
-    # In modeling_llama_add_attn.py these flags are read at import time,
-    # so they must stay conceptually enabled for the whole visualization run.
-    #
-    # Per-sample paths/tags are reset in run_one_sample().
     for k in [
         "SAVE_IMG_LOGITS_PATH",
         "SAVE_IMG_LOGITS_LAYERS",
         "SAVE_IMG_LOGITS_TAG",
         "SAVE_ATTN_PATH",
+        "SAVE_ATTN_LAYERS",
     ]:
         if k in os.environ:
             del os.environ[k]
 
 
-# -----------------------------
-# image helpers
-# -----------------------------
 def tensor_to_pil(pixel_values, processor):
-    """
-    pixel_values: [3, H, W] normalized tensor
-    """
     arr = pixel_values.detach().float().cpu().numpy()
     mean = getattr(getattr(processor, "image_processor", processor), "image_mean", [0.48145466, 0.4578275, 0.40821073])
     std = getattr(getattr(processor, "image_processor", processor), "image_std", [0.26862954, 0.26130258, 0.27577711])
@@ -205,9 +186,6 @@ def patch_id_to_rc(pid, patch_side):
 
 
 def draw_patch_overlay_on_square(img, object_patch_ids, negative_patch_ids, patch_side, alpha=100):
-    """
-    img: PIL, should be the model input image (preprocessed square image)
-    """
     img = img.convert("RGBA")
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
@@ -216,14 +194,12 @@ def draw_patch_overlay_on_square(img, object_patch_ids, negative_patch_ids, patc
     cell_w = w / patch_side
     cell_h = h / patch_side
 
-    # object patch outlines
     for pid in object_patch_ids:
         r, c = patch_id_to_rc(pid, patch_side)
         x0, y0 = c * cell_w, r * cell_h
         x1, y1 = (c + 1) * cell_w, (r + 1) * cell_h
         draw.rectangle([x0, y0, x1, y1], outline=(255, 255, 0, 220), width=2)
 
-    # negative patches filled red
     for pid in negative_patch_ids:
         r, c = patch_id_to_rc(pid, patch_side)
         x0, y0 = c * cell_w, r * cell_h
@@ -233,148 +209,62 @@ def draw_patch_overlay_on_square(img, object_patch_ids, negative_patch_ids, patc
     return Image.alpha_composite(img, overlay).convert("RGB")
 
 
-def get_clipstyle_resize_crop(orig_w, orig_h, target_w, target_h):
-    """
-    Approximate CLIP-style preprocess:
-    resize shortest side -> target, then center crop target_w x target_h
-    """
-    scale = float(min(target_w, target_h)) / float(min(orig_w, orig_h))
-    resized_w = int(round(orig_w * scale))
-    resized_h = int(round(orig_h * scale))
-    crop_left = max(0, (resized_w - target_w) / 2.0)
-    crop_top = max(0, (resized_h - target_h) / 2.0)
-    return scale, resized_w, resized_h, crop_left, crop_top
-
-
-def patch_boxes_on_original_image(orig_img, object_patch_ids, negative_patch_ids, patch_side, target_w, target_h, alpha=80):
-    """
-    Map square crop patch grid back to original image approximately.
-    """
-    orig = orig_img.convert("RGBA")
-    overlay = Image.new("RGBA", orig.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-
-    orig_w, orig_h = orig.size
-    scale, resized_w, resized_h, crop_left, crop_top = get_clipstyle_resize_crop(orig_w, orig_h, target_w, target_h)
-
-    cell_w = target_w / patch_side
-    cell_h = target_h / patch_side
-
-    def crop_patch_to_orig_box(pid):
-        r, c = patch_id_to_rc(pid, patch_side)
-        x0c, y0c = c * cell_w, r * cell_h
-        x1c, y1c = (c + 1) * cell_w, (r + 1) * cell_h
-
-        # map from crop coords -> resized coords -> original coords
-        x0r = x0c + crop_left
-        x1r = x1c + crop_left
-        y0r = y0c + crop_top
-        y1r = y1c + crop_top
-
-        x0o = x0r / scale
-        x1o = x1r / scale
-        y0o = y0r / scale
-        y1o = y1r / scale
-
-        x0o = max(0, min(orig_w, x0o))
-        x1o = max(0, min(orig_w, x1o))
-        y0o = max(0, min(orig_h, y0o))
-        y1o = max(0, min(orig_h, y1o))
-        return [x0o, y0o, x1o, y1o]
-
-    for pid in object_patch_ids:
-        draw.rectangle(crop_patch_to_orig_box(pid), outline=(255, 255, 0, 220), width=2)
-
-    for pid in negative_patch_ids:
-        draw.rectangle(crop_patch_to_orig_box(pid), fill=(255, 0, 0, alpha), outline=(255, 0, 0, 220), width=2)
-
-    return Image.alpha_composite(orig, overlay).convert("RGB")
-
-
-# -----------------------------
-# npy/npz loading
-# -----------------------------
 def load_layer_npz(logit_dir, sid, layer):
     patt = os.path.join(logit_dir, f"sid{sid:04d}_layer{layer:02d}_img_logits.npz")
     files = glob.glob(patt)
     if len(files) == 0:
         existing = sorted(os.listdir(logit_dir)) if os.path.exists(logit_dir) else []
         raise FileNotFoundError(
-            f"Cannot find {patt}\n"
-            f"logit_dir={logit_dir}\n"
-            f"existing_files={existing[:20]}\n"
-            f"Hint: SAVE_IMG_LOGITS must be set before modeling_llama_add_attn.py is imported."
+            f"Cannot find {patt}\nlogit_dir={logit_dir}\nexisting_files={existing[:20]}"
         )
     return np.load(files[0])
+
+
+def _parse_attn_fname(path):
+    base = os.path.basename(path)
+    m = re.search(r"_(\d+)_start(-?\d+)_end(-?\d+)\.npy$", base)
+    if not m:
+        return None
+    layer = int(m.group(1))
+    start = int(m.group(2))
+    end = int(m.group(3))
+    return layer, start, end
+
+
+def _pick_best_attn_file(files):
+    if not files:
+        return None
+    parsed = []
+    for f in files:
+        info = _parse_attn_fname(f)
+        if info is not None:
+            _, start, end = info
+            parsed.append((f, start, end))
+    if not parsed:
+        return sorted(files)[0]
+    valid = [x for x in parsed if x[1] >= 0 and x[2] >= x[1]]
+    if valid:
+        valid = sorted(valid, key=lambda x: (x[1], x[2], x[0]))
+        return valid[0][0]
+    parsed = sorted(parsed, key=lambda x: (x[1], x[2], x[0]))
+    return parsed[0][0]
 
 
 def load_layer_attn(attn_dir, layer):
     ori_files = glob.glob(os.path.join(attn_dir, f"ori_postsoftmax_{layer}_start*_end*.npy"))
     fin_files = glob.glob(os.path.join(attn_dir, f"final_postsoftmax_{layer}_start*_end*.npy"))
-    if len(ori_files) == 0 or len(fin_files) == 0:
+    ori_file = _pick_best_attn_file(ori_files)
+    fin_file = _pick_best_attn_file(fin_files)
+    if ori_file is None or fin_file is None:
         existing = sorted(os.listdir(attn_dir)) if os.path.exists(attn_dir) else []
         raise FileNotFoundError(
-            f"Cannot find attn files for layer={layer} in {attn_dir}\n"
-            f"existing_files={existing[:20]}\n"
-            f"Hint: SAVE_ATTN must be set before modeling_llama_add_attn.py is imported."
+            f"Cannot find attn files for layer={layer} in {attn_dir}\nexisting_files={existing[:20]}"
         )
-    ori = np.load(ori_files[0])   # [1, H, kv_len]
-    fin = np.load(fin_files[0])   # [1, H, kv_len]
-    return ori, fin
+    ori = np.load(ori_file)
+    fin = np.load(fin_file)
+    return ori, fin, ori_file, fin_file
 
 
-def aggregate_maps(logit_dir, attn_dir, sid, layers):
-    """
-    Returns:
-      mean_ori_logits: [P]
-      neg_frac: [P]
-      mean_ori_prob: [P]
-      mean_edit_prob: [P]
-      image_start, image_end_exclusive
-    """
-    ori_logits_list = []
-    negmask_list = []
-    ori_prob_list = []
-    edit_prob_list = []
-    image_start = None
-    image_end = None
-
-    for layer in layers:
-        d = load_layer_npz(logit_dir, sid, layer)
-
-        ori_logits = d["ori_img_logits"][0]       # [H, P]
-        edited_logits = d["edited_img_logits"][0] # [H, P], here not directly used
-        image_start = int(d["image_start"])
-        image_end = int(d["image_end"])  # exclusive in npz
-
-        ori, fin = load_layer_attn(attn_dir, layer)   # [1, H, kv_len]
-        ori = ori[0]
-        fin = fin[0]
-
-        img_ori_prob = ori[:, image_start:image_end]   # [H, P]
-        img_fin_prob = fin[:, image_start:image_end]   # [H, P]
-
-        ori_logits_list.append(ori_logits)
-        negmask_list.append((ori_logits < 0).astype(np.float32))
-        ori_prob_list.append(img_ori_prob)
-        edit_prob_list.append(img_fin_prob)
-
-    ori_logits_stack = np.stack(ori_logits_list, axis=0)   # [L, H, P]
-    negmask_stack = np.stack(negmask_list, axis=0)         # [L, H, P]
-    ori_prob_stack = np.stack(ori_prob_list, axis=0)       # [L, H, P]
-    edit_prob_stack = np.stack(edit_prob_list, axis=0)     # [L, H, P]
-
-    mean_ori_logits = ori_logits_stack.mean(axis=(0, 1))
-    neg_frac = negmask_stack.mean(axis=(0, 1))
-    mean_ori_prob = ori_prob_stack.mean(axis=(0, 1))
-    mean_edit_prob = edit_prob_stack.mean(axis=(0, 1))
-
-    return mean_ori_logits, neg_frac, mean_ori_prob, mean_edit_prob, image_start, image_end
-
-
-# -----------------------------
-# plotting
-# -----------------------------
 def grid_from_vector(v, patch_side):
     return np.array(v).reshape(patch_side, patch_side)
 
@@ -390,15 +280,12 @@ def normalize_map(x):
 def make_heat_overlay(base_img, grid_map, cmap="jet", alpha=0.45):
     base = np.array(base_img.convert("RGB"))
     H, W = base.shape[:2]
-
     norm_map = normalize_map(grid_map)
     fig = plt.figure(figsize=(W / 100, H / 100), dpi=100)
     ax = fig.add_axes([0, 0, 1, 1])
     ax.imshow(base)
-    ax.imshow(norm_map, cmap=cmap, alpha=alpha, interpolation="bilinear",
-              extent=[0, W, H, 0])
+    ax.imshow(norm_map, cmap=cmap, alpha=alpha, interpolation="bilinear", extent=[0, W, H, 0])
     ax.axis("off")
-
     fig.canvas.draw()
     img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
     img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
@@ -416,49 +303,120 @@ def save_heatmap_only(grid_map, out_path, title=""):
     plt.close()
 
 
-def save_panel(sample_dir, pre_img, orig_img_overlay, pre_overlay, ori_prob_grid, edit_prob_grid, diff_prob_grid, title_lines):
+def save_panel(out_path, pre_img, pre_overlay, ori_prob_grid, edit_prob_grid, diff_prob_grid, title_lines):
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
 
-    axes[0, 0].imshow(orig_img_overlay)
-    axes[0, 0].set_title("Original image + mapped object/negative patches")
+    axes[0, 0].imshow(pre_img)
+    axes[0, 0].set_title("Preprocessed model input")
     axes[0, 0].axis("off")
 
-    axes[0, 1].imshow(pre_img)
-    axes[0, 1].set_title("Model input image (preprocessed)")
+    axes[0, 1].imshow(pre_overlay)
+    axes[0, 1].set_title("Object patches + negative patches")
     axes[0, 1].axis("off")
 
-    axes[0, 2].imshow(pre_overlay)
-    axes[0, 2].set_title("Preprocessed image + negative patch overlay")
+    axes[0, 2].imshow(make_heat_overlay(pre_img, diff_prob_grid, cmap="bwr", alpha=0.45))
+    axes[0, 2].set_title("Attention diff overlay")
     axes[0, 2].axis("off")
 
     im1 = axes[1, 0].imshow(ori_prob_grid, cmap="jet")
-    axes[1, 0].set_title("Original post-softmax attention (image tokens)")
+    axes[1, 0].set_title("Original post-softmax attention")
     plt.colorbar(im1, ax=axes[1, 0], fraction=0.046, pad=0.04)
 
     im2 = axes[1, 1].imshow(edit_prob_grid, cmap="jet")
-    axes[1, 1].set_title("Edited post-softmax attention (image tokens)")
+    axes[1, 1].set_title("Edited post-softmax attention")
     plt.colorbar(im2, ax=axes[1, 1], fraction=0.046, pad=0.04)
 
     im3 = axes[1, 2].imshow(diff_prob_grid, cmap="bwr")
     axes[1, 2].set_title("Edited - original attention")
     plt.colorbar(im3, ax=axes[1, 2], fraction=0.046, pad=0.04)
 
-    for ax in axes.flat:
-        if ax not in [axes[1, 0], axes[1, 1], axes[1, 2]]:
-            ax.axis("off")
-
     fig.suptitle("\n".join(title_lines), fontsize=13)
     plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig(os.path.join(sample_dir, "panel.png"))
+    plt.savefig(out_path)
     plt.close(fig)
 
 
-# -----------------------------
-# core
-# -----------------------------
-def run_one_sample(
-    sid, group_name, args, wrapper, dataset_loader, prompts, answers, patch_meta, records_data
-):
+def compute_layer_maps(logit_dir, attn_dir, sid, layer):
+    d = load_layer_npz(logit_dir, sid, layer)
+    ori_logits = d["ori_img_logits"][0]      # [H, P]
+    edited_logits = d["edited_img_logits"][0]  # [H, P]
+    image_start = int(d["image_start"])
+    image_end = int(d["image_end"])
+
+    ori, fin, ori_file, fin_file = load_layer_attn(attn_dir, layer)  # [1,H,K]
+    ori = ori[0]
+    fin = fin[0]
+
+    img_ori_prob = ori[:, image_start:image_end]  # [H, P]
+    img_fin_prob = fin[:, image_start:image_end]  # [H, P]
+
+    stats = {
+        "mean_ori_logits": ori_logits.mean(axis=0),
+        "mean_edited_logits": edited_logits.mean(axis=0),
+        "neg_frac": (ori_logits < 0).astype(np.float32).mean(axis=0),
+        "mean_ori_prob": img_ori_prob.mean(axis=0),
+        "mean_edit_prob": img_fin_prob.mean(axis=0),
+        "image_start": image_start,
+        "image_end_exclusive": image_end,
+        "ori_file": os.path.basename(ori_file),
+        "fin_file": os.path.basename(fin_file),
+    }
+    return stats
+
+
+def compute_mean_layers(layer_stats):
+    keys = ["mean_ori_logits", "neg_frac", "mean_ori_prob", "mean_edit_prob"]
+    out = {}
+    for k in keys:
+        stacked = np.stack([x[k] for x in layer_stats], axis=0)
+        out[k] = stacked.mean(axis=0)
+    out["image_start"] = int(layer_stats[0]["image_start"])
+    out["image_end_exclusive"] = int(layer_stats[0]["image_end_exclusive"])
+    out["ori_files"] = [x["ori_file"] for x in layer_stats]
+    out["fin_files"] = [x["fin_file"] for x in layer_stats]
+    return out
+
+
+def save_one_visual_set(out_dir, pre_img, patch_ids, patch_side, stats, neg_frac_threshold, title_lines, keep_raw_meta=True):
+    ensure_dir(out_dir)
+
+    negative_patch_ids = [pid for pid in patch_ids if stats["neg_frac"][pid] >= float(neg_frac_threshold)]
+    pre_overlay = draw_patch_overlay_on_square(
+        pre_img,
+        object_patch_ids=patch_ids,
+        negative_patch_ids=negative_patch_ids,
+        patch_side=patch_side,
+    )
+
+    ori_prob_grid = grid_from_vector(stats["mean_ori_prob"], patch_side)
+    edit_prob_grid = grid_from_vector(stats["mean_edit_prob"], patch_side)
+    diff_prob_grid = edit_prob_grid - ori_prob_grid
+
+    pre_img.save(os.path.join(out_dir, "preprocessed_input.png"))
+    pre_overlay.save(os.path.join(out_dir, "negative_patch_overlay_preprocessed.png"))
+    make_heat_overlay(pre_img, ori_prob_grid, cmap="jet", alpha=0.45).save(os.path.join(out_dir, "attention_overlay_original.png"))
+    make_heat_overlay(pre_img, edit_prob_grid, cmap="jet", alpha=0.45).save(os.path.join(out_dir, "attention_overlay_edited.png"))
+    make_heat_overlay(pre_img, diff_prob_grid, cmap="bwr", alpha=0.45).save(os.path.join(out_dir, "attention_overlay_diff.png"))
+
+    save_heatmap_only(ori_prob_grid, os.path.join(out_dir, "heatmap_original_probs.png"), title="Original post-softmax attention")
+    save_heatmap_only(edit_prob_grid, os.path.join(out_dir, "heatmap_edited_probs.png"), title="Edited post-softmax attention")
+    save_heatmap_only(diff_prob_grid, os.path.join(out_dir, "heatmap_diff_probs.png"), title="Edited - original attention")
+    save_panel(os.path.join(out_dir, "panel.png"), pre_img, pre_overlay, ori_prob_grid, edit_prob_grid, diff_prob_grid, title_lines)
+
+    meta = {
+        "negative_patch_ids": negative_patch_ids,
+        "neg_frac_threshold": float(neg_frac_threshold),
+        "num_negative_patches": len(negative_patch_ids),
+        "image_start": int(stats["image_start"]),
+        "image_end_exclusive": int(stats["image_end_exclusive"]),
+    }
+    if keep_raw_meta:
+        meta["negative_patch_fraction"] = {str(pid): float(stats["neg_frac"][pid]) for pid in patch_ids}
+        meta["mean_ori_logits"] = {str(pid): float(stats["mean_ori_logits"][pid]) for pid in patch_ids}
+    save_json(meta, os.path.join(out_dir, "meta.json"))
+
+
+def run_one_sample(sid, group_name, args, wrapper, dataset_loader, prompts, answers, patch_meta, records_data):
     layers = [int(x) for x in args.layers.split(",") if x.strip() != ""]
     obj_key = records_data["object_key"]
     all_data = records_data["all_data"]
@@ -480,7 +438,6 @@ def run_one_sample(
     ensure_dir(logit_dir)
     ensure_dir(attn_dir)
 
-    # find image from dataset
     image = None
     for cur_sid, cur_img in iter_samples(dataset_loader):
         if cur_sid == sid:
@@ -501,23 +458,9 @@ def run_one_sample(
     ).to(args.device)
 
     pre_img = tensor_to_pil(single_input["pixel_values"][0], wrapper.processor)
-    target_w, target_h = pre_img.size
-
-    # try original image path first
-    orig_path = meta.get("image_path", "")
-    if orig_path and os.path.exists(orig_path):
-        orig_img = Image.open(orig_path).convert("RGB")
-    else:
-        # fallback
-        if isinstance(image, Image.Image):
-            orig_img = image.convert("RGB")
-        else:
-            orig_img = pre_img.copy()
-
     keys = make_keys_from_input_ids(single_input, wrapper.model)
     prompt_len = len(single_input["input_ids"][-1])
 
-    # env
     set_common_env(args.layers, args.variant)
     set_patch_env_for_sample(patch_ids)
     set_weight_env_for_sample(args.weight)
@@ -529,6 +472,7 @@ def run_one_sample(
 
     os.environ["SAVE_ATTN"] = "1"
     os.environ["SAVE_ATTN_PATH"] = attn_dir
+    os.environ["SAVE_ATTN_LAYERS"] = args.layers
     os.environ["SAVE_ORI"] = "1"
 
     with torch.no_grad():
@@ -541,98 +485,83 @@ def run_one_sample(
             return_dict_in_generate=True,
         )
 
-    gen = decode_generated(wrapper.processor, output, prompt_len)
-    conf = first_step_confidence(output)
+    rerun_gen = decode_generated(wrapper.processor, output, prompt_len)
+    rerun_conf = first_step_confidence(output)
 
-    mean_ori_logits, neg_frac, mean_ori_prob, mean_edit_prob, image_start, image_end = aggregate_maps(
-        logit_dir, attn_dir, sid, layers
-    )
+    layer_stats = []
+    for layer in layers:
+        layer_stat = compute_layer_maps(logit_dir, attn_dir, sid, layer)
+        layer_stats.append(layer_stat)
 
-    # define negative patches:
-    # among object patch ids, mark negative if mean pre-softmax image logit < 0
-    negative_patch_ids = [pid for pid in patch_ids if mean_ori_logits[pid] < 0.0]
+        layer_dir = os.path.join(sample_dir, f"layer_{layer:02d}")
+        title_lines = [
+            f"{group_name} | sid={sid} | layer={layer}",
+            f"gold={gold}",
+            f"base_correct={base_rec['correct']} | edited_correct={obj_rec['correct']}",
+            f"base_gen={base_rec['generation']}",
+            f"edited_gen={obj_rec['generation']}",
+        ]
+        save_one_visual_set(
+            out_dir=layer_dir,
+            pre_img=pre_img,
+            patch_ids=patch_ids,
+            patch_side=patch_side,
+            stats=layer_stat,
+            neg_frac_threshold=args.neg_frac_threshold,
+            title_lines=title_lines,
+            keep_raw_meta=True,
+        )
 
-    # prepare overlays
-    pre_overlay = draw_patch_overlay_on_square(
-        pre_img,
-        object_patch_ids=patch_ids,
-        negative_patch_ids=negative_patch_ids,
-        patch_side=patch_side,
-    )
+    if args.save_mean_layers:
+        mean_stats = compute_mean_layers(layer_stats)
+        mean_dir = os.path.join(sample_dir, "mean_layers")
+        title_lines = [
+            f"{group_name} | sid={sid} | mean layers={args.layers}",
+            f"gold={gold}",
+            f"base_correct={base_rec['correct']} | edited_correct={obj_rec['correct']}",
+            f"base_gen={base_rec['generation']}",
+            f"edited_gen={obj_rec['generation']}",
+        ]
+        save_one_visual_set(
+            out_dir=mean_dir,
+            pre_img=pre_img,
+            patch_ids=patch_ids,
+            patch_side=patch_side,
+            stats=mean_stats,
+            neg_frac_threshold=args.neg_frac_threshold,
+            title_lines=title_lines,
+            keep_raw_meta=True,
+        )
+        shutil.copy2(os.path.join(mean_dir, "panel.png"), os.path.join(sample_dir, "panel_mean_layers.png"))
 
-    orig_overlay = patch_boxes_on_original_image(
-        orig_img,
-        object_patch_ids=patch_ids,
-        negative_patch_ids=negative_patch_ids,
-        patch_side=patch_side,
-        target_w=target_w,
-        target_h=target_h,
-    )
+    sample_meta = {
+        "sample_id": sid,
+        "group": group_name,
+        "prompt": prompt,
+        "gold": gold,
+        "base_correct": bool(base_rec["correct"]),
+        "edited_correct": bool(obj_rec["correct"]),
+        "base_generation": base_rec["generation"],
+        "edited_generation": obj_rec["generation"],
+        "base_confidence_from_records": float(base_rec.get("confidence", 0.0)),
+        "edited_selected_weight_from_records": float(obj_rec.get("selected_weight", args.weight)),
+        "rerun_first_step_confidence": float(rerun_conf),
+        "rerun_generation": rerun_gen,
+        "variant": args.variant,
+        "layers": layers,
+        "num_object_patch_ids": len(patch_ids),
+        "object_patch_ids": patch_ids,
+        "patch_side": patch_side,
+        "image_path": meta.get("image_path", ""),
+        "neg_frac_threshold": float(args.neg_frac_threshold),
+    }
+    save_json(sample_meta, os.path.join(sample_dir, "meta.json"))
 
-    ori_prob_grid = grid_from_vector(mean_ori_prob, patch_side)
-    edit_prob_grid = grid_from_vector(mean_edit_prob, patch_side)
-    diff_prob_grid = edit_prob_grid - ori_prob_grid
-
-    # heat overlays
-    ori_heat_overlay = make_heat_overlay(pre_img, ori_prob_grid, cmap="jet", alpha=0.45)
-    edit_heat_overlay = make_heat_overlay(pre_img, edit_prob_grid, cmap="jet", alpha=0.45)
-    diff_heat_overlay = make_heat_overlay(pre_img, diff_prob_grid, cmap="bwr", alpha=0.45)
-
-    pre_img.save(os.path.join(sample_dir, "preprocessed_input.png"))
-    orig_img.save(os.path.join(sample_dir, "original_image.png"))
-    pre_overlay.save(os.path.join(sample_dir, "negative_patch_overlay_preprocessed.png"))
-    orig_overlay.save(os.path.join(sample_dir, "negative_patch_overlay_original.png"))
-    ori_heat_overlay.save(os.path.join(sample_dir, "attention_overlay_original.png"))
-    edit_heat_overlay.save(os.path.join(sample_dir, "attention_overlay_edited.png"))
-    diff_heat_overlay.save(os.path.join(sample_dir, "attention_overlay_diff.png"))
-
-    save_heatmap_only(ori_prob_grid, os.path.join(sample_dir, "heatmap_original_probs.png"), title="Original post-softmax attention")
-    save_heatmap_only(edit_prob_grid, os.path.join(sample_dir, "heatmap_edited_probs.png"), title="Edited post-softmax attention")
-    save_heatmap_only(diff_prob_grid, os.path.join(sample_dir, "heatmap_diff_probs.png"), title="Edited - original attention")
-
-    title_lines = [
-        f"{group_name} | sid={sid}",
-        f"gold={gold}",
-        f"base_correct={base_rec['correct']} | edited_correct={obj_rec['correct']}",
-        f"base_gen={base_rec['generation']}",
-        f"edited_gen={obj_rec['generation']}",
-    ]
-    save_panel(sample_dir, pre_img, orig_overlay, pre_overlay, ori_prob_grid, edit_prob_grid, diff_prob_grid, title_lines)
-
-    save_json(
-        {
-            "sample_id": sid,
-            "group": group_name,
-            "prompt": prompt,
-            "gold": gold,
-            "base_correct": bool(base_rec["correct"]),
-            "edited_correct": bool(obj_rec["correct"]),
-            "base_generation": base_rec["generation"],
-            "edited_generation": obj_rec["generation"],
-            "base_confidence_from_records": float(base_rec.get("confidence", 0.0)),
-            "edited_selected_weight_from_records": float(obj_rec.get("selected_weight", args.weight)),
-            "rerun_first_step_confidence": float(conf),
-            "variant": args.variant,
-            "layers": layers,
-            "num_object_patch_ids": len(patch_ids),
-            "object_patch_ids": patch_ids,
-            "negative_patch_ids": negative_patch_ids,
-            "negative_patch_fraction_mean_over_layers_heads": {
-                str(i): float(neg_frac[i]) for i in negative_patch_ids
-            },
-            "image_start": int(image_start),
-            "image_end_exclusive": int(image_end),
-            "patch_side": patch_side,
-            "image_path": meta.get("image_path", ""),
-        },
-        os.path.join(sample_dir, "meta.json"),
-    )
-
-    # also save raw numpy for later analysis
-    np.save(os.path.join(sample_dir, "mean_ori_logits.npy"), mean_ori_logits)
-    np.save(os.path.join(sample_dir, "neg_frac.npy"), neg_frac)
-    np.save(os.path.join(sample_dir, "mean_ori_prob.npy"), mean_ori_prob)
-    np.save(os.path.join(sample_dir, "mean_edit_prob.npy"), mean_edit_prob)
+    if not args.keep_raw:
+        if os.path.exists(logit_dir):
+            shutil.rmtree(logit_dir)
+        if os.path.exists(attn_dir):
+            shutil.rmtree(attn_dir)
 
     clear_debug_env()
 
@@ -651,11 +580,14 @@ def main():
     parser.add_argument("--layers", default="0,1,2,3,4")
     parser.add_argument("--weight", type=float, default=0.5)
     parser.add_argument("--max-length", type=int, default=77)
-    parser.add_argument("--max-new-tokens", type=int, default=100)
+    parser.add_argument("--max-new-tokens", type=int, default=1)
     parser.add_argument("--num-per-group", type=int, default=5)
     parser.add_argument("--random-pick", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-dir", default="output/negmean_patch_visuals")
+    parser.add_argument("--neg-frac-threshold", type=float, default=0.5)
+    parser.add_argument("--keep-raw", action="store_true")
+    parser.add_argument("--save-mean-layers", action="store_true")
     args = parser.parse_args()
 
     ensure_dir(args.out_dir)
@@ -678,9 +610,6 @@ def main():
         os.path.join(args.out_dir, "selected_sids.json"),
     )
 
-    # These flags MUST be set before change_greedy_to_add_weight() / get_model().
-    # modeling_llama_add_attn.py reads SAVE_IMG_LOGITS / SAVE_ATTN at import time.
-    # Per-sample paths and tags are still set later inside run_one_sample().
     os.environ["SAVE_IMG_LOGITS"] = "1"
     os.environ["SAVE_ATTN"] = "1"
     os.environ["SAVE_ORI"] = "1"
