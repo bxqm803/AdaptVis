@@ -69,6 +69,37 @@ def tensor_to_pil(pixel_values: torch.Tensor, processor: Any) -> Image.Image:
     return Image.fromarray(arr)
 
 
+def process_image_to_pil(wrapper_processor: Any, prompt: str, image: Image.Image, max_length: int, device: str) -> Image.Image:
+    """Return the actual processor-space image used by the VLM, inverted to RGB."""
+    inp = wrapper_processor(
+        text=prompt,
+        images=image,
+        padding="max_length",
+        return_tensors="pt",
+        max_length=max_length,
+    )
+    if hasattr(inp, "to"):
+        inp = inp.to(device)
+    return tensor_to_pil(inp["pixel_values"][0], wrapper_processor)
+
+
+def draw_patch_overlay(img: Image.Image, patch_ids: List[int], patch_side: int) -> Image.Image:
+    """Draw selected patch ids on a processor-space image."""
+    img = img.convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    w, h = img.size
+    cell_w = w / patch_side
+    cell_h = h / patch_side
+    for pid in patch_ids:
+        r = int(pid) // patch_side
+        c = int(pid) % patch_side
+        x0, y0 = c * cell_w, r * cell_h
+        x1, y1 = (c + 1) * cell_w, (r + 1) * cell_h
+        draw.rectangle([x0, y0, x1, y1], outline=(255, 0, 0, 220), fill=(255, 0, 0, 80), width=2)
+    return Image.alpha_composite(img, overlay).convert("RGB")
+
+
 def parse_candidate_objects(prompt: str) -> Tuple[str, str]:
     """Best-effort parser for Controlled_Images prompts.
 
@@ -401,11 +432,22 @@ def save_debug_vis(
     vis_dir: str,
     sid: int,
     image_pil: Image.Image,
+    prompt: str,
+    wrapper_processor: Any,
     detections: List[Dict[str, Any]],
     proc_mask: Image.Image,
     patch_ids: List[int],
     patch_side: int,
+    max_length: int,
+    device: str,
 ) -> None:
+    """Save sanity-check images.
+
+    Outputs:
+      1. raw original image + GroundingDINO bbox
+      2. processor-space mask + selected patch ids
+      3. processor-space real image + selected patch ids  <-- most important
+    """
     os.makedirs(vis_dir, exist_ok=True)
 
     raw = image_pil.copy().convert("RGB")
@@ -417,20 +459,21 @@ def save_debug_vis(
         draw.text((box[0], max(0, box[1] - 12)), label, fill=(255, 0, 0))
     raw.save(os.path.join(vis_dir, f"sid{sid:04d}_raw_bbox.png"))
 
-    proc_rgb = Image.merge("RGB", [proc_mask, proc_mask, proc_mask]).convert("RGBA")
-    overlay = Image.new("RGBA", proc_rgb.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    w, h = proc_rgb.size
-    cell_w = w / patch_side
-    cell_h = h / patch_side
-    for pid in patch_ids:
-        r = int(pid) // patch_side
-        c = int(pid) % patch_side
-        x0, y0 = c * cell_w, r * cell_h
-        x1, y1 = (c + 1) * cell_w, (r + 1) * cell_h
-        draw.rectangle([x0, y0, x1, y1], outline=(255, 0, 0, 220), fill=(255, 0, 0, 80), width=2)
-    Image.alpha_composite(proc_rgb, overlay).convert("RGB").save(
+    proc_mask_rgb = Image.merge("RGB", [proc_mask, proc_mask, proc_mask])
+    draw_patch_overlay(proc_mask_rgb, patch_ids, patch_side).save(
         os.path.join(vis_dir, f"sid{sid:04d}_processed_mask_patch_ids.png")
+    )
+
+    processed_img = process_image_to_pil(
+        wrapper_processor=wrapper_processor,
+        prompt=prompt,
+        image=image_pil,
+        max_length=max_length,
+        device=device,
+    )
+    processed_img.save(os.path.join(vis_dir, f"sid{sid:04d}_processed_image.png"))
+    draw_patch_overlay(processed_img, patch_ids, patch_side).save(
+        os.path.join(vis_dir, f"sid{sid:04d}_processed_image_patch_ids.png")
     )
 
 
@@ -602,10 +645,14 @@ def main():
                 vis_dir=args.vis_dir,
                 sid=sid,
                 image_pil=image_pil,
+                prompt=prompt,
+                wrapper_processor=wrapper.processor,
                 detections=detections,
                 proc_mask=proc_mask,
                 patch_ids=patch_ids,
                 patch_side=args.patch_side,
+                max_length=args.max_length,
+                device=args.device,
             )
 
     with open(args.out_json, "w", encoding="utf-8") as f:
