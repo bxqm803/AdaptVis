@@ -1,5 +1,6 @@
 import os
 import csv
+import json
 import argparse
 import torch
 from tqdm import tqdm
@@ -26,11 +27,11 @@ def parse_args():
     p.add_argument("--root-dir", default="data")
     p.add_argument("--device", default="cuda")
 
-    p.add_argument("--layers", default="0,1,2,3", help="Early layers used by the intervention.")
+    p.add_argument("--layers", default="0,1,2,3,4", help="Transformer layers used by the intervention.")
     p.add_argument("--num-layers", type=int, default=32)
     p.add_argument("--patch-grid", type=int, default=4, help="4 means 4x4 spatial blocks = 16 blocks.")
 
-    p.add_argument("--variant", default="negonly_median_img")
+    p.add_argument("--variant", default="negonly_mean_img")
     p.add_argument("--posneg-strength", type=float, default=1.0)
     p.add_argument("--posneg-clamp-zero", default="1")
 
@@ -45,6 +46,14 @@ def parse_args():
     p.add_argument("--fresh-limit", type=int, default=-1)
 
     p.add_argument("--out-csv", default="output/block_leave_one_out_first4_summary.csv")
+    p.add_argument("--save-records", default="", help="Optional json path to save summaries and per-sample records.")
+    p.add_argument(
+        "--run-mode",
+        default="leave_one_out",
+        choices=["leave_one_out", "only_blocks", "all_blocks"],
+        help="leave_one_out: original 16-block ablation; only_blocks: intervene only selected blocks; all_blocks: intervene all blocks only.",
+    )
+    p.add_argument("--blocks", default="13,14", help="Comma-separated spatial block ids for --run-mode only_blocks.")
     return p.parse_args()
 
 
@@ -123,6 +132,10 @@ def set_common_env(args, block_mode="all", blocks=""):
     # Keep head intervention unrestricted; this experiment ablates spatial blocks.
     os.environ["ADAPTVIS_HEAD_MODE"] = "all"
     os.environ.pop("ADAPTVIS_HEADS", None)
+
+    # Make sure old object-box experiments do not override block selection.
+    os.environ.pop("ADAPTVIS_PATCH_ID_MODE", None)
+    os.environ.pop("ADAPTVIS_PATCH_IDS", None)
 
     os.environ["ADAPTVIS_PATCH_GRID"] = str(args.patch_grid)
     os.environ["ADAPTVIS_PATCH_BLOCK_MODE"] = str(block_mode)
@@ -264,6 +277,81 @@ def compare_groups(base_records, mixed_records):
     return stats
 
 
+
+def make_summary_row(mode, base_summary, summary=None, stats=None, block_mode="", blocks="", block_id="", block_row="", block_col="", excluded_block=""):
+    if summary is None:
+        summary = {}
+    if stats is None:
+        stats = {}
+
+    return {
+        "mode": mode,
+        "run_mode": "",
+        "block_mode": block_mode,
+        "blocks": blocks,
+        "block_id": block_id,
+        "block_row": block_row,
+        "block_col": block_col,
+        "excluded_block": excluded_block,
+        "num_total": summary.get("num_total", base_summary["num_total"]),
+        "base_acc": base_summary["acc"],
+        "mode_acc": summary.get("acc", ""),
+        "base_num_correct": base_summary["num_correct"],
+        "mode_num_correct": summary.get("num_correct", ""),
+        "selected_0p5_count": summary.get("selected_0p5_count", ""),
+        "selected_1p5_count": summary.get("selected_1p5_count", ""),
+        "wrong_to_correct": stats.get("wrong_to_correct", ""),
+        "correct_to_wrong": stats.get("correct_to_wrong", ""),
+        "correct_to_correct": stats.get("correct_to_correct", ""),
+        "wrong_to_wrong": stats.get("wrong_to_wrong", ""),
+        "net_gain": stats.get("net_gain", ""),
+        "selected0p5_wrong_to_correct": stats.get("selected0p5_wrong_to_correct", ""),
+        "selected0p5_correct_to_wrong": stats.get("selected0p5_correct_to_wrong", ""),
+        "selected0p5_net_gain": stats.get("selected0p5_net_gain", ""),
+        "full_acc": "",
+        "except_acc": "",
+        "drop_acc_from_full": "",
+        "full_num_correct": "",
+        "except_num_correct": "",
+        "drop_correct_from_full": "",
+        "full_net_gain": "",
+        "except_net_gain": "",
+        "drop_net_gain_from_full": "",
+        "full_selected0p5_net_gain": "",
+        "except_selected0p5_net_gain": "",
+        "drop_selected0p5_net_gain_from_full": "",
+    }
+
+
+def write_rows(out_csv, rows):
+    fieldnames = [
+        "mode", "run_mode", "block_mode", "blocks",
+        "block_id", "block_row", "block_col", "excluded_block", "num_total",
+        "base_acc", "mode_acc",
+        "base_num_correct", "mode_num_correct",
+        "selected_0p5_count", "selected_1p5_count",
+        "wrong_to_correct", "correct_to_wrong", "correct_to_correct", "wrong_to_wrong", "net_gain",
+        "selected0p5_wrong_to_correct", "selected0p5_correct_to_wrong", "selected0p5_net_gain",
+        "full_acc", "except_acc", "drop_acc_from_full",
+        "full_num_correct", "except_num_correct", "drop_correct_from_full",
+        "full_net_gain", "except_net_gain", "drop_net_gain_from_full",
+        "full_selected0p5_net_gain", "except_selected0p5_net_gain", "drop_selected0p5_net_gain_from_full",
+    ]
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+
+def save_records_if_needed(args, payload):
+    if not args.save_records:
+        return
+    os.makedirs(os.path.dirname(args.save_records), exist_ok=True)
+    with open(args.save_records, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print("[RECORDS SAVED]", args.save_records)
+
 def main():
     args = parse_args()
     os.makedirs(os.path.dirname(args.out_csv), exist_ok=True)
@@ -299,7 +387,54 @@ def main():
         blocks="",
     )
 
-    # Full early spatial intervention baseline: all 4x4 blocks active.
+    rows = []
+    records_payload = {
+        "args": vars(args),
+        "base_summary": base_summary,
+        "base_records": base_records,
+    }
+
+    base_row = make_summary_row("base", base_summary, summary=base_summary, block_mode="all", blocks="")
+    base_row["run_mode"] = args.run_mode
+    rows.append(base_row)
+
+    # New mode: intervene only selected spatial blocks, e.g. blocks 13,14.
+    if args.run_mode == "only_blocks":
+        only_mode = f"only_blocks_{args.blocks.replace(',', '_')}"
+        only_summary, only_records = run_pass(
+            args, wrapper, make_loader(), prompts, answers,
+            mode_name=only_mode,
+            base_records=base_records,
+            block_mode="only",
+            blocks=args.blocks,
+        )
+        only_stats = compare_groups(base_records, only_records)
+
+        row = make_summary_row(
+            only_mode,
+            base_summary,
+            summary=only_summary,
+            stats=only_stats,
+            block_mode="only",
+            blocks=args.blocks,
+        )
+        row["run_mode"] = args.run_mode
+        rows.append(row)
+
+        records_payload.update({
+            "only_summary": only_summary,
+            "only_stats": only_stats,
+            "only_records": only_records,
+        })
+
+        write_rows(args.out_csv, rows)
+        save_records_if_needed(args, records_payload)
+        print("[ONLY BLOCKS SUMMARY]", only_summary)
+        print("[ONLY BLOCKS STATS]", only_stats)
+        print("[CSV SAVED]", args.out_csv)
+        return
+
+    # Mode: intervene all spatial blocks only, without leave-one-out.
     full_summary, full_records = run_pass(
         args, wrapper, make_loader(), prompts, answers,
         mode_name="full_all_blocks",
@@ -309,57 +444,39 @@ def main():
     )
     full_stats = compare_groups(base_records, full_records)
 
-    rows = []
-    rows.append({
-        "mode": "base",
-        "block_id": "",
-        "block_row": "",
-        "block_col": "",
-        "excluded_block": "",
-        "num_total": base_summary["num_total"],
-        "base_acc": base_summary["acc"],
-        "full_acc": "",
-        "except_acc": "",
-        "drop_acc_from_full": "",
-        "base_num_correct": base_summary["num_correct"],
-        "full_num_correct": "",
-        "except_num_correct": "",
-        "drop_correct_from_full": "",
-        "selected_0p5_count": "",
-        "selected_1p5_count": "",
-        "full_net_gain": "",
-        "except_net_gain": "",
-        "drop_net_gain_from_full": "",
-        "full_selected0p5_net_gain": "",
-        "except_selected0p5_net_gain": "",
-        "drop_selected0p5_net_gain_from_full": "",
-    })
-    rows.append({
-        "mode": "full_all_blocks",
-        "block_id": "",
-        "block_row": "",
-        "block_col": "",
-        "excluded_block": "",
-        "num_total": full_summary["num_total"],
-        "base_acc": base_summary["acc"],
-        "full_acc": full_summary["acc"],
-        "except_acc": "",
-        "drop_acc_from_full": "",
-        "base_num_correct": base_summary["num_correct"],
-        "full_num_correct": full_summary["num_correct"],
-        "except_num_correct": "",
-        "drop_correct_from_full": "",
-        "selected_0p5_count": full_summary["selected_0p5_count"],
-        "selected_1p5_count": full_summary["selected_1p5_count"],
-        "full_net_gain": full_stats["net_gain"],
-        "except_net_gain": "",
-        "drop_net_gain_from_full": "",
-        "full_selected0p5_net_gain": full_stats["selected0p5_net_gain"],
-        "except_selected0p5_net_gain": "",
-        "drop_selected0p5_net_gain_from_full": "",
+    full_row = make_summary_row(
+        "full_all_blocks",
+        base_summary,
+        summary=full_summary,
+        stats=full_stats,
+        block_mode="all",
+        blocks="",
+    )
+    full_row["run_mode"] = args.run_mode
+    full_row["full_acc"] = full_summary["acc"]
+    full_row["full_num_correct"] = full_summary["num_correct"]
+    full_row["full_net_gain"] = full_stats["net_gain"]
+    full_row["full_selected0p5_net_gain"] = full_stats["selected0p5_net_gain"]
+    rows.append(full_row)
+
+    records_payload.update({
+        "full_summary": full_summary,
+        "full_stats": full_stats,
+        "full_records": full_records,
     })
 
+    if args.run_mode == "all_blocks":
+        write_rows(args.out_csv, rows)
+        save_records_if_needed(args, records_payload)
+        print("[FULL SUMMARY]", full_summary)
+        print("[FULL STATS]", full_stats)
+        print("[CSV SAVED]", args.out_csv)
+        return
+
+    # Original leave-one-out over 4x4 spatial blocks.
     num_blocks = int(args.patch_grid) * int(args.patch_grid)
+    except_payload = {}
+
     for block_id in range(num_blocks):
         block_row = block_id // int(args.patch_grid)
         block_col = block_id % int(args.patch_grid)
@@ -374,47 +491,46 @@ def main():
         )
         except_stats = compare_groups(base_records, except_records)
 
-        row = {
-            "mode": mode_name,
-            "block_id": block_id,
-            "block_row": block_row,
-            "block_col": block_col,
-            "excluded_block": block_id,
-            "num_total": except_summary["num_total"],
-            "base_acc": base_summary["acc"],
-            "full_acc": full_summary["acc"],
-            "except_acc": except_summary["acc"],
-            "drop_acc_from_full": full_summary["acc"] - except_summary["acc"],
-            "base_num_correct": base_summary["num_correct"],
-            "full_num_correct": full_summary["num_correct"],
-            "except_num_correct": except_summary["num_correct"],
-            "drop_correct_from_full": full_summary["num_correct"] - except_summary["num_correct"],
-            "selected_0p5_count": except_summary["selected_0p5_count"],
-            "selected_1p5_count": except_summary["selected_1p5_count"],
-            "full_net_gain": full_stats["net_gain"],
-            "except_net_gain": except_stats["net_gain"],
-            "drop_net_gain_from_full": full_stats["net_gain"] - except_stats["net_gain"],
-            "full_selected0p5_net_gain": full_stats["selected0p5_net_gain"],
-            "except_selected0p5_net_gain": except_stats["selected0p5_net_gain"],
-            "drop_selected0p5_net_gain_from_full": full_stats["selected0p5_net_gain"] - except_stats["selected0p5_net_gain"],
-        }
+        row = make_summary_row(
+            mode_name,
+            base_summary,
+            summary=except_summary,
+            stats=except_stats,
+            block_mode="except",
+            blocks=str(block_id),
+            block_id=block_id,
+            block_row=block_row,
+            block_col=block_col,
+            excluded_block=block_id,
+        )
+        row["run_mode"] = args.run_mode
+        row["full_acc"] = full_summary["acc"]
+        row["except_acc"] = except_summary["acc"]
+        row["drop_acc_from_full"] = full_summary["acc"] - except_summary["acc"]
+        row["full_num_correct"] = full_summary["num_correct"]
+        row["except_num_correct"] = except_summary["num_correct"]
+        row["drop_correct_from_full"] = full_summary["num_correct"] - except_summary["num_correct"]
+        row["full_net_gain"] = full_stats["net_gain"]
+        row["except_net_gain"] = except_stats["net_gain"]
+        row["drop_net_gain_from_full"] = full_stats["net_gain"] - except_stats["net_gain"]
+        row["full_selected0p5_net_gain"] = full_stats["selected0p5_net_gain"]
+        row["except_selected0p5_net_gain"] = except_stats["selected0p5_net_gain"]
+        row["drop_selected0p5_net_gain_from_full"] = full_stats["selected0p5_net_gain"] - except_stats["selected0p5_net_gain"]
+
         rows.append(row)
         print("[ROW]", row)
 
-        # Stream-save after every block so a long run can be inspected/resumed manually.
-        fieldnames = [
-            "mode", "block_id", "block_row", "block_col", "excluded_block", "num_total",
-            "base_acc", "full_acc", "except_acc", "drop_acc_from_full",
-            "base_num_correct", "full_num_correct", "except_num_correct", "drop_correct_from_full",
-            "selected_0p5_count", "selected_1p5_count",
-            "full_net_gain", "except_net_gain", "drop_net_gain_from_full",
-            "full_selected0p5_net_gain", "except_selected0p5_net_gain", "drop_selected0p5_net_gain_from_full",
-        ]
-        with open(args.out_csv, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
-            for r in rows:
-                w.writerow(r)
+        except_payload[mode_name] = {
+            "summary": except_summary,
+            "stats": except_stats,
+            "records": except_records,
+        }
+
+        # Stream-save after every block.
+        write_rows(args.out_csv, rows)
+
+    records_payload["except"] = except_payload
+    save_records_if_needed(args, records_payload)
 
     print("\n[DONE]")
     print("[CSV SAVED]", args.out_csv)
