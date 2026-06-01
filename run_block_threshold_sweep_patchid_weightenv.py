@@ -487,7 +487,7 @@ def main():
     wrapper.model.eval()
 
     print("[LOAD DATASET]", args.dataset)
-    dataset = get_dataset(args.dataset, image_preprocess=image_preprocess, download=False)
+    dataset = get_dataset(args.dataset, image_preprocess=image_preprocess, download=True)
     collate_fn = _default_collate if image_preprocess is None else None
 
     def make_loader():
