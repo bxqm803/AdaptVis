@@ -211,6 +211,15 @@ def set_common_env(args, block_mode="all", blocks=""):
     print("[PATCH_IDS_HEAD]", patch_ids[:20])
 
 
+def set_weight_env_for_sample(selected_w):
+    """
+    Some generate() paths drop custom kwargs such as `weight` before they reach
+    LLaMAAttention. The modified attention code reads ADAPTVIS_WEIGHT as a
+    fallback, same as run_objectbox_negpatch_once.py.
+    """
+    os.environ["ADAPTVIS_WEIGHT"] = str(float(selected_w))
+
+
 def run_pass(args, wrapper, loader, prompts, answers, mode_name, base_records=None, block_mode="all", blocks=""):
     set_common_env(args, block_mode=block_mode, blocks=blocks)
 
@@ -255,6 +264,24 @@ def run_pass(args, wrapper, loader, prompts, answers, mode_name, base_records=No
             else:
                 conf = float(base_records[sid]["confidence"])
                 selected_w = args.weight1 if conf < args.threshold else args.weight2
+
+            # Important: the modified attention module reads ADAPTVIS_WEIGHT
+            # as a fallback when generate() drops custom kwargs.
+            set_weight_env_for_sample(selected_w)
+
+            if sid < 3:
+                num_patch_ids = (
+                    len(os.environ.get("ADAPTVIS_PATCH_IDS", "").split(","))
+                    if os.environ.get("ADAPTVIS_PATCH_IDS", "")
+                    else 0
+                )
+                print(
+                    f"[DEBUG] mode={mode_name} sid={sid} "
+                    f"selected_w={selected_w} "
+                    f"ADAPTVIS_WEIGHT={os.environ.get('ADAPTVIS_WEIGHT')} "
+                    f"PATCH_ID_MODE={os.environ.get('ADAPTVIS_PATCH_ID_MODE')} "
+                    f"num_patch_ids={num_patch_ids}"
+                )
 
             if abs(selected_w - 0.5) <= 1e-6:
                 selected_05 += 1
