@@ -47,10 +47,13 @@ def parse_objects_from_prompt(prompt):
     s = re.sub(r"USER:\s*", " ", s, flags=re.I)
     s = re.sub(r"ASSISTANT:\s*", " ", s, flags=re.I)
 
+    # Support both singular and plural forms:
+    #   Where is the cup in relation to the chair?
+    #   Where are the sunglasses in relation to the chair?
     patterns = [
-        r"Where is\s+(?:the\s+)?(.+?)\s+in relation to\s+(?:the\s+)?(.+?)\?",
-        r"Where is\s+(?:the\s+)?(.+?)\s+relative to\s+(?:the\s+)?(.+?)\?",
-        r"Where is\s+(?:the\s+)?(.+?)\s+with respect to\s+(?:the\s+)?(.+?)\?",
+        r"Where\s+(?:is|are)\s+(?:the\s+)?(.+?)\s+in relation to\s+(?:the\s+)?(.+?)\?",
+        r"Where\s+(?:is|are)\s+(?:the\s+)?(.+?)\s+relative to\s+(?:the\s+)?(.+?)\?",
+        r"Where\s+(?:is|are)\s+(?:the\s+)?(.+?)\s+with respect to\s+(?:the\s+)?(.+?)\?",
     ]
 
     for pat in patterns:
@@ -276,6 +279,11 @@ def main():
     parser.add_argument("--fresh-limit", type=int, default=20)
     parser.add_argument("--idxs", default="")
     parser.add_argument("--out-dir", default="output/controlledA_object_token_visual_attention")
+    parser.add_argument(
+        "--save-model-input",
+        action="store_true",
+        help="Also save model_input_image.png for each sample. By default only attention images are saved.",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -300,7 +308,6 @@ def main():
 
     prompts, answers = sf.load_prompts(args.dataset, args.option)
 
-    meta = {}
     num_done = 0
 
     for sid, image in tqdm(iter_samples(loader), desc="object-token visual attention"):
@@ -396,20 +403,9 @@ def main():
 
         sample_dir = os.path.join(args.out_dir, f"idx{sid:04d}")
         os.makedirs(sample_dir, exist_ok=True)
-        proc_img.save(os.path.join(sample_dir, "model_input_image.png"))
 
-        sample_meta = {
-            "sample_idx": sid,
-            "prompt": prompt,
-            "gold": gold,
-            "obj1": obj1,
-            "obj2": obj2,
-            "image_pos": image_pos,
-            "image_start": image_start,
-            "image_end": image_end,
-            "objects": obj_infos,
-            "saved": [],
-        }
+        if args.save_model_input:
+            proc_img.save(os.path.join(sample_dir, "model_input_image.png"))
 
         for layer in layers:
             for info in obj_infos:
@@ -433,15 +429,6 @@ def main():
                     save_heatmap(arr, heat_path, title=base)
                     save_overlay(proc_img, arr, overlay_path)
 
-                    sample_meta["saved"].append({
-                        "layer": layer,
-                        "obj_label": obj_label,
-                        "obj": obj,
-                        "token_order": j,
-                        "token_text": tok_txt,
-                        "heat_path": heat_path,
-                        "overlay_path": overlay_path,
-                    })
 
                 if token_maps:
                     phrase_arr = np.mean(np.stack(token_maps, axis=0), axis=0)
@@ -452,29 +439,13 @@ def main():
                     save_heatmap(phrase_arr, heat_path, title=base)
                     save_overlay(proc_img, phrase_arr, overlay_path)
 
-                    sample_meta["saved"].append({
-                        "layer": layer,
-                        "obj_label": obj_label,
-                        "obj": obj,
-                        "token_order": "phrase_mean",
-                        "token_text": "phrase_mean",
-                        "heat_path": heat_path,
-                        "overlay_path": overlay_path,
-                    })
 
-        with open(os.path.join(sample_dir, "meta.json"), "w", encoding="utf-8") as f:
-            json.dump(sample_meta, f, indent=2, ensure_ascii=False)
-
-        meta[str(sid)] = sample_meta
         num_done += 1
 
         if sid < 3:
             print("[DEBUG]", sid, obj1, obj2)
             for info in obj_infos:
                 print(" ", info)
-
-    with open(os.path.join(args.out_dir, "all_meta.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2, ensure_ascii=False)
 
     print("[DONE]")
     print("[OUT DIR]", args.out_dir)
