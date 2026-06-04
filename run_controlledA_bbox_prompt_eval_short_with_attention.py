@@ -244,25 +244,59 @@ def extract_union_patch_box(rec):
     return None
 
 
-def fmt_box_short(box):
-    x1, y1, x2, y2 = box
-    return f"[{x1:.3f},{y1:.3f},{x2:.3f},{y2:.3f}]"
+def strip_answer_order_clause(q):
+    q = str(q).strip()
+
+    # Remove common answer-choice suffixes from the original question.
+    # We append one compact instruction ourselves below.
+    q = re.sub(
+        r"\s*Answer\s+with\s+left\s*,\s*right\s*,\s*on\s+or\s+under\s*\.?",
+        "",
+        q,
+        flags=re.I,
+    )
+    q = re.sub(
+        r"\s*Answer\s+with\s+left\s*,\s*right\s*,\s*above\s*,\s*or\s*below\s*\.?",
+        "",
+        q,
+        flags=re.I,
+    )
+    q = re.sub(
+        r"\s*Answer\s+with\s+left\s*,\s*right\s*,\s*above\s+or\s+below\s*\.?",
+        "",
+        q,
+        flags=re.I,
+    )
+    return q.strip()
+
+
+def fmt_box_short(box, image_size=336):
+    # extract_obj_box returns normalized boxes. Convert them back to the
+    # 336x336 processed-image pixel space used by the multiq-attn prompt.
+    x1, y1, x2, y2 = [float(v) for v in box]
+    if max(abs(x1), abs(y1), abs(x2), abs(y2)) <= 1.5:
+        x1, y1, x2, y2 = (
+            x1 * image_size,
+            y1 * image_size,
+            x2 * image_size,
+            y2 * image_size,
+        )
+
+    return f"[{x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}]"
 
 
 def build_short_bbox_hint(obj1, obj2, box1, box2, union_box=None):
     if box1 is not None and box2 is not None:
         return (
-            "Given two object bounding boxes in normalized image coordinates [x1,y1,x2,y2], "
-            "where x increases left-to-right and y increases top-to-bottom:\n"
-            f"obj1 = {obj1}, bbox1 = {fmt_box_short(box1)}\n"
-            f"obj2 = {obj2}, bbox2 = {fmt_box_short(box2)}"
+            "Bounding boxes in resize shortest edge to 336, then center crop to 336x336 image space: "
+            f"{obj1}={fmt_box_short(box1)}, "
+            f"{obj2}={fmt_box_short(box2)}."
         )
 
     if union_box is not None:
         return (
-            "Given the relevant object region in normalized image coordinates [x1,y1,x2,y2], "
-            "where x increases left-to-right and y increases top-to-bottom:\n"
-            f"region = {fmt_box_short(union_box)}"
+            "Bounding box in resize shortest edge to 336, then center crop to 336x336 image space: "
+            f"relevant region={fmt_box_short(union_box)}."
         )
 
     return ""
@@ -276,14 +310,17 @@ def inject_hint(prompt, hint):
     q = q.replace("<image>", "").strip()
     q = re.sub(r"^USER:\s*", "", q, flags=re.I).strip()
     q = re.sub(r"ASSISTANT:\s*$", "", q, flags=re.I).strip()
+    q = strip_answer_order_clause(q)
 
     return (
         "<image>\n"
         "USER: "
         + hint
-        + "\nQuestion: "
+        + "\n"
+        + "Question: "
         + q
-        + "\nASSISTANT:"
+        + " Answer with left, right, on or under only.\n"
+        + "ASSISTANT:"
     )
 
 
