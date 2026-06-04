@@ -127,19 +127,24 @@ def box_to_norm(box, image_size=336):
     x1, y1, x2, y2 = [float(v) for v in box]
 
     if max(abs(x1), abs(y1), abs(x2), abs(y2)) <= 1.5:
-        return [
+        out = [
             max(0.0, min(1.0, x1)),
             max(0.0, min(1.0, y1)),
             max(0.0, min(1.0, x2)),
             max(0.0, min(1.0, y2)),
         ]
+    else:
+        out = [
+            max(0.0, min(1.0, x1 / image_size)),
+            max(0.0, min(1.0, y1 / image_size)),
+            max(0.0, min(1.0, x2 / image_size)),
+            max(0.0, min(1.0, y2 / image_size)),
+        ]
 
-    return [
-        max(0.0, min(1.0, x1 / image_size)),
-        max(0.0, min(1.0, y1 / image_size)),
-        max(0.0, min(1.0, x2 / image_size)),
-        max(0.0, min(1.0, y2 / image_size)),
-    ]
+    if out[2] <= out[0] or out[3] <= out[1]:
+        return None
+
+    return out
 
 
 def get_box_from_det(det):
@@ -161,13 +166,23 @@ def extract_obj_box(rec, obj, obj_label=None, image_size=336):
         return None, "missing_record"
 
     if obj_label:
-        for k in [f"{obj_label}_box", f"{obj_label}_bbox", f"{obj_label}_box_xyxy"]:
+        for k in [
+            f"{obj_label}_box_norm",
+            f"{obj_label}_box_xyxy_processed",
+            f"{obj_label}_box_xyxy",
+            f"{obj_label}_box",
+            f"{obj_label}_bbox",
+        ]:
             if k in rec:
-                return box_to_norm(rec[k], image_size=image_size), k
+                b = box_to_norm(rec[k], image_size=image_size)
+                if b is not None:
+                    return b, k
 
         for k in [f"{obj_label}_patch_ids", f"{obj_label}_patches"]:
             if k in rec:
-                return patch_ids_to_norm_box(rec[k]), k
+                b = patch_ids_to_norm_box(rec[k])
+                if b is not None:
+                    return b, k
 
     for dict_key in ["boxes_by_object", "bbox_by_object", "object_boxes"]:
         d = rec.get(dict_key, None)
@@ -199,16 +214,20 @@ def extract_obj_box(rec, obj, obj_label=None, image_size=336):
                 continue
 
             box = get_box_from_det(det)
-            if box is None and "patch_ids" in det:
-                return patch_ids_to_norm_box(det["patch_ids"]), "detections.patch_ids"
+            normed_box = box_to_norm(box, image_size=image_size) if box is not None else None
 
-            if box is None:
+            if normed_box is None and "patch_ids" in det:
+                normed_box = patch_ids_to_norm_box(det["patch_ids"])
+                if normed_box is not None:
+                    return normed_box, "detections.patch_ids"
+
+            if normed_box is None:
                 continue
 
             score = float(det.get("score", det.get("confidence", 0.0)))
             if score > best_score:
                 best_score = score
-                best = box_to_norm(box, image_size=image_size)
+                best = normed_box
 
     if best is not None:
         return best, "detections.box"
@@ -455,7 +474,7 @@ class AttentionCollector:
         }
 
         if int(layer) in self.heatmap_layers:
-            arr = image_probs.mean(dim=0).mean(dim=0).detach().float().cpu().numpy().reshape(24, 24)
+            arr = image_probs.mean(dim=0).detach().float().cpu().numpy().reshape(24, 24)
             self.heatmaps[int(layer)] = arr
 
 
