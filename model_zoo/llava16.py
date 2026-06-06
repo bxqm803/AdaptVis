@@ -15,7 +15,7 @@ from transformers import (
     LlavaNextForConditionalGeneration,
 )
 
-MODEL = "llava-hf/llava-v1.6-vicuna-7b-hf"
+MODEL = os.getenv("LLAVA16_MODEL", "llava-hf/llava-v1.6-vicuna-7b-hf")
 
 
 def _norm_gold(x):
@@ -31,28 +31,6 @@ def _is_correct(gold, gen):
     if gold.lower() == "on" and "front" in gen.strip().lower():
         ok = False
     return bool(ok)
-
-
-def _strip_prompt(raw_prompt):
-    q = str(raw_prompt)
-    q = q.replace("<image>", "").strip()
-    q = re.sub(r"^USER:\s*", "", q, flags=re.I).strip()
-    q = re.sub(r"^User:\s*", "", q, flags=re.I).strip()
-    q = re.sub(r"ASSISTANT:\s*$", "", q, flags=re.I).strip()
-    q = re.sub(r"Assistant:\s*$", "", q, flags=re.I).strip()
-    return q
-
-
-def _build_prompt(processor, raw_prompt):
-    question = _strip_prompt(raw_prompt)
-    messages = [{
-        "role": "user",
-        "content": [{"type": "image"}, {"type": "text", "text": question}],
-    }]
-    try:
-        return processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-    except Exception:
-        return "<image>\nUSER: " + question + "\nASSISTANT:"
 
 
 def _generation_scores(output):
@@ -71,12 +49,17 @@ def _generation_sequences(output):
     return output["sequences"]
 
 
-def _first_step_confidence(output):
+def _first_step_confidence(output, use_softmax=True, round_digits=2):
     scores = _generation_scores(output)
     if scores is None or len(scores) == 0:
         return 0.0
-    prob = torch.nn.functional.softmax(scores[0], dim=-1)
-    return float(torch.max(prob[0]).detach().float().cpu())
+    x = scores[0]
+    if use_softmax:
+        x = torch.nn.functional.softmax(x, dim=-1)
+    val = float(torch.max(x[0]).detach().float().cpu())
+    if round_digits is not None:
+        val = round(val, int(round_digits))
+    return val
 
 
 def _decode_generated(processor, output, prompt_len):
@@ -84,11 +67,37 @@ def _decode_generated(processor, output, prompt_len):
     return processor.decode(seq[0][int(prompt_len):], skip_special_tokens=True).strip()
 
 
+def _strip_prompt(raw_prompt):
+    q = str(raw_prompt)
+    q = q.replace("<image>", "").strip()
+    q = re.sub(r"^USER:\s*", "", q, flags=re.I).strip()
+    q = re.sub(r"^User:\s*", "", q, flags=re.I).strip()
+    q = re.sub(r"ASSISTANT:\s*$", "", q, flags=re.I).strip()
+    q = re.sub(r"Assistant:\s*$", "", q, flags=re.I).strip()
+    return q
+
+
+def _build_chat_prompt(processor, raw_prompt):
+    question = _strip_prompt(raw_prompt)
+    messages = [{
+        "role": "user",
+        "content": [{"type": "image"}, {"type": "text", "text": question}],
+    }]
+    try:
+        return processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    except Exception:
+        return "<image>\nUSER: " + question + "\nASSISTANT:"
+
+
+def _make_prompt(processor, raw_prompt):
+    # Default is llava15.py-compatible: use prompt exactly as prompts/*.jsonl stores it.
+    # Set LLAVA16_USE_CHAT_TEMPLATE=1 only for debugging HF chat-template behavior.
+    if os.getenv("LLAVA16_USE_CHAT_TEMPLATE", "0") == "1":
+        return _build_chat_prompt(processor, raw_prompt)
+    return str(raw_prompt)
+
+
 class _AdaptVisContext:
-    """
-    LLaVA-1.6 / LLaVA-NeXT whole-image-token-span intervention.
-    This avoids assuming LLaVA-1.5's 24x24 patch-id order.
-    """
     def __init__(self, layers=None, num_layers=32):
         self.active = False
         self.in_lm = False
@@ -120,10 +129,8 @@ class _AdaptVisContext:
         first = min(self.image_positions)
         last = max(self.image_positions)
         n_placeholder = len(self.image_positions)
-
         if int(kv_len) == int(self.input_len):
             return first, last + 1
-
         image_len = int(kv_len) - (int(self.input_len) - int(n_placeholder))
         if image_len <= 0:
             return None
@@ -135,6 +142,8 @@ class _AdaptVisContext:
 
 
 def _apply_adaptvis_to_image_logits(attn_logits, ctx):
+    # Same multiplication rule as llava15 paper-code path, but applied to the
+    # detected LLaVA-1.6 whole image-token span rather than fixed 24x24 patch ids.
     if not ctx.active:
         return attn_logits
     if not ctx.in_lm:
@@ -144,8 +153,6 @@ def _apply_adaptvis_to_image_logits(attn_logits, ctx):
 
     q_len = attn_logits.shape[-2]
     kv_len = attn_logits.shape[-1]
-
-    # Only modify prefill. Skip decoding q_len=1.
     if q_len <= 1:
         return attn_logits
 
@@ -176,11 +183,9 @@ def _apply_adaptvis_to_image_logits(attn_logits, ctx):
 def _patch_language_model_and_softmax(model, ctx):
     old_f_softmax = F.softmax
     old_torch_softmax = torch.softmax
-
     language_model = getattr(model, "language_model", None)
     if language_model is None:
         raise AttributeError("LLaVA-NeXT model has no language_model")
-
     old_lm_forward = language_model.forward
 
     def wrapped_lm_forward(*args, **kwargs):
@@ -254,22 +259,36 @@ class LlavaWrapper:
                 torch_dtype=dtype,
                 low_cpu_mem_usage=True,
             )
-
         self.model = self.model.eval().to(device)
 
         self.num_layers = int(os.getenv("LLAVA16_NUM_LAYERS", "32"))
         self.layers = _parse_layers_from_env(self.num_layers)
         self.ctx = _AdaptVisContext(layers=self.layers, num_layers=self.num_layers)
 
-        print("[LLaVA-1.6 wrapper]")
+        # llava15.py-compatible defaults.
+        self.max_length = int(os.getenv("LLAVA16_MAX_LENGTH", "77"))
+        self.max_new_tokens = int(os.getenv("LLAVA16_MAX_NEW_TOKENS", "100"))
+        self.conf_round_digits = int(os.getenv("LLAVA16_CONF_ROUND_DIGITS", "2"))
+        self.conf_use_softmax = os.getenv("LLAVA16_CONF_USE_SOFTMAX", "1") != "0"
+
+        print("[LLaVA-1.6 wrapper: llava15-consistent control flow]")
         print("MODEL:", MODEL)
         print("method:", method)
         print("layers:", self.layers)
+        print("max_length:", self.max_length)
+        print("max_new_tokens:", self.max_new_tokens)
+        print("use_chat_template:", os.getenv("LLAVA16_USE_CHAT_TEMPLATE", "0"))
 
     @torch.no_grad()
-    def _generate_one(self, image, prompt, weight=1.0, active=False, max_new_tokens=100):
-        hf_prompt = _build_prompt(self.processor, prompt)
-        inputs = self.processor(text=hf_prompt, images=image, return_tensors="pt").to(self.device)
+    def _generate_one(self, image, prompt, weight=1.0, active=False):
+        text = _make_prompt(self.processor, prompt)
+        inputs = self.processor(
+            text=text,
+            images=image,
+            padding="max_length",
+            max_length=self.max_length,
+            return_tensors="pt",
+        ).to(self.device)
         prompt_len = inputs["input_ids"].shape[-1]
 
         image_token_index = getattr(getattr(self.model, "config", None), "image_token_index", None)
@@ -286,13 +305,17 @@ class LlavaWrapper:
         with _patch_language_model_and_softmax(self.model, self.ctx):
             output = self.model.generate(
                 **inputs,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=self.max_new_tokens,
                 output_scores=True,
                 return_dict_in_generate=True,
             )
 
         gen = _decode_generated(self.processor, output, prompt_len)
-        conf = _first_step_confidence(output)
+        conf = _first_step_confidence(
+            output,
+            use_softmax=self.conf_use_softmax,
+            round_digits=self.conf_round_digits,
+        )
         return gen, conf, int(self.ctx.modified_calls)
 
     def _run_generation_by_method(self, image, prompt, method, weight, threshold, weight1, weight2):
@@ -303,10 +326,14 @@ class LlavaWrapper:
             return gen, conf, modified, float(weight), "scaling_vis"
 
         if method == "adapt_vis":
+            # llava15.py: base generation -> confidence -> weighted generation.
             _, base_conf, _ = self._generate_one(image, prompt, weight=1.0, active=False)
-            selected_weight = float(weight1) if float(base_conf) < float(threshold) else float(weight2)
-            branch = "low_conf_lt_threshold" if float(base_conf) < float(threshold) else "high_conf_ge_threshold"
-
+            if float(base_conf) < float(threshold):
+                selected_weight = float(weight1)
+                branch = "low_conf_lt_threshold"
+            else:
+                selected_weight = float(weight2)
+                branch = "high_conf_ge_threshold"
             gen, _, modified = self._generate_one(image, prompt, weight=selected_weight, active=True)
             return gen, base_conf, modified, selected_weight, branch
 
@@ -314,30 +341,24 @@ class LlavaWrapper:
         return gen, conf, modified, 1.0, "base"
 
     @torch.no_grad()
-    def get_out_scores_wh_batched(
-        self,
-        dataset,
-        joint_loader,
-        method,
-        weight,
-        option,
-        threshold=1.0,
-        weight1=1.0,
-        weight2=1.0,
-    ):
-        qst_ans_file = f"prompts/{dataset}_with_answer_{option}_options.jsonl"
+    def get_out_scores_wh_batched(self, dataset, joint_loader, method, weight, option, threshold=1.0, weight1=1.0, weight2=1.0):
+        scores = []
+        index_of_total = 0
+        acc = 0
+        correct_id = []
 
-        prompt_list, answer_list = [], []
-        with open(qst_ans_file, "r", encoding="utf-8") as f:
-            for line in f:
+        qst_ans_file = f"prompts/{dataset}_with_answer_{option}_options.jsonl"
+        prompt_list = []
+        answer_list = []
+        with open(qst_ans_file, "r", encoding="utf-8") as file:
+            for line in file:
                 data = json.loads(line)
                 prompt_list.append(data["question"])
                 answer_list.append(data["answer"])
 
-        SAMPLE = False
+        SAMPLE = True
         TEST = os.getenv("TEST_MODE", "False") == "True"
         total_data_count = len(prompt_list)
-
         if SAMPLE:
             idx_file_path = f"./output/sampled_idx_{dataset}.npy"
             if os.path.exists(idx_file_path):
@@ -347,31 +368,21 @@ class LlavaWrapper:
                 sampled_indices.sort()
                 os.makedirs("./output", exist_ok=True)
                 np.save(idx_file_path, np.array(sampled_indices))
-
             if TEST:
                 all_indices = set(range(total_data_count))
                 sampled_indices = sorted(list(all_indices - set(sampled_indices)))
-
             prompt_list = [prompt_list[i] for i in sampled_indices]
             answer_list = [answer_list[i] for i in sampled_indices]
 
         results = []
-        scores = []
-        correct_id = []
-        acc = 0
-        index_of_total = 0
-
         for batch in tqdm(joint_loader, desc=f"llava1.6 {dataset} {method}"):
             batch_scores = []
-
             for i_option in batch["image_options"]:
                 images = list(i_option) if isinstance(i_option, (list, tuple)) else [i_option]
                 im_scores = []
-
                 for image in images:
                     if index_of_total >= len(prompt_list):
                         break
-
                     prompt = prompt_list[index_of_total]
                     gold = answer_list[index_of_total][0]
 
@@ -392,7 +403,6 @@ class LlavaWrapper:
 
                     c_option = batch["caption_options"]
                     n_options = len(list(c_option))
-
                     if n_options == 4:
                         answers = [1, 0, 0, 0] if corr else [0, 0, 1, 0]
                     elif n_options == 2:
@@ -400,12 +410,11 @@ class LlavaWrapper:
                     else:
                         answers = [0] * n_options
                         answers[0 if corr else min(1, n_options - 1)] = 1
-
                     im_scores.append(np.expand_dims(np.array(answers), -1))
 
+                    print(f"Prompt: {prompt}\nGeneration: {gen}\nGolden: {gold}")
                     print(
-                        f"[{dataset}] sid={index_of_total} "
-                        f"gold={gold} gen={gen} correct={corr} "
+                        f"[llava1.6] sid={index_of_total} correct={corr} "
                         f"conf={conf:.4f} selected_weight={selected_weight} "
                         f"branch={branch} modified_calls={modified}"
                     )
@@ -415,17 +424,14 @@ class LlavaWrapper:
                         "Generation": gen,
                         "Golden": gold,
                         "Correct": bool(corr),
-                        "Confidence": float(conf),
+                        "Uncertainty": float(conf),
                         "Selected_weight": float(selected_weight),
                         "Branch": branch,
                         "Modified_calls": int(modified),
                     })
-
                     index_of_total += 1
-
                 if im_scores:
                     batch_scores.append(np.concatenate(im_scores, axis=-1))
-
             if batch_scores:
                 scores.append(batch_scores)
 
@@ -437,13 +443,12 @@ class LlavaWrapper:
 
         final_acc = acc / max(index_of_total, 1)
         print(acc, index_of_total, final_acc)
-
+        print(final_acc)
         output_score_file = output_file_path.replace(".json", "scores.json")
         with open(output_score_file, "w", encoding="utf-8") as fout:
             json.dump({"acc": final_acc, "correct_id": correct_id}, fout, ensure_ascii=False, indent=4)
 
-        all_scores = np.concatenate(scores, axis=0)
-
+        all_scores = np.concatenate(scores, axis=0) if scores else np.array([])
         if dataset in ["Controlled_Images_B", "Controlled_Images_A"]:
             return (all_scores, [])
         return (final_acc, correct_id)
@@ -452,21 +457,18 @@ class LlavaWrapper:
     def get_judge_scores_vsr_batched(self, dataset, joint_loader, method, weight, threshold, weight1, weight2):
         TP, TN, FP, FN = 0, 0, 0, 0
         results = []
-
         for batch in tqdm(joint_loader, desc=f"llava1.6 {dataset} {method}"):
             for i_option in batch["image_options"]:
                 images = list(i_option) if isinstance(i_option, (list, tuple)) else [i_option]
                 captions = list(batch["caption_options"])
                 labels = list(batch["labels"][0]) if isinstance(batch["labels"], (list, tuple)) else list(batch["labels"])
-
                 for idx, image in enumerate(images):
                     caption = captions[idx] if idx < len(captions) else captions[0]
                     label = int(labels[idx]) if idx < len(labels) else int(labels[0])
                     prompt = (
-                        "Determine whether the description about the spatial relationship is correct or not. "
-                        "Answer with yes or no: " + str(caption)
+                        "User: \n Determine whether the description about the spatial relationship is correct or not.\n"
+                        "Answer with yes or no: " + str(caption) + " Assistant:"
                     )
-
                     gen, conf, modified, selected_weight, branch = self._run_generation_by_method(
                         image=image,
                         prompt=prompt,
@@ -476,22 +478,19 @@ class LlavaWrapper:
                         weight1=weight1,
                         weight2=weight2,
                     )
-
-                    is_yes = "yes" in gen.lower()
                     if label == 1:
-                        TP += int(is_yes)
-                        FN += int(not is_yes)
+                        TP += 1 if "yes" in gen.lower() else 0
+                        FN += 1 if "yes" not in gen.lower() else 0
                         gold = "Yes"
                     else:
-                        TN += int(not is_yes)
-                        FP += int(is_yes)
+                        TN += 1 if "no" in gen.lower() else 0
+                        FP += 1 if "no" not in gen.lower() else 0
                         gold = "No"
-
                     results.append({
                         "Prompt": prompt,
                         "Generation": gen,
                         "Golden": gold,
-                        "Confidence": float(conf),
+                        "Uncertainty": float(conf),
                         "Selected_weight": float(selected_weight),
                         "Branch": branch,
                         "Modified_calls": int(modified),
@@ -501,7 +500,6 @@ class LlavaWrapper:
         recall = TN / max((TN + FP), 1)
         f1_score = 2 * precision * recall / max((precision + recall), 1e-12)
         acc = (TN + TP) / max((TN + TP + FN + FP), 1)
-
         print(f"TP: {TP}, TN: {TN}, FP: {FP}, FN: {FN}")
         print(f"Accuracy: {acc}")
         print(f"Precision: {precision}")
@@ -512,9 +510,7 @@ class LlavaWrapper:
         output_file_path = f"./outputs/results_{dataset}_{method}_{weight}.json"
         with open(output_file_path, "w", encoding="utf-8") as fout:
             json.dump(results, fout, ensure_ascii=False, indent=4)
-
         output_score_file = output_file_path.replace(".json", "_scores.json")
         with open(output_score_file, "w", encoding="utf-8") as fout:
             json.dump({"acc": acc, "precision": precision, "recall": recall, "f1": f1_score}, fout, ensure_ascii=False, indent=4)
-
         return (TP, TN, FP, FN)
