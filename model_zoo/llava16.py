@@ -334,7 +334,7 @@ class LlavaWrapper:
                 prompt_list.append(data["question"])
                 answer_list.append(data["answer"])
 
-        SAMPLE = True
+        SAMPLE = False
         TEST = os.getenv("TEST_MODE", "False") == "True"
         total_data_count = len(prompt_list)
 
