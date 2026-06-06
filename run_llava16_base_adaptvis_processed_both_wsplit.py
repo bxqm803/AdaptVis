@@ -410,11 +410,28 @@ def main():
     )
     parser.add_argument("--mean-scale", type=float, default=1.0)
     parser.add_argument("--mul-factor", type=float, default=0.5)
+    parser.add_argument(
+        "--mul-factor-high",
+        type=float,
+        default=None,
+        help="For --intervention mul: factor used when base_confidence >= threshold. If unset, uses --mul-factor.",
+    )
+    parser.add_argument(
+        "--mul-factor-low",
+        type=float,
+        default=None,
+        help="For --intervention mul: factor used when base_confidence < threshold. If unset, uses --mul-factor.",
+    )
 
     parser.add_argument("--fresh-limit", type=int, default=-1)
     parser.add_argument("--max-new-tokens", type=int, default=20)
     parser.add_argument("--print-each-sample", action="store_true")
     args = parser.parse_args()
+
+    if args.mul_factor_high is None:
+        args.mul_factor_high = float(args.mul_factor)
+    if args.mul_factor_low is None:
+        args.mul_factor_low = float(args.mul_factor)
 
     os.makedirs(os.path.dirname(args.out_csv), exist_ok=True)
     if args.out_json:
@@ -502,6 +519,8 @@ def main():
     print("[INTERVENTION]", args.intervention)
     print("[MEAN_SCALE]", args.mean_scale)
     print("[MUL_FACTOR]", args.mul_factor)
+    print("[MUL_FACTOR_HIGH]", args.mul_factor_high)
+    print("[MUL_FACTOR_LOW]", args.mul_factor_low)
     print("=" * 80)
 
     base_by_sid = {int(r["sample_id"]): r for r in base_records}
@@ -517,7 +536,27 @@ def main():
 
         base_r = base_by_sid[sid]
         base_conf = float(base_r["base_confidence"])
-        do_adapt = base_conf < float(args.threshold)
+
+        selected_mul_factor = ""
+        gate_branch = "none"
+
+        if args.intervention == "mul":
+            # For multiplication, always run AdaptVis, but choose factor by confidence:
+            # base_confidence >= threshold -> w1 / high factor
+            # base_confidence <  threshold -> w2 / low factor
+            do_adapt = True
+            if base_conf >= float(args.threshold):
+                selected_mul_factor = float(args.mul_factor_high)
+                gate_branch = "high_conf_ge_threshold"
+            else:
+                selected_mul_factor = float(args.mul_factor_low)
+                gate_branch = "low_conf_lt_threshold"
+            ctx.mul_factor = float(selected_mul_factor)
+        else:
+            # For mean, keep the old gate: only low-confidence samples are re-run.
+            do_adapt = base_conf < float(args.threshold)
+            selected_mul_factor = float(ctx.mul_factor)
+            gate_branch = "low_conf_lt_threshold" if do_adapt else "high_conf_ge_threshold"
 
         if not do_adapt:
             gen = base_r["base_generation"]
@@ -577,6 +616,10 @@ def main():
             "intervention": args.intervention,
             "mean_scale": float(args.mean_scale),
             "mul_factor": float(args.mul_factor),
+            "mul_factor_high": float(args.mul_factor_high),
+            "mul_factor_low": float(args.mul_factor_low),
+            "selected_mul_factor": selected_mul_factor,
+            "gate_branch": gate_branch,
             "transition": transition,
             "prompt": raw_prompt,
         }
@@ -584,8 +627,9 @@ def main():
 
         if args.print_each_sample or i < 5:
             print(
-                f"[MIXED] sid={sid} gate={do_adapt} "
-                f"base_conf={base_conf:.4f} modified_calls={modified_calls} "
+                f"[MIXED] sid={sid} gate={do_adapt} branch={gate_branch} "
+                f"base_conf={base_conf:.4f} selected_mul={selected_mul_factor} "
+                f"modified_calls={modified_calls} "
                 f"gold={gold} gen={gen} correct={bool(corr)} "
                 f"transition={transition} running_acc={running_acc:.4f}"
             )
@@ -616,6 +660,10 @@ def main():
             "intervention",
             "mean_scale",
             "mul_factor",
+            "mul_factor_high",
+            "mul_factor_low",
+            "selected_mul_factor",
+            "gate_branch",
             "transition",
             "prompt",
         ]
@@ -632,6 +680,8 @@ def main():
         "intervention": args.intervention,
         "mean_scale": args.mean_scale,
         "mul_factor": args.mul_factor,
+        "mul_factor_high": args.mul_factor_high,
+        "mul_factor_low": args.mul_factor_low,
         "num_total": len(mixed_records),
         "base_acc": base_acc,
         "mixed_acc": mixed_acc,
