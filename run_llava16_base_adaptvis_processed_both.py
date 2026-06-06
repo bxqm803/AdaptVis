@@ -128,13 +128,18 @@ def decode_generated(processor, output, prompt_len):
 
 
 class AdaptVisContext:
-    def __init__(self, layers, num_layers, mean_scale):
+    def __init__(self, layers, num_layers, intervention, mean_scale, mul_factor):
         self.active = False
         self.in_lm = False
 
         self.layers = set(int(x) for x in layers)
         self.num_layers = int(num_layers)
+        self.intervention = str(intervention).strip().lower()
         self.mean_scale = float(mean_scale)
+        self.mul_factor = float(mul_factor)
+
+        if self.intervention not in ["mean", "mul"]:
+            raise ValueError(f"Unknown intervention={self.intervention}; use mean or mul")
 
         self.call_idx = 0
         self.modified_calls = 0
@@ -182,15 +187,21 @@ class AdaptVisContext:
         return start, end
 
 
-def apply_mean_lift_to_image_logits(attn_logits, ctx):
+def apply_adaptvis_to_image_logits(attn_logits, ctx):
     """
     attn_logits: [bsz, heads, q_len, kv_len]
 
-    Operation:
-      selected image-key logits in selected layers:
-      negative logits += mean_scale * abs(mean(image logits))
+    Supported interventions on selected image-key logits in selected LM layers:
 
-    This is the "add abs(mean)" variant.
+    1) mean:
+       negative logits += mean_scale * abs(mean(selected image logits)).
+       This matches the LLaVA-1.5 negonly_mean_img formula, except this
+       LLaVA-1.6 script currently applies it to the whole image-token span
+       rather than a 24x24 patch-id subset.
+
+    2) mul:
+       negative logits *= mul_factor.
+       For mul_factor < 1, negative logits move toward zero, e.g. -8 * 0.5 = -4.
     """
     if not ctx.active:
         return attn_logits
@@ -229,19 +240,25 @@ def apply_mean_lift_to_image_logits(attn_logits, ctx):
         return attn_logits
 
     x = attn_logits.clone()
-
     region = x[..., :, image_start:image_end]
-
-    # Per batch/head/query mean over image-key logits.
-    mean_abs = region.detach().float().mean(dim=-1, keepdim=True).abs()
-    mean_abs = mean_abs.to(dtype=region.dtype, device=region.device)
-
     neg_mask = region < 0
-    region_new = torch.where(
-        neg_mask,
-        region + float(ctx.mean_scale) * mean_abs,
-        region,
-    )
+
+    if ctx.intervention == "mean":
+        mean_abs = region.detach().float().mean(dim=-1, keepdim=True).abs()
+        mean_abs = mean_abs.to(dtype=region.dtype, device=region.device)
+        region_new = torch.where(
+            neg_mask,
+            region + float(ctx.mean_scale) * mean_abs,
+            region,
+        )
+    elif ctx.intervention == "mul":
+        region_new = torch.where(
+            neg_mask,
+            region * float(ctx.mul_factor),
+            region,
+        )
+    else:
+        raise ValueError(f"Unknown intervention={ctx.intervention}")
 
     x[..., :, image_start:image_end] = region_new
     ctx.modified_calls += 1
@@ -274,7 +291,7 @@ def patch_language_model_and_softmax(model, ctx):
             dim = args[0]
 
         if dim == -1 or dim == input.dim() - 1:
-            input = apply_mean_lift_to_image_logits(input, ctx)
+            input = apply_adaptvis_to_image_logits(input, ctx)
 
         return old_f_softmax(input, *args, **kwargs)
 
@@ -284,7 +301,7 @@ def patch_language_model_and_softmax(model, ctx):
             dim = args[0]
 
         if dim == -1 or dim == input.dim() - 1:
-            input = apply_mean_lift_to_image_logits(input, ctx)
+            input = apply_adaptvis_to_image_logits(input, ctx)
 
         return old_torch_softmax(input, *args, **kwargs)
 
@@ -385,7 +402,14 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.4)
     parser.add_argument("--layers", default="0,1,2,3,4")
     parser.add_argument("--num-layers", type=int, default=32)
+    parser.add_argument(
+        "--intervention",
+        default="mean",
+        choices=["mean", "mul"],
+        help="mean: negative image logits += mean_scale * abs(mean); mul: negative image logits *= mul_factor.",
+    )
     parser.add_argument("--mean-scale", type=float, default=1.0)
+    parser.add_argument("--mul-factor", type=float, default=0.5)
 
     parser.add_argument("--fresh-limit", type=int, default=-1)
     parser.add_argument("--max-new-tokens", type=int, default=20)
@@ -408,7 +432,9 @@ def main():
     ctx = AdaptVisContext(
         layers=layers,
         num_layers=args.num_layers,
+        intervention=args.intervention,
         mean_scale=args.mean_scale,
+        mul_factor=args.mul_factor,
     )
 
     base_records = []
@@ -473,7 +499,9 @@ def main():
     print("[PASS 2] MIXED BASE + ADAPTVIS")
     print("[GATE] base_confidence < ", args.threshold)
     print("[LAYERS]", layers)
+    print("[INTERVENTION]", args.intervention)
     print("[MEAN_SCALE]", args.mean_scale)
+    print("[MUL_FACTOR]", args.mul_factor)
     print("=" * 80)
 
     base_by_sid = {int(r["sample_id"]): r for r in base_records}
@@ -546,7 +574,9 @@ def main():
             "modified_softmax_calls": int(modified_calls),
             "threshold": float(args.threshold),
             "layers": args.layers,
+            "intervention": args.intervention,
             "mean_scale": float(args.mean_scale),
+            "mul_factor": float(args.mul_factor),
             "transition": transition,
             "prompt": raw_prompt,
         }
@@ -583,7 +613,9 @@ def main():
             "modified_softmax_calls",
             "threshold",
             "layers",
+            "intervention",
             "mean_scale",
+            "mul_factor",
             "transition",
             "prompt",
         ]
@@ -597,7 +629,9 @@ def main():
         "manifest_json": args.manifest_json,
         "threshold": args.threshold,
         "layers": args.layers,
+        "intervention": args.intervention,
         "mean_scale": args.mean_scale,
+        "mul_factor": args.mul_factor,
         "num_total": len(mixed_records),
         "base_acc": base_acc,
         "mixed_acc": mixed_acc,
