@@ -127,6 +127,133 @@ def decode_generated(processor, output, prompt_len):
     ).strip()
 
 
+OPTIONS = ["left", "right", "on", "under"]
+
+
+def option_token_ids(tokenizer, opt):
+    """
+    Return possible first-token ids for an option.
+    We sum variants like "left" and " left" because tokenizer behavior can differ.
+    """
+    ids = set()
+    variants = [
+        opt,
+        " " + opt,
+        opt.capitalize(),
+        " " + opt.capitalize(),
+        opt.upper(),
+        " " + opt.upper(),
+    ]
+
+    for v in variants:
+        toks = tokenizer(v, add_special_tokens=False).input_ids
+        if toks:
+            ids.add(int(toks[0]))
+
+    return sorted(ids)
+
+
+_OPTION_TOKEN_CACHE = {}
+
+
+def get_option_token_ids_cached(tokenizer, opt):
+    key = (id(tokenizer), str(opt))
+    if key not in _OPTION_TOKEN_CACHE:
+        _OPTION_TOKEN_CACHE[key] = option_token_ids(tokenizer, opt)
+    return _OPTION_TOKEN_CACHE[key]
+
+
+def option_probs_from_output(processor, output):
+    """
+    Use generation scores[0], i.e. the next-token distribution at the first generated step.
+    Returns:
+      probs: dict for left/right/on/under
+      pred: option with max probability
+    """
+    scores = generation_scores(output)
+    if scores is None or len(scores) == 0:
+        probs = {opt: 0.0 for opt in OPTIONS}
+        return probs, ""
+
+    first_scores = scores[0][0].float()
+    prob = torch.nn.functional.softmax(first_scores, dim=-1)
+
+    out = {}
+    for opt in OPTIONS:
+        tids = get_option_token_ids_cached(processor.tokenizer, opt)
+        out[opt] = float(sum(prob[t].detach().cpu() for t in tids)) if tids else 0.0
+
+    pred = max(out, key=out.get)
+    return out, pred
+
+
+def norm_option_gold(x):
+    return norm_gold(x).lower()
+
+
+def option_correct(gold, pred):
+    return norm_option_gold(gold) == str(pred).strip().lower()
+
+
+def option_prob_fields(prefix, probs):
+    return {
+        f"{prefix}_prob_{opt}": float(probs.get(opt, 0.0))
+        for opt in OPTIONS
+    }
+
+
+def add_delta_prob_fields(row):
+    for opt in OPTIONS:
+        row[f"delta_prob_{opt}"] = (
+            float(row.get(f"mixed_prob_{opt}", 0.0))
+            - float(row.get(f"base_prob_{opt}", 0.0))
+        )
+    return row
+
+
+def option_summary(records):
+    total = len(records)
+    if total == 0:
+        summary = {
+            "n": 0,
+            "base_option_acc": 0.0,
+            "mixed_option_acc": 0.0,
+            "delta_option_acc": 0.0,
+        }
+        for opt in OPTIONS:
+            summary[f"base_avg_prob_{opt}"] = 0.0
+            summary[f"mixed_avg_prob_{opt}"] = 0.0
+            summary[f"delta_avg_prob_{opt}"] = 0.0
+        return summary
+
+    base_correct = sum(int(bool(r.get("base_option_correct", False))) for r in records)
+    mixed_correct = sum(int(bool(r.get("mixed_option_correct", False))) for r in records)
+
+    summary = {
+        "n": total,
+        "base_option_acc": base_correct / total,
+        "mixed_option_acc": mixed_correct / total,
+        "delta_option_acc": mixed_correct / total - base_correct / total,
+    }
+
+    for opt in OPTIONS:
+        b = sum(float(r.get(f"base_prob_{opt}", 0.0)) for r in records) / total
+        m = sum(float(r.get(f"mixed_prob_{opt}", 0.0)) for r in records) / total
+        summary[f"base_avg_prob_{opt}"] = b
+        summary[f"mixed_avg_prob_{opt}"] = m
+        summary[f"delta_avg_prob_{opt}"] = m - b
+
+    return summary
+
+
+def option_summary_by_gold(records):
+    out = {}
+    for gold in OPTIONS:
+        sub = [r for r in records if norm_option_gold(r.get("gold", "")) == gold]
+        out[gold] = option_summary(sub)
+    return out
+
+
 class AdaptVisContext:
     def __init__(self, layers, num_layers, intervention, mean_scale, mul_factor):
         self.active = False
@@ -385,8 +512,9 @@ def run_one(processor, model, image, raw_prompt, device, max_new_tokens, ctx=Non
 
     gen = decode_generated(processor, output, prompt_len)
     conf = first_step_confidence(output)
+    opt_probs, opt_pred = option_probs_from_output(processor, output)
 
-    return gen, conf, prompt
+    return gen, conf, prompt, opt_probs, opt_pred
 
 
 def main():
@@ -479,7 +607,7 @@ def main():
         image = Image.open(img_path).convert("RGB")
 
         with patch_language_model_and_softmax(model, ctx):
-            gen, conf, hf_prompt = run_one(
+            gen, conf, hf_prompt, base_opt_probs, base_opt_pred = run_one(
                 processor=processor,
                 model=model,
                 image=image,
@@ -491,6 +619,7 @@ def main():
             )
 
         corr = raw_generation_correct(gold, gen)
+        base_opt_corr = option_correct(gold, base_opt_pred)
         base_correct += int(corr)
 
         row = {
@@ -500,6 +629,9 @@ def main():
             "base_generation": gen,
             "base_correct": bool(corr),
             "base_confidence": float(conf),
+            "base_option_pred": base_opt_pred,
+            "base_option_correct": bool(base_opt_corr),
+            **option_prob_fields("base", base_opt_probs),
             "prompt": raw_prompt,
             "hf_prompt": hf_prompt,
         }
@@ -509,6 +641,7 @@ def main():
             print(
                 f"[BASE] sid={sid} gold={gold} gen={gen} "
                 f"correct={corr} conf={conf:.4f} "
+                f"option_pred={base_opt_pred} option_correct={base_opt_corr} "
                 f"running_acc={base_correct / max(len(base_records), 1):.4f}"
             )
 
@@ -562,13 +695,19 @@ def main():
             gen = base_r["base_generation"]
             conf = base_r["base_confidence"]
             corr = base_r["base_correct"]
+            mixed_opt_pred = base_r.get("base_option_pred", "")
+            mixed_opt_corr = base_r.get("base_option_correct", False)
+            mixed_opt_probs = {
+                opt: float(base_r.get(f"base_prob_{opt}", 0.0))
+                for opt in OPTIONS
+            }
             modified_calls = 0
         else:
             image = Image.open(img_path).convert("RGB")
             adapt_count += 1
 
             with patch_language_model_and_softmax(model, ctx):
-                gen, conf, _ = run_one(
+                gen, conf, _, mixed_opt_probs, mixed_opt_pred = run_one(
                     processor=processor,
                     model=model,
                     image=image,
@@ -581,6 +720,7 @@ def main():
                 modified_calls = int(ctx.modified_calls)
 
             corr = raw_generation_correct(gold, gen)
+            mixed_opt_corr = option_correct(gold, mixed_opt_pred)
             modified_call_total += modified_calls
 
         mixed_correct += int(corr)
@@ -604,10 +744,19 @@ def main():
             "base_generation": base_r["base_generation"],
             "base_correct": base_r["base_correct"],
             "base_confidence": base_conf,
+            "base_option_pred": base_r.get("base_option_pred", ""),
+            "base_option_correct": bool(base_r.get("base_option_correct", False)),
+            **option_prob_fields(
+                "base",
+                {opt: float(base_r.get(f"base_prob_{opt}", 0.0)) for opt in OPTIONS},
+            ),
 
             "mixed_generation": gen,
             "mixed_correct": bool(corr),
             "mixed_confidence": float(conf),
+            "mixed_option_pred": mixed_opt_pred,
+            "mixed_option_correct": bool(mixed_opt_corr),
+            **option_prob_fields("mixed", mixed_opt_probs),
 
             "did_adaptvis": bool(do_adapt),
             "modified_softmax_calls": int(modified_calls),
@@ -631,11 +780,27 @@ def main():
                 f"base_conf={base_conf:.4f} selected_mul={selected_mul_factor} "
                 f"modified_calls={modified_calls} "
                 f"gold={gold} gen={gen} correct={bool(corr)} "
+                f"option_pred={mixed_opt_pred} option_correct={mixed_opt_corr} "
                 f"transition={transition} running_acc={running_acc:.4f}"
             )
 
+    for r in mixed_records:
+        add_delta_prob_fields(r)
+
     base_acc = sum(int(r["base_correct"]) for r in base_records) / max(len(base_records), 1)
     mixed_acc = sum(int(r["mixed_correct"]) for r in mixed_records) / max(len(mixed_records), 1)
+
+    base_option_acc = (
+        sum(int(bool(r.get("base_option_correct", False))) for r in mixed_records)
+        / max(len(mixed_records), 1)
+    )
+    mixed_option_acc = (
+        sum(int(bool(r.get("mixed_option_correct", False))) for r in mixed_records)
+        / max(len(mixed_records), 1)
+    )
+
+    opt_summary = option_summary(mixed_records)
+    opt_summary_by_gold = option_summary_by_gold(mixed_records)
 
     w2c = sum(1 for r in mixed_records if r["transition"] == "wrong_to_correct")
     c2w = sum(1 for r in mixed_records if r["transition"] == "correct_to_wrong")
@@ -650,9 +815,25 @@ def main():
             "base_generation",
             "base_correct",
             "base_confidence",
+            "base_option_pred",
+            "base_option_correct",
+            "base_prob_left",
+            "base_prob_right",
+            "base_prob_on",
+            "base_prob_under",
             "mixed_generation",
             "mixed_correct",
             "mixed_confidence",
+            "mixed_option_pred",
+            "mixed_option_correct",
+            "mixed_prob_left",
+            "mixed_prob_right",
+            "mixed_prob_on",
+            "mixed_prob_under",
+            "delta_prob_left",
+            "delta_prob_right",
+            "delta_prob_on",
+            "delta_prob_under",
             "did_adaptvis",
             "modified_softmax_calls",
             "threshold",
@@ -685,6 +866,10 @@ def main():
         "num_total": len(mixed_records),
         "base_acc": base_acc,
         "mixed_acc": mixed_acc,
+        "base_option_acc": base_option_acc,
+        "mixed_option_acc": mixed_option_acc,
+        "option_summary": opt_summary,
+        "option_summary_by_gold": opt_summary_by_gold,
         "adaptvis_count": adapt_count,
         "modified_call_total": modified_call_total,
         "wrong_to_correct": w2c,
@@ -705,6 +890,10 @@ def main():
     print("num_total:", len(mixed_records))
     print("base_acc:", base_acc)
     print("mixed_acc:", mixed_acc)
+    print("base_option_acc:", base_option_acc)
+    print("mixed_option_acc:", mixed_option_acc)
+    print("[OPTION SUMMARY]", opt_summary)
+    print("[OPTION SUMMARY BY GOLD]", opt_summary_by_gold)
     print("adaptvis_count:", adapt_count)
     print("wrong_to_correct:", w2c)
     print("correct_to_wrong:", c2w)
