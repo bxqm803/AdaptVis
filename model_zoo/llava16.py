@@ -15,7 +15,7 @@ from transformers import (
     LlavaNextForConditionalGeneration,
 )
 
-MODEL = "llava-hf/llava-v1.6-vicuna-7b-hf"
+MODEL = os.getenv("LLAVA16_MODEL", "llava-hf/llava-v1.6-vicuna-7b-hf")
 
 
 def _norm_gold(x):
@@ -234,7 +234,12 @@ class LlavaWrapper:
 
         image_processor = LlavaNextImageProcessor.from_pretrained(MODEL, cache_dir=root_dir)
         tokenizer = AutoTokenizer.from_pretrained(MODEL, cache_dir=root_dir, use_fast=False)
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
         self.processor = LlavaNextProcessor(image_processor=image_processor, tokenizer=tokenizer)
+        self.processor.tokenizer.padding_side = "left"
         self.tokenizer = tokenizer
         self.feature_extractor = image_processor
 
@@ -261,13 +266,17 @@ class LlavaWrapper:
         self.layers = _parse_layers_from_env(self.num_layers)
         self.ctx = _AdaptVisContext(layers=self.layers, num_layers=self.num_layers)
 
+        self.max_new_tokens = int(os.getenv("LLAVA16_MAX_NEW_TOKENS", "20"))
+
         print("[LLaVA-1.6 wrapper]")
         print("MODEL:", MODEL)
         print("method:", method)
         print("layers:", self.layers)
+        print("tokenizer.padding_side:", self.processor.tokenizer.padding_side)
+        print("max_new_tokens:", self.max_new_tokens)
 
     @torch.no_grad()
-    def _generate_one(self, image, prompt, weight=1.0, active=False, max_new_tokens=100):
+    def _generate_one(self, image, prompt, weight=1.0, active=False, max_new_tokens=None):
         hf_prompt = _build_prompt(self.processor, prompt)
         inputs = self.processor(text=hf_prompt, images=image, return_tensors="pt").to(self.device)
         prompt_len = inputs["input_ids"].shape[-1]
@@ -282,6 +291,9 @@ class LlavaWrapper:
             weight=weight,
             active=active,
         )
+
+        if max_new_tokens is None:
+            max_new_tokens = self.max_new_tokens
 
         with _patch_language_model_and_softmax(self.model, self.ctx):
             output = self.model.generate(
@@ -334,26 +346,12 @@ class LlavaWrapper:
                 prompt_list.append(data["question"])
                 answer_list.append(data["answer"])
 
-        SAMPLE = True
+        # Run the full dataset inside this wrapper.
+        # Do NOT sample here. Otherwise scores can be length 330 while
+        # dataset.evaluate_scores expects 412 Controlled-A samples.
         TEST = os.getenv("TEST_MODE", "False") == "True"
         total_data_count = len(prompt_list)
-
-        if SAMPLE:
-            idx_file_path = f"./output/sampled_idx_{dataset}.npy"
-            if os.path.exists(idx_file_path):
-                sampled_indices = np.load(idx_file_path).tolist()
-            else:
-                sampled_indices = random.sample(range(total_data_count), int(0.2 * total_data_count))
-                sampled_indices.sort()
-                os.makedirs("./output", exist_ok=True)
-                np.save(idx_file_path, np.array(sampled_indices))
-
-            if TEST:
-                all_indices = set(range(total_data_count))
-                sampled_indices = sorted(list(all_indices - set(sampled_indices)))
-
-            prompt_list = [prompt_list[i] for i in sampled_indices]
-            answer_list = [answer_list[i] for i in sampled_indices]
+        sampled_indices = []
 
         results = []
         scores = []
@@ -430,7 +428,13 @@ class LlavaWrapper:
                 scores.append(batch_scores)
 
         os.makedirs("./output", exist_ok=True)
-        output_file_path = f"./output/results1.6_{dataset}_{method}_{weight}_{option}option_{TEST}.json"
+        if method == "adapt_vis":
+            output_file_path = (
+                f"./output/results1.6_{dataset}_{method}_"
+                f"w1_{weight1}_w2_{weight2}_thr_{threshold}_{option}option_{TEST}.json"
+            )
+        else:
+            output_file_path = f"./output/results1.6_{dataset}_{method}_{weight}_{option}option_{TEST}.json"
         print("Saving results to", output_file_path)
         with open(output_file_path, "w", encoding="utf-8") as fout:
             json.dump(results, fout, ensure_ascii=False, indent=4)
