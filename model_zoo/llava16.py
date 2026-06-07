@@ -64,12 +64,36 @@ def _strip_prompt(raw_prompt):
     return q
 
 
-def _build_prompt(processor, raw_prompt):
+def _format_controlled_relation_prompt(raw_prompt, choices=None):
+    """Force ARO Controlled Images to produce a single relation label.
+
+    The Controlled_Images_A/B prompts ask about spatial relations, but an
+    open-ended LLaVA prompt often generates full captions like
+    "The lemon is on the table."  For this benchmark wrapper we need the
+    model to output one label so the downstream string match is meaningful.
+    """
+    question = _strip_prompt(raw_prompt)
+    if choices is None:
+        choices = ["Left", "Right", "On", "Under"]
+    choice_text = ", ".join(choices)
+    return (
+        "Answer the spatial relationship question based on the image.\n"
+        f"Choose exactly one option from: {choice_text}.\n"
+        "Output only the option word. Do not output a sentence or explanation.\n"
+        f"Question: {question}"
+    )
+
+
+def _build_prompt(processor, raw_prompt, force_relation_options=False, choices=None):
     """
     Prefer the HF chat template. If unavailable, fall back to the Vicuna-style
     LLaVA-NeXT prompt used by llava-v1.6-vicuna HF checkpoints.
     """
-    question = _strip_prompt(raw_prompt)
+    if force_relation_options:
+        question = _format_controlled_relation_prompt(raw_prompt, choices=choices)
+    else:
+        question = _strip_prompt(raw_prompt)
+
     messages = [
         {
             "role": "user",
@@ -86,7 +110,7 @@ def _build_prompt(processor, raw_prompt):
             tokenize=False,
         )
     except Exception:
-        return f"[INST] <image>\n{question} [/INST]"
+        return f"USER: <image>\n{question}\nASSISTANT:"
 
 
 def _generation_scores(output):
@@ -114,12 +138,11 @@ def _first_step_confidence(output):
 
 
 def _decode_generated(processor, output, prompt_len=None, input_ids=None, debug=False):
-    """Robustly decode generated text.
+    """Decode only newly generated tokens.
 
-    Some HF generation paths for multimodal decoder-only models return
-    full sequences (prompt + new tokens); others can return only generated
-    token ids. If we always slice by prompt_len, the decoded generation can
-    become empty even when the model generated tokens.
+    For multimodal generation, prompt_len can be unreliable because image
+    placeholders may be expanded before the language model. The most stable
+    signal is len(output.scores): one score tensor per generated token.
     """
     seq = _generation_sequences(output)
     if seq is None:
@@ -128,18 +151,24 @@ def _decode_generated(processor, output, prompt_len=None, input_ids=None, debug=
     full_ids = seq[0].detach().cpu()
     prompt_len = int(prompt_len or 0)
 
-    # Standard decoder-only path: sequence contains prompt + generation.
-    if prompt_len > 0 and full_ids.numel() > prompt_len:
+    scores = _generation_scores(output)
+    gen_len = len(scores) if scores is not None else 0
+
+    if gen_len > 0 and full_ids.numel() >= gen_len:
+        gen_ids = full_ids[-gen_len:]
+        mode = "last_scores_len_tokens"
+    elif prompt_len > 0 and full_ids.numel() > prompt_len:
         gen_ids = full_ids[prompt_len:]
         mode = "full_sequence_slice"
     else:
-        # Robust fallback: sequence is already generated-only, or prompt_len is
-        # larger than returned sequence length because image placeholders were
-        # expanded in input_ids but not preserved in output.sequences.
         gen_ids = full_ids
         mode = "generated_only_fallback"
 
     text = processor.decode(gen_ids, skip_special_tokens=True).strip()
+    # Defensive cleanup for broken chat-template fallbacks or legacy outputs.
+    text = re.sub(r"^\s*\[/INST\]\s*", "", text).strip()
+    text = re.sub(r"^\s*ASSISTANT:\s*", "", text, flags=re.I).strip()
+    text = re.sub(r"^\s*Assistant:\s*", "", text).strip()
 
     if debug:
         raw = processor.decode(gen_ids, skip_special_tokens=False)
@@ -447,8 +476,22 @@ class LlavaWrapper:
         print("max_new_tokens:", self.max_new_tokens)
 
     @torch.no_grad()
-    def _generate_one(self, image, prompt, weight=1.0, active=False, max_new_tokens=None):
-        hf_prompt = _build_prompt(self.processor, prompt)
+    def _generate_one(
+        self,
+        image,
+        prompt,
+        weight=1.0,
+        active=False,
+        max_new_tokens=None,
+        force_relation_options=False,
+        choices=None,
+    ):
+        hf_prompt = _build_prompt(
+            self.processor,
+            prompt,
+            force_relation_options=force_relation_options,
+            choices=choices,
+        )
         if os.getenv("LLAVA16_DEBUG_PROMPT", "0") == "1":
             print("[llava16 prompt]", repr(hf_prompt[:1000]))
         inputs = self.processor(text=hf_prompt, images=image, return_tensors="pt").to(self.device)
@@ -493,21 +536,60 @@ class LlavaWrapper:
         conf = _first_step_confidence(output)
         return gen, conf, int(self.ctx.modified_calls)
 
-    def _run_generation_by_method(self, image, prompt, method, weight, threshold, weight1, weight2):
+    def _run_generation_by_method(
+        self,
+        image,
+        prompt,
+        method,
+        weight,
+        threshold,
+        weight1,
+        weight2,
+        force_relation_options=False,
+        choices=None,
+    ):
         method = str(method)
 
         if method == "scaling_vis":
-            gen, conf, modified = self._generate_one(image, prompt, weight=weight, active=True)
+            gen, conf, modified = self._generate_one(
+                image,
+                prompt,
+                weight=weight,
+                active=True,
+                force_relation_options=force_relation_options,
+                choices=choices,
+            )
             return gen, conf, modified, float(weight), "scaling_vis"
 
         if method == "adapt_vis":
-            _, base_conf, _ = self._generate_one(image, prompt, weight=1.0, active=False)
+            _, base_conf, _ = self._generate_one(
+                image,
+                prompt,
+                weight=1.0,
+                active=False,
+                force_relation_options=force_relation_options,
+                choices=choices,
+            )
             selected_weight = float(weight1) if float(base_conf) < float(threshold) else float(weight2)
             branch = "low_conf_lt_threshold" if float(base_conf) < float(threshold) else "high_conf_ge_threshold"
-            gen, _, modified = self._generate_one(image, prompt, weight=selected_weight, active=True)
+            gen, _, modified = self._generate_one(
+                image,
+                prompt,
+                weight=selected_weight,
+                active=True,
+                force_relation_options=force_relation_options,
+                choices=choices,
+            )
             return gen, base_conf, modified, selected_weight, branch
 
-        gen, conf, modified = self._generate_one(image, prompt, weight=1.0, active=False)
+        gen, conf, modified = self._generate_one(
+            image,
+            prompt,
+            weight=1.0,
+            active=False,
+            force_relation_options=force_relation_options,
+            choices=choices,
+        )
         return gen, conf, modified, 1.0, "base"
 
     @torch.no_grad()
@@ -532,6 +614,8 @@ class LlavaWrapper:
                 answer_list.append(data["answer"])
 
         TEST = os.getenv("TEST_MODE", "False") == "True"
+        force_relation_options = dataset in ["Controlled_Images_A", "Controlled_Images_B"]
+        relation_choices = ["Left", "Right", "On", "Under"] if str(option).lower() == "four" else None
         results = []
         scores = []
         correct_id = []
@@ -560,6 +644,8 @@ class LlavaWrapper:
                         threshold=threshold,
                         weight1=weight1,
                         weight2=weight2,
+                        force_relation_options=force_relation_options,
+                        choices=relation_choices,
                     )
 
                     corr = _is_correct(gold, gen)
@@ -632,6 +718,8 @@ class LlavaWrapper:
     @torch.no_grad()
     def get_judge_scores_vsr_batched(self, dataset, joint_loader, method, weight, threshold, weight1, weight2):
         TP, TN, FP, FN = 0, 0, 0, 0
+        force_relation_options = False
+        relation_choices = None
         results = []
 
         for batch in tqdm(joint_loader, desc=f"llava1.6 {dataset} {method}"):
@@ -671,6 +759,8 @@ class LlavaWrapper:
                         threshold=threshold,
                         weight1=weight1,
                         weight2=weight2,
+                        force_relation_options=force_relation_options,
+                        choices=relation_choices,
                     )
 
                     gen_l = gen.lower()
