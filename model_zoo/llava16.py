@@ -113,9 +113,43 @@ def _first_step_confidence(output):
     return float(probs[0].max().cpu())
 
 
-def _decode_generated(processor, output, prompt_len):
+def _decode_generated(processor, output, prompt_len=None, input_ids=None, debug=False):
+    """Robustly decode generated text.
+
+    Some HF generation paths for multimodal decoder-only models return
+    full sequences (prompt + new tokens); others can return only generated
+    token ids. If we always slice by prompt_len, the decoded generation can
+    become empty even when the model generated tokens.
+    """
     seq = _generation_sequences(output)
-    return processor.decode(seq[0][int(prompt_len):], skip_special_tokens=True).strip()
+    if seq is None:
+        return ""
+
+    full_ids = seq[0].detach().cpu()
+    prompt_len = int(prompt_len or 0)
+
+    # Standard decoder-only path: sequence contains prompt + generation.
+    if prompt_len > 0 and full_ids.numel() > prompt_len:
+        gen_ids = full_ids[prompt_len:]
+        mode = "full_sequence_slice"
+    else:
+        # Robust fallback: sequence is already generated-only, or prompt_len is
+        # larger than returned sequence length because image placeholders were
+        # expanded in input_ids but not preserved in output.sequences.
+        gen_ids = full_ids
+        mode = "generated_only_fallback"
+
+    text = processor.decode(gen_ids, skip_special_tokens=True).strip()
+
+    if debug:
+        raw = processor.decode(gen_ids, skip_special_tokens=False)
+        print(
+            f"[llava16 decode] mode={mode} prompt_len={prompt_len} "
+            f"seq_len={full_ids.numel()} gen_len={gen_ids.numel()} "
+            f"text={text!r} raw={raw!r} ids={gen_ids[:20].tolist()}"
+        )
+
+    return text
 
 
 def _as_list(x):
@@ -415,6 +449,8 @@ class LlavaWrapper:
     @torch.no_grad()
     def _generate_one(self, image, prompt, weight=1.0, active=False, max_new_tokens=None):
         hf_prompt = _build_prompt(self.processor, prompt)
+        if os.getenv("LLAVA16_DEBUG_PROMPT", "0") == "1":
+            print("[llava16 prompt]", repr(hf_prompt[:1000]))
         inputs = self.processor(text=hf_prompt, images=image, return_tensors="pt").to(self.device)
         prompt_len = int(inputs["input_ids"].shape[-1])
 
@@ -438,12 +474,22 @@ class LlavaWrapper:
             output = self.model.generate(
                 **inputs,
                 max_new_tokens=int(max_new_tokens),
+                min_new_tokens=int(os.getenv("LLAVA16_MIN_NEW_TOKENS", "1")),
                 do_sample=False,
                 output_scores=True,
                 return_dict_in_generate=True,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
             )
 
-        gen = _decode_generated(self.processor, output, prompt_len)
+        debug_decode = os.getenv("LLAVA16_DEBUG_DECODE", "0") == "1"
+        gen = _decode_generated(
+            self.processor,
+            output,
+            prompt_len=prompt_len,
+            input_ids=inputs.get("input_ids", None),
+            debug=debug_decode,
+        )
         conf = _first_step_confidence(output)
         return gen, conf, int(self.ctx.modified_calls)
 
