@@ -1,8 +1,19 @@
+"""
+LLaVA-1.6 / LLaVA-NeXT wrapper for AdaptVis.
+
+Drop this file into:
+    model_zoo/llava16.py
+
+This version is designed for the HuggingFace LLaVA-NeXT implementation
+(e.g. llava-hf/llava-v1.6-vicuna-7b-hf). It keeps the public methods used
+by AdaptVis: get_out_scores_wh_batched() and get_judge_scores_vsr_batched().
+"""
+
 import os
 import re
 import json
-import random
 from contextlib import contextmanager
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -18,41 +29,64 @@ from transformers import (
 MODEL = os.getenv("LLAVA16_MODEL", "llava-hf/llava-v1.6-vicuna-7b-hf")
 
 
+# -----------------------------------------------------------------------------
+# Basic utilities
+# -----------------------------------------------------------------------------
+
 def _norm_gold(x):
-    if isinstance(x, list):
+    if isinstance(x, (list, tuple)):
         return str(x[0]).strip() if x else ""
     return str(x).strip()
 
 
 def _is_correct(gold, gen):
     gold = _norm_gold(gold)
-    gen = str(gen)
+    gen = str(gen).strip()
+    if not gold:
+        return False
     ok = (gold in gen) or (gold.lower() in gen.lower())
-    if gold.lower() == "on" and "front" in gen.strip().lower():
+    # Original AdaptVis special case.
+    if gold.lower() == "on" and "front" in gen.lower():
         ok = False
     return bool(ok)
 
 
 def _strip_prompt(raw_prompt):
+    """Remove old LLaVA-1.5 style wrappers if the prompt file already has them."""
     q = str(raw_prompt)
     q = q.replace("<image>", "").strip()
-    q = re.sub(r"^USER:\s*", "", q, flags=re.I).strip()
-    q = re.sub(r"^User:\s*", "", q, flags=re.I).strip()
-    q = re.sub(r"ASSISTANT:\s*$", "", q, flags=re.I).strip()
-    q = re.sub(r"Assistant:\s*$", "", q, flags=re.I).strip()
+    q = re.sub(r"^\s*USER:\s*", "", q, flags=re.I).strip()
+    q = re.sub(r"^\s*User:\s*", "", q, flags=re.I).strip()
+    q = re.sub(r"\s*ASSISTANT:\s*$", "", q, flags=re.I).strip()
+    q = re.sub(r"\s*Assistant:\s*$", "", q, flags=re.I).strip()
+    q = re.sub(r"^\s*\[INST\]\s*", "", q).strip()
+    q = re.sub(r"\s*\[/INST\]\s*$", "", q).strip()
     return q
 
 
 def _build_prompt(processor, raw_prompt):
+    """
+    Prefer the HF chat template. If unavailable, fall back to the Vicuna-style
+    LLaVA-NeXT prompt used by llava-v1.6-vicuna HF checkpoints.
+    """
     question = _strip_prompt(raw_prompt)
-    messages = [{
-        "role": "user",
-        "content": [{"type": "image"}, {"type": "text", "text": question}],
-    }]
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": question},
+            ],
+        }
+    ]
     try:
-        return processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        return processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
     except Exception:
-        return "<image>\nUSER: " + question + "\nASSISTANT:"
+        return f"[INST] <image>\n{question} [/INST]"
 
 
 def _generation_scores(output):
@@ -75,8 +109,8 @@ def _first_step_confidence(output):
     scores = _generation_scores(output)
     if scores is None or len(scores) == 0:
         return 0.0
-    prob = torch.nn.functional.softmax(scores[0], dim=-1)
-    return float(torch.max(prob[0]).detach().float().cpu())
+    probs = torch.softmax(scores[0].detach().float(), dim=-1)
+    return float(probs[0].max().cpu())
 
 
 def _decode_generated(processor, output, prompt_len):
@@ -84,24 +118,75 @@ def _decode_generated(processor, output, prompt_len):
     return processor.decode(seq[0][int(prompt_len):], skip_special_tokens=True).strip()
 
 
+def _as_list(x):
+    if isinstance(x, list):
+        return x
+    if isinstance(x, tuple):
+        return list(x)
+    return [x]
+
+
+def _num_caption_options(caption_options):
+    c = caption_options
+    if isinstance(c, torch.Tensor):
+        return int(c.numel())
+    if isinstance(c, (list, tuple)):
+        if len(c) == 1 and isinstance(c[0], (list, tuple)):
+            return len(c[0])
+        return len(c)
+    return 1
+
+
+def _parse_layers_from_env(num_layers=32):
+    text = os.getenv("LLAVA16_ADAPTVIS_LAYERS", "").strip()
+    if not text:
+        text = os.getenv("ADAPTVIS_LAYERS", "").strip()
+    if not text or text.lower() in {"all", "none"}:
+        return list(range(int(num_layers)))
+
+    layers = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            layers.extend(range(int(a), int(b) + 1))
+        else:
+            layers.append(int(part))
+    return sorted(set(layers))
+
+
+# -----------------------------------------------------------------------------
+# AdaptVis attention-logit patching
+# -----------------------------------------------------------------------------
+
 class _AdaptVisContext:
     """
-    LLaVA-1.6 / LLaVA-NeXT whole-image-token-span intervention.
-    This avoids assuming LLaVA-1.5's 24x24 patch-id order.
+    Tracks the image-token span in the language-model sequence.
+
+    HF LLaVA-NeXT has two possible behaviours depending on transformers version:
+      1. input_ids already contains many repeated image tokens; then kv_len == input_len.
+      2. input_ids contains a single image placeholder; the model expands it before
+         the language model; then kv_len > input_len.
+
+    This class supports both cases.
     """
-    def __init__(self, layers=None, num_layers=32):
+
+    def __init__(self, layers=None, num_layers=32, debug=False):
         self.active = False
         self.in_lm = False
         self.weight = 1.0
-        if layers is None:
-            layers = list(range(num_layers))
-        self.layers = set(int(x) for x in layers)
+        self.layers = set(int(x) for x in (layers if layers is not None else range(num_layers)))
         self.num_layers = int(num_layers)
+        self.debug = bool(debug)
+
         self.call_idx = 0
         self.modified_calls = 0
-        self.input_len = None
-        self.image_positions = []
-        self.image_token_index = None
+        self.input_len = 0
+        self.image_positions: List[int] = []
+        self.image_token_index: Optional[int] = None
+        self._printed_span = False
 
     def reset_for_sample(self, input_ids, image_token_index, weight=1.0, active=False):
         self.call_idx = 0
@@ -110,45 +195,66 @@ class _AdaptVisContext:
         self.active = bool(active)
         self.input_len = int(input_ids.shape[-1])
         self.image_token_index = int(image_token_index)
-        ids = input_ids[0]
-        pos = torch.where(ids == int(image_token_index))[0]
-        self.image_positions = [int(x.detach().cpu()) for x in pos]
+        self._printed_span = False
 
-    def get_image_span(self, kv_len):
+        ids = input_ids[0].detach()
+        pos = torch.where(ids == int(image_token_index))[0]
+        self.image_positions = [int(x.cpu()) for x in pos]
+
+    def get_image_span(self, kv_len) -> Optional[Tuple[int, int]]:
+        kv_len = int(kv_len)
         if not self.image_positions:
             return None
+
         first = min(self.image_positions)
         last = max(self.image_positions)
         n_placeholder = len(self.image_positions)
 
-        if int(kv_len) == int(self.input_len):
-            return first, last + 1
+        # Newer HF processor: image tokens are already expanded in input_ids.
+        if kv_len == int(self.input_len):
+            span = (first, last + 1)
+        else:
+            # Older behaviour: one placeholder is expanded to image features before LM.
+            expanded_image_len = kv_len - (int(self.input_len) - int(n_placeholder))
+            if expanded_image_len <= 0:
+                return None
+            span = (first, first + expanded_image_len)
 
-        image_len = int(kv_len) - (int(self.input_len) - int(n_placeholder))
-        if image_len <= 0:
+        image_start, image_end = span
+        image_start = max(0, int(image_start))
+        image_end = min(kv_len, int(image_end))
+        if image_end <= image_start:
             return None
-        start = first
-        end = start + image_len
-        if start < 0 or end > int(kv_len) or end <= start:
-            return None
-        return start, end
+
+        if self.debug and not self._printed_span:
+            print(
+                f"[llava16 span] input_len={self.input_len} kv_len={kv_len} "
+                f"n_image_placeholders={n_placeholder} span=({image_start}, {image_end})"
+            )
+            self._printed_span = True
+        return image_start, image_end
 
 
-def _apply_adaptvis_to_image_logits(attn_logits, ctx):
-    if not ctx.active:
-        return attn_logits
-    if not ctx.in_lm:
+def _apply_adaptvis_to_image_logits(attn_logits, ctx: _AdaptVisContext):
+    """
+    AdaptVis intervention: scale negative attention logits whose KEY positions
+    are visual tokens. This matches the original idea without assuming LLaVA-1.5's
+    fixed 24x24 patch ordering.
+    """
+    if not ctx.active or not ctx.in_lm:
         return attn_logits
     if not torch.is_tensor(attn_logits) or attn_logits.dim() != 4:
         return attn_logits
 
-    q_len = attn_logits.shape[-2]
-    kv_len = attn_logits.shape[-1]
+    q_len = int(attn_logits.shape[-2])
+    kv_len = int(attn_logits.shape[-1])
 
-    # Only modify prefill. Skip decoding q_len=1.
+    # Only modify the prefill pass. During decoding q_len == 1 and cached keys
+    # already contain the modified prefill state.
     if q_len <= 1:
         return attn_logits
 
+    # One self-attention softmax per decoder layer in eager attention.
     layer = ctx.call_idx % ctx.num_layers
     ctx.call_idx += 1
     if layer not in ctx.layers:
@@ -158,28 +264,28 @@ def _apply_adaptvis_to_image_logits(attn_logits, ctx):
     if span is None:
         return attn_logits
     image_start, image_end = span
-    image_start = max(0, int(image_start))
-    image_end = min(int(kv_len), int(image_end))
-    if image_end <= image_start:
-        return attn_logits
 
     x = attn_logits.clone()
     region = x[..., :, image_start:image_end]
-    neg_mask = region < 0
-    region_new = torch.where(neg_mask, region * float(ctx.weight), region)
+    # Original AdaptVis scaling only acts on negative logits.
+    region_new = torch.where(region < 0, region * float(ctx.weight), region)
     x[..., :, image_start:image_end] = region_new
     ctx.modified_calls += 1
     return x
 
 
 @contextmanager
-def _patch_language_model_and_softmax(model, ctx):
+def _patch_language_model_and_softmax(model, ctx: _AdaptVisContext):
+    """
+    Patches softmax only while we are inside model.language_model.forward().
+    Requires eager attention; the wrapper sets attn_implementation='eager'.
+    """
     old_f_softmax = F.softmax
     old_torch_softmax = torch.softmax
 
     language_model = getattr(model, "language_model", None)
     if language_model is None:
-        raise AttributeError("LLaVA-NeXT model has no language_model")
+        raise AttributeError("Expected HuggingFace LlavaNextForConditionalGeneration.language_model")
 
     old_lm_forward = language_model.forward
 
@@ -218,32 +324,35 @@ def _patch_language_model_and_softmax(model, ctx):
         torch.softmax = old_torch_softmax
 
 
-def _parse_layers_from_env(num_layers=32):
-    text = os.getenv("LLAVA16_ADAPTVIS_LAYERS", "").strip()
-    if not text:
-        text = os.getenv("ADAPTVIS_LAYERS", "").strip()
-    if not text or text.lower() in ["all", "none"]:
-        return list(range(num_layers))
-    return [int(x) for x in text.split(",") if x.strip()]
-
+# -----------------------------------------------------------------------------
+# Public wrapper used by AdaptVis
+# -----------------------------------------------------------------------------
 
 class LlavaWrapper:
     def __init__(self, root_dir, device, method):
         self.device = device
         self.method = method
 
-        image_processor = LlavaNextImageProcessor.from_pretrained(MODEL, cache_dir=root_dir)
-        tokenizer = AutoTokenizer.from_pretrained(MODEL, cache_dir=root_dir, use_fast=False)
-        tokenizer.padding_side = "left"
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        self.processor = LlavaNextProcessor(image_processor=image_processor, tokenizer=tokenizer)
-        self.processor.tokenizer.padding_side = "left"
-        self.tokenizer = tokenizer
-        self.feature_extractor = image_processor
-
         dtype = torch.float16 if str(device).startswith("cuda") else torch.float32
+
+        # Load processor directly from the checkpoint. This preserves the correct
+        # LLaVA-NeXT chat template and image-processing metadata.
+        try:
+            self.processor = LlavaNextProcessor.from_pretrained(MODEL, cache_dir=root_dir)
+            self.tokenizer = self.processor.tokenizer
+            self.feature_extractor = self.processor.image_processor
+        except Exception:
+            image_processor = LlavaNextImageProcessor.from_pretrained(MODEL, cache_dir=root_dir)
+            tokenizer = AutoTokenizer.from_pretrained(MODEL, cache_dir=root_dir, use_fast=False)
+            self.processor = LlavaNextProcessor(image_processor=image_processor, tokenizer=tokenizer)
+            self.tokenizer = tokenizer
+            self.feature_extractor = image_processor
+
+        self.tokenizer.padding_side = "left"
+        self.processor.tokenizer.padding_side = "left"
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
         try:
             self.model = LlavaNextForConditionalGeneration.from_pretrained(
                 MODEL,
@@ -262,15 +371,43 @@ class LlavaWrapper:
 
         self.model = self.model.eval().to(device)
 
-        self.num_layers = int(os.getenv("LLAVA16_NUM_LAYERS", "32"))
+        # Force eager attention where possible; otherwise monkey-patching softmax
+        # will not catch FlashAttention/SDPA kernels.
+        for cfg in [getattr(self.model, "config", None), getattr(getattr(self.model, "language_model", None), "config", None)]:
+            if cfg is not None and hasattr(cfg, "_attn_implementation"):
+                cfg._attn_implementation = "eager"
+
+        if getattr(self.model.generation_config, "pad_token_id", None) is None:
+            self.model.generation_config.pad_token_id = self.tokenizer.pad_token_id
+        if getattr(self.model.generation_config, "eos_token_id", None) is None:
+            self.model.generation_config.eos_token_id = self.tokenizer.eos_token_id
+
+        # Newer transformers expects these processor attributes for correct
+        # LLaVA-NeXT image-token expansion. Fill them if missing.
+        vision_cfg = getattr(getattr(self.model, "config", None), "vision_config", None)
+        if getattr(self.processor, "patch_size", None) is None and vision_cfg is not None:
+            self.processor.patch_size = getattr(vision_cfg, "patch_size", None)
+        if getattr(self.processor, "vision_feature_select_strategy", None) is None:
+            self.processor.vision_feature_select_strategy = getattr(self.model.config, "vision_feature_select_strategy", "default")
+        if getattr(self.processor, "num_additional_image_tokens", None) is None:
+            self.processor.num_additional_image_tokens = 1
+
+        lm_cfg = getattr(getattr(self.model, "language_model", None), "config", None)
+        default_layers = getattr(lm_cfg, "num_hidden_layers", 32)
+        self.num_layers = int(os.getenv("LLAVA16_NUM_LAYERS", str(default_layers)))
         self.layers = _parse_layers_from_env(self.num_layers)
-        self.ctx = _AdaptVisContext(layers=self.layers, num_layers=self.num_layers)
+        self.ctx = _AdaptVisContext(
+            layers=self.layers,
+            num_layers=self.num_layers,
+            debug=os.getenv("LLAVA16_DEBUG_SPAN", "0") == "1",
+        )
 
         self.max_new_tokens = int(os.getenv("LLAVA16_MAX_NEW_TOKENS", "20"))
 
-        print("[LLaVA-1.6 wrapper]")
+        print("[LLaVA-1.6 / LLaVA-NeXT wrapper]")
         print("MODEL:", MODEL)
         print("method:", method)
+        print("num_layers:", self.num_layers)
         print("layers:", self.layers)
         print("tokenizer.padding_side:", self.processor.tokenizer.padding_side)
         print("max_new_tokens:", self.max_new_tokens)
@@ -279,17 +416,19 @@ class LlavaWrapper:
     def _generate_one(self, image, prompt, weight=1.0, active=False, max_new_tokens=None):
         hf_prompt = _build_prompt(self.processor, prompt)
         inputs = self.processor(text=hf_prompt, images=image, return_tensors="pt").to(self.device)
-        prompt_len = inputs["input_ids"].shape[-1]
+        prompt_len = int(inputs["input_ids"].shape[-1])
 
         image_token_index = getattr(getattr(self.model, "config", None), "image_token_index", None)
         if image_token_index is None:
+            image_token_index = getattr(self.tokenizer, "convert_tokens_to_ids", lambda x: None)("<image>")
+        if image_token_index is None or image_token_index < 0:
             image_token_index = 32000
 
         self.ctx.reset_for_sample(
             inputs["input_ids"],
-            image_token_index=image_token_index,
-            weight=weight,
-            active=active,
+            image_token_index=int(image_token_index),
+            weight=float(weight),
+            active=bool(active),
         )
 
         if max_new_tokens is None:
@@ -298,7 +437,8 @@ class LlavaWrapper:
         with _patch_language_model_and_softmax(self.model, self.ctx):
             output = self.model.generate(
                 **inputs,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=int(max_new_tokens),
+                do_sample=False,
                 output_scores=True,
                 return_dict_in_generate=True,
             )
@@ -318,7 +458,6 @@ class LlavaWrapper:
             _, base_conf, _ = self._generate_one(image, prompt, weight=1.0, active=False)
             selected_weight = float(weight1) if float(base_conf) < float(threshold) else float(weight2)
             branch = "low_conf_lt_threshold" if float(base_conf) < float(threshold) else "high_conf_ge_threshold"
-
             gen, _, modified = self._generate_one(image, prompt, weight=selected_weight, active=True)
             return gen, base_conf, modified, selected_weight, branch
 
@@ -346,13 +485,7 @@ class LlavaWrapper:
                 prompt_list.append(data["question"])
                 answer_list.append(data["answer"])
 
-        # Run the full dataset inside this wrapper.
-        # Do NOT sample here. Otherwise scores can be length 330 while
-        # dataset.evaluate_scores expects 412 Controlled-A samples.
         TEST = os.getenv("TEST_MODE", "False") == "True"
-        total_data_count = len(prompt_list)
-        sampled_indices = []
-
         results = []
         scores = []
         correct_id = []
@@ -363,7 +496,7 @@ class LlavaWrapper:
             batch_scores = []
 
             for i_option in batch["image_options"]:
-                images = list(i_option) if isinstance(i_option, (list, tuple)) else [i_option]
+                images = _as_list(i_option)
                 im_scores = []
 
                 for image in images:
@@ -371,7 +504,7 @@ class LlavaWrapper:
                         break
 
                     prompt = prompt_list[index_of_total]
-                    gold = answer_list[index_of_total][0]
+                    gold = _norm_gold(answer_list[index_of_total])
 
                     gen, conf, modified, selected_weight, branch = self._run_generation_by_method(
                         image=image,
@@ -388,18 +521,16 @@ class LlavaWrapper:
                         acc += 1
                         correct_id.append(index_of_total)
 
-                    c_option = batch["caption_options"]
-                    n_options = len(list(c_option))
-
+                    n_options = _num_caption_options(batch.get("caption_options", []))
                     if n_options == 4:
                         answers = [1, 0, 0, 0] if corr else [0, 0, 1, 0]
                     elif n_options == 2:
                         answers = [1, 0] if corr else [0, 1]
                     else:
-                        answers = [0] * n_options
-                        answers[0 if corr else min(1, n_options - 1)] = 1
+                        answers = [0] * max(n_options, 2)
+                        answers[0 if corr else 1] = 1
 
-                    im_scores.append(np.expand_dims(np.array(answers), -1))
+                    im_scores.append(np.expand_dims(np.asarray(answers), -1))
 
                     print(
                         f"[{dataset}] sid={index_of_total} "
@@ -435,6 +566,7 @@ class LlavaWrapper:
             )
         else:
             output_file_path = f"./output/results1.6_{dataset}_{method}_{weight}_{option}option_{TEST}.json"
+
         print("Saving results to", output_file_path)
         with open(output_file_path, "w", encoding="utf-8") as fout:
             json.dump(results, fout, ensure_ascii=False, indent=4)
@@ -446,8 +578,7 @@ class LlavaWrapper:
         with open(output_score_file, "w", encoding="utf-8") as fout:
             json.dump({"acc": final_acc, "correct_id": correct_id}, fout, ensure_ascii=False, indent=4)
 
-        all_scores = np.concatenate(scores, axis=0)
-
+        all_scores = np.concatenate(scores, axis=0) if scores else np.empty((0,))
         if dataset in ["Controlled_Images_B", "Controlled_Images_A"]:
             return (all_scores, [])
         return (final_acc, correct_id)
@@ -458,14 +589,29 @@ class LlavaWrapper:
         results = []
 
         for batch in tqdm(joint_loader, desc=f"llava1.6 {dataset} {method}"):
-            for i_option in batch["image_options"]:
-                images = list(i_option) if isinstance(i_option, (list, tuple)) else [i_option]
-                captions = list(batch["caption_options"])
-                labels = list(batch["labels"][0]) if isinstance(batch["labels"], (list, tuple)) else list(batch["labels"])
+            image_options = _as_list(batch["image_options"])
+            caption_options = _as_list(batch["caption_options"])
+            labels_obj = batch.get("labels", [])
 
-                for idx, image in enumerate(images):
-                    caption = captions[idx] if idx < len(captions) else captions[0]
-                    label = int(labels[idx]) if idx < len(labels) else int(labels[0])
+            for option_idx, i_option in enumerate(image_options):
+                images = _as_list(i_option)
+                captions = _as_list(caption_options[option_idx]) if option_idx < len(caption_options) else _as_list(caption_options[0])
+
+                # labels are usually stored as batch['labels'][0][idx] in AdaptVis.
+                if isinstance(labels_obj, torch.Tensor):
+                    labels = labels_obj.detach().cpu().view(-1).tolist()
+                elif isinstance(labels_obj, (list, tuple)) and labels_obj and isinstance(labels_obj[0], (list, tuple, torch.Tensor)):
+                    first = labels_obj[0]
+                    labels = first.detach().cpu().view(-1).tolist() if isinstance(first, torch.Tensor) else list(first)
+                else:
+                    labels = list(labels_obj) if isinstance(labels_obj, (list, tuple)) else []
+
+                n = min(len(images), len(captions))
+                for idx in range(n):
+                    image = images[idx]
+                    caption = captions[idx]
+                    label = int(labels[idx]) if idx < len(labels) else 0
+
                     prompt = (
                         "Determine whether the description about the spatial relationship is correct or not. "
                         "Answer with yes or no: " + str(caption)
@@ -481,7 +627,8 @@ class LlavaWrapper:
                         weight2=weight2,
                     )
 
-                    is_yes = "yes" in gen.lower()
+                    gen_l = gen.lower()
+                    is_yes = ("yes" in gen_l) and ("no" not in gen_l[:10])
                     if label == 1:
                         TP += int(is_yes)
                         FN += int(not is_yes)
