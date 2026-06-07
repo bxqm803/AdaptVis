@@ -86,32 +86,20 @@ def _format_controlled_relation_prompt(raw_prompt, choices=None):
 
 def _build_prompt(processor, raw_prompt, force_relation_options=False, choices=None):
     """
-    Prefer the HF chat template. If unavailable, fall back to the Vicuna-style
-    LLaVA-NeXT prompt used by llava-v1.6-vicuna HF checkpoints.
+    Build a stable LLaVA/Vicuna-style prompt.
+
+    We intentionally do not call processor.apply_chat_template() here. Some
+    HF LLaVA-NeXT chat templates insert [INST] ... [/INST]. Under attention-logit
+    interventions, the model can copy the template terminator as the answer.
+    The original LLaVA-style USER/ASSISTANT template is more stable for this
+    AdaptVis evaluation.
     """
     if force_relation_options:
         question = _format_controlled_relation_prompt(raw_prompt, choices=choices)
     else:
         question = _strip_prompt(raw_prompt)
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": question},
-            ],
-        }
-    ]
-    try:
-        return processor.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=False,
-        )
-    except Exception:
-        return f"USER: <image>\n{question}\nASSISTANT:"
-
+    return f"USER: <image>\n{question}\nASSISTANT:"
 
 def _generation_scores(output):
     if hasattr(output, "scores"):
@@ -329,10 +317,18 @@ def _apply_adaptvis_to_image_logits(attn_logits, ctx: _AdaptVisContext):
     image_start, image_end = span
 
     x = attn_logits.clone()
-    region = x[..., :, image_start:image_end]
+
+    # AdaptVis / ScalingVis should intervene only on the last prefill query.
+    # Do not modify every query row. Modifying all rows corrupts the prompt
+    # representation and can make the model generate template tokens such as
+    # [/INST].
+    q_pos = q_len - 1
+    region = x[..., q_pos:q_pos + 1, image_start:image_end]
+
     # Original AdaptVis scaling only acts on negative logits.
     region_new = torch.where(region < 0, region * float(ctx.weight), region)
-    x[..., :, image_start:image_end] = region_new
+    x[..., q_pos:q_pos + 1, image_start:image_end] = region_new
+
     ctx.modified_calls += 1
     return x
 
