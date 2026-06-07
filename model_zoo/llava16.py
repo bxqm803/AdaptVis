@@ -461,7 +461,7 @@ class LlavaWrapper:
             debug=os.getenv("LLAVA16_DEBUG_SPAN", "0") == "1",
         )
 
-        self.max_new_tokens = int(os.getenv("LLAVA16_MAX_NEW_TOKENS", "20"))
+        self.max_new_tokens = int(os.getenv("LLAVA16_MAX_NEW_TOKENS", "50"))
 
         print("[LLaVA-1.6 / LLaVA-NeXT wrapper]")
         print("MODEL:", MODEL)
@@ -610,8 +610,15 @@ class LlavaWrapper:
                 answer_list.append(data["answer"])
 
         TEST = os.getenv("TEST_MODE", "False") == "True"
-        force_relation_options = dataset in ["Controlled_Images_A", "Controlled_Images_B"]
-        relation_choices = ["Left", "Right", "On", "Under"] if str(option).lower() == "four" else None
+
+        # Use the original jsonl prompt directly.
+        # Controlled_Images_A/B already contain prompts like:
+        #   "Where is the X in relation to the Y? Answer with left, right, on or under."
+        # Do not wrap the prompt again with extra option instructions; doing so
+        # changes the final-query attention distribution and first-token confidence.
+        force_relation_options = False
+        relation_choices = None
+
         results = []
         scores = []
         correct_id = []
