@@ -22,6 +22,66 @@ from PIL import Image
 import math
 MODEL='llava-hf/llava-1.5-7b-hf'
 
+
+def _norm_gold(x):
+    if isinstance(x, (list, tuple)):
+        return str(x[0]).strip() if x else ""
+    return str(x).strip()
+
+
+def _is_correct(gold, gen):
+    gold = _norm_gold(gold)
+    gen = str(gen).strip()
+    if not gold:
+        return False
+    ok = (gold in gen) or (gold.lower() in gen.lower())
+    if gold.lower() == "on" and "front" in gen.lower():
+        ok = False
+    return bool(ok)
+
+
+def _decode_generated(processor, output, prompt_len):
+    if hasattr(output, "sequences"):
+        seq = output.sequences
+    elif isinstance(output, dict):
+        seq = output.get("sequences", None)
+    else:
+        try:
+            seq = output[0]
+        except Exception:
+            seq = None
+    if seq is None:
+        return ""
+    return processor.decode(seq[0][int(prompt_len):], skip_special_tokens=True).strip()
+
+
+def _first_step_confidence(output):
+    scores = None
+    if hasattr(output, "scores"):
+        scores = output.scores
+    elif isinstance(output, dict):
+        scores = output.get("scores", None)
+    if scores is None or len(scores) == 0:
+        return 0.0
+    return float(torch.softmax(scores[0].detach().float(), dim=-1)[0].max().cpu())
+
+
+def _parse_yes_no(gen):
+    text = str(gen).strip().lower()
+    text = re.sub(r"[^a-z\s]", " ", text)
+    toks = text.split()
+    for t in toks[:8]:
+        if t in {"yes", "true", "correct"}:
+            return True
+        if t in {"no", "false", "incorrect"}:
+            return False
+    if "yes" in toks:
+        return True
+    if "no" in toks:
+        return False
+    return None
+
+
 import copy
 import inspect
 import warnings
@@ -355,7 +415,10 @@ class LlavaWrapper:
                 im_scores = []
                 
                 for _ in i_option:
+                    if index_of_total >= len(prompt_list):
+                        break
                     prompt = prompt_list[index_of_total]
+                    gold = _norm_gold(answer_list[index_of_total])
                     
                     # Preprocess input for the model
                     single_input = self.processor(
@@ -374,7 +437,7 @@ class LlavaWrapper:
                             max_new_tokens=100, output_scores=True, return_dict_in_generate=True
                         )
                         uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
-                        gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
+                        gen = _decode_generated(self.processor, output, len(single_input['input_ids'][-1]))
                     
                     elif method == 'adapt_vis':
                         change_greedy_to_add_weight()
@@ -396,31 +459,30 @@ class LlavaWrapper:
                                 **single_input, keys=keys, weight=weight2, 
                                 max_new_tokens=100, output_scores=True, return_dict_in_generate=True
                             )
-                        gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
+                        gen = _decode_generated(self.processor, output, len(single_input['input_ids'][-1]))
 
                     else:
                         # Default generation method
                         output = self.model.generate(
                             **single_input, max_new_tokens=100, output_scores=True, return_dict_in_generate=True
                         )
-                        gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
-                        uncertainty = np.round(float(max(output['scores'][0][0])), 2)
+                        gen = _decode_generated(self.processor, output, len(single_input['input_ids'][-1]))
+                        uncertainty = np.round(_first_step_confidence(output), 2)
 
                     # Print prompt, generated text, and expected answer
-                    print(f"Prompt: {prompt}\nGeneration: {gen}\nGolden: {answer_list[index_of_total][0]}")
+                    print(f"Prompt: {prompt}\nGeneration: {gen}\nGolden: {gold}")
                     
                     result = {
                         "Prompt": prompt,
                         "Generation": gen,
-                        "Golden": answer_list[index_of_total][0],
+                        "Golden": gold,
                     }
                     results.append(result)
                     
                     # Check if the generation matches the expected answer
                     c_option = batch["caption_options"]
                     if len(list(c_option)) == 4:
-                        if (answer_list[index_of_total][0] in gen or answer_list[index_of_total][0].lower() in gen.lower()) \
-                                and not (answer_list[index_of_total][0].lower() == 'on' and 'front' in gen.strip().lower()):
+                        if _is_correct(gold, gen):
                             acc += 1
                             correct_id.append(index_of_total)
                             answers = [1, 0, 0, 0]
@@ -428,8 +490,7 @@ class LlavaWrapper:
                             answers = [0, 0, 1, 0]
                     
                     elif len(list(c_option)) == 2:
-                        if (answer_list[index_of_total][0] in gen or answer_list[index_of_total][0].lower() in gen.lower()) \
-                                and not (answer_list[index_of_total][0].lower() == 'on' and 'front' in gen.strip().lower()):
+                        if _is_correct(gold, gen):
                             acc += 1
                             correct_id.append(index_of_total)
                             answers = [1, 0]
@@ -439,9 +500,11 @@ class LlavaWrapper:
                     im_scores.append(np.expand_dims(np.array(answers), -1))
                     index_of_total += 1
 
-                batch_scores.append(np.concatenate(im_scores, axis=-1))
+                if im_scores:
+                    batch_scores.append(np.concatenate(im_scores, axis=-1))
 
-            scores.append(batch_scores)
+            if batch_scores:
+                scores.append(batch_scores)
 
             # Save results to file
             output_file_path = f'./output/results1.5_{dataset}_{method}_{weight}_{option}option_{TEST}.json'
@@ -473,10 +536,10 @@ class LlavaWrapper:
         TP, TN, FP, FN = 0, 0, 0, 0
 
         # Set the directory to save attention maps
-        save_attn_dir = f"/home/user/shiqi/mmlm_mech/whatsup_vlms/outputs/{dataset}_weight{weight:.2f}"
+        save_attn_dir = f"./outputs/{dataset}_weight{weight:.2f}"
         if not os.path.exists(save_attn_dir):
             print("Creating directory for saving attention maps:", save_attn_dir)
-            os.makedirs(save_attn_dir)
+            os.makedirs(save_attn_dir, exist_ok=True)
         
         index_of_total = 0
         results = []
@@ -511,35 +574,37 @@ class LlavaWrapper:
                             change_greedy_to_add_weight()
                             output = self.model.generate(**single_input, keys=keys, weight=weight, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
                             uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
-                            gen = self.processor.decode(output[0][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True, output_attentions=True)
+                            gen = _decode_generated(self.processor, output, len(single_input['input_ids'][-1]))
                         
                         elif method == 'adapt_vis':
                             change_greedy_to_add_weight()
                             # Basic generation step
                             output = self.model.generate(**single_input, weight=1.0,max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
-                            gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True, output_attentions=True)
-                            uncertainty = np.round(float(max(output['scores'][0][0])), 2)
+                            gen = _decode_generated(self.processor, output, len(single_input['input_ids'][-1]))
+                            uncertainty = np.round(_first_step_confidence(output), 2)
                             
                             # Apply weighted generation based on uncertainty
                             if uncertainty < threshold:
                                 output = self.model.generate(**single_input, keys=keys, weight=weight1, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
                             else:
                                 output = self.model.generate(**single_input, keys=keys, weight=weight2, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
-                            gen = self.processor.decode(output[0][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True, output_attentions=True)
+                            gen = _decode_generated(self.processor, output, len(single_input['input_ids'][-1]))
 
                         else:
                             output = self.model.generate(**single_input, keys=keys, weight=weight, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
                             uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
-                            gen = self.processor.decode(output[0][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True, output_attentions=True)
+                            gen = _decode_generated(self.processor, output, len(single_input['input_ids'][-1]))
                         
                         # Check correctness of the generated response
                         label = int(batch['labels'][0][idx])
+                        parsed_yes = _parse_yes_no(gen)
+                        is_yes = bool(parsed_yes) if parsed_yes is not None else False
                         if label == 1:
-                            TP += 1 if 'Yes' in gen else 0
-                            FN += 1 if 'Yes' not in gen else 0
+                            TP += int(is_yes)
+                            FN += int(not is_yes)
                         else:
-                            TN += 1 if 'No' in gen else 0
-                            FP += 1 if 'No' not in gen else 0
+                            TN += int(not is_yes)
+                            FP += int(is_yes)
                         
                         print(f"TP: {TP}, TN: {TN}, FP: {FP}, FN: {FN}")
                         
@@ -556,12 +621,12 @@ class LlavaWrapper:
                         
                 index += 1    
         # Calculate metrics
-        precision = TP / (TP + FN)
-        recall = TN / (TN + FP)
-        f1_score = 2 * precision * recall / (precision + recall)
+        precision = TP / max((TP + FN), 1)
+        recall = TN / max((TN + FP), 1)
+        f1_score = 2 * precision * recall / max((precision + recall), 1e-12)
 
         print(f"TP: {TP}, TN: {TN}, FP: {FP}, FN: {FN}\n"
-            f"Accuracy: {(TN + TP) / (TN + TP + FN + FP)}\n"
+            f"Accuracy: {(TN + TP) / max((TN + TP + FN + FP), 1)}\n"
             f"Precision: {precision}\n"
             f"Recall: {recall}\n"
             f"F1 Score: {f1_score}")
@@ -569,6 +634,7 @@ class LlavaWrapper:
         all_scores = (TP, TN, FP, FN)
         
         # Save results to JSON file
+        os.makedirs('./outputs', exist_ok=True)
         output_file_path = f'./outputs/results_{dataset}_{method}_{weight}.json'
         with open(output_file_path, 'w', encoding='utf-8') as fout:
             json.dump(results, fout, ensure_ascii=False, indent=4)
@@ -576,6 +642,6 @@ class LlavaWrapper:
         # Save evaluation metrics
         output_score_file = output_file_path.replace(".json", "_scores.json")
         with open(output_score_file, 'w', encoding='utf-8') as fout:
-            json.dump({"acc": (TN + TP) / (TN + TP + FN + FP), "precision": precision, "recall": recall, "f1": f1_score}, fout, ensure_ascii=False, indent=4)
+            json.dump({"acc": (TN + TP) / max((TN + TP + FN + FP), 1), "precision": precision, "recall": recall, "f1": f1_score}, fout, ensure_ascii=False, indent=4)
         return all_scores
     
