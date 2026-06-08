@@ -591,7 +591,9 @@ class LlavaWrapper:
                             gen = _decode_generated(self.processor, output, len(single_input['input_ids'][-1]))
 
                         else:
-                            output = self.model.generate(**single_input, keys=keys, weight=weight, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
+                            # Base LLaVA-1.5 model does not accept AdaptVis-only kwargs
+                            # such as keys/weight. Pass them only for scaling/adapt modes.
+                            output = self.model.generate(**single_input, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
                             uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
                             gen = _decode_generated(self.processor, output, len(single_input['input_ids'][-1]))
                         
