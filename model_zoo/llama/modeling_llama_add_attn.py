@@ -180,12 +180,119 @@ def _get_query_indices(q_len: int, caption_length: Optional[list], device: torch
     return torch.tensor([q_len - 1], device=device, dtype=torch.long)
 
 
+def _normalize_local_pos_for_batch(
+    pos: Optional[torch.Tensor],
+    batch_index: int,
+    bsz: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """
+    Normalize local visual patch indices to a 1-D LongTensor.
+
+    Expected meaning of pos:
+      - indices are relative to the visual-token span, not absolute sequence positions.
+      - for LLaVA-1.5 with 336x336 images, this is normally 0..575 for a 24x24 grid.
+
+    Accepted shapes:
+      - [n]
+      - [1, n]
+      - [bsz, n]
+      - Python list/tuple
+    """
+    if pos is None:
+        return None
+
+    if torch.is_tensor(pos):
+        p = pos
+    else:
+        try:
+            p = torch.tensor(pos, dtype=torch.long)
+        except Exception:
+            return None
+
+    if p.numel() == 0:
+        return p.to(device=device, dtype=torch.long).view(-1)
+
+    if p.dim() == 0:
+        p = p.view(1)
+    elif p.dim() == 1:
+        pass
+    else:
+        # If batched, select this sample. Otherwise use the first row.
+        if p.shape[0] == bsz:
+            p = p[batch_index]
+        else:
+            p = p[0]
+        p = p.reshape(-1)
+
+    return p.to(device=device, dtype=torch.long)
+
+
+def _restrict_image_mask_with_local_pos(
+    image_key_mask: torch.Tensor,
+    pos: Optional[torch.Tensor],
+    batch_index: int,
+    bsz: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Convert a global image-token mask into a local bbox/image-token mask.
+
+    image_key_mask[b] marks all visual tokens in the merged LLM sequence.
+    pos contains indices relative to that visual-token list.
+
+    Example:
+      true_indices = positions of all image tokens in sequence, length 576
+      pos = [10, 11, 12]
+      local mask marks true_indices[10], true_indices[11], true_indices[12]
+    """
+    img_idx = image_key_mask[batch_index].to(device=device).bool()
+    if img_idx.sum().item() == 0:
+        return img_idx
+
+    if pos is None:
+        return img_idx
+
+    pos_b = _normalize_local_pos_for_batch(
+        pos=pos,
+        batch_index=batch_index,
+        bsz=bsz,
+        device=device,
+    )
+
+    if pos_b is None or pos_b.numel() == 0:
+        if _env_bool("ADAPTVIS_LOCAL_FALLBACK_GLOBAL", False):
+            return img_idx
+        return torch.zeros_like(img_idx)
+
+    true_indices = torch.where(img_idx)[0]
+    pos_b = pos_b[(pos_b >= 0) & (pos_b < true_indices.numel())]
+    pos_b = torch.unique(pos_b)
+
+    local_img_idx = torch.zeros_like(img_idx)
+    if pos_b.numel() > 0:
+        local_img_idx[true_indices[pos_b]] = True
+    elif _env_bool("ADAPTVIS_LOCAL_FALLBACK_GLOBAL", False):
+        local_img_idx = img_idx
+
+    if _env_bool("ADAPTVIS_LOCAL_DEBUG", False):
+        print(
+            f"[AdaptVis local] b={batch_index} "
+            f"global_img={int(img_idx.sum().item())} "
+            f"local_img={int(local_img_idx.sum().item())} "
+            f"pos_valid={int(pos_b.numel()) if pos_b is not None else 0}"
+        )
+
+    return local_img_idx
+
+
 def _apply_adaptvis_pre_softmax_variant(
     attn_logits: torch.Tensor,
     image_key_mask: Optional[torch.Tensor],
     query_indices: torch.Tensor,
     weight: Optional[float],
     adjust_method: Optional[str] = None,
+    pos: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     attn_logits: [bsz, num_heads, q_len, kv_len], pre-softmax attention logits.
@@ -233,7 +340,13 @@ def _apply_adaptvis_pre_softmax_variant(
     bsz = attn_logits.shape[0]
 
     for b in range(bsz):
-        img_idx = image_key_mask[b].to(attn_logits.device).bool()
+        img_idx = _restrict_image_mask_with_local_pos(
+            image_key_mask=image_key_mask,
+            pos=pos,
+            batch_index=b,
+            bsz=bsz,
+            device=attn_logits.device,
+        )
         if img_idx.sum().item() == 0:
             continue
 
@@ -297,6 +410,7 @@ def _apply_adaptvis_post_softmax_variant(
     query_indices: torch.Tensor,
     weight: Optional[float],
     adjust_method: Optional[str] = None,
+    pos: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Only used for prob_img.
@@ -327,7 +441,13 @@ def _apply_adaptvis_post_softmax_variant(
     bsz = attn_probs.shape[0]
 
     for b in range(bsz):
-        img_idx = image_key_mask[b].to(attn_probs.device).bool()
+        img_idx = _restrict_image_mask_with_local_pos(
+            image_key_mask=image_key_mask,
+            pos=pos,
+            batch_index=b,
+            bsz=bsz,
+            device=attn_probs.device,
+        )
         if img_idx.sum().item() == 0:
             continue
 
@@ -602,6 +722,7 @@ class LLaMAAttention(nn.Module):
                             query_indices=query_indices,
                             weight=weight,
                             adjust_method=adjust_method,
+                            pos=pos,
                         )
             else:
                 start_idx, end_idx, square_size = -1, -1, -1
@@ -648,6 +769,7 @@ class LLaMAAttention(nn.Module):
                 query_indices=query_indices,
                 weight=weight,
                 adjust_method=adjust_method,
+                pos=pos,
             )
 
         # This tensor is the post-softmax attention probability that will be
