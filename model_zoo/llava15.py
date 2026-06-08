@@ -307,6 +307,24 @@ class LlavaWrapper:
         self.processor = AutoProcessor.from_pretrained(MODEL, revision='a272c74',cache_dir=root_dir)
 
         self.device = device
+
+        # Optional bbox-local visual-token scaling for VSR.
+        # Expected JSON format:
+        # {
+        #   "0": [patch_idx_0, patch_idx_1, ...],
+        #   "1": [...]
+        # }
+        # where patch_idx is relative to the 24x24 LLaVA-1.5 visual patch grid.
+        local_pos_path = os.getenv("VSR_LOCAL_PATCH_JSON", "").strip()
+        self.vsr_local_patch_indices = None
+        if local_pos_path:
+            if os.path.exists(local_pos_path):
+                with open(local_pos_path, "r", encoding="utf-8") as f:
+                    self.vsr_local_patch_indices = json.load(f)
+                print(f"Loaded VSR local patch indices: {local_pos_path} "
+                      f"({len(self.vsr_local_patch_indices)} samples)")
+            else:
+                print(f"[Warning] VSR_LOCAL_PATCH_JSON is set but not found: {local_pos_path}")
     
     @torch.no_grad()
     def get_text_embeddings(self, texts, text_batch_size=64, normalize=False):
@@ -569,11 +587,21 @@ class LlavaWrapper:
                         # Prepare input data for the model
                         single_input = self.processor(text=text, images=list(i_option)[idx], padding="max_length", return_tensors="pt", max_length=77).to(self.device)
                         keys = [torch.where(input_id == 32001, 1, 0) for input_id in single_input['input_ids']]
+
+                        # Optional local visual-token positions for bbox-local AdaptVis/ScalingVis.
+                        # If VSR_LOCAL_PATCH_JSON is loaded, always pass a tensor:
+                        #   - non-empty tensor => modify only those bbox patch tokens
+                        #   - empty tensor => do not modify this sample
+                        # If no JSON is loaded, local_pos=None keeps the original global behavior.
+                        local_pos = None
+                        if getattr(self, "vsr_local_patch_indices", None) is not None:
+                            pos_list = self.vsr_local_patch_indices.get(str(index_of_total), [])
+                            local_pos = torch.tensor(pos_list, dtype=torch.long, device=self.device)
                         
                         # Apply different attention adjustment methods based on the 'method' argument
                         if method == 'scaling_vis':
                             change_greedy_to_add_weight()
-                            output = self.model.generate(**single_input, keys=keys, weight=weight, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
+                            output = self.model.generate(**single_input, keys=keys, weight=weight, pos=local_pos, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
                             uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
                             gen = _decode_generated(self.processor, output, len(single_input['input_ids'][-1]))
                         
@@ -586,9 +614,9 @@ class LlavaWrapper:
                             
                             # Apply weighted generation based on uncertainty
                             if uncertainty < threshold:
-                                output = self.model.generate(**single_input, keys=keys, weight=weight1, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
+                                output = self.model.generate(**single_input, keys=keys, weight=weight1, pos=local_pos, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
                             else:
-                                output = self.model.generate(**single_input, keys=keys, weight=weight2, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
+                                output = self.model.generate(**single_input, keys=keys, weight=weight2, pos=local_pos, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
                             gen = _decode_generated(self.processor, output, len(single_input['input_ids'][-1]))
 
                         else:
@@ -618,6 +646,8 @@ class LlavaWrapper:
                             "Generation": gen,
                             "Golden": gold,
                             "Uncertainty": uncertainty,
+                            "LocalPatchCount": int(local_pos.numel()) if torch.is_tensor(local_pos) else None,
+                            "LocalPatchPreview": local_pos.detach().cpu().tolist()[:20] if torch.is_tensor(local_pos) else None,
                         }
                         results.append(result)
                         index_of_total += 1
