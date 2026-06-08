@@ -15,6 +15,7 @@ from PIL import Image
 import requests
 import json
 import os
+import re
 from collections import Counter
 # from model_zoo.utils import normalize_answer,chat_completion_request,run_conversation
 
