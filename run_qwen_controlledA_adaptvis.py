@@ -25,7 +25,6 @@ def setup_cache():
     os.environ.setdefault("TRANSFORMERS_CACHE", "/ddnB/work/mwang32/hf_cache/transformers")
     os.environ.setdefault("HF_DATASETS_CACHE", "/ddnB/work/mwang32/hf_cache/datasets")
     os.environ.setdefault("TORCH_HOME", "/ddnB/work/mwang32/torch_cache")
-
     for k in ["HF_HOME", "HF_HUB_CACHE", "TRANSFORMERS_CACHE", "HF_DATASETS_CACHE", "TORCH_HOME"]:
         Path(os.environ[k]).mkdir(parents=True, exist_ok=True)
 
@@ -44,6 +43,7 @@ def parse_prep(text):
     t = re.sub(r"[^a-z\s-]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
 
+    # 顺序上先 under，再 on，避免 "on top of under..." 这类极端文本干扰
     if re.search(r"\bleft\b", t):
         return "left"
     if re.search(r"\bright\b", t):
@@ -59,21 +59,17 @@ def resolve_image_path(p):
     p = str(p)
     if os.path.exists(p):
         return p
-
     base = os.path.basename(p)
     candidates = [
         os.path.join("data", "controlled_images", base),
         os.path.join("data", base),
     ]
-
     for c in candidates:
         if os.path.exists(c):
             return c
-
     hits = list(Path("data").rglob(base))
     if hits:
         return str(hits[0])
-
     raise FileNotFoundError(p)
 
 
@@ -89,9 +85,10 @@ def get_img_token_ids(tokenizer):
     return int(img_id), int(img_end_id)
 
 
-def find_image_span(input_ids, tokenizer):
+def find_image_span_from_query(tokenizer, query):
+    enc = tokenizer(query, return_tensors="pt")
     img_id, img_end_id = get_img_token_ids(tokenizer)
-    ids = input_ids[0].tolist()
+    ids = enc["input_ids"][0].tolist()
 
     starts = [i for i, x in enumerate(ids) if x == img_id]
     ends = [i for i, x in enumerate(ids) if x == img_end_id]
@@ -99,25 +96,10 @@ def find_image_span(input_ids, tokenizer):
     if len(starts) != 1 or len(ends) != 1:
         raise RuntimeError(f"Bad image tokens: starts={starts}, ends={ends}")
 
-    st = starts[0] + 1
-    ed = ends[0]
-
-    if ed <= st:
-        raise RuntimeError(f"Bad image span: [{st}, {ed})")
-
-    return st, ed
+    return starts[0] + 1, ends[0], enc
 
 
 def patch_qwen_attention(model, debug=False):
-    """
-    Post-softmax image-key scaling:
-        attn_probs[..., image_start:image_end] *= weight
-        renormalize over key dimension
-        attn_output = attn_probs @ value
-
-    This does not train anything and does not edit model files.
-    """
-
     patched = 0
 
     for name, module in model.named_modules():
@@ -149,55 +131,36 @@ def patch_qwen_attention(model, debug=False):
                     return out
 
                 attn_output, attn_probs = out[0], out[1]
-
-                if attn_probs is None:
-                    return out
-
-                # attn_probs: [bsz, heads, q_len, kv_len]
-                if attn_probs.dim() != 4:
+                if attn_probs is None or attn_probs.dim() != 4:
                     return out
 
                 bsz, n_heads, q_len, kv_len = attn_probs.shape
-
                 scaled = attn_probs.clone()
 
                 for b in range(min(bsz, len(spans))):
                     st, ed = spans[b]
-                    st = int(st)
-                    ed = int(ed)
+                    st = max(0, int(st))
+                    ed = min(kv_len, int(ed))
+                    if ed > st:
+                        scaled[b, :, :, st:ed] *= weight
 
-                    if st < 0:
-                        st = 0
-                    if ed > kv_len:
-                        ed = kv_len
-
-                    if ed <= st:
-                        continue
-
-                    scaled[b, :, :, st:ed] = scaled[b, :, :, st:ed] * weight
-
-                denom = scaled.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-                scaled = scaled / denom
-
+                scaled = scaled / scaled.sum(dim=-1, keepdim=True).clamp_min(1e-12)
                 new_attn_output = torch.matmul(scaled, value)
 
                 if len(out) == 2:
                     return new_attn_output, scaled
-                else:
-                    return (new_attn_output, scaled) + tuple(out[2:])
+                return (new_attn_output, scaled) + tuple(out[2:])
 
             return patched_attn
 
         module._attn = types.MethodType(make_patched(old_attn, name), module)
         patched += 1
-
         if debug:
             print("patched:", name)
 
     if patched == 0:
         raise RuntimeError("No QWenAttention._attn modules patched.")
-
-    print(f"Patched QWenAttention modules: {patched}")
+    print("Patched QWenAttention modules:", patched)
 
 
 def build_query(tokenizer, image_path, prompt):
@@ -210,32 +173,28 @@ def build_query(tokenizer, image_path, prompt):
 def encode_query(tokenizer, query, model):
     enc = tokenizer(query, return_tensors="pt")
     device = get_device(model)
-    enc = {k: v.to(device) for k, v in enc.items()}
-    return enc
+    return {k: v.to(device) for k, v in enc.items()}
 
 
 def candidate_token_ids(tokenizer):
-    cands = {
-        "left": " left",
-        "right": " right",
-        "on": " on",
-        "under": " under",
-    }
-
+    labels = ["left", "right", "on", "under"]
     out = {}
-    for k, s in cands.items():
-        ids = tokenizer(s, add_special_tokens=False)["input_ids"]
-        if isinstance(ids[0], list):
-            ids = ids[0]
-        if len(ids) < 1:
-            raise RuntimeError(f"Cannot tokenize candidate {s}")
-        out[k] = int(ids[0])
-
+    for lab in labels:
+        ids1 = tokenizer(" " + lab, add_special_tokens=False)["input_ids"]
+        ids2 = tokenizer(lab, add_special_tokens=False)["input_ids"]
+        if isinstance(ids1[0], list):
+            ids1 = ids1[0]
+        if isinstance(ids2[0], list):
+            ids2 = ids2[0]
+        out[lab] = {"space": int(ids1[0]), "plain": int(ids2[0])}
     return out
 
 
 @torch.no_grad()
-def get_candidate_confidence(model, tokenizer, enc, span, cand_ids):
+def score_candidates_for_conf(model, tokenizer, query, span, cand_ids):
+    # 只用于 AdaptVis threshold，不用于最终预测
+    enc = encode_query(tokenizer, query, model)
+
     model._adaptvis_enable = True
     model._adaptvis_weight = 1.0
     model._adaptvis_image_spans = [span]
@@ -247,47 +206,43 @@ def get_candidate_confidence(model, tokenizer, enc, span, cand_ids):
         return_dict=True,
     )
 
-    logits = out.logits[0, -1, :]
+    logits = out.logits[0, -1, :].float()
     labels = ["left", "right", "on", "under"]
-    ids = torch.tensor([cand_ids[x] for x in labels], device=logits.device)
+    cand_logits = []
 
-    cand_logits = logits[ids]
-    probs = F.softmax(cand_logits.float(), dim=-1)
+    for lab in labels:
+        tid_space = cand_ids[lab]["space"]
+        tid_plain = cand_ids[lab]["plain"]
+        cand_logits.append(torch.maximum(logits[tid_space], logits[tid_plain]))
+
+    cand_logits = torch.stack(cand_logits)
+    probs = F.softmax(cand_logits, dim=-1)
 
     best_idx = int(torch.argmax(probs).item())
-    conf = float(probs[best_idx].item())
-
     return {
-        "confidence": conf,
-        "best_candidate": labels[best_idx],
-        "candidate_probs": {labels[i]: float(probs[i].item()) for i in range(len(labels))},
+        "best": labels[best_idx],
+        "confidence": float(probs[best_idx].item()),
+        "probs": {labels[i]: float(probs[i].item()) for i in range(len(labels))},
     }
 
 
 @torch.no_grad()
-def generate_response(model, tokenizer, enc, span, weight, max_new_tokens):
+def chat_generate(model, tokenizer, query, span, weight):
     model._adaptvis_enable = True
     model._adaptvis_weight = float(weight)
     model._adaptvis_image_spans = [span]
 
-    input_len = enc["input_ids"].shape[-1]
-
-    gen = model.generate(
-        input_ids=enc["input_ids"],
-        attention_mask=enc.get("attention_mask", None),
-        do_sample=False,
-        max_new_tokens=max_new_tokens,
-        pad_token_id=getattr(tokenizer, "eod_id", None),
+    response, history = model.chat(
+        tokenizer,
+        query=query,
+        history=None,
     )
 
-    new_ids = gen[0, input_len:]
-    text = tokenizer.decode(new_ids, skip_special_tokens=True)
-    text = str(text).strip()
-    return text
+    return str(response).strip()
 
 
-def pred_index_from_generation(gen, gold_answer, caption_options):
-    pred = parse_prep(gen)
+def pred_index_from_generation(response, gold_answer, caption_options):
+    pred = parse_prep(response)
     gold = parse_prep(gold_answer)
 
     if pred is not None and gold is not None and pred == gold:
@@ -298,6 +253,7 @@ def pred_index_from_generation(gen, gold_answer, caption_options):
             if parse_prep(cap) == pred:
                 return i, pred
 
+    # generation 没解析出来时，固定判错
     return 2 if len(caption_options) >= 3 else 1, pred
 
 
@@ -308,27 +264,22 @@ def main():
     parser.add_argument("--dataset", default="Controlled_Images_A")
     parser.add_argument("--subset", default="A")
     parser.add_argument("--option", default="four")
-    parser.add_argument("--method", choices=["base", "scaling_vis", "adapt_vis"], default="adapt_vis")
+    parser.add_argument("--method", choices=["base", "scaling_vis", "adapt_vis"], default="base")
 
     parser.add_argument("--weight", type=float, default=1.0)
     parser.add_argument("--weight1", type=float, default=0.5)
     parser.add_argument("--weight2", type=float, default=1.5)
     parser.add_argument("--threshold", type=float, default=0.4)
-
-    # high_w1: confidence >= threshold -> weight1, else weight2
-    # high_w2: confidence >= threshold -> weight2, else weight1
     parser.add_argument("--adapt_rule", choices=["high_w1", "high_w2"], default="high_w1")
 
     parser.add_argument("--limit", type=int, default=-1)
-    parser.add_argument("--max_new_tokens", type=int, default=16)
     parser.add_argument("--debug_patch", action="store_true")
-    parser.add_argument("--print_every", type=int, default=1)
+    parser.add_argument("--print_every", type=int, default=20)
     args = parser.parse_args()
 
     setup_cache()
     Path("outputs").mkdir(parents=True, exist_ok=True)
 
-    print("Loading dataset...")
     dataset = Controlled_Images(
         image_preprocess=None,
         root_dir=args.root_dir,
@@ -337,9 +288,8 @@ def main():
     )
 
     prompt_file = f"prompts/{args.dataset}_with_answer_{args.option}_options.jsonl"
+    prompts, answers = [], []
 
-    prompts = []
-    answers = []
     with open(prompt_file, "r", encoding="utf-8") as f:
         for line in f:
             r = json.loads(line)
@@ -353,21 +303,13 @@ def main():
     print("dataset total:", len(dataset.dataset))
     print("running n:", n_total)
     print("method:", args.method)
-    print("weight:", args.weight)
-    print("weight1:", args.weight1)
-    print("weight2:", args.weight2)
-    print("threshold:", args.threshold)
-    print("adapt_rule:", args.adapt_rule)
 
-    print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_id,
         trust_remote_code=True,
     )
 
-    print("Loading Qwen model...")
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-
     load_kwargs = dict(
         trust_remote_code=True,
         torch_dtype=dtype,
@@ -392,11 +334,17 @@ def main():
                 args.model_id,
                 trust_remote_code=True,
             )
-        except Exception as e:
-            print("GenerationConfig skipped:", repr(e))
+        except Exception:
+            pass
+
+    # 尽量让 chat 输出短答案
+    try:
+        model.generation_config.max_new_tokens = 16
+        model.generation_config.do_sample = False
+    except Exception:
+        pass
 
     model.requires_grad_(False)
-
     patch_qwen_attention(model, debug=args.debug_patch)
 
     cand_ids = candidate_token_ids(tokenizer)
@@ -405,12 +353,13 @@ def main():
     scores = np.zeros((len(dataset.dataset), 1, 4), dtype=np.float32)
     records = []
     correct = 0
+    unparsed = 0
 
     out_tag = (
         f"qwen_vl_chat_{args.dataset}_{args.method}"
-        f"_w{args.weight}_w1{args.weight1}_w2{args.weight2}_thr{args.threshold}"
+        f"_generation_w{args.weight}_w1{args.weight1}_w2{args.weight2}_thr{args.threshold}"
     )
-    out_json = Path("outputs") / f"{out_tag}_generations.json"
+    out_json = Path("outputs") / f"{out_tag}_records.json"
     out_summary = Path("outputs") / f"{out_tag}_summary.json"
 
     for i in tqdm(range(n_total), total=n_total):
@@ -422,13 +371,13 @@ def main():
         gold = answers[i]
 
         query = build_query(tokenizer, image_path, prompt)
-        enc = encode_query(tokenizer, query, model)
-        span = find_image_span(enc["input_ids"], tokenizer)
+        span_st, span_ed, _ = find_image_span_from_query(tokenizer, query)
+        span = (span_st, span_ed)
 
-        conf_info = get_candidate_confidence(
+        conf_info = score_candidates_for_conf(
             model=model,
             tokenizer=tokenizer,
-            enc=enc,
+            query=query,
             span=span,
             cand_ids=cand_ids,
         )
@@ -444,13 +393,12 @@ def main():
             else:
                 chosen_weight = args.weight2 if conf >= args.threshold else args.weight1
 
-        response = generate_response(
+        response = chat_generate(
             model=model,
             tokenizer=tokenizer,
-            enc=enc,
+            query=query,
             span=span,
             weight=chosen_weight,
-            max_new_tokens=args.max_new_tokens,
         )
 
         pred_idx, pred_prep = pred_index_from_generation(
@@ -458,6 +406,9 @@ def main():
             gold,
             caption_options,
         )
+
+        if pred_prep is None:
+            unparsed += 1
 
         scores[i, 0, pred_idx] = 1.0
 
@@ -473,13 +424,14 @@ def main():
             "pred_prep": pred_prep,
             "pred_idx": int(pred_idx),
             "correct": bool(is_correct),
+            "conf_best": conf_info["best"],
             "confidence": conf_info["confidence"],
-            "base_best_candidate": conf_info["best_candidate"],
-            "candidate_probs": conf_info["candidate_probs"],
+            "conf_probs": conf_info["probs"],
             "chosen_weight": float(chosen_weight),
             "image_span": [int(span[0]), int(span[1])],
             "caption_options": caption_options,
         }
+
         records.append(rec)
 
         if args.print_every > 0 and (i % args.print_every == 0):
@@ -487,11 +439,11 @@ def main():
             print("idx:", i)
             print("image:", image_path)
             print("gold:", gold)
-            print("conf:", conf_info["confidence"], "base_best:", conf_info["best_candidate"])
+            print("conf:", conf_info)
             print("chosen_weight:", chosen_weight, "span:", span)
             print("generation:", response)
             print("pred:", pred_prep, "pred_idx:", pred_idx, "correct:", bool(is_correct))
-            print("running acc:", correct / (i + 1))
+            print("running acc:", correct / (i + 1), "unparsed:", unparsed)
 
         if (i + 1) % 25 == 0:
             with open(out_json, "w", encoding="utf-8") as f:
@@ -513,6 +465,7 @@ def main():
         "adapt_rule": args.adapt_rule,
         "n": n_total,
         "direct_acc": direct_acc,
+        "unparsed": unparsed,
         "out_json": str(out_json),
     }
 
@@ -520,7 +473,8 @@ def main():
         json.dump(summary, f, indent=2)
 
     print("\nDirect acc:", direct_acc)
-    print("saved generations:", out_json)
+    print("unparsed:", unparsed)
+    print("saved records:", out_json)
     print("saved summary:", out_summary)
 
     print("\nRunning Controlled_Images evaluator...")
@@ -534,8 +488,6 @@ def main():
         sampled_indices=[],
         option=args.option,
     )
-
-    print("\nDone.")
 
 
 if __name__ == "__main__":
