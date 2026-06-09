@@ -57,7 +57,6 @@ def parse_prep(text):
 
 def resolve_image_path(p):
     p = str(p)
-
     if os.path.exists(p):
         return p
 
@@ -133,6 +132,8 @@ def patch_qwen_forward_for_span(model, tokenizer, debug=False):
                 if debug:
                     print("forward image spans:", fixed)
             else:
+                # During generation, later steps only contain the new token.
+                # Reuse the image span from the first full-context forward.
                 last = getattr(model, "_adaptvis_last_image_spans", None)
                 if last is not None:
                     model._adaptvis_image_spans = last
@@ -158,17 +159,18 @@ def patch_qwen_attention(model, debug=False):
             def patched_attn(self, *args, **kwargs):
                 args = list(args)
 
-                # Qwen _attn signature usually:
+                # Qwen _attn signature:
                 # _attn(query, key, value, registered_causal_mask, attention_mask=None, head_mask=None)
-                # query/key/value layout in Qwen-VL-Chat _attn input is usually [B, Q/K, H, D].
-                # Therefore q_len/k_len should use shape[1], not shape[-2].
+                #
+                # In this Qwen-VL-Chat remote code, query/key inside _attn are [B, H, Q/K, D].
+                # Therefore q_len/k_len must use shape[-2], not shape[1].
                 if len(args) >= 5 and args[4] is None:
                     query = args[0]
                     key = args[1]
 
                     bsz = query.shape[0]
-                    q_len = query.shape[1]
-                    k_len = key.shape[1]
+                    q_len = query.shape[-2]
+                    k_len = key.shape[-2]
 
                     args[4] = torch.zeros(
                         (bsz, 1, q_len, k_len),
@@ -182,8 +184,8 @@ def patch_qwen_attention(model, debug=False):
 
                     if query is not None and key is not None:
                         bsz = query.shape[0]
-                        q_len = query.shape[1]
-                        k_len = key.shape[1]
+                        q_len = query.shape[-2]
+                        k_len = key.shape[-2]
 
                         kwargs["attention_mask"] = torch.zeros(
                             (bsz, 1, q_len, k_len),
@@ -220,12 +222,12 @@ def patch_qwen_attention(model, debug=False):
                 if value.dim() != 4:
                     return out
 
-                # value is usually [B, K, H, D] in Qwen before _attn.
-                # Convert to [B, H, K, D] for matmul.
-                if value.shape[1] == kv_len and value.shape[2] == n_heads:
-                    value_for_mm = value.permute(0, 2, 1, 3).contiguous()
-                elif value.shape[1] == n_heads and value.shape[2] == kv_len:
-                    value_for_mm = value.contiguous()
+                # value should normally be [B, H, K, D].
+                # Keep robust handling for [B, K, H, D] just in case.
+                if value.shape[1] == n_heads and value.shape[2] == kv_len:
+                    value_for_mm = value.contiguous()                       # [B,H,K,D]
+                elif value.shape[1] == kv_len and value.shape[2] == n_heads:
+                    value_for_mm = value.permute(0, 2, 1, 3).contiguous()    # [B,H,K,D]
                 else:
                     if debug:
                         print(
@@ -244,37 +246,31 @@ def patch_qwen_attention(model, debug=False):
                     ed = min(kv_len, int(ed))
 
                     if ed > st:
-                        # AdaptVis-style: only current / last query -> image key tokens
+                        # AdaptVis-style:
+                        # all layers, all heads, last/current query -> image key tokens only.
                         scaled[b, :, -1:, st:ed] *= weight
 
                 scaled = scaled / scaled.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
                 # [B,H,Q,K] @ [B,H,K,D] -> [B,H,Q,D]
-                new_attn_output = torch.matmul(scaled, value_for_mm)
+                new_attn_output = torch.matmul(scaled, value_for_mm).contiguous()
 
-                # Qwen expects _attn output as [B,Q,H,D] before _merge_heads.
-                new_attn_output_bqhd = new_attn_output.permute(0, 2, 1, 3).contiguous()
-
-                if tuple(attn_output.shape) == tuple(new_attn_output_bqhd.shape):
-                    final_attn_output = new_attn_output_bqhd
-                elif tuple(attn_output.shape) == tuple(new_attn_output.shape):
-                    final_attn_output = new_attn_output.contiguous()
-                else:
+                # Qwen _merge_heads expects the original _attn output layout.
+                # In this remote code that is [B,H,Q,D], so do NOT permute to [B,Q,H,D].
+                if tuple(new_attn_output.shape) != tuple(attn_output.shape):
                     if debug:
                         print(
                             "attn_output shape mismatch. old:",
                             tuple(attn_output.shape),
-                            "new_bqhd:",
-                            tuple(new_attn_output_bqhd.shape),
-                            "new_bhqd:",
+                            "new:",
                             tuple(new_attn_output.shape),
                         )
                     return out
 
                 if len(out) == 2:
-                    return final_attn_output, scaled
+                    return new_attn_output, scaled
 
-                return (final_attn_output, scaled) + tuple(out[2:])
+                return (new_attn_output, scaled) + tuple(out[2:])
 
             return patched_attn
 
@@ -326,7 +322,7 @@ def candidate_token_ids(tokenizer):
 
 @torch.no_grad()
 def score_candidates_for_conf(model, tokenizer, query, cand_ids):
-    # only used for AdaptVis confidence threshold
+    # Only used for AdaptVis threshold selection. Final prediction still uses generation.
     enc = encode_query(tokenizer, query, model)
 
     model._adaptvis_enable = True
