@@ -1,5 +1,7 @@
 import argparse
+import csv
 import json
+import math
 import os
 import re
 import types
@@ -19,6 +21,9 @@ except Exception:
 from dataset_zoo.aro_datasets import Controlled_Images
 
 
+# ============================================================
+# Basic utilities
+# ============================================================
 def setup_cache():
     os.environ.setdefault("HF_HOME", "/ddnB/work/mwang32/hf_cache")
     os.environ.setdefault("HF_HUB_CACHE", "/ddnB/work/mwang32/hf_cache/hub")
@@ -77,6 +82,149 @@ def resolve_image_path(p):
     raise FileNotFoundError(p)
 
 
+def get_device(model):
+    return next(model.parameters()).device
+
+
+# ============================================================
+# Processed image + bbox utilities
+# ============================================================
+def load_processed_manifest(path):
+    """
+    Manifest produced by the processed-image preprocessing step.
+    Expected columns:
+      src,dst,orig_w,orig_h,proc_w,proc_h
+
+    Returns:
+      basename(src) -> row dict
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    out = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            src = r["src"]
+            base = os.path.basename(src)
+            out[base] = {
+                "src": src,
+                "dst": r["dst"],
+                "orig_w": int(float(r.get("orig_w", 0) or 0)),
+                "orig_h": int(float(r.get("orig_h", 0) or 0)),
+                "proc_w": int(float(r.get("proc_w", 0) or 0)),
+                "proc_h": int(float(r.get("proc_h", 0) or 0)),
+            }
+    return out
+
+
+def load_bbox_json(path):
+    """
+    Expected GroundingDINO json format:
+      [
+        {
+          "sid": 0,
+          "subject_best": {"box_xyxy": [x1,y1,x2,y2], ...},
+          "object_best": {"box_xyxy": [x1,y1,x2,y2], ...}
+        }, ...
+      ]
+
+    Coordinates should be on the processed image if --use_processed_image is used.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    data = json.load(open(path, "r", encoding="utf-8"))
+    out = {}
+    for j, r in enumerate(data):
+        sid = int(r.get("sid", r.get("index", j)))
+        out[sid] = r
+    return out
+
+
+def make_bbox_region(bbox_record, target="both"):
+    """
+    Convert one GroundingDINO record into a region payload.
+    target: subject | object | both
+    """
+    if bbox_record is None:
+        return None
+
+    boxes = []
+    sources = []
+
+    if target in ["subject", "both"]:
+        b = bbox_record.get("subject_best", None)
+        if b is not None and b.get("box_xyxy", None) is not None:
+            boxes.append([float(x) for x in b["box_xyxy"]])
+            sources.append("subject")
+
+    if target in ["object", "both"]:
+        b = bbox_record.get("object_best", None)
+        if b is not None and b.get("box_xyxy", None) is not None:
+            boxes.append([float(x) for x in b["box_xyxy"]])
+            sources.append("object")
+
+    if not boxes:
+        return None
+
+    return {
+        "boxes": boxes,
+        "source": "+".join(sources),
+    }
+
+
+def boxes_to_patch_offsets(boxes, image_w, image_h, n_img_tokens):
+    """
+    Convert xyxy bbox coordinates to row-major patch offsets inside the image-token span.
+
+    For Qwen-VL-Chat observed image span:
+      n_img_tokens = 256 -> 16x16 grid
+      offset = row * 16 + col
+
+    The bbox is mapped by patch intersection.
+    """
+    if not boxes or image_w <= 0 or image_h <= 0 or n_img_tokens <= 0:
+        return []
+
+    grid = int(round(math.sqrt(n_img_tokens)))
+    if grid * grid != n_img_tokens:
+        raise RuntimeError(f"Cannot map bbox to square grid: n_img_tokens={n_img_tokens}")
+
+    offsets = set()
+
+    for box in boxes:
+        x1, y1, x2, y2 = [float(v) for v in box]
+
+        x1 = max(0.0, min(float(image_w), x1))
+        x2 = max(0.0, min(float(image_w), x2))
+        y1 = max(0.0, min(float(image_h), y1))
+        y2 = max(0.0, min(float(image_h), y2))
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        c0 = int(math.floor(x1 / image_w * grid))
+        c1 = int(math.ceil(x2 / image_w * grid)) - 1
+        r0 = int(math.floor(y1 / image_h * grid))
+        r1 = int(math.ceil(y2 / image_h * grid)) - 1
+
+        c0 = max(0, min(grid - 1, c0))
+        c1 = max(0, min(grid - 1, c1))
+        r0 = max(0, min(grid - 1, r0))
+        r1 = max(0, min(grid - 1, r1))
+
+        for rr in range(r0, r1 + 1):
+            for cc in range(c0, c1 + 1):
+                offsets.add(rr * grid + cc)
+
+    return sorted(offsets)
+
+
+# ============================================================
+# Qwen image-span detection
+# ============================================================
 def get_img_token_ids(tokenizer):
     img_id = tokenizer.convert_tokens_to_ids("<img>")
     img_end_id = tokenizer.convert_tokens_to_ids("</img>")
@@ -92,13 +240,13 @@ def find_image_spans_in_input_ids(input_ids, tokenizer):
     input_ids_cpu = input_ids.detach().cpu()
 
     spans = []
-
     for b in range(input_ids_cpu.shape[0]):
         ids = input_ids_cpu[b].tolist()
         starts = [i for i, x in enumerate(ids) if x == img_id]
         ends = [i for i, x in enumerate(ids) if x == img_end_id]
 
         if len(starts) == 1 and len(ends) == 1 and ends[0] > starts[0]:
+            # exclusive image-token span: (<img>, </img>)
             spans.append((starts[0] + 1, ends[0]))
         else:
             spans.append(None)
@@ -125,6 +273,8 @@ def patch_qwen_forward_for_span(model, tokenizer, debug=False):
                 if debug:
                     print("forward image spans:", fixed)
             else:
+                # generation later steps only contain generated tokens;
+                # reuse the full-context image span.
                 last = getattr(model, "_adaptvis_last_image_spans", None)
                 if last is not None:
                     model._adaptvis_image_spans = last
@@ -135,6 +285,9 @@ def patch_qwen_forward_for_span(model, tokenizer, debug=False):
     print("Patched model.forward for dynamic image-span detection.")
 
 
+# ============================================================
+# Qwen attention patch: whole-image or bbox-patch scaling
+# ============================================================
 def patch_qwen_attention(model, debug=False):
     patched = 0
 
@@ -152,7 +305,7 @@ def patch_qwen_attention(model, debug=False):
 
                 # Qwen _attn signature usually:
                 # _attn(query, key, value, registered_causal_mask, attention_mask=None, head_mask=None)
-                # query/key entering _attn are [B,H,Q/K,D], so Q/K length is shape[-2].
+                # In this remote code, query/key entering _attn are [B,H,Q/K,D].
                 if len(args) >= 5 and args[4] is None:
                     query = args[0]
                     key = args[1]
@@ -227,21 +380,68 @@ def patch_qwen_attention(model, debug=False):
                 local_before = 0.0
                 local_after_raw = 0.0
 
+                region_mode = getattr(model, "_adaptvis_region_mode", "all_image")
+                bbox_regions = getattr(model, "_adaptvis_bbox_regions", None)
+                bbox_fallback = getattr(model, "_adaptvis_bbox_fallback", "skip")
+
                 for b in range(min(bsz, len(spans))):
                     st, ed = spans[b]
                     st = max(0, int(st))
                     ed = min(kv_len, int(ed))
 
-                    if ed > st:
-                        # AdaptVis-style:
-                        # all layers, all heads, current/last query -> image key tokens only.
+                    if ed <= st:
+                        continue
+
+                    token_indices = None
+                    bbox_offsets = None
+
+                    if region_mode == "bbox":
+                        region = None
+                        if bbox_regions is not None and b < len(bbox_regions):
+                            region = bbox_regions[b]
+
+                        if region is not None:
+                            n_img_tokens = ed - st
+                            bbox_offsets = boxes_to_patch_offsets(
+                                boxes=region.get("boxes", []),
+                                image_w=int(region.get("image_w", 0)),
+                                image_h=int(region.get("image_h", 0)),
+                                n_img_tokens=n_img_tokens,
+                            )
+
+                        if bbox_offsets:
+                            idx = [st + int(o) for o in bbox_offsets if 0 <= int(o) < (ed - st)]
+                            if idx:
+                                token_indices = torch.tensor(idx, device=scaled.device, dtype=torch.long)
+                        elif bbox_fallback == "all_image":
+                            token_indices = None
+                        else:
+                            # No valid bbox: do not scale this sample.
+                            continue
+
+                    if token_indices is None:
+                        # Original AdaptVis behavior: scale whole image-token span.
                         before = scaled[b, :, -1:, st:ed].detach().float().sum().item()
                         scaled[b, :, -1:, st:ed] *= weight
                         after_raw = scaled[b, :, -1:, st:ed].detach().float().sum().item()
+                        scaled_patch_count = ed - st
+                    else:
+                        # Bbox behavior: scale only visual tokens whose patches intersect bbox.
+                        before = scaled[b, :, -1:, token_indices].detach().float().sum().item()
+                        scaled[b, :, -1:, token_indices] *= weight
+                        after_raw = scaled[b, :, -1:, token_indices].detach().float().sum().item()
+                        scaled_patch_count = int(token_indices.numel())
 
-                        local_calls += 1
-                        local_before += before
-                        local_after_raw += after_raw
+                    local_calls += 1
+                    local_before += before
+                    local_after_raw += after_raw
+
+                    model._adaptvis_scaled_patch_count = (
+                        getattr(model, "_adaptvis_scaled_patch_count", 0) + int(scaled_patch_count)
+                    )
+
+                    if bbox_offsets is not None and getattr(model, "_adaptvis_last_bbox_offsets", None) is None:
+                        model._adaptvis_last_bbox_offsets = [[int(x) for x in bbox_offsets]]
 
                 if local_calls == 0:
                     return out
@@ -289,6 +489,9 @@ def patch_qwen_attention(model, debug=False):
     print("Patched QWenAttention modules:", patched)
 
 
+# ============================================================
+# Qwen generation and probability capture
+# ============================================================
 def build_query(tokenizer, image_path, prompt):
     return tokenizer.from_list_format([
         {"image": image_path},
@@ -296,16 +499,31 @@ def build_query(tokenizer, image_path, prompt):
     ])
 
 
-def chat_generate_with_scores(model, tokenizer, query, weight, capture_scores=True):
+def chat_generate_with_scores(
+    model,
+    tokenizer,
+    query,
+    weight,
+    capture_scores=True,
+    bbox_regions=None,
+    region_mode="all_image",
+    bbox_fallback="skip",
+):
     model._adaptvis_enable = True
     model._adaptvis_weight = float(weight)
     model._adaptvis_last_image_spans = None
     model._adaptvis_image_spans = None
 
     model._adaptvis_scaled_calls = 0
+    model._adaptvis_scaled_patch_count = 0
     model._adaptvis_scaled_mass_before = 0.0
     model._adaptvis_scaled_mass_after_raw = 0.0
     model._adaptvis_last_layout = None
+    model._adaptvis_last_bbox_offsets = None
+
+    model._adaptvis_region_mode = region_mode
+    model._adaptvis_bbox_regions = bbox_regions
+    model._adaptvis_bbox_fallback = bbox_fallback
 
     captured = {}
     old_generate = model.generate
@@ -381,6 +599,9 @@ def chat_generate_with_scores(model, tokenizer, query, weight, capture_scores=Tr
     return str(response).strip(), score_info
 
 
+# ============================================================
+# Evaluation helpers
+# ============================================================
 def pred_to_option_index(pred_prep, gold_answer, caption_options):
     gold = parse_prep(gold_answer)
 
@@ -410,7 +631,7 @@ def choose_adapt_weight(confidence, threshold, weight1, weight2, adapt_rule):
         confidence = 0.0
 
     if adapt_rule == "paper":
-        # Align with original AdaptVis/LLaVA code:
+        # Original AdaptVis/LLaVA logic:
         # if first-token full-vocab max prob < threshold -> weight1, else weight2.
         return weight1 if confidence < threshold else weight2
 
@@ -423,6 +644,9 @@ def choose_adapt_weight(confidence, threshold, weight1, weight2, adapt_rule):
     raise ValueError(adapt_rule)
 
 
+# ============================================================
+# Main
+# ============================================================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_id", default="Qwen/Qwen-VL-Chat")
@@ -441,6 +665,19 @@ def main():
     parser.add_argument("--limit", type=int, default=-1)
     parser.add_argument("--debug_patch", action="store_true")
     parser.add_argument("--print_every", type=int, default=20)
+
+    # Processed image input.
+    parser.add_argument("--use_processed_image", action="store_true")
+    parser.add_argument("--processed_manifest", default="data/controlledA_llava15_processed_manifest.csv")
+
+    # Region scaling.
+    # all_image: original AdaptVis behavior.
+    # bbox: only scale visual tokens whose patches intersect detected bbox.
+    parser.add_argument("--scale_region", choices=["all_image", "bbox"], default="all_image")
+    parser.add_argument("--bbox_json", default="data/controlledA_groundingdino_bbox_on_processed.json")
+    parser.add_argument("--bbox_target", choices=["subject", "object", "both"], default="both")
+    parser.add_argument("--bbox_fallback", choices=["skip", "all_image"], default="skip")
+
     args = parser.parse_args()
 
     setup_cache()
@@ -456,12 +693,21 @@ def main():
 
     prompt_file = f"prompts/{args.dataset}_with_answer_{args.option}_options.jsonl"
     prompts, answers = [], []
-
     with open(prompt_file, "r", encoding="utf-8") as f:
         for line in f:
             r = json.loads(line)
             prompts.append(r["question"])
             answers.append(r["answer"])
+
+    processed_manifest = {}
+    if args.use_processed_image:
+        print("Loading processed image manifest:", args.processed_manifest)
+        processed_manifest = load_processed_manifest(args.processed_manifest)
+
+    bbox_by_sid = {}
+    if args.scale_region == "bbox":
+        print("Loading bbox json:", args.bbox_json)
+        bbox_by_sid = load_bbox_json(args.bbox_json)
 
     n_total = len(dataset.dataset)
     if args.limit > 0:
@@ -475,6 +721,10 @@ def main():
     print("weight2:", args.weight2)
     print("threshold:", args.threshold)
     print("adapt_rule:", args.adapt_rule)
+    print("use_processed_image:", args.use_processed_image)
+    print("scale_region:", args.scale_region)
+    print("bbox_target:", args.bbox_target)
+    print("bbox_fallback:", args.bbox_fallback)
 
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -531,10 +781,17 @@ def main():
     correct = 0
     unparsed = 0
 
+    extra_tag = (
+        f"_proc{int(args.use_processed_image)}"
+        f"_region{args.scale_region}"
+        f"_target{args.bbox_target}"
+        f"_fallback{args.bbox_fallback}"
+    )
+
     out_tag = (
         f"qwen_vl_chat_{args.dataset}_{args.method}"
         f"_llava_aligned_generation_w{args.weight}_w1{args.weight1}_w2{args.weight2}"
-        f"_thr{args.threshold}_rule{args.adapt_rule}"
+        f"_thr{args.threshold}_rule{args.adapt_rule}{extra_tag}"
     )
 
     out_json = Path("outputs") / f"{out_tag}_records.json"
@@ -546,10 +803,36 @@ def main():
         image_path = resolve_image_path(d["image_path"])
         caption_options = d["caption_options"]
 
+        qwen_image_path = image_path
+        proc_info = None
+
+        if args.use_processed_image:
+            base = os.path.basename(image_path)
+            if base not in processed_manifest:
+                raise KeyError(f"processed image not found for basename: {base}")
+            proc_info = processed_manifest[base]
+            qwen_image_path = proc_info["dst"]
+
         prompt = clean_prompt_for_qwen(prompts[i])
         gold = answers[i]
 
-        query = build_query(tokenizer, image_path, prompt)
+        bbox_region = None
+        if args.scale_region == "bbox":
+            bbox_rec = bbox_by_sid.get(i, None)
+            bbox_region = make_bbox_region(bbox_rec, target=args.bbox_target)
+
+            if bbox_region is not None:
+                if proc_info is not None:
+                    bbox_region["image_w"] = int(proc_info["proc_w"])
+                    bbox_region["image_h"] = int(proc_info["proc_h"])
+                else:
+                    # Assume bbox coordinates are on the image actually passed to Qwen.
+                    from PIL import Image
+                    with Image.open(qwen_image_path) as im:
+                        bbox_region["image_w"], bbox_region["image_h"] = im.size
+
+        bbox_regions_for_batch = [bbox_region] if bbox_region is not None else None
+        query = build_query(tokenizer, qwen_image_path, prompt)
 
         probe_generation = None
         probe_score = None
@@ -565,6 +848,9 @@ def main():
                 query=query,
                 weight=1.0,
                 capture_scores=True,
+                bbox_regions=bbox_regions_for_batch,
+                region_mode=args.scale_region,
+                bbox_fallback=args.bbox_fallback,
             )
 
             confidence = probe_score["first_token_max_prob_round"]
@@ -588,6 +874,9 @@ def main():
             query=query,
             weight=chosen_weight,
             capture_scores=True,
+            bbox_regions=bbox_regions_for_batch,
+            region_mode=args.scale_region,
+            bbox_fallback=args.bbox_fallback,
         )
 
         pred_prep = parse_prep(response)
@@ -606,10 +895,14 @@ def main():
         correct += is_correct
 
         image_span = getattr(model, "_adaptvis_last_image_spans", None)
+        bbox_offsets = getattr(model, "_adaptvis_last_bbox_offsets", None)
 
         rec = {
             "index": i,
             "image_path": image_path,
+            "qwen_image_path": qwen_image_path,
+            "using_processed_image": bool(args.use_processed_image),
+            "processed_info": proc_info,
             "prompt": prompt,
             "gold": gold,
             "generation": response,
@@ -633,7 +926,15 @@ def main():
             "final_first_token_top5": final_score["first_token_top5"],
 
             "image_span": image_span,
+            "scale_region": args.scale_region,
+            "bbox_target": args.bbox_target,
+            "bbox_fallback": args.bbox_fallback,
+            "bbox_region": bbox_region,
+            "bbox_offsets": bbox_offsets,
+            "bbox_patch_count": 0 if not bbox_offsets else len(bbox_offsets[0]),
+
             "scaled_calls": int(getattr(model, "_adaptvis_scaled_calls", 0)),
+            "scaled_patch_count": int(getattr(model, "_adaptvis_scaled_patch_count", 0)),
             "scaled_mass_before": float(getattr(model, "_adaptvis_scaled_mass_before", 0.0)),
             "scaled_mass_after_raw": float(getattr(model, "_adaptvis_scaled_mass_after_raw", 0.0)),
             "attn_output_layout": getattr(model, "_adaptvis_last_layout", None),
@@ -647,12 +948,18 @@ def main():
             print("\n" + "=" * 80)
             print("idx:", i)
             print("image:", image_path)
+            print("qwen_image:", qwen_image_path)
             print("gold:", gold)
+            print("bbox_region:", bbox_region)
+            print("bbox_offsets:", bbox_offsets)
+            print("bbox_patch_count:", rec["bbox_patch_count"])
+
             if probe_score is not None:
                 print("probe_generation:", probe_generation)
                 print("probe_first_token_max_prob:", probe_score["first_token_max_prob"])
                 print("probe_first_token_max_prob_round:", probe_score["first_token_max_prob_round"])
                 print("probe_first_token_argmax_text:", probe_score["first_token_argmax_text"])
+
             print("chosen_weight:", chosen_weight)
             print("generation:", response)
             print("final_first_token_max_prob:", final_score["first_token_max_prob"])
@@ -661,6 +968,7 @@ def main():
             print("running acc:", correct / (i + 1), "unparsed:", unparsed)
             print("last image_span:", image_span)
             print("scaled_calls:", rec["scaled_calls"])
+            print("scaled_patch_count:", rec["scaled_patch_count"])
             print("scaled_mass_before:", rec["scaled_mass_before"])
             print("scaled_mass_after_raw:", rec["scaled_mass_after_raw"])
             print("attn_output_layout:", rec["attn_output_layout"])
@@ -683,11 +991,18 @@ def main():
         "weight2": args.weight2,
         "threshold": args.threshold,
         "adapt_rule": args.adapt_rule,
+        "use_processed_image": args.use_processed_image,
+        "processed_manifest": args.processed_manifest,
+        "scale_region": args.scale_region,
+        "bbox_json": args.bbox_json,
+        "bbox_target": args.bbox_target,
+        "bbox_fallback": args.bbox_fallback,
         "n": n_total,
         "direct_acc": direct_acc,
         "unparsed": unparsed,
         "out_json": str(out_json),
         "prob_definition": "first generated token full-vocab max softmax probability from model.chat/model.generate output_scores",
+        "scaling_definition": "last-query attention probability scaling over either whole image tokens or bbox-intersecting image patch tokens",
     }
 
     with open(out_summary, "w", encoding="utf-8") as f:
