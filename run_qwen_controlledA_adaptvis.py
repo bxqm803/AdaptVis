@@ -19,10 +19,6 @@ except Exception:
 from dataset_zoo.aro_datasets import Controlled_Images
 
 
-# -------------------------
-# basic utils
-# -------------------------
-
 def setup_cache():
     os.environ.setdefault("HF_HOME", "/ddnB/work/mwang32/hf_cache")
     os.environ.setdefault("HF_HUB_CACHE", "/ddnB/work/mwang32/hf_cache/hub")
@@ -86,10 +82,6 @@ def get_device(model):
     return next(model.parameters()).device
 
 
-# -------------------------
-# Qwen image span
-# -------------------------
-
 def get_img_token_ids(tokenizer):
     img_id = tokenizer.convert_tokens_to_ids("<img>")
     img_end_id = tokenizer.convert_tokens_to_ids("</img>")
@@ -108,7 +100,6 @@ def find_image_spans_in_input_ids(input_ids, tokenizer):
 
     for b in range(input_ids_cpu.shape[0]):
         ids = input_ids_cpu[b].tolist()
-
         starts = [i for i, x in enumerate(ids) if x == img_id]
         ends = [i for i, x in enumerate(ids) if x == img_end_id]
 
@@ -119,10 +110,6 @@ def find_image_spans_in_input_ids(input_ids, tokenizer):
 
     return spans
 
-
-# -------------------------
-# monkey patch
-# -------------------------
 
 def patch_qwen_forward_for_span(model, tokenizer, debug=False):
     old_forward = model.forward
@@ -145,10 +132,7 @@ def patch_qwen_forward_for_span(model, tokenizer, debug=False):
 
                 if debug:
                     print("forward image spans:", fixed)
-
             else:
-                # generation 后续 step 通常只有新增 token，没有 <img>...</img>
-                # 继续沿用第一次 full context 的 span
                 last = getattr(model, "_adaptvis_last_image_spans", None)
                 if last is not None:
                     model._adaptvis_image_spans = last
@@ -176,12 +160,12 @@ def patch_qwen_attention(model, debug=False):
 
                 # Qwen _attn signature usually:
                 # _attn(query, key, value, registered_causal_mask, attention_mask=None, head_mask=None)
-                # During generation, attention_mask can become None.
+                # query/key/value layout in Qwen-VL-Chat _attn input is usually [B, Q/K, H, D].
+                # Therefore q_len/k_len should use shape[1], not shape[-2].
                 if len(args) >= 5 and args[4] is None:
                     query = args[0]
                     key = args[1]
 
-                    # Qwen query/key before _attn are normally [B, Q/K, H, D]
                     bsz = query.shape[0]
                     q_len = query.shape[1]
                     k_len = key.shape[1]
@@ -200,6 +184,7 @@ def patch_qwen_attention(model, debug=False):
                         bsz = query.shape[0]
                         q_len = query.shape[1]
                         k_len = key.shape[1]
+
                         kwargs["attention_mask"] = torch.zeros(
                             (bsz, 1, q_len, k_len),
                             device=query.device,
@@ -232,11 +217,11 @@ def patch_qwen_attention(model, debug=False):
                 # attn_probs: [B, H, Q, K]
                 bsz, n_heads, q_len, kv_len = attn_probs.shape
 
-                # value normally: [B, K, H, D]
-                # convert to [B, H, K, D]
                 if value.dim() != 4:
                     return out
 
+                # value is usually [B, K, H, D] in Qwen before _attn.
+                # Convert to [B, H, K, D] for matmul.
                 if value.shape[1] == kv_len and value.shape[2] == n_heads:
                     value_for_mm = value.permute(0, 2, 1, 3).contiguous()
                 elif value.shape[1] == n_heads and value.shape[2] == kv_len:
@@ -259,14 +244,15 @@ def patch_qwen_attention(model, debug=False):
                     ed = min(kv_len, int(ed))
 
                     if ed > st:
-                        scaled[b, :, :, st:ed] *= weight
+                        # AdaptVis-style: only current / last query -> image key tokens
+                        scaled[b, :, -1:, st:ed] *= weight
 
                 scaled = scaled / scaled.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
                 # [B,H,Q,K] @ [B,H,K,D] -> [B,H,Q,D]
                 new_attn_output = torch.matmul(scaled, value_for_mm)
 
-                # Qwen expects _attn output as [B,Q,H,D] before _merge_heads
+                # Qwen expects _attn output as [B,Q,H,D] before _merge_heads.
                 new_attn_output_bqhd = new_attn_output.permute(0, 2, 1, 3).contiguous()
 
                 if tuple(attn_output.shape) == tuple(new_attn_output_bqhd.shape):
@@ -303,10 +289,6 @@ def patch_qwen_attention(model, debug=False):
 
     print("Patched QWenAttention modules:", patched)
 
-
-# -------------------------
-# query / generation / scoring
-# -------------------------
 
 def build_query(tokenizer, image_path, prompt):
     return tokenizer.from_list_format([
@@ -400,7 +382,6 @@ def pred_to_option_index(pred_prep, gold_answer, caption_options):
     gold = parse_prep(gold_answer)
 
     if pred_prep is None:
-        # force a wrong option if possible
         for i, cap in enumerate(caption_options):
             if parse_prep(cap) != gold:
                 return i, False
@@ -420,10 +401,6 @@ def pred_to_option_index(pred_prep, gold_answer, caption_options):
 
     return pred_idx, pred_prep == gold
 
-
-# -------------------------
-# main
-# -------------------------
 
 def main():
     parser = argparse.ArgumentParser()
@@ -514,7 +491,6 @@ def main():
         except Exception:
             pass
 
-    # make chat deterministic and short
     try:
         model.generation_config.do_sample = False
         model.generation_config.top_p = 1.0
@@ -539,7 +515,7 @@ def main():
 
     out_tag = (
         f"qwen_vl_chat_{args.dataset}_{args.method}"
-        f"_generation_w{args.weight}_w1{args.weight1}_w2{args.weight2}_thr{args.threshold}"
+        f"_lastquery_generation_w{args.weight}_w1{args.weight1}_w2{args.weight2}_thr{args.threshold}"
     )
 
     out_json = Path("outputs") / f"{out_tag}_records.json"
@@ -570,7 +546,6 @@ def main():
                 chosen_weight = args.weight1 if conf >= args.threshold else args.weight2
             else:
                 chosen_weight = args.weight2 if conf >= args.threshold else args.weight1
-
         else:
             conf_info = {
                 "best": None,
