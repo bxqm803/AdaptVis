@@ -43,7 +43,6 @@ def parse_prep(text):
     t = re.sub(r"[^a-z\s-]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
 
-    # 顺序上先 under，再 on，避免 "on top of under..." 这类极端文本干扰
     if re.search(r"\bleft\b", t):
         return "left"
     if re.search(r"\bright\b", t):
@@ -59,17 +58,21 @@ def resolve_image_path(p):
     p = str(p)
     if os.path.exists(p):
         return p
+
     base = os.path.basename(p)
     candidates = [
         os.path.join("data", "controlled_images", base),
         os.path.join("data", base),
     ]
+
     for c in candidates:
         if os.path.exists(c):
             return c
+
     hits = list(Path("data").rglob(base))
     if hits:
         return str(hits[0])
+
     raise FileNotFoundError(p)
 
 
@@ -85,18 +88,59 @@ def get_img_token_ids(tokenizer):
     return int(img_id), int(img_end_id)
 
 
-def find_image_span_from_query(tokenizer, query):
-    enc = tokenizer(query, return_tensors="pt")
+def find_image_spans_in_input_ids(input_ids, tokenizer):
     img_id, img_end_id = get_img_token_ids(tokenizer)
-    ids = enc["input_ids"][0].tolist()
 
-    starts = [i for i, x in enumerate(ids) if x == img_id]
-    ends = [i for i, x in enumerate(ids) if x == img_end_id]
+    spans = []
+    input_ids_cpu = input_ids.detach().cpu()
 
-    if len(starts) != 1 or len(ends) != 1:
-        raise RuntimeError(f"Bad image tokens: starts={starts}, ends={ends}")
+    for b in range(input_ids_cpu.shape[0]):
+        ids = input_ids_cpu[b].tolist()
 
-    return starts[0] + 1, ends[0], enc
+        starts = [i for i, x in enumerate(ids) if x == img_id]
+        ends = [i for i, x in enumerate(ids) if x == img_end_id]
+
+        if len(starts) == 1 and len(ends) == 1 and ends[0] > starts[0]:
+            spans.append((starts[0] + 1, ends[0]))
+        else:
+            spans.append(None)
+
+    return spans
+
+
+def patch_qwen_forward_for_span(model, tokenizer, debug=False):
+    old_forward = model.forward
+
+    def patched_forward(self, *args, **kwargs):
+        input_ids = kwargs.get("input_ids", None)
+        if input_ids is None and len(args) > 0:
+            input_ids = args[0]
+
+        if input_ids is not None and torch.is_tensor(input_ids):
+            spans = find_image_spans_in_input_ids(input_ids, tokenizer)
+
+            if any(s is not None for s in spans):
+                fixed = []
+                for s in spans:
+                    if s is None:
+                        fixed.append((-1, -1))
+                    else:
+                        fixed.append(s)
+                model._adaptvis_image_spans = fixed
+                model._adaptvis_last_image_spans = fixed
+
+                if debug:
+                    print("forward found image spans:", fixed)
+
+            elif getattr(model, "_adaptvis_last_image_spans", None) is not None:
+                # generation 后续 step input_ids 只有新 token，没有 <img>...</img>
+                # 继续使用第一次 full context 的 image span
+                model._adaptvis_image_spans = model._adaptvis_last_image_spans
+
+        return old_forward(*args, **kwargs)
+
+    model.forward = types.MethodType(patched_forward, model)
+    print("Patched model.forward for dynamic image-span detection.")
 
 
 def patch_qwen_attention(model, debug=False):
@@ -127,25 +171,67 @@ def patch_qwen_attention(model, debug=False):
                     return out
 
                 value = args[2] if len(args) >= 3 else kwargs.get("value", None)
-                if value is None:
+                if value is None or not torch.is_tensor(value):
                     return out
 
                 attn_output, attn_probs = out[0], out[1]
+
                 if attn_probs is None or attn_probs.dim() != 4:
                     return out
 
+                # attn_probs: [B, H, Q, K]
                 bsz, n_heads, q_len, kv_len = attn_probs.shape
+
+                if value.dim() != 4:
+                    return out
+
+                # Qwen _attn receives value usually as [B, K, H, D].
+                # Convert to [B, H, K, D] for matmul.
+                if value.shape[1] == kv_len and value.shape[2] == n_heads:
+                    value_for_mm = value.permute(0, 2, 1, 3).contiguous()
+                elif value.shape[1] == n_heads and value.shape[2] == kv_len:
+                    value_for_mm = value
+                else:
+                    if debug:
+                        print("Unexpected value shape:", tuple(value.shape), "attn_probs:", tuple(attn_probs.shape))
+                    return out
+
                 scaled = attn_probs.clone()
 
                 for b in range(min(bsz, len(spans))):
                     st, ed = spans[b]
                     st = max(0, int(st))
                     ed = min(kv_len, int(ed))
+
                     if ed > st:
                         scaled[b, :, :, st:ed] *= weight
 
                 scaled = scaled / scaled.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-                new_attn_output = torch.matmul(scaled, value)
+
+                # [B, H, Q, K] @ [B, H, K, D] -> [B, H, Q, D]
+                new_attn_output = torch.matmul(scaled, value_for_mm)
+
+                # Qwen expects [B, Q, H, D] before _merge_heads
+                expected_bqhd = (bsz, q_len, n_heads, value_for_mm.shape[-1])
+                expected_bhqd = (bsz, n_heads, q_len, value_for_mm.shape[-1])
+
+                if tuple(attn_output.shape) == expected_bqhd:
+                    new_attn_output = new_attn_output.permute(0, 2, 1, 3).contiguous()
+                elif tuple(attn_output.shape) == expected_bhqd:
+                    new_attn_output = new_attn_output.contiguous()
+                else:
+                    # 默认按 Qwen 原版格式 [B,Q,H,D]
+                    new_attn_output = new_attn_output.permute(0, 2, 1, 3).contiguous()
+
+                    if tuple(new_attn_output.shape) != tuple(attn_output.shape):
+                        if debug:
+                            print(
+                                "Output shape mismatch. old:",
+                                tuple(attn_output.shape),
+                                "new:",
+                                tuple(new_attn_output.shape),
+                            )
+                        return out
 
                 if len(out) == 2:
                     return new_attn_output, scaled
@@ -155,11 +241,13 @@ def patch_qwen_attention(model, debug=False):
 
         module._attn = types.MethodType(make_patched(old_attn, name), module)
         patched += 1
+
         if debug:
-            print("patched:", name)
+            print("patched attention:", name)
 
     if patched == 0:
         raise RuntimeError("No QWenAttention._attn modules patched.")
+
     print("Patched QWenAttention modules:", patched)
 
 
@@ -179,25 +267,31 @@ def encode_query(tokenizer, query, model):
 def candidate_token_ids(tokenizer):
     labels = ["left", "right", "on", "under"]
     out = {}
+
     for lab in labels:
         ids1 = tokenizer(" " + lab, add_special_tokens=False)["input_ids"]
         ids2 = tokenizer(lab, add_special_tokens=False)["input_ids"]
+
         if isinstance(ids1[0], list):
             ids1 = ids1[0]
         if isinstance(ids2[0], list):
             ids2 = ids2[0]
-        out[lab] = {"space": int(ids1[0]), "plain": int(ids2[0])}
+
+        out[lab] = {
+            "space": int(ids1[0]),
+            "plain": int(ids2[0]),
+        }
+
     return out
 
 
 @torch.no_grad()
-def score_candidates_for_conf(model, tokenizer, query, span, cand_ids):
-    # 只用于 AdaptVis threshold，不用于最终预测
+def score_candidates_for_conf(model, tokenizer, query, cand_ids):
+    # 只用于 AdaptVis threshold，不用于最终答案
     enc = encode_query(tokenizer, query, model)
 
     model._adaptvis_enable = True
     model._adaptvis_weight = 1.0
-    model._adaptvis_image_spans = [span]
 
     out = model(
         input_ids=enc["input_ids"],
@@ -219,6 +313,7 @@ def score_candidates_for_conf(model, tokenizer, query, span, cand_ids):
     probs = F.softmax(cand_logits, dim=-1)
 
     best_idx = int(torch.argmax(probs).item())
+
     return {
         "best": labels[best_idx],
         "confidence": float(probs[best_idx].item()),
@@ -227,10 +322,9 @@ def score_candidates_for_conf(model, tokenizer, query, span, cand_ids):
 
 
 @torch.no_grad()
-def chat_generate(model, tokenizer, query, span, weight):
+def chat_generate(model, tokenizer, query, weight):
     model._adaptvis_enable = True
     model._adaptvis_weight = float(weight)
-    model._adaptvis_image_spans = [span]
 
     response, history = model.chat(
         tokenizer,
@@ -253,7 +347,6 @@ def pred_index_from_generation(response, gold_answer, caption_options):
             if parse_prep(cap) == pred:
                 return i, pred
 
-    # generation 没解析出来时，固定判错
     return 2 if len(caption_options) >= 3 else 1, pred
 
 
@@ -280,6 +373,7 @@ def main():
     setup_cache()
     Path("outputs").mkdir(parents=True, exist_ok=True)
 
+    print("Loading dataset...")
     dataset = Controlled_Images(
         image_preprocess=None,
         root_dir=args.root_dir,
@@ -288,8 +382,8 @@ def main():
     )
 
     prompt_file = f"prompts/{args.dataset}_with_answer_{args.option}_options.jsonl"
-    prompts, answers = [], []
 
+    prompts, answers = [], []
     with open(prompt_file, "r", encoding="utf-8") as f:
         for line in f:
             r = json.loads(line)
@@ -303,13 +397,21 @@ def main():
     print("dataset total:", len(dataset.dataset))
     print("running n:", n_total)
     print("method:", args.method)
+    print("weight:", args.weight)
+    print("weight1:", args.weight1)
+    print("weight2:", args.weight2)
+    print("threshold:", args.threshold)
+    print("adapt_rule:", args.adapt_rule)
 
+    print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_id,
         trust_remote_code=True,
     )
 
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+    print("Loading Qwen model...")
     load_kwargs = dict(
         trust_remote_code=True,
         torch_dtype=dtype,
@@ -337,7 +439,6 @@ def main():
         except Exception:
             pass
 
-    # 尽量让 chat 输出短答案
     try:
         model.generation_config.max_new_tokens = 16
         model.generation_config.do_sample = False
@@ -345,6 +446,8 @@ def main():
         pass
 
     model.requires_grad_(False)
+
+    patch_qwen_forward_for_span(model, tokenizer, debug=args.debug_patch)
     patch_qwen_attention(model, debug=args.debug_patch)
 
     cand_ids = candidate_token_ids(tokenizer)
@@ -359,6 +462,7 @@ def main():
         f"qwen_vl_chat_{args.dataset}_{args.method}"
         f"_generation_w{args.weight}_w1{args.weight1}_w2{args.weight2}_thr{args.threshold}"
     )
+
     out_json = Path("outputs") / f"{out_tag}_records.json"
     out_summary = Path("outputs") / f"{out_tag}_summary.json"
 
@@ -371,14 +475,11 @@ def main():
         gold = answers[i]
 
         query = build_query(tokenizer, image_path, prompt)
-        span_st, span_ed, _ = find_image_span_from_query(tokenizer, query)
-        span = (span_st, span_ed)
 
         conf_info = score_candidates_for_conf(
             model=model,
             tokenizer=tokenizer,
             query=query,
-            span=span,
             cand_ids=cand_ids,
         )
 
@@ -397,7 +498,6 @@ def main():
             model=model,
             tokenizer=tokenizer,
             query=query,
-            span=span,
             weight=chosen_weight,
         )
 
@@ -415,6 +515,8 @@ def main():
         is_correct = int(pred_idx == 0)
         correct += is_correct
 
+        image_span = getattr(model, "_adaptvis_last_image_spans", None)
+
         rec = {
             "index": i,
             "image_path": image_path,
@@ -428,7 +530,7 @@ def main():
             "confidence": conf_info["confidence"],
             "conf_probs": conf_info["probs"],
             "chosen_weight": float(chosen_weight),
-            "image_span": [int(span[0]), int(span[1])],
+            "image_span": image_span,
             "caption_options": caption_options,
         }
 
@@ -440,10 +542,11 @@ def main():
             print("image:", image_path)
             print("gold:", gold)
             print("conf:", conf_info)
-            print("chosen_weight:", chosen_weight, "span:", span)
+            print("chosen_weight:", chosen_weight)
             print("generation:", response)
             print("pred:", pred_prep, "pred_idx:", pred_idx, "correct:", bool(is_correct))
             print("running acc:", correct / (i + 1), "unparsed:", unparsed)
+            print("last image_span:", image_span)
 
         if (i + 1) % 25 == 0:
             with open(out_json, "w", encoding="utf-8") as f:
@@ -477,17 +580,20 @@ def main():
     print("saved records:", out_json)
     print("saved summary:", out_summary)
 
-    print("\nRunning Controlled_Images evaluator...")
-    dataset.evaluate_scores(
-        scores=scores,
-        path="outputs",
-        dataset=args.dataset,
-        model="qwen_vl_chat",
-        method=args.method,
-        weight=args.weight if args.method == "scaling_vis" else 1.0,
-        sampled_indices=[],
-        option=args.option,
-    )
+    if n_total == len(dataset.dataset):
+        print("\nRunning Controlled_Images evaluator...")
+        dataset.evaluate_scores(
+            scores=scores,
+            path="outputs",
+            dataset=args.dataset,
+            model="qwen_vl_chat",
+            method=args.method,
+            weight=args.weight if args.method == "scaling_vis" else 1.0,
+            sampled_indices=[],
+            option=args.option,
+        )
+    else:
+        print("\nSkip evaluator because --limit was used.")
 
 
 if __name__ == "__main__":
