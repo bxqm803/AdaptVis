@@ -132,8 +132,8 @@ def patch_qwen_forward_for_span(model, tokenizer, debug=False):
                 if debug:
                     print("forward image spans:", fixed)
             else:
-                # During generation, later steps only contain the new token.
-                # Reuse the image span from the first full-context forward.
+                # generation 后续 step 只有新 token，没有 <img>...</img>
+                # 继续沿用第一次 full context 的 image span
                 last = getattr(model, "_adaptvis_last_image_spans", None)
                 if last is not None:
                     model._adaptvis_image_spans = last
@@ -159,11 +159,11 @@ def patch_qwen_attention(model, debug=False):
             def patched_attn(self, *args, **kwargs):
                 args = list(args)
 
-                # Qwen _attn signature:
+                # Qwen _attn signature usually:
                 # _attn(query, key, value, registered_causal_mask, attention_mask=None, head_mask=None)
                 #
-                # In this Qwen-VL-Chat remote code, query/key inside _attn are [B, H, Q/K, D].
-                # Therefore q_len/k_len must use shape[-2], not shape[1].
+                # In this Qwen-VL-Chat remote code, query/key entering _attn are [B,H,Q/K,D].
+                # Therefore q_len/k_len must be shape[-2], not shape[1] (= heads).
                 if len(args) >= 5 and args[4] is None:
                     query = args[0]
                     key = args[1]
@@ -205,40 +205,42 @@ def patch_qwen_attention(model, debug=False):
                     return out
 
                 if not isinstance(out, tuple) or len(out) < 2:
-                    return out
+                    raise RuntimeError(f"{module_name}: _attn output is not a tuple with attention weights.")
 
                 value = args[2] if len(args) >= 3 else kwargs.get("value", None)
                 if value is None or not torch.is_tensor(value):
-                    return out
+                    raise RuntimeError(f"{module_name}: cannot find value tensor.")
 
                 attn_output, attn_probs = out[0], out[1]
 
                 if attn_probs is None or attn_probs.dim() != 4:
-                    return out
+                    raise RuntimeError(
+                        f"{module_name}: bad attn_probs shape: "
+                        f"{None if attn_probs is None else tuple(attn_probs.shape)}"
+                    )
 
-                # attn_probs: [B, H, Q, K]
+                # attn_probs: [B,H,Q,K]
                 bsz, n_heads, q_len, kv_len = attn_probs.shape
 
                 if value.dim() != 4:
-                    return out
+                    raise RuntimeError(f"{module_name}: bad value shape: {tuple(value.shape)}")
 
-                # value should normally be [B, H, K, D].
-                # Keep robust handling for [B, K, H, D] just in case.
+                # Convert value to [B,H,K,D].
                 if value.shape[1] == n_heads and value.shape[2] == kv_len:
                     value_for_mm = value.contiguous()                       # [B,H,K,D]
                 elif value.shape[1] == kv_len and value.shape[2] == n_heads:
                     value_for_mm = value.permute(0, 2, 1, 3).contiguous()    # [B,H,K,D]
                 else:
-                    if debug:
-                        print(
-                            "Unexpected value shape:",
-                            tuple(value.shape),
-                            "attn_probs:",
-                            tuple(attn_probs.shape),
-                        )
-                    return out
+                    raise RuntimeError(
+                        f"{module_name}: unexpected value shape {tuple(value.shape)} "
+                        f"for attn_probs {tuple(attn_probs.shape)}"
+                    )
 
                 scaled = attn_probs.clone()
+
+                local_calls = 0
+                local_before = 0.0
+                local_after_raw = 0.0
 
                 for b in range(min(bsz, len(spans))):
                     st, ed = spans[b]
@@ -247,30 +249,48 @@ def patch_qwen_attention(model, debug=False):
 
                     if ed > st:
                         # AdaptVis-style:
-                        # all layers, all heads, last/current query -> image key tokens only.
+                        # all layers, all heads, current/last query -> image key tokens only.
+                        before = scaled[b, :, -1:, st:ed].detach().float().sum().item()
                         scaled[b, :, -1:, st:ed] *= weight
+                        after_raw = scaled[b, :, -1:, st:ed].detach().float().sum().item()
+
+                        local_calls += 1
+                        local_before += before
+                        local_after_raw += after_raw
+
+                if local_calls == 0:
+                    return out
 
                 scaled = scaled / scaled.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
                 # [B,H,Q,K] @ [B,H,K,D] -> [B,H,Q,D]
-                new_attn_output = torch.matmul(scaled, value_for_mm).contiguous()
+                new_attn_output_bhqd = torch.matmul(scaled, value_for_mm).contiguous()
 
-                # Qwen _merge_heads expects the original _attn output layout.
-                # In this remote code that is [B,H,Q,D], so do NOT permute to [B,Q,H,D].
-                if tuple(new_attn_output.shape) != tuple(attn_output.shape):
-                    if debug:
-                        print(
-                            "attn_output shape mismatch. old:",
-                            tuple(attn_output.shape),
-                            "new:",
-                            tuple(new_attn_output.shape),
-                        )
-                    return out
+                # Match original _attn output layout exactly.
+                # Qwen's old _attn often returns [B,Q,H,D], while matmul gives [B,H,Q,D].
+                if tuple(new_attn_output_bhqd.shape) == tuple(attn_output.shape):
+                    final_attn_output = new_attn_output_bhqd
+                    layout = "BHQD"
+                elif tuple(new_attn_output_bhqd.permute(0, 2, 1, 3).shape) == tuple(attn_output.shape):
+                    final_attn_output = new_attn_output_bhqd.permute(0, 2, 1, 3).contiguous()
+                    layout = "BQHD"
+                else:
+                    raise RuntimeError(
+                        f"{module_name}: cannot match attn_output shape. "
+                        f"old={tuple(attn_output.shape)}, "
+                        f"new_bhqd={tuple(new_attn_output_bhqd.shape)}, "
+                        f"new_bqhd={tuple(new_attn_output_bhqd.permute(0, 2, 1, 3).shape)}"
+                    )
+
+                model._adaptvis_scaled_calls = getattr(model, "_adaptvis_scaled_calls", 0) + local_calls
+                model._adaptvis_scaled_mass_before = getattr(model, "_adaptvis_scaled_mass_before", 0.0) + local_before
+                model._adaptvis_scaled_mass_after_raw = getattr(model, "_adaptvis_scaled_mass_after_raw", 0.0) + local_after_raw
+                model._adaptvis_last_layout = layout
 
                 if len(out) == 2:
-                    return new_attn_output, scaled
+                    return final_attn_output, scaled
 
-                return (new_attn_output, scaled) + tuple(out[2:])
+                return (final_attn_output, scaled) + tuple(out[2:])
 
             return patched_attn
 
@@ -322,7 +342,7 @@ def candidate_token_ids(tokenizer):
 
 @torch.no_grad()
 def score_candidates_for_conf(model, tokenizer, query, cand_ids):
-    # Only used for AdaptVis threshold selection. Final prediction still uses generation.
+    # 只用于 AdaptVis threshold selection；最终预测仍来自 generation。
     enc = encode_query(tokenizer, query, model)
 
     model._adaptvis_enable = True
@@ -364,6 +384,11 @@ def chat_generate(model, tokenizer, query, weight):
     model._adaptvis_weight = float(weight)
     model._adaptvis_last_image_spans = None
     model._adaptvis_image_spans = None
+
+    model._adaptvis_scaled_calls = 0
+    model._adaptvis_scaled_mass_before = 0.0
+    model._adaptvis_scaled_mass_after_raw = 0.0
+    model._adaptvis_last_layout = None
 
     response, history = model.chat(
         tokenizer,
@@ -592,6 +617,10 @@ def main():
             "conf_probs": conf_info["probs"],
             "chosen_weight": float(chosen_weight),
             "image_span": image_span,
+            "scaled_calls": int(getattr(model, "_adaptvis_scaled_calls", 0)),
+            "scaled_mass_before": float(getattr(model, "_adaptvis_scaled_mass_before", 0.0)),
+            "scaled_mass_after_raw": float(getattr(model, "_adaptvis_scaled_mass_after_raw", 0.0)),
+            "attn_output_layout": getattr(model, "_adaptvis_last_layout", None),
             "caption_options": caption_options,
         }
 
@@ -608,6 +637,10 @@ def main():
             print("pred:", pred_prep, "pred_idx:", pred_idx, "correct:", bool(is_correct))
             print("running acc:", correct / (i + 1), "unparsed:", unparsed)
             print("last image_span:", image_span)
+            print("scaled_calls:", rec["scaled_calls"])
+            print("scaled_mass_before:", rec["scaled_mass_before"])
+            print("scaled_mass_after_raw:", rec["scaled_mass_after_raw"])
+            print("attn_output_layout:", rec["attn_output_layout"])
 
         if (i + 1) % 25 == 0:
             with open(out_json, "w", encoding="utf-8") as f:
