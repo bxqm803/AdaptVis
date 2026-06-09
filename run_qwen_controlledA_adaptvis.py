@@ -19,12 +19,17 @@ except Exception:
 from dataset_zoo.aro_datasets import Controlled_Images
 
 
+# -------------------------
+# basic utils
+# -------------------------
+
 def setup_cache():
     os.environ.setdefault("HF_HOME", "/ddnB/work/mwang32/hf_cache")
     os.environ.setdefault("HF_HUB_CACHE", "/ddnB/work/mwang32/hf_cache/hub")
     os.environ.setdefault("TRANSFORMERS_CACHE", "/ddnB/work/mwang32/hf_cache/transformers")
     os.environ.setdefault("HF_DATASETS_CACHE", "/ddnB/work/mwang32/hf_cache/datasets")
     os.environ.setdefault("TORCH_HOME", "/ddnB/work/mwang32/torch_cache")
+
     for k in ["HF_HOME", "HF_HUB_CACHE", "TRANSFORMERS_CACHE", "HF_DATASETS_CACHE", "TORCH_HOME"]:
         Path(os.environ[k]).mkdir(parents=True, exist_ok=True)
 
@@ -56,6 +61,7 @@ def parse_prep(text):
 
 def resolve_image_path(p):
     p = str(p)
+
     if os.path.exists(p):
         return p
 
@@ -80,19 +86,25 @@ def get_device(model):
     return next(model.parameters()).device
 
 
+# -------------------------
+# Qwen image span
+# -------------------------
+
 def get_img_token_ids(tokenizer):
     img_id = tokenizer.convert_tokens_to_ids("<img>")
     img_end_id = tokenizer.convert_tokens_to_ids("</img>")
+
     if img_id is None or img_end_id is None:
-        raise RuntimeError("Cannot find <img> or </img> token ids.")
+        raise RuntimeError("Cannot find <img> / </img> token ids.")
+
     return int(img_id), int(img_end_id)
 
 
 def find_image_spans_in_input_ids(input_ids, tokenizer):
     img_id, img_end_id = get_img_token_ids(tokenizer)
+    input_ids_cpu = input_ids.detach().cpu()
 
     spans = []
-    input_ids_cpu = input_ids.detach().cpu()
 
     for b in range(input_ids_cpu.shape[0]):
         ids = input_ids_cpu[b].tolist()
@@ -108,6 +120,10 @@ def find_image_spans_in_input_ids(input_ids, tokenizer):
     return spans
 
 
+# -------------------------
+# monkey patch
+# -------------------------
+
 def patch_qwen_forward_for_span(model, tokenizer, debug=False):
     old_forward = model.forward
 
@@ -122,20 +138,20 @@ def patch_qwen_forward_for_span(model, tokenizer, debug=False):
             if any(s is not None for s in spans):
                 fixed = []
                 for s in spans:
-                    if s is None:
-                        fixed.append((-1, -1))
-                    else:
-                        fixed.append(s)
+                    fixed.append(s if s is not None else (-1, -1))
+
                 model._adaptvis_image_spans = fixed
                 model._adaptvis_last_image_spans = fixed
 
                 if debug:
-                    print("forward found image spans:", fixed)
+                    print("forward image spans:", fixed)
 
-            elif getattr(model, "_adaptvis_last_image_spans", None) is not None:
-                # generation 后续 step input_ids 只有新 token，没有 <img>...</img>
-                # 继续使用第一次 full context 的 image span
-                model._adaptvis_image_spans = model._adaptvis_last_image_spans
+            else:
+                # generation 后续 step 通常只有新增 token，没有 <img>...</img>
+                # 继续沿用第一次 full context 的 span
+                last = getattr(model, "_adaptvis_last_image_spans", None)
+                if last is not None:
+                    model._adaptvis_image_spans = last
 
         return old_forward(*args, **kwargs)
 
@@ -156,6 +172,40 @@ def patch_qwen_attention(model, debug=False):
 
         def make_patched(old_attn_func, module_name):
             def patched_attn(self, *args, **kwargs):
+                args = list(args)
+
+                # Qwen _attn signature usually:
+                # _attn(query, key, value, registered_causal_mask, attention_mask=None, head_mask=None)
+                # During generation, attention_mask can become None.
+                if len(args) >= 5 and args[4] is None:
+                    query = args[0]
+                    key = args[1]
+
+                    # Qwen query/key before _attn are normally [B, Q/K, H, D]
+                    bsz = query.shape[0]
+                    q_len = query.shape[1]
+                    k_len = key.shape[1]
+
+                    args[4] = torch.zeros(
+                        (bsz, 1, q_len, k_len),
+                        device=query.device,
+                        dtype=query.dtype,
+                    )
+
+                if "attention_mask" in kwargs and kwargs["attention_mask"] is None:
+                    query = args[0] if len(args) > 0 else kwargs.get("query", None)
+                    key = args[1] if len(args) > 1 else kwargs.get("key", None)
+
+                    if query is not None and key is not None:
+                        bsz = query.shape[0]
+                        q_len = query.shape[1]
+                        k_len = key.shape[1]
+                        kwargs["attention_mask"] = torch.zeros(
+                            (bsz, 1, q_len, k_len),
+                            device=query.device,
+                            dtype=query.dtype,
+                        )
+
                 out = old_attn_func(*args, **kwargs)
 
                 if not getattr(model, "_adaptvis_enable", False):
@@ -182,18 +232,23 @@ def patch_qwen_attention(model, debug=False):
                 # attn_probs: [B, H, Q, K]
                 bsz, n_heads, q_len, kv_len = attn_probs.shape
 
+                # value normally: [B, K, H, D]
+                # convert to [B, H, K, D]
                 if value.dim() != 4:
                     return out
 
-                # Qwen _attn receives value usually as [B, K, H, D].
-                # Convert to [B, H, K, D] for matmul.
                 if value.shape[1] == kv_len and value.shape[2] == n_heads:
                     value_for_mm = value.permute(0, 2, 1, 3).contiguous()
                 elif value.shape[1] == n_heads and value.shape[2] == kv_len:
-                    value_for_mm = value
+                    value_for_mm = value.contiguous()
                 else:
                     if debug:
-                        print("Unexpected value shape:", tuple(value.shape), "attn_probs:", tuple(attn_probs.shape))
+                        print(
+                            "Unexpected value shape:",
+                            tuple(value.shape),
+                            "attn_probs:",
+                            tuple(attn_probs.shape),
+                        )
                     return out
 
                 scaled = attn_probs.clone()
@@ -208,34 +263,32 @@ def patch_qwen_attention(model, debug=False):
 
                 scaled = scaled / scaled.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
-                # [B, H, Q, K] @ [B, H, K, D] -> [B, H, Q, D]
+                # [B,H,Q,K] @ [B,H,K,D] -> [B,H,Q,D]
                 new_attn_output = torch.matmul(scaled, value_for_mm)
 
-                # Qwen expects [B, Q, H, D] before _merge_heads
-                expected_bqhd = (bsz, q_len, n_heads, value_for_mm.shape[-1])
-                expected_bhqd = (bsz, n_heads, q_len, value_for_mm.shape[-1])
+                # Qwen expects _attn output as [B,Q,H,D] before _merge_heads
+                new_attn_output_bqhd = new_attn_output.permute(0, 2, 1, 3).contiguous()
 
-                if tuple(attn_output.shape) == expected_bqhd:
-                    new_attn_output = new_attn_output.permute(0, 2, 1, 3).contiguous()
-                elif tuple(attn_output.shape) == expected_bhqd:
-                    new_attn_output = new_attn_output.contiguous()
+                if tuple(attn_output.shape) == tuple(new_attn_output_bqhd.shape):
+                    final_attn_output = new_attn_output_bqhd
+                elif tuple(attn_output.shape) == tuple(new_attn_output.shape):
+                    final_attn_output = new_attn_output.contiguous()
                 else:
-                    # 默认按 Qwen 原版格式 [B,Q,H,D]
-                    new_attn_output = new_attn_output.permute(0, 2, 1, 3).contiguous()
-
-                    if tuple(new_attn_output.shape) != tuple(attn_output.shape):
-                        if debug:
-                            print(
-                                "Output shape mismatch. old:",
-                                tuple(attn_output.shape),
-                                "new:",
-                                tuple(new_attn_output.shape),
-                            )
-                        return out
+                    if debug:
+                        print(
+                            "attn_output shape mismatch. old:",
+                            tuple(attn_output.shape),
+                            "new_bqhd:",
+                            tuple(new_attn_output_bqhd.shape),
+                            "new_bhqd:",
+                            tuple(new_attn_output.shape),
+                        )
+                    return out
 
                 if len(out) == 2:
-                    return new_attn_output, scaled
-                return (new_attn_output, scaled) + tuple(out[2:])
+                    return final_attn_output, scaled
+
+                return (final_attn_output, scaled) + tuple(out[2:])
 
             return patched_attn
 
@@ -250,6 +303,10 @@ def patch_qwen_attention(model, debug=False):
 
     print("Patched QWenAttention modules:", patched)
 
+
+# -------------------------
+# query / generation / scoring
+# -------------------------
 
 def build_query(tokenizer, image_path, prompt):
     return tokenizer.from_list_format([
@@ -269,17 +326,17 @@ def candidate_token_ids(tokenizer):
     out = {}
 
     for lab in labels:
-        ids1 = tokenizer(" " + lab, add_special_tokens=False)["input_ids"]
-        ids2 = tokenizer(lab, add_special_tokens=False)["input_ids"]
+        ids_space = tokenizer(" " + lab, add_special_tokens=False)["input_ids"]
+        ids_plain = tokenizer(lab, add_special_tokens=False)["input_ids"]
 
-        if isinstance(ids1[0], list):
-            ids1 = ids1[0]
-        if isinstance(ids2[0], list):
-            ids2 = ids2[0]
+        if isinstance(ids_space[0], list):
+            ids_space = ids_space[0]
+        if isinstance(ids_plain[0], list):
+            ids_plain = ids_plain[0]
 
         out[lab] = {
-            "space": int(ids1[0]),
-            "plain": int(ids2[0]),
+            "space": int(ids_space[0]),
+            "plain": int(ids_plain[0]),
         }
 
     return out
@@ -287,11 +344,13 @@ def candidate_token_ids(tokenizer):
 
 @torch.no_grad()
 def score_candidates_for_conf(model, tokenizer, query, cand_ids):
-    # 只用于 AdaptVis threshold，不用于最终答案
+    # only used for AdaptVis confidence threshold
     enc = encode_query(tokenizer, query, model)
 
     model._adaptvis_enable = True
     model._adaptvis_weight = 1.0
+    model._adaptvis_last_image_spans = None
+    model._adaptvis_image_spans = None
 
     out = model(
         input_ids=enc["input_ids"],
@@ -301,6 +360,7 @@ def score_candidates_for_conf(model, tokenizer, query, cand_ids):
     )
 
     logits = out.logits[0, -1, :].float()
+
     labels = ["left", "right", "on", "under"]
     cand_logits = []
 
@@ -311,7 +371,6 @@ def score_candidates_for_conf(model, tokenizer, query, cand_ids):
 
     cand_logits = torch.stack(cand_logits)
     probs = F.softmax(cand_logits, dim=-1)
-
     best_idx = int(torch.argmax(probs).item())
 
     return {
@@ -325,6 +384,8 @@ def score_candidates_for_conf(model, tokenizer, query, cand_ids):
 def chat_generate(model, tokenizer, query, weight):
     model._adaptvis_enable = True
     model._adaptvis_weight = float(weight)
+    model._adaptvis_last_image_spans = None
+    model._adaptvis_image_spans = None
 
     response, history = model.chat(
         tokenizer,
@@ -335,20 +396,34 @@ def chat_generate(model, tokenizer, query, weight):
     return str(response).strip()
 
 
-def pred_index_from_generation(response, gold_answer, caption_options):
-    pred = parse_prep(response)
+def pred_to_option_index(pred_prep, gold_answer, caption_options):
     gold = parse_prep(gold_answer)
 
-    if pred is not None and gold is not None and pred == gold:
-        return 0, pred
-
-    if pred is not None:
+    if pred_prep is None:
+        # force a wrong option if possible
         for i, cap in enumerate(caption_options):
-            if parse_prep(cap) == pred:
-                return i, pred
+            if parse_prep(cap) != gold:
+                return i, False
+        return 0, False
 
-    return 2 if len(caption_options) >= 3 else 1, pred
+    pred_idx = None
+    for i, cap in enumerate(caption_options):
+        if parse_prep(cap) == pred_prep:
+            pred_idx = i
+            break
 
+    if pred_idx is None:
+        for i, cap in enumerate(caption_options):
+            if parse_prep(cap) != gold:
+                return i, False
+        return 0, False
+
+    return pred_idx, pred_prep == gold
+
+
+# -------------------------
+# main
+# -------------------------
 
 def main():
     parser = argparse.ArgumentParser()
@@ -382,8 +457,8 @@ def main():
     )
 
     prompt_file = f"prompts/{args.dataset}_with_answer_{args.option}_options.jsonl"
-
     prompts, answers = [], []
+
     with open(prompt_file, "r", encoding="utf-8") as f:
         for line in f:
             r = json.loads(line)
@@ -439,9 +514,12 @@ def main():
         except Exception:
             pass
 
+    # make chat deterministic and short
     try:
-        model.generation_config.max_new_tokens = 16
         model.generation_config.do_sample = False
+        model.generation_config.top_p = 1.0
+        model.generation_config.top_k = 50
+        model.generation_config.max_new_tokens = 16
     except Exception:
         pass
 
@@ -455,6 +533,7 @@ def main():
 
     scores = np.zeros((len(dataset.dataset), 1, 4), dtype=np.float32)
     records = []
+
     correct = 0
     unparsed = 0
 
@@ -468,6 +547,7 @@ def main():
 
     for i in tqdm(range(n_total), total=n_total):
         d = dataset.dataset[i]
+
         image_path = resolve_image_path(d["image_path"])
         caption_options = d["caption_options"]
 
@@ -476,23 +556,32 @@ def main():
 
         query = build_query(tokenizer, image_path, prompt)
 
-        conf_info = score_candidates_for_conf(
-            model=model,
-            tokenizer=tokenizer,
-            query=query,
-            cand_ids=cand_ids,
-        )
+        if args.method == "adapt_vis":
+            conf_info = score_candidates_for_conf(
+                model=model,
+                tokenizer=tokenizer,
+                query=query,
+                cand_ids=cand_ids,
+            )
 
-        if args.method == "base":
-            chosen_weight = 1.0
-        elif args.method == "scaling_vis":
-            chosen_weight = args.weight
-        else:
             conf = conf_info["confidence"]
+
             if args.adapt_rule == "high_w1":
                 chosen_weight = args.weight1 if conf >= args.threshold else args.weight2
             else:
                 chosen_weight = args.weight2 if conf >= args.threshold else args.weight1
+
+        else:
+            conf_info = {
+                "best": None,
+                "confidence": None,
+                "probs": None,
+            }
+
+            if args.method == "base":
+                chosen_weight = 1.0
+            else:
+                chosen_weight = args.weight
 
         response = chat_generate(
             model=model,
@@ -501,8 +590,9 @@ def main():
             weight=chosen_weight,
         )
 
-        pred_idx, pred_prep = pred_index_from_generation(
-            response,
+        pred_prep = parse_prep(response)
+        pred_idx, is_correct_bool = pred_to_option_index(
+            pred_prep,
             gold,
             caption_options,
         )
@@ -512,7 +602,7 @@ def main():
 
         scores[i, 0, pred_idx] = 1.0
 
-        is_correct = int(pred_idx == 0)
+        is_correct = int(is_correct_bool)
         correct += is_correct
 
         image_span = getattr(model, "_adaptvis_last_image_spans", None)
