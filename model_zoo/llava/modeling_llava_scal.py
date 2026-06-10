@@ -453,34 +453,16 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
                     # Get the target length
                     target_seqlen = first_layer_past_key_value.shape[-1] + 1
 
-                    # Original AdaptVis code creates only the *extension* part of the
-                    # attention mask and then indexes it with `non_attended_tokens`.
-                    # That is unsafe when the language model uses HF-style cache:
-                    # `non_attended_tokens` are absolute cache positions, while
-                    # `extended_attention_mask` is only the newly appended local slice.
-                    #
-                    # Here we keep the same zero-cache filtering idea:
-                    #     torch.where(first_layer_past_key_value == 0)
-                    # but apply the zeroing on a full-length mask, where absolute
-                    # cache positions are valid indices.
-                    full_attention_mask = torch.ones(
-                        (attention_mask.shape[0], target_seqlen),
+                    extended_attention_mask = torch.ones(
+                        (attention_mask.shape[0], target_seqlen - attention_mask.shape[1]),
                         dtype=attention_mask.dtype,
                         device=attention_mask.device,
                     )
 
-                    copy_len = min(attention_mask.shape[1], target_seqlen)
-                    full_attention_mask[:, :copy_len] = attention_mask[:, :copy_len]
+                    # Zero-out the places where we don't need to attend
+                    extended_attention_mask[batch_index, non_attended_tokens] = 0
 
-                    valid = (non_attended_tokens >= 0) & (non_attended_tokens < target_seqlen)
-
-                    if bool(valid.any().detach().cpu()):
-                        full_attention_mask[
-                            batch_index[valid],
-                            non_attended_tokens[valid],
-                        ] = 0
-
-                    attention_mask = full_attention_mask
+                    attention_mask = torch.cat((attention_mask, extended_attention_mask), dim=1)
                     position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
                     image_id=None
         
