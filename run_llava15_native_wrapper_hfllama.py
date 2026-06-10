@@ -262,10 +262,10 @@ def patch_hf_llama_attention(lm, max_layers=32, require_square=True):
             if attention_mask is not None:
                 causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
                 attn_weights = attn_weights + causal_mask
-            attn_weights = torch.max(
-                attn_weights,
-                torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device, dtype=attn_weights.dtype),
-            )
+            # Same logical clamp as AdaptVis, but avoid constructing a CUDA scalar tensor.
+            # The previous CUDA stacktrace often points here even when the real device assert
+            # happened earlier asynchronously.
+            attn_weights = torch.clamp(attn_weights, min=torch.finfo(attn_weights.dtype).min)
             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             attn_output = torch.matmul(attn_weights, value_states)
             attn_output = attn_output.transpose(1, 2).contiguous()
