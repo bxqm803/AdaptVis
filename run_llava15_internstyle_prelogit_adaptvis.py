@@ -655,6 +655,7 @@ def generate_with_scores(model, processor, tokenizer, inputs, image_token_id, we
         **inputs,
         max_new_tokens=max_new_tokens,
         do_sample=False,
+        use_cache=False,
     )
 
     if capture_scores:
@@ -828,6 +829,15 @@ def main():
 
     model.requires_grad_(False)
 
+    try:
+        model.config.use_cache = False
+    except Exception:
+        pass
+    try:
+        model.generation_config.use_cache = False
+    except Exception:
+        pass
+
     language_model = get_language_model(model)
     install_adaptvis_softmax_patch(language_model, verbose=True)
 
@@ -852,7 +862,7 @@ def main():
 
     model_tag = args.model_id.replace("/", "_").replace("-", "_")
     out_tag = (
-        f"llava15_internstyle_prelogit_promptfix_nopad_{model_tag}_{args.dataset}_{args.method}"
+        f"llava15_internstyle_prelogit_promptfix_nopad_nocache_{model_tag}_{args.dataset}_{args.method}"
         f"_w{args.weight}_w1{args.weight1}_w2{args.weight2}_thr{args.threshold}_rule{args.adapt_rule}"
     )
     out_json = Path("outputs") / f"{out_tag}_records.json"
@@ -1010,6 +1020,7 @@ def main():
         "direct_acc": direct_acc,
         "unparsed": unparsed,
         "max_new_tokens": args.max_new_tokens,
+        "use_cache": False,
         "out_json": str(out_json),
         "prob_definition": "first generated token full-vocab max softmax probability",
         "adaptvis_definition": "InternVL-style wrapper but with main_aro-like pre-softmax attention-logit scaling: last query -> image-token positions, prefill only",
