@@ -326,43 +326,13 @@ def build_inputs(processor, tokenizer, model, image_path, prompt, device):
     # LLaVA-1.5 standard conversation style.
     question = f"<image>\nUSER: {prompt}\nASSISTANT:"
 
-    # Tokenize normally first, then manually LEFT-pad input_ids/attention_mask to 77.
-    # This avoids HF generate's right-padding warning while matching main_aro's fixed length.
     inputs = processor(
         text=question,
         images=image,
         return_tensors="pt",
     )
 
-    target_len = 77
-    input_ids = inputs["input_ids"]
-    attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids))
-
-    pad_id = tokenizer.pad_token_id
-    if pad_id is None:
-        pad_id = tokenizer.eos_token_id
-
-    cur_len = input_ids.shape[1]
-    if cur_len < target_len:
-        pad_len = target_len - cur_len
-        pad_ids = torch.full(
-            (input_ids.shape[0], pad_len),
-            int(pad_id),
-            dtype=input_ids.dtype,
-            device=input_ids.device,
-        )
-        pad_mask = torch.zeros(
-            (attention_mask.shape[0], pad_len),
-            dtype=attention_mask.dtype,
-            device=attention_mask.device,
-        )
-        inputs["input_ids"] = torch.cat([pad_ids, input_ids], dim=1)
-        inputs["attention_mask"] = torch.cat([pad_mask, attention_mask], dim=1)
-    elif cur_len > target_len:
-        # Keep the right side so the prompt ending "ASSISTANT:" remains at the end.
-        inputs["input_ids"] = input_ids[:, -target_len:]
-        inputs["attention_mask"] = attention_mask[:, -target_len:]
-
+    # Do NOT expand the <image> token here.
     # HF LLaVA expects exactly one <image> token per image in input_ids.
     # It expands this single token to image_seq_len visual embeddings internally
     # before calling the language model.
@@ -841,8 +811,6 @@ def main():
 
     try:
         tokenizer.padding_side = "left"
-        if hasattr(processor, "tokenizer"):
-            processor.tokenizer.padding_side = "left"
     except Exception:
         pass
 
@@ -884,7 +852,7 @@ def main():
 
     model_tag = args.model_id.replace("/", "_").replace("-", "_")
     out_tag = (
-        f"llava15_internstyle_prelogit_promptfix_pad77manualleft_{model_tag}_{args.dataset}_{args.method}"
+        f"llava15_internstyle_prelogit_promptfix_nopad_{model_tag}_{args.dataset}_{args.method}"
         f"_w{args.weight}_w1{args.weight1}_w2{args.weight2}_thr{args.threshold}_rule{args.adapt_rule}"
     )
     out_json = Path("outputs") / f"{out_tag}_records.json"
@@ -910,17 +878,6 @@ def main():
 
         if i == 0:
             print("first_question_repr:", repr(question))
-
-        if i == 0:
-            print("first_input_ids_shape:", tuple(inputs["input_ids"].shape))
-            print("first_attention_mask_sum:", int(inputs["attention_mask"].sum().item()) if "attention_mask" in inputs else None)
-            print("tokenizer_padding_side:", getattr(tokenizer, "padding_side", None))
-            print("pad_token_id:", tokenizer.pad_token_id, "eos_token_id:", tokenizer.eos_token_id)
-            try:
-                print("first_last_token_id:", int(inputs["input_ids"][0, -1].item()))
-                print("first_tail_tokens:", tokenizer.decode(inputs["input_ids"][0, -20:].detach().cpu().tolist()))
-            except Exception as e:
-                print("first_tail_decode_failed:", repr(e))
 
         img_pos_count = int((inputs["input_ids"] == image_token_id).sum().item())
 
