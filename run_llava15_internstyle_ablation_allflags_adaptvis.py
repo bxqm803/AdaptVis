@@ -124,23 +124,23 @@ def get_model_device(model):
 #   image + prompt -> model.generate -> parse generation.
 # It does not use the original LLaVA/AdaptVis repo wrapper.
 # ============================================================
-def load_llava_processor(model_id):
+def load_llava_processor(model_id, revision=None):
     """
     Prefer AutoProcessor. If the installed tokenizers library cannot read the fast
     tokenizer JSON, fall back to slow tokenizer + image processor.
     """
     try:
-        processor = AutoProcessor.from_pretrained(model_id, use_fast=False)
+        processor = AutoProcessor.from_pretrained(model_id, use_fast=False, revision=revision)
         tokenizer = getattr(processor, "tokenizer", None)
         if tokenizer is None:
-            tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False)
+            tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False, revision=revision)
         return processor, tokenizer
     except Exception as e:
         print("AutoProcessor failed, falling back to slow tokenizer + image processor.")
         print("AutoProcessor error:", repr(e))
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False)
-    image_processor = AutoImageProcessor.from_pretrained(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False, revision=revision)
+    image_processor = AutoImageProcessor.from_pretrained(model_id, revision=revision)
 
     if LlavaProcessor is None:
         raise RuntimeError("LlavaProcessor is not available in this transformers install.")
@@ -152,11 +152,13 @@ def load_llava_processor(model_id):
     return processor, tokenizer
 
 
-def load_llava_model(model_id, torch_dtype, device_map=None, load_in_8bit=False, attn_implementation="eager"):
+def load_llava_model(model_id, torch_dtype, device_map=None, load_in_8bit=False, attn_implementation="eager", revision=None):
     kwargs = dict(
         torch_dtype=torch_dtype,
         low_cpu_mem_usage=True,
     )
+    if revision is not None and str(revision).lower() not in {"", "none", "null"}:
+        kwargs["revision"] = revision
 
     if load_in_8bit:
         kwargs["load_in_8bit"] = True
@@ -320,26 +322,76 @@ def maybe_expand_single_image_token(inputs, model, processor, tokenizer):
     return inputs
 
 
-def build_inputs(processor, tokenizer, model, image_path, prompt, device):
+def build_inputs(processor, tokenizer, model, image_path, prompt, device,
+                 prompt_style="mainaro", pad_mode="none", target_len=77):
     image = Image.open(image_path).convert("RGB")
 
-    # LLaVA-1.5 standard conversation style.
-    question = f"<image>\nUSER: {prompt}\nASSISTANT:"
+    if prompt_style == "mainaro":
+        question = f"<image>\nUSER: {prompt}\nASSISTANT:"
+    elif prompt_style == "hf":
+        question = f"USER: <image>\n{prompt}\nASSISTANT:"
+    elif prompt_style == "raw":
+        question = prompt
+    else:
+        raise ValueError(f"Unknown prompt_style: {prompt_style}")
 
-    inputs = processor(
-        text=question,
-        images=image,
-        return_tensors="pt",
-    )
+    if pad_mode == "processor77":
+        inputs = processor(
+            text=question,
+            images=image,
+            padding="max_length",
+            max_length=int(target_len),
+            truncation=True,
+            return_tensors="pt",
+        )
+    else:
+        inputs = processor(
+            text=question,
+            images=image,
+            return_tensors="pt",
+        )
 
-    # Do NOT expand the <image> token here.
+    if pad_mode == "manual_left77":
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids))
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = tokenizer.eos_token_id
+
+        cur_len = input_ids.shape[1]
+        target_len = int(target_len)
+        if cur_len < target_len:
+            pad_len = target_len - cur_len
+            pad_ids = torch.full(
+                (input_ids.shape[0], pad_len),
+                int(pad_id),
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+            pad_mask = torch.zeros(
+                (attention_mask.shape[0], pad_len),
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
+            )
+            inputs["input_ids"] = torch.cat([pad_ids, input_ids], dim=1)
+            inputs["attention_mask"] = torch.cat([pad_mask, attention_mask], dim=1)
+        elif cur_len > target_len:
+            inputs["input_ids"] = input_ids[:, -target_len:]
+            inputs["attention_mask"] = attention_mask[:, -target_len:]
+
+    elif pad_mode == "none":
+        pass
+    elif pad_mode == "processor77":
+        pass
+    else:
+        raise ValueError(f"Unknown pad_mode: {pad_mode}")
+
     # HF LLaVA expects exactly one <image> token per image in input_ids.
     # It expands this single token to image_seq_len visual embeddings internally
     # before calling the language model.
     inputs = {k: v.to(device) if torch.is_tensor(v) else v for k, v in inputs.items()}
 
     return inputs, question
-
 
 # ============================================================
 # Generic AdaptVis via language-model PRE-SOFTMAX attention-logit patch
@@ -602,7 +654,7 @@ def reset_adaptvis_counters(language_model, weight):
     language_model._adaptvis_last_image_positions = None
 
 
-def set_image_positions_from_input_ids(language_model, input_ids, image_token_id, image_seq_len=576):
+def set_image_positions_from_input_ids(language_model, input_ids, image_token_id, image_seq_len=576, image_pos_shift=0):
     """
     HF LLaVA input_ids usually contain exactly one <image> token.
     The model internally expands that single token into image_seq_len visual
@@ -619,11 +671,11 @@ def set_image_positions_from_input_ids(language_model, input_ids, image_token_id
         pos = torch.nonzero(ids[b] == int(image_token_id), as_tuple=False).view(-1)
 
         if pos.numel() == 1:
-            start = int(pos.item())
+            start = int(pos.item()) + int(image_pos_shift)
             expanded = torch.arange(start, start + int(image_seq_len), dtype=torch.long)
             positions.append(expanded)
         else:
-            positions.append(pos.detach().cpu())
+            positions.append((pos.detach().cpu() + int(image_pos_shift)))
 
     language_model._adaptvis_image_positions = positions
     language_model._adaptvis_last_image_positions = positions
@@ -646,17 +698,18 @@ def choose_adapt_weight(confidence, threshold, weight1, weight2, adapt_rule):
 
 
 @torch.no_grad()
-def generate_with_scores(model, processor, tokenizer, inputs, image_token_id, weight, image_seq_len=576, max_new_tokens=16, capture_scores=True):
+def generate_with_scores(model, processor, tokenizer, inputs, image_token_id, weight, image_seq_len=576, max_new_tokens=16, capture_scores=True, use_cache=True, image_pos_shift=0):
     language_model = get_language_model(model)
     reset_adaptvis_counters(language_model, weight=weight)
-    set_image_positions_from_input_ids(language_model, inputs["input_ids"], image_token_id, image_seq_len=image_seq_len)
+    set_image_positions_from_input_ids(language_model, inputs["input_ids"], image_token_id, image_seq_len=image_seq_len, image_pos_shift=image_pos_shift)
 
     gen_kwargs = dict(
         **inputs,
         max_new_tokens=max_new_tokens,
         do_sample=False,
-        use_cache=False,
     )
+    if use_cache is not None:
+        gen_kwargs["use_cache"] = bool(use_cache)
 
     if capture_scores:
         gen_kwargs["output_scores"] = True
@@ -745,6 +798,7 @@ def generate_with_scores(model, processor, tokenizer, inputs, image_token_id, we
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_id", default="llava-hf/llava-1.5-7b-hf")
+    parser.add_argument("--revision", default=None)
     parser.add_argument("--root_dir", default="data")
     parser.add_argument("--dataset", default="Controlled_Images_A")
     parser.add_argument("--subset", default="A")
@@ -760,6 +814,11 @@ def main():
     parser.add_argument("--limit", type=int, default=-1)
     parser.add_argument("--print_every", type=int, default=20)
     parser.add_argument("--max_new_tokens", type=int, default=16)
+    parser.add_argument("--prompt_style", choices=["mainaro", "hf", "raw"], default="mainaro")
+    parser.add_argument("--pad_mode", choices=["none", "processor77", "manual_left77"], default="none")
+    parser.add_argument("--target_len", type=int, default=77)
+    parser.add_argument("--no_cache", action="store_true")
+    parser.add_argument("--image_pos_shift", type=int, default=0)
 
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="fp16")
     parser.add_argument("--load_in_8bit", action="store_true")
@@ -799,6 +858,13 @@ def main():
     print("weight2:", args.weight2)
     print("threshold:", args.threshold)
     print("adapt_rule:", args.adapt_rule)
+    print("revision:", args.revision)
+    print("prompt_style:", args.prompt_style)
+    print("pad_mode:", args.pad_mode)
+    print("target_len:", args.target_len)
+    print("no_cache:", args.no_cache)
+    print("max_new_tokens:", args.max_new_tokens)
+    print("image_pos_shift:", args.image_pos_shift)
 
     if args.dtype == "bf16":
         torch_dtype = torch.bfloat16
@@ -808,7 +874,7 @@ def main():
         torch_dtype = torch.float32
 
     print("Loading processor/tokenizer...")
-    processor, tokenizer = load_llava_processor(args.model_id)
+    processor, tokenizer = load_llava_processor(args.model_id, revision=args.revision)
 
     try:
         tokenizer.padding_side = "left"
@@ -822,6 +888,7 @@ def main():
         device_map=args.device_map,
         load_in_8bit=args.load_in_8bit,
         attn_implementation="eager",
+        revision=args.revision,
     )
 
     if torch.cuda.is_available() and not args.load_in_8bit and args.device_map is None:
@@ -829,14 +896,15 @@ def main():
 
     model.requires_grad_(False)
 
-    try:
-        model.config.use_cache = False
-    except Exception:
-        pass
-    try:
-        model.generation_config.use_cache = False
-    except Exception:
-        pass
+    if args.no_cache:
+        try:
+            model.config.use_cache = False
+        except Exception:
+            pass
+        try:
+            model.generation_config.use_cache = False
+        except Exception:
+            pass
 
     language_model = get_language_model(model)
     install_adaptvis_softmax_patch(language_model, verbose=True)
@@ -861,8 +929,12 @@ def main():
     unparsed = 0
 
     model_tag = args.model_id.replace("/", "_").replace("-", "_")
+    rev_tag = "none" if args.revision is None else str(args.revision).replace("/", "_")
+    cache_tag = "nocache" if args.no_cache else "cache"
     out_tag = (
-        f"llava15_internstyle_prelogit_promptfix_nopad_nocache_{model_tag}_{args.dataset}_{args.method}"
+        f"llava15_ablate_{model_tag}_{args.dataset}_{args.method}"
+        f"_prompt{args.prompt_style}_pad{args.pad_mode}_len{args.target_len}"
+        f"_cache{cache_tag}_max{args.max_new_tokens}_rev{rev_tag}_shift{args.image_pos_shift}"
         f"_w{args.weight}_w1{args.weight1}_w2{args.weight2}_thr{args.threshold}_rule{args.adapt_rule}"
     )
     out_json = Path("outputs") / f"{out_tag}_records.json"
@@ -884,6 +956,9 @@ def main():
             image_path=image_path,
             prompt=prompt,
             device=device,
+            prompt_style=args.prompt_style,
+            pad_mode=args.pad_mode,
+            target_len=args.target_len,
         )
 
         if i == 0:
@@ -906,6 +981,8 @@ def main():
                 image_seq_len=image_seq_len,
                 max_new_tokens=args.max_new_tokens,
                 capture_scores=True,
+                use_cache=(not args.no_cache),
+                image_pos_shift=args.image_pos_shift,
             )
             confidence = probe_score["first_token_max_prob_round"]
             chosen_weight = choose_adapt_weight(
@@ -930,6 +1007,8 @@ def main():
             image_seq_len=image_seq_len,
             max_new_tokens=args.max_new_tokens,
             capture_scores=True,
+            use_cache=(not args.no_cache),
+            image_pos_shift=args.image_pos_shift,
         )
 
         pred_prep = parse_prep(response)
@@ -1020,7 +1099,13 @@ def main():
         "direct_acc": direct_acc,
         "unparsed": unparsed,
         "max_new_tokens": args.max_new_tokens,
-        "use_cache": False,
+        "revision": args.revision,
+        "prompt_style": args.prompt_style,
+        "pad_mode": args.pad_mode,
+        "target_len": args.target_len,
+        "no_cache": args.no_cache,
+        "use_cache": not args.no_cache,
+        "image_pos_shift": args.image_pos_shift,
         "out_json": str(out_json),
         "prob_definition": "first generated token full-vocab max softmax probability",
         "adaptvis_definition": "InternVL-style wrapper but with main_aro-like pre-softmax attention-logit scaling: last query -> image-token positions, prefill only",
