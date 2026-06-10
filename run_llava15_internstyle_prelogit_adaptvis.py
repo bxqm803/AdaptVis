@@ -331,6 +331,7 @@ def build_inputs(processor, tokenizer, model, image_path, prompt, device):
         images=image,
         padding="max_length",
         max_length=77,
+        truncation=True,
         return_tensors="pt",
     )
 
@@ -812,9 +813,9 @@ def main():
     processor, tokenizer = load_llava_processor(args.model_id)
 
     try:
-        tokenizer.padding_side = "right"
+        tokenizer.padding_side = "left"
         if hasattr(processor, "tokenizer"):
-            processor.tokenizer.padding_side = "right"
+            processor.tokenizer.padding_side = "left"
     except Exception:
         pass
 
@@ -856,7 +857,7 @@ def main():
 
     model_tag = args.model_id.replace("/", "_").replace("-", "_")
     out_tag = (
-        f"llava15_internstyle_prelogit_promptfix_pad77_{model_tag}_{args.dataset}_{args.method}"
+        f"llava15_internstyle_prelogit_promptfix_pad77left_{model_tag}_{args.dataset}_{args.method}"
         f"_w{args.weight}_w1{args.weight1}_w2{args.weight2}_thr{args.threshold}_rule{args.adapt_rule}"
     )
     out_json = Path("outputs") / f"{out_tag}_records.json"
@@ -886,6 +887,11 @@ def main():
         if i == 0:
             print("first_input_ids_shape:", tuple(inputs["input_ids"].shape))
             print("first_attention_mask_sum:", int(inputs["attention_mask"].sum().item()) if "attention_mask" in inputs else None)
+            try:
+                tail_ids = inputs["input_ids"][0, -20:].detach().cpu().tolist()
+                print("first_tail_tokens:", tokenizer.decode(tail_ids))
+            except Exception as e:
+                print("first_tail_tokens_decode_failed:", repr(e))
 
         img_pos_count = int((inputs["input_ids"] == image_token_id).sum().item())
 
