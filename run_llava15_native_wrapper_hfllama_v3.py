@@ -241,14 +241,38 @@ def patch_hf_llama_attention(lm, max_layers=32, require_square=True):
                     kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
                 except Exception:
                     pass
+            # Robust RoPE handling across transformers versions.
+            # Important: do NOT pass position_ids as the positional seq_len argument
+            # to old-style LlamaRotaryEmbedding. That can create cos/sin with the
+            # wrong length and later trigger CUDA index out-of-bounds.
             if position_embeddings is not None:
                 cos, sin = position_embeddings
+                try:
+                    query_states, key_states = apply_rotary_pos_emb(
+                        query_states, key_states, cos, sin, position_ids
+                    )
+                except TypeError:
+                    query_states, key_states = apply_rotary_pos_emb(
+                        query_states, key_states, cos, sin
+                    )
             else:
                 try:
-                    cos, sin = self.rotary_emb(value_states, position_ids)
-                except TypeError:
+                    # Old-style transformers: rotary_emb(x, seq_len=kv_seq_len)
                     cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+                    query_states, key_states = apply_rotary_pos_emb(
+                        query_states, key_states, cos, sin, position_ids
+                    )
+                except TypeError:
+                    # New-style transformers: rotary_emb(x, position_ids)
+                    cos, sin = self.rotary_emb(value_states, position_ids)
+                    try:
+                        query_states, key_states = apply_rotary_pos_emb(
+                            query_states, key_states, cos, sin
+                        )
+                    except TypeError:
+                        query_states, key_states = apply_rotary_pos_emb(
+                            query_states, key_states, cos, sin, position_ids
+                        )
             if past_key_value is not None:
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
                 try:
@@ -392,6 +416,9 @@ def main():
     correct = strict_correct = unparsed = 0
 
     for i in tqdm(range(n_total), total=n_total):
+        # Useful with CUDA_LAUNCH_BLOCKING=1 if a CUDA assert occurs.
+        if args.print_every > 0 and i % args.print_every == 0:
+            print(f"[sample_start] i={i}", flush=True)
         d = dataset.dataset[i]
         image_path = resolve_image_path(d["image_path"])
         image = Image.open(image_path).convert("RGB")
