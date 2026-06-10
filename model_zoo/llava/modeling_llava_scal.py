@@ -16,7 +16,7 @@
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 import pdb
-from model_zoo import llama
+from model_zoo import llama_hf_scal as llama
 import torch
 import torch.utils.checkpoint
 from torch import nn
