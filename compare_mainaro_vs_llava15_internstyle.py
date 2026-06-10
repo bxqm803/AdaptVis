@@ -1,66 +1,127 @@
 #!/usr/bin/env python3
-import argparse, csv, json, os, re
+import argparse
+import csv
+import json
+import re
 from pathlib import Path
 from collections import defaultdict
 
 LABELS = ["left", "right", "on", "under"]
 
+
 def parse_label(x):
     t = str(x).lower()
     t = re.sub(r"[^a-z\s-]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
-    if re.search(r"\bleft\b", t): return "left"
-    if re.search(r"\bright\b", t): return "right"
-    if re.search(r"\bunder\b|\bbelow\b|\bbeneath\b", t): return "under"
-    if re.search(r"\bon\b|\btop\b|\babove\b|\bover\b", t): return "on"
+    if re.search(r"\bleft\b", t):
+        return "left"
+    if re.search(r"\bright\b", t):
+        return "right"
+    if re.search(r"\bunder\b|\bbelow\b|\bbeneath\b", t):
+        return "under"
+    if re.search(r"\bon\b|\btop\b|\babove\b|\bover\b", t):
+        return "on"
     return None
 
+
 def as_bool(x):
-    if isinstance(x, bool): return x
-    if isinstance(x, (int, float)): return bool(x)
-    return str(x).strip().lower() in {"1", "true", "yes", "correct"}
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, float)):
+        return bool(x)
+    return str(x).strip().lower() in {"1", "true", "yes", "y", "correct"}
+
+
+def find_latest(patterns):
+    hits = []
+    for pat in patterns:
+        hits.extend(Path(".").glob(pat))
+    hits = sorted(set(hits), key=lambda p: p.stat().st_mtime if p.exists() else 0)
+    return str(hits[-1]) if hits else None
+
 
 def acc_from_log(path):
-    if not path or not Path(path).exists(): return None
+    if not path or not Path(path).exists():
+        return None
     text = Path(path).read_text(errors="ignore")
-    pats = [
+    vals = []
+    patterns = [
         r"Direct acc:\s*([0-9]*\.?[0-9]+)",
         r"Individual accuracy:\s*([0-9]*\.?[0-9]+)",
-        r"Accuracy:\s*([0-9]*\.?[0-9]+)",
+        r"\n\s*([0-9]+)\s+([0-9]+)\s+([0-9]*\.?[0-9]+)\s*\n",
         r"accuracy:\s*([0-9]*\.?[0-9]+)",
         r"acc:\s*([0-9]*\.?[0-9]+)",
     ]
-    vals = []
-    for p in pats:
-        vals += [float(m.group(1)) for m in re.finditer(p, text)]
-    if not vals: return None
+    for pat in patterns:
+        for m in re.finditer(pat, text, flags=re.IGNORECASE):
+            try:
+                if len(m.groups()) == 3:
+                    vals.append(float(m.group(3)))
+                else:
+                    vals.append(float(m.group(1)))
+            except Exception:
+                pass
+    if not vals:
+        return None
     v = vals[-1]
     return v / 100.0 if v > 1 else v
 
-def load_records(path):
-    if not path or not Path(path).exists(): return None
-    p = Path(path)
-    if p.suffix == ".json":
-        obj = json.load(open(p, "r", encoding="utf-8"))
-        if isinstance(obj, dict):
-            obj = obj.get("records") or obj.get("results") or obj.get("examples") or obj.get("data")
-        recs = obj
-    elif p.suffix == ".jsonl":
-        recs = [json.loads(l) for l in open(p, "r", encoding="utf-8") if l.strip()]
-    elif p.suffix == ".csv":
-        recs = list(csv.DictReader(open(p, "r", encoding="utf-8")))
-    else:
-        raise ValueError(f"unsupported file type: {p}")
 
-    if not isinstance(recs, list): return None
+def load_json_obj(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
+
+def extract_list_from_obj(obj):
+    if isinstance(obj, list):
+        return obj
+
+    if isinstance(obj, dict):
+        for k in ["records", "results", "predictions", "examples", "data", "details", "outputs"]:
+            if isinstance(obj.get(k), list):
+                return obj[k]
+
+        # dict indexed by sample id
+        vals = list(obj.values())
+        if vals and all(isinstance(v, dict) for v in vals):
+            return vals
+
+    return None
+
+
+def normalize_records(records):
     out = {}
-    for j, r in enumerate(recs):
-        idx = int(r.get("index", r.get("idx", j)))
-        gold = parse_label(r.get("gold", r.get("answer", "")))
-        pred = parse_label(r.get("pred_prep", r.get("pred", r.get("prediction", ""))))
+    for j, r in enumerate(records):
+        if not isinstance(r, dict):
+            continue
+
+        idx = r.get("index", r.get("idx", r.get("sample_id", r.get("id", j))))
+        try:
+            idx = int(idx)
+        except Exception:
+            idx = j
+
+        gold = parse_label(r.get("gold", r.get("answer", r.get("label", r.get("target", "")))))
+
+        pred = parse_label(r.get("pred_prep", r.get("pred", r.get("prediction", r.get("pred_label", "")))))
         if pred is None:
-            pred = parse_label(r.get("generation", r.get("response", "")))
+            pred = parse_label(r.get("generation", r.get("response", r.get("output", r.get("text", "")))))
+
+        # main_aro sometimes stores "Generation:" / "Golden:" style strings in records
+        if pred is None:
+            for k, v in r.items():
+                if "generation" in str(k).lower() or "pred" in str(k).lower():
+                    pred = parse_label(v)
+                    if pred is not None:
+                        break
+
+        if gold is None:
+            for k, v in r.items():
+                if "gold" in str(k).lower() or "answer" in str(k).lower() or "label" in str(k).lower():
+                    gold = parse_label(v)
+                    if gold is not None:
+                        break
+
         if "correct" in r:
             correct = as_bool(r["correct"])
         elif "is_correct" in r:
@@ -69,77 +130,124 @@ def load_records(path):
             correct = (gold == pred)
         else:
             correct = None
+
         prob = None
-        for k in ["final_first_token_max_prob", "first_token_max_prob", "probe_first_token_max_prob"]:
+        for k in ["final_first_token_max_prob", "first_token_max_prob", "probe_first_token_max_prob", "prob", "confidence"]:
             if r.get(k) is not None:
                 try:
-                    prob = float(r[k]); break
+                    prob = float(r[k])
+                    break
                 except Exception:
                     pass
+
         out[idx] = {
-            "idx": idx,
+            "index": idx,
             "gold": gold,
             "pred": pred,
             "correct": correct,
-            "generation": r.get("generation", r.get("response", "")),
+            "generation": r.get("generation", r.get("response", r.get("output", ""))),
             "prob": prob,
             "trace": r.get("final_trace", r.get("trace", None)),
         }
-    return out
+    return out if out else None
 
-def find_one(patterns):
-    for pat in patterns:
-        hits = sorted(Path(".").glob(pat))
-        if hits: return str(hits[-1])
+
+def load_records(path):
+    if not path or not Path(path).exists():
+        return None
+
+    p = Path(path)
+    if p.suffix == ".json":
+        obj = load_json_obj(p)
+        records = extract_list_from_obj(obj)
+        if records is None:
+            print(f"[WARN] {p} is JSON but not a per-sample record list.")
+            if isinstance(obj, dict):
+                print("[WARN] keys:", list(obj.keys())[:30])
+            return None
+        return normalize_records(records)
+
+    if p.suffix == ".jsonl":
+        records = [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+        return normalize_records(records)
+
+    if p.suffix == ".csv":
+        with open(p, "r", encoding="utf-8") as f:
+            return normalize_records(list(csv.DictReader(f)))
+
+    print(f"[WARN] unsupported records file type: {p}")
     return None
 
-def acc_from_records(recs):
-    if not recs: return None
-    vals = [r["correct"] for r in recs.values() if r["correct"] is not None]
+
+def acc_from_records(records):
+    if not records:
+        return None
+    vals = [r["correct"] for r in records.values() if r["correct"] is not None]
     return None if not vals else sum(vals) / len(vals)
 
-def print_run(name, recs, log):
-    print(f"{name}")
-    print(f"  records: {len(recs) if recs else 'NA'}")
-    print(f"  acc(records): {acc_from_records(recs) if recs else 'NA'}")
-    print(f"  acc(log): {acc_from_log(log) if log else 'NA'}")
-    print(f"  log: {log}")
 
-def compare(name_a, A, name_b, B, out_prefix=None):
+def print_run(name, records, log_path, record_path):
+    print(name)
+    print("  records_path:", record_path)
+    print("  records_n:", len(records) if records else "NA")
+    print("  acc(records):", acc_from_records(records) if records else "NA")
+    print("  log_path:", log_path)
+    print("  acc(log):", acc_from_log(log_path) if log_path else "NA")
+
+
+def compare(name_a, A, name_b, B, out_prefix):
     if A is None or B is None:
-        print(f"\n[{name_a} vs {name_b}] skipped: missing per-sample records")
+        print(f"\n[{name_a} vs {name_b}] skipped: missing per-sample records.")
         return
+
     common = sorted(set(A) & set(B))
     print(f"\n[{name_a} vs {name_b}] n={len(common)}")
+
     stats = defaultdict(int)
     by_gold = defaultdict(lambda: defaultdict(int))
     flips = []
-    for i in common:
-        a, b = A[i], B[i]
+
+    for idx in common:
+        a, b = A[idx], B[idx]
         ac, bc = a["correct"], b["correct"]
         gold = a["gold"] or b["gold"]
-        if ac and bc: cat = "both_correct"
-        elif (ac is False) and (bc is False): cat = "both_wrong"
-        elif ac and (bc is False): cat = "A_correct_B_wrong"
-        elif (ac is False) and bc: cat = "A_wrong_B_correct"
-        else: cat = "unknown"
-        same_pred = a["pred"] == b["pred"]
+
+        if ac is True and bc is True:
+            cat = "both_correct"
+        elif ac is False and bc is False:
+            cat = "both_wrong"
+        elif ac is True and bc is False:
+            cat = "A_correct_B_wrong"
+        elif ac is False and bc is True:
+            cat = "A_wrong_B_correct"
+        else:
+            cat = "unknown"
+
+        same_pred = (a["pred"] == b["pred"])
+
         stats[cat] += 1
         stats["same_pred"] += int(same_pred)
         stats["changed_pred"] += int(not same_pred)
+
         if gold:
             by_gold[gold]["n"] += 1
             by_gold[gold][cat] += 1
             by_gold[gold]["same_pred"] += int(same_pred)
             by_gold[gold]["changed_pred"] += int(not same_pred)
+
         if cat in {"A_correct_B_wrong", "A_wrong_B_correct"}:
             flips.append({
-                "index": i, "gold": gold, "category": cat,
-                f"{name_a}_pred": a["pred"], f"{name_b}_pred": b["pred"],
-                f"{name_a}_correct": ac, f"{name_b}_correct": bc,
-                f"{name_a}_prob": a["prob"], f"{name_b}_prob": b["prob"],
+                "index": idx,
+                "gold": gold,
+                "category": cat,
+                f"{name_a}_pred": a["pred"],
+                f"{name_b}_pred": b["pred"],
+                f"{name_a}_correct": ac,
+                f"{name_b}_correct": bc,
                 f"{name_a}_generation": a["generation"],
                 f"{name_b}_generation": b["generation"],
+                f"{name_a}_prob": a["prob"],
+                f"{name_b}_prob": b["prob"],
             })
 
     print("both_correct:", stats["both_correct"])
@@ -150,17 +258,20 @@ def compare(name_a, A, name_b, B, out_prefix=None):
     print("same_pred:", stats["same_pred"])
     print("changed_pred:", stats["changed_pred"])
 
-    print("per_gold")
-    header = ["gold","n","both_correct","both_wrong",
-              f"{name_a}_correct_to_{name_b}_wrong",
-              f"{name_a}_wrong_to_{name_b}_correct",
-              "net_gain_B_minus_A","changed_pred","same_pred"]
+    header = [
+        "gold", "n", "both_correct", "both_wrong",
+        f"{name_a}_correct_to_{name_b}_wrong",
+        f"{name_a}_wrong_to_{name_b}_correct",
+        "net_gain_B_minus_A", "changed_pred", "same_pred",
+    ]
     rows = []
+    print("per_gold")
     print(",".join(header))
-    for g in LABELS:
-        d = by_gold[g]
+    for gold in LABELS:
+        d = by_gold[gold]
         row = {
-            "gold": g, "n": d["n"],
+            "gold": gold,
+            "n": d["n"],
             "both_correct": d["both_correct"],
             "both_wrong": d["both_wrong"],
             f"{name_a}_correct_to_{name_b}_wrong": d["A_correct_B_wrong"],
@@ -172,53 +283,56 @@ def compare(name_a, A, name_b, B, out_prefix=None):
         rows.append(row)
         print(",".join(str(row[h]) for h in header))
 
-    if out_prefix:
-        out_prefix = Path(out_prefix)
-        out_prefix.parent.mkdir(parents=True, exist_ok=True)
-        with open(str(out_prefix)+".flips.json", "w", encoding="utf-8") as f:
-            json.dump(flips, f, ensure_ascii=False, indent=2)
-        with open(str(out_prefix)+".per_gold.csv", "w", encoding="utf-8", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=header)
-            w.writeheader(); w.writerows(rows)
-        print("saved:", str(out_prefix)+".flips.json")
-        print("saved:", str(out_prefix)+".per_gold.csv")
+    out_prefix = Path(out_prefix)
+    out_prefix.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(str(out_prefix) + ".flips.json", "w", encoding="utf-8") as f:
+        json.dump(flips, f, ensure_ascii=False, indent=2)
+
+    with open(str(out_prefix) + ".per_gold.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        w.writeheader()
+        w.writerows(rows)
+
+    print("saved:", str(out_prefix) + ".flips.json")
+    print("saved:", str(out_prefix) + ".per_gold.csv")
+
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--outputs", default="outputs")
     ap.add_argument("--main_base_records", default=None)
     ap.add_argument("--main_scale_records", default=None)
     ap.add_argument("--intern_base_records", default=None)
     ap.add_argument("--intern_scale_records", default=None)
-    ap.add_argument("--main_base_log", default=None)
-    ap.add_argument("--main_scale_log", default=None)
-    ap.add_argument("--intern_base_log", default=None)
-    ap.add_argument("--intern_scale_log", default=None)
+
+    ap.add_argument("--main_base_log", default="outputs/log_main_aro_llava15_ControlledA_base.txt")
+    ap.add_argument("--main_scale_log", default="outputs/log_main_aro_llava15_ControlledA_scaling_w0.5.txt")
+    ap.add_argument("--intern_base_log", default="outputs/log_llava15_internstyle_ControlledA_base.txt")
+    ap.add_argument("--intern_scale_log", default="outputs/log_llava15_internstyle_ControlledA_scaling_w0.5.txt")
+
+    ap.add_argument("--out_dir", default="outputs")
     args = ap.parse_args()
-    out = Path(args.outputs)
 
-    args.intern_base_records = args.intern_base_records or str(out / "llava15_internstyle_llava_hf_llava_1.5_7b_hf_Controlled_Images_A_base_w1.0_w10.5_w21.5_thr0.4_rulepaper_records.json")
-    args.intern_scale_records = args.intern_scale_records or str(out / "llava15_internstyle_llava_hf_llava_1.5_7b_hf_Controlled_Images_A_scaling_vis_w0.5_w10.5_w21.5_thr0.4_rulepaper_records.json")
+    # Important: main_aro saves under ./output, not ./outputs.
+    # Do NOT auto-match outputs/*llava15_internstyle* as main_aro.
+    if args.main_base_records is None:
+        args.main_base_records = find_latest([
+            "output/results*Controlled_Images_A_base_1.0_fouroption_False.json",
+            "output/results*Controlled_Images_A_base*.json",
+        ])
+    if args.main_scale_records is None:
+        args.main_scale_records = find_latest([
+            "output/results*Controlled_Images_A_scaling_vis_0.5_fouroption_False.json",
+            "output/results*Controlled_Images_A_scaling_vis*0.5*.json",
+        ])
 
-    args.main_base_log = args.main_base_log or str(out / "log_main_aro_llava15_ControlledA_base.txt")
-    args.main_scale_log = args.main_scale_log or str(out / "log_main_aro_llava15_ControlledA_scaling_w0.5.txt")
-    args.intern_base_log = args.intern_base_log or str(out / "log_llava15_internstyle_ControlledA_base.txt")
-    args.intern_scale_log = args.intern_scale_log or str(out / "log_llava15_internstyle_ControlledA_scaling_w0.5.txt")
-
-    # main_aro normally may not save per-sample records. Try common names.
-    args.main_base_records = args.main_base_records or find_one([
-        "outputs/*main*aro*llava*Controlled*base*records.json",
-        "outputs/*llava1.5*Controlled*base*records.json",
-        "outputs/*llava15*Controlled*base*records.json",
-    ])
-    args.main_scale_records = args.main_scale_records or find_one([
-        "outputs/*main*aro*llava*Controlled*scaling*0.5*records.json",
-        "outputs/*llava1.5*Controlled*scaling*0.5*records.json",
-        "outputs/*llava15*Controlled*scaling*0.5*records.json",
-    ])
+    if args.intern_base_records is None:
+        args.intern_base_records = "outputs/llava15_internstyle_llava_hf_llava_1.5_7b_hf_Controlled_Images_A_base_w1.0_w10.5_w21.5_thr0.4_rulepaper_records.json"
+    if args.intern_scale_records is None:
+        args.intern_scale_records = "outputs/llava15_internstyle_llava_hf_llava_1.5_7b_hf_Controlled_Images_A_scaling_vis_w0.5_w10.5_w21.5_thr0.4_rulepaper_records.json"
 
     print("resolved paths")
-    for k,v in vars(args).items():
+    for k, v in vars(args).items():
         print(f"  {k}: {v}")
 
     MB = load_records(args.main_base_records)
@@ -226,27 +340,29 @@ def main():
     IB = load_records(args.intern_base_records)
     IS = load_records(args.intern_scale_records)
 
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("summary")
-    print_run("main_aro_base", MB, args.main_base_log)
-    print_run("main_aro_scale0.5", MS, args.main_scale_log)
-    print_run("internstyle_base", IB, args.intern_base_log)
-    print_run("internstyle_scale0.5", IS, args.intern_scale_log)
+    print_run("main_aro_base", MB, args.main_base_log, args.main_base_records)
+    print_run("main_aro_scale0.5", MS, args.main_scale_log, args.main_scale_records)
+    print_run("internstyle_base", IB, args.intern_base_log, args.intern_base_records)
+    print_run("internstyle_scale0.5", IS, args.intern_scale_log, args.intern_scale_records)
 
-    print("\n" + "="*80)
+    out = Path(args.out_dir)
+
+    print("\n" + "=" * 80)
     print("base -> scale")
-    compare("main_base", MB, "main_scale0.5", MS, out / "compare_main_base_vs_scale0.5")
-    compare("intern_base", IB, "intern_scale0.5", IS, out / "compare_internstyle_base_vs_scale0.5")
+    compare("main_base", MB, "main_scale0.5", MS, out / "v2_compare_main_base_vs_scale0.5")
+    compare("intern_base", IB, "intern_scale0.5", IS, out / "v2_compare_internstyle_base_vs_scale0.5")
 
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("main_aro vs internstyle")
-    compare("main_base", MB, "intern_base", IB, out / "compare_main_vs_internstyle_base")
-    compare("main_scale0.5", MS, "intern_scale0.5", IS, out / "compare_main_vs_internstyle_scale0.5")
+    compare("main_base", MB, "intern_base", IB, out / "v2_compare_main_vs_internstyle_base")
+    compare("main_scale0.5", MS, "intern_scale0.5", IS, out / "v2_compare_main_vs_internstyle_scale0.5")
 
-    if MB is None or MS is None:
-        print("\nNOTE: 没找到 main_aro 的逐样本 records，所以 main_aro 只能从 log 对比整体 acc。")
-        print("如果你有 main_aro 的逐样本 json/csv，重新运行时加：")
-        print("  --main_base_records PATH --main_scale_records PATH")
+    print("\nNOTE:")
+    print("If main_aro records_n is NA, its result JSON is probably only aggregate metrics.")
+    print("Then only acc(log) is valid for main_aro; per-sample flips need a real per-sample main_aro record file.")
+
 
 if __name__ == "__main__":
     main()
