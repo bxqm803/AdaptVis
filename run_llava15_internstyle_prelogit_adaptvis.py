@@ -324,7 +324,7 @@ def build_inputs(processor, tokenizer, model, image_path, prompt, device):
     image = Image.open(image_path).convert("RGB")
 
     # LLaVA-1.5 standard conversation style.
-    question = f"USER: <image>\n{prompt}\nASSISTANT:"
+    question = f"<image>\nUSER: {prompt}\nASSISTANT:"
 
     inputs = processor(
         text=question,
@@ -852,7 +852,7 @@ def main():
 
     model_tag = args.model_id.replace("/", "_").replace("-", "_")
     out_tag = (
-        f"llava15_internstyle_prelogit_{model_tag}_{args.dataset}_{args.method}"
+        f"llava15_internstyle_prelogit_promptfix_{model_tag}_{args.dataset}_{args.method}"
         f"_w{args.weight}_w1{args.weight1}_w2{args.weight2}_thr{args.threshold}_rule{args.adapt_rule}"
     )
     out_json = Path("outputs") / f"{out_tag}_records.json"
@@ -875,6 +875,9 @@ def main():
             prompt=prompt,
             device=device,
         )
+
+        if i == 0:
+            print("first_question_repr:", repr(question))
 
         img_pos_count = int((inputs["input_ids"] == image_token_id).sum().item())
 
