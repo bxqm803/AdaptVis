@@ -217,11 +217,24 @@ def get_image_token_id(model, processor, tokenizer):
 
 
 def get_expected_image_seq_len(model, processor):
-    # LLaVA-1.5/CLIP-L/14-336 usually 24*24 = 576.
+    """
+    HF LLaVA-1.5 usually has 576 image features for CLIP-L/14-336.
+    Prefer config.image_seq_length when available; otherwise infer from vision config.
+    """
     if hasattr(model, "config") and hasattr(model.config, "image_seq_length"):
         return int(model.config.image_seq_length)
+
+    cfg = getattr(model, "config", None)
+    vision_cfg = getattr(cfg, "vision_config", None)
+    if vision_cfg is not None:
+        image_size = getattr(vision_cfg, "image_size", None)
+        patch_size = getattr(vision_cfg, "patch_size", None)
+        if image_size is not None and patch_size is not None:
+            return int((int(image_size) // int(patch_size)) ** 2)
+
     if hasattr(processor, "num_image_tokens"):
         return int(processor.num_image_tokens)
+
     return 576
 
 
@@ -319,22 +332,26 @@ def build_inputs(processor, tokenizer, model, image_path, prompt, device):
         return_tensors="pt",
     )
 
-    inputs = maybe_expand_single_image_token(inputs, model, processor, tokenizer)
+    # Do NOT expand the <image> token here.
+    # HF LLaVA expects exactly one <image> token per image in input_ids.
+    # It expands this single token to image_seq_len visual embeddings internally
+    # before calling the language model.
     inputs = {k: v.to(device) if torch.is_tensor(v) else v for k, v in inputs.items()}
 
     return inputs, question
 
 
 # ============================================================
-# Generic AdaptVis via language-model softmax patch
-# Same intervention style as the InternVL2.5 script:
-#   - activate only inside language_model.forward
-#   - patch F.softmax
-#   - modify [B,H,Q,K] attention probs
-#   - scale current/last query -> image-token positions
+# Generic AdaptVis via language-model attention patch
+# Same high-level style as the InternVL2.5 script, but more robust:
+#   1) patch F.softmax for eager attention implementations
+#   2) patch F.scaled_dot_product_attention for SDPA implementations
+#   3) activate only inside language_model.forward
+#   4) scale current/last query -> LLaVA image-feature positions
 # ============================================================
 _ORIG_SOFTMAX = None
-_SOFTMAX_PATCHED = False
+_ORIG_SDPA = None
+_ATTN_PATCHED = False
 
 
 def _safe_softmax_call(orig_softmax, input_tensor, dim=None, _stacklevel=3, dtype=None):
@@ -350,8 +367,163 @@ def _safe_softmax_call(orig_softmax, input_tensor, dim=None, _stacklevel=3, dtyp
             return orig_softmax(input_tensor, dim=dim, dtype=dtype)
 
 
+def _get_active_lm():
+    lm = getattr(F.softmax, "language_model", None)
+    if lm is None:
+        lm = getattr(F.scaled_dot_product_attention, "language_model", None)
+    return lm
+
+
+def _scale_attention_probs_if_needed(attn_probs, lm, weight):
+    """
+    attn_probs: [B,H,Q,K], post-softmax probabilities.
+    Scale only last/current query -> image-feature positions.
+    """
+    if attn_probs.dim() != 4:
+        return attn_probs
+
+    positions_by_batch = getattr(lm, "_adaptvis_image_positions", None)
+    if not positions_by_batch:
+        return attn_probs
+
+    bsz, _, q_len, kv_len = attn_probs.shape
+    scaled = attn_probs.clone()
+
+    local_calls = 0
+    local_before = 0.0
+    local_after_raw = 0.0
+    local_pos_count = 0
+
+    for b in range(min(bsz, len(positions_by_batch))):
+        pos = positions_by_batch[b]
+        if pos is None:
+            continue
+        if not torch.is_tensor(pos):
+            pos = torch.tensor(pos, device=scaled.device, dtype=torch.long)
+        else:
+            pos = pos.to(device=scaled.device, dtype=torch.long)
+
+        pos = pos[(pos >= 0) & (pos < kv_len)]
+        if pos.numel() == 0:
+            continue
+
+        before = scaled[b, :, -1:, pos].detach().float().sum().item()
+        scaled[b, :, -1:, pos] *= weight
+        after_raw = scaled[b, :, -1:, pos].detach().float().sum().item()
+
+        local_calls += 1
+        local_before += before
+        local_after_raw += after_raw
+        local_pos_count += int(pos.numel())
+
+    if local_calls == 0:
+        return attn_probs
+
+    scaled = scaled / scaled.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    lm._adaptvis_scaled_calls = getattr(lm, "_adaptvis_scaled_calls", 0) + local_calls
+    lm._adaptvis_scaled_pos_count = getattr(lm, "_adaptvis_scaled_pos_count", 0) + local_pos_count
+    lm._adaptvis_scaled_mass_before = getattr(lm, "_adaptvis_scaled_mass_before", 0.0) + local_before
+    lm._adaptvis_scaled_mass_after_raw = getattr(lm, "_adaptvis_scaled_mass_after_raw", 0.0) + local_after_raw
+
+    return scaled
+
+
+def _make_causal_mask(q_len, k_len, device):
+    # Equivalent to PyTorch SDPA causal alignment when using KV cache:
+    # for q_len=1 and k_len>1, allow attending to all previous keys.
+    return torch.ones((q_len, k_len), dtype=torch.bool, device=device).tril(diagonal=k_len - q_len)
+
+
+def _manual_scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
+                                         is_causal=False, scale=None, enable_gqa=False):
+    """
+    Drop-in replacement for F.scaled_dot_product_attention in language_model.forward,
+    so we can access and scale attention probabilities.
+    Expected shape: [B,H,Q,D], [B,H,K,D], [B,H,K,D].
+    """
+    lm = getattr(F.scaled_dot_product_attention, "language_model", None)
+
+    if lm is None or not getattr(lm, "_adaptvis_in_lm_forward", False) or not getattr(lm, "_adaptvis_enable", False):
+        return _ORIG_SDPA(
+            query, key, value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
+
+    weight = float(getattr(lm, "_adaptvis_weight", 1.0))
+    if weight == 1.0:
+        return _ORIG_SDPA(
+            query, key, value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
+
+    if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
+        return _ORIG_SDPA(
+            query, key, value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
+
+    # Assume [B,H,Q,D]. This is how Llama/LLaVA SDPA calls this function.
+    bsz, q_heads, q_len, head_dim = query.shape
+    _, k_heads, k_len, _ = key.shape
+
+    # Handle grouped-query attention if present.
+    if k_heads != q_heads:
+        if q_heads % k_heads == 0:
+            repeat = q_heads // k_heads
+            key = key.repeat_interleave(repeat, dim=1)
+            value = value.repeat_interleave(repeat, dim=1)
+        else:
+            return _ORIG_SDPA(
+                query, key, value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=scale,
+                enable_gqa=enable_gqa,
+            )
+
+    scale_factor = (1.0 / (query.size(-1) ** 0.5)) if scale is None else scale
+    attn_logits = torch.matmul(query, key.transpose(-2, -1)) * scale_factor
+
+    if is_causal:
+        causal_mask = _make_causal_mask(q_len, k_len, query.device)
+        attn_logits = attn_logits.masked_fill(~causal_mask.view(1, 1, q_len, k_len), torch.finfo(attn_logits.dtype).min)
+
+    if attn_mask is not None:
+        # Support bool masks and additive masks.
+        if attn_mask.dtype == torch.bool:
+            attn_logits = attn_logits.masked_fill(~attn_mask, torch.finfo(attn_logits.dtype).min)
+        else:
+            attn_logits = attn_logits + attn_mask
+
+    attn_probs = _ORIG_SOFTMAX(attn_logits.float(), dim=-1).to(query.dtype)
+    attn_probs = _scale_attention_probs_if_needed(attn_probs, lm, weight)
+
+    if dropout_p and dropout_p > 0:
+        attn_probs = torch.dropout(attn_probs, dropout_p, train=True)
+
+    return torch.matmul(attn_probs, value)
+
+
 def install_adaptvis_softmax_patch(language_model, verbose=False):
-    global _ORIG_SOFTMAX, _SOFTMAX_PATCHED
+    """
+    The old version patched only F.softmax. That misses models/layers using
+    scaled_dot_product_attention. This version patches both softmax and SDPA.
+    """
+    global _ORIG_SOFTMAX, _ORIG_SDPA, _ATTN_PATCHED
 
     if not getattr(language_model, "_adaptvis_forward_patched", False):
         old_forward = language_model.forward
@@ -367,8 +539,9 @@ def install_adaptvis_softmax_patch(language_model, verbose=False):
         language_model._adaptvis_forward_patched = True
         language_model._adaptvis_in_lm_forward = False
 
-    if not _SOFTMAX_PATCHED:
+    if not _ATTN_PATCHED:
         _ORIG_SOFTMAX = F.softmax
+        _ORIG_SDPA = F.scaled_dot_product_attention
 
         def patched_softmax(input, dim=None, _stacklevel=3, dtype=None):
             out = _safe_softmax_call(
@@ -390,68 +563,22 @@ def install_adaptvis_softmax_patch(language_model, verbose=False):
             weight = float(getattr(lm, "_adaptvis_weight", 1.0))
             if weight == 1.0:
                 return out
-
             if dim not in (-1, input.dim() - 1):
                 return out
-
-            # Standard eager attention probabilities are [B,H,Q,K].
             if out.dim() != 4:
                 return out
 
-            positions_by_batch = getattr(lm, "_adaptvis_image_positions", None)
-            if not positions_by_batch:
-                return out
-
-            bsz, _, q_len, kv_len = out.shape
-            scaled = out.clone()
-
-            local_calls = 0
-            local_before = 0.0
-            local_after_raw = 0.0
-            local_pos_count = 0
-
-            for b in range(min(bsz, len(positions_by_batch))):
-                pos = positions_by_batch[b]
-                if pos is None:
-                    continue
-                if not torch.is_tensor(pos):
-                    pos = torch.tensor(pos, device=scaled.device, dtype=torch.long)
-                else:
-                    pos = pos.to(device=scaled.device, dtype=torch.long)
-
-                pos = pos[(pos >= 0) & (pos < kv_len)]
-                if pos.numel() == 0:
-                    continue
-
-                before = scaled[b, :, -1:, pos].detach().float().sum().item()
-                scaled[b, :, -1:, pos] *= weight
-                after_raw = scaled[b, :, -1:, pos].detach().float().sum().item()
-
-                local_calls += 1
-                local_before += before
-                local_after_raw += after_raw
-                local_pos_count += int(pos.numel())
-
-            if local_calls == 0:
-                return out
-
-            scaled = scaled / scaled.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-
-            lm._adaptvis_scaled_calls = getattr(lm, "_adaptvis_scaled_calls", 0) + local_calls
-            lm._adaptvis_scaled_pos_count = getattr(lm, "_adaptvis_scaled_pos_count", 0) + local_pos_count
-            lm._adaptvis_scaled_mass_before = getattr(lm, "_adaptvis_scaled_mass_before", 0.0) + local_before
-            lm._adaptvis_scaled_mass_after_raw = getattr(lm, "_adaptvis_scaled_mass_after_raw", 0.0) + local_after_raw
-
-            return scaled
+            return _scale_attention_probs_if_needed(out, lm, weight)
 
         F.softmax = patched_softmax
-        _SOFTMAX_PATCHED = True
+        F.scaled_dot_product_attention = _manual_scaled_dot_product_attention
+        _ATTN_PATCHED = True
 
     F.softmax.language_model = language_model
+    F.scaled_dot_product_attention.language_model = language_model
 
     if verbose:
-        print("Installed generic AdaptVis softmax patch on LLaVA language_model.forward.")
-
+        print("Installed AdaptVis patch on LLaVA language_model.forward: F.softmax + F.scaled_dot_product_attention.")
 
 def reset_adaptvis_counters(language_model, weight):
     language_model._adaptvis_enable = True
@@ -464,12 +591,28 @@ def reset_adaptvis_counters(language_model, weight):
     language_model._adaptvis_last_image_positions = None
 
 
-def set_image_positions_from_input_ids(language_model, input_ids, image_token_id):
+def set_image_positions_from_input_ids(language_model, input_ids, image_token_id, image_seq_len=576):
+    """
+    HF LLaVA input_ids usually contain exactly one <image> token.
+    The model internally expands that single token into image_seq_len visual
+    embeddings before calling the language model.
+
+    Therefore:
+      - if input has one <image> token at position p, scale merged positions p:p+image_seq_len
+      - if input already has many image tokens, use those positions directly
+    """
     ids = input_ids.detach()
     positions = []
+
     for b in range(ids.shape[0]):
         pos = torch.nonzero(ids[b] == int(image_token_id), as_tuple=False).view(-1)
-        positions.append(pos.detach().cpu())
+
+        if pos.numel() == 1:
+            start = int(pos.item())
+            expanded = torch.arange(start, start + int(image_seq_len), dtype=torch.long)
+            positions.append(expanded)
+        else:
+            positions.append(pos.detach().cpu())
 
     language_model._adaptvis_image_positions = positions
     language_model._adaptvis_last_image_positions = positions
@@ -492,10 +635,10 @@ def choose_adapt_weight(confidence, threshold, weight1, weight2, adapt_rule):
 
 
 @torch.no_grad()
-def generate_with_scores(model, processor, tokenizer, inputs, image_token_id, weight, max_new_tokens=16, capture_scores=True):
+def generate_with_scores(model, processor, tokenizer, inputs, image_token_id, weight, image_seq_len=576, max_new_tokens=16, capture_scores=True):
     language_model = get_language_model(model)
     reset_adaptvis_counters(language_model, weight=weight)
-    set_image_positions_from_input_ids(language_model, inputs["input_ids"], image_token_id)
+    set_image_positions_from_input_ids(language_model, inputs["input_ids"], image_token_id, image_seq_len=image_seq_len)
 
     gen_kwargs = dict(
         **inputs,
@@ -668,9 +811,18 @@ def main():
     language_model = get_language_model(model)
     install_adaptvis_softmax_patch(language_model, verbose=True)
 
+    # Print a small attention-class summary for sanity.
+    attn_classes = {}
+    for name, module in language_model.named_modules():
+        cls = module.__class__.__name__
+        if "Attention" in cls or "Sdpa" in cls or "Flash" in cls:
+            attn_classes[cls] = attn_classes.get(cls, 0) + 1
+    print("language_model attention classes:", attn_classes)
+
     image_token_id = get_image_token_id(model, processor, tokenizer)
+    image_seq_len = get_expected_image_seq_len(model, processor)
     print("image_token_id:", image_token_id)
-    print("expected_image_seq_len:", get_expected_image_seq_len(model, processor))
+    print("expected_image_seq_len:", image_seq_len)
 
     scores = np.zeros((len(dataset.dataset), 1, 4), dtype=np.float32)
     records = []
@@ -718,6 +870,7 @@ def main():
                 inputs=inputs,
                 image_token_id=image_token_id,
                 weight=1.0,
+                image_seq_len=image_seq_len,
                 max_new_tokens=args.max_new_tokens,
                 capture_scores=True,
             )
@@ -741,6 +894,7 @@ def main():
             inputs=inputs,
             image_token_id=image_token_id,
             weight=chosen_weight,
+            image_seq_len=image_seq_len,
             max_new_tokens=args.max_new_tokens,
             capture_scores=True,
         )
