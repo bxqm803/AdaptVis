@@ -1,27 +1,21 @@
 #!/usr/bin/env python3
 """
-Simulate the two native AdaptVis modules without importing:
+Closer simulation of AdaptVis WITHOUT importing:
   - model_zoo.llava.LlavaForConditionalGenerationScal
   - model_zoo.llava15.change_greedy_to_add_weight
 
-What is simulated:
-  1) change_greedy_to_add_weight()
-     -> replaced by an explicit manual greedy loop, where each model forward is called
-        directly and the AdaptVis state is set before the forward.
-
-  2) LlavaForConditionalGenerationScal
-     -> approximated on stock HF LlavaForConditionalGeneration by monkey-patching
-        the language model attention softmax and scaling pre-softmax image logits.
-
-This is a diagnostic script. If it does NOT reach native main_aro accuracy, that means
-the remaining gap is inside the native Scal implementation, especially exact merged
-image-mask propagation / custom LLaMA attention behavior.
+It simulates:
+  1) change_greedy_to_add_weight -> explicit manual greedy loop.
+  2) Scal attention -> patch each LLaMA attention forward and modify raw
+     attention logits BEFORE adding attention_mask.
 """
 
 import argparse
 import json
+import math
 import os
 import re
+import types
 from pathlib import Path
 
 import numpy as np
@@ -32,11 +26,9 @@ from tqdm import tqdm
 
 from transformers import AutoProcessor, LlavaForConditionalGeneration
 from dataset_zoo.aro_datasets import Controlled_Images
+from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
 
 
-# ============================================================
-# Utilities
-# ============================================================
 def setup_cache(cache_dir):
     if cache_dir and str(cache_dir).lower() not in {"", "none", "null"}:
         os.environ.setdefault("HF_HOME", cache_dir)
@@ -61,11 +53,7 @@ def resolve_image_path(p):
     if os.path.exists(p):
         return p
     base = os.path.basename(p)
-    candidates = [
-        os.path.join("data", "controlled_images", base),
-        os.path.join("data", base),
-    ]
-    for c in candidates:
+    for c in [os.path.join("data", "controlled_images", base), os.path.join("data", base)]:
         if os.path.exists(c):
             return c
     hits = list(Path("data").rglob(base))
@@ -134,19 +122,16 @@ def pred_to_option_index(pred_prep, gold_answer, caption_options):
             if parse_prep(cap) != gold:
                 return i, False
         return 0, False
-
     pred_idx = None
     for i, cap in enumerate(caption_options):
         if parse_prep(cap) == pred_prep:
             pred_idx = i
             break
-
     if pred_idx is None:
         for i, cap in enumerate(caption_options):
             if parse_prep(cap) != gold:
                 return i, False
         return 0, False
-
     return pred_idx, pred_prep == gold
 
 
@@ -173,183 +158,184 @@ def get_image_seq_len(model):
     return 576
 
 
-# ============================================================
-# Simulated Scal attention intervention on stock HF LLaVA
-# ============================================================
-_ORIG_SOFTMAX = None
-_PATCH_INSTALLED = False
+def set_sim_state(lm, enable, weight, input_ids, image_token_id, image_seq_len, image_pos_shift, require_square=True):
+    lm._sim_enable = bool(enable)
+    lm._sim_weight = float(weight)
+    lm._sim_require_square = bool(require_square)
+    lm._sim_modified_calls = 0
+    lm._sim_modified_pos_count = 0
+    lm._sim_logit_sum_before = 0.0
+    lm._sim_logit_sum_after = 0.0
+
+    positions = []
+    for b in range(input_ids.shape[0]):
+        raw_pos = torch.nonzero(input_ids[b] == int(image_token_id), as_tuple=False).view(-1)
+        if raw_pos.numel() == 1:
+            start = int(raw_pos.item()) + int(image_pos_shift)
+            positions.append(torch.arange(start, start + int(image_seq_len), dtype=torch.long))
+        else:
+            positions.append(raw_pos.detach().cpu() + int(image_pos_shift))
+    lm._sim_image_positions = positions
+    lm._sim_last_positions = positions
 
 
-def _scale_attention_logits(attn_logits, lm):
-    if attn_logits.dim() != 4:
-        return attn_logits
+def apply_sim_intervention(attn_weights, lm, layer_idx):
     if not getattr(lm, "_sim_enable", False):
-        return attn_logits
-
+        return attn_weights
+    if layer_idx is not None and int(layer_idx) >= int(getattr(lm, "_sim_max_layers", 32)):
+        return attn_weights
     positions_by_batch = getattr(lm, "_sim_image_positions", None)
     if not positions_by_batch:
-        return attn_logits
-
+        return attn_weights
     weight = float(getattr(lm, "_sim_weight", 1.0))
     if weight == 1.0:
-        return attn_logits
-
-    bsz, _, q_len, kv_len = attn_logits.shape
+        return attn_weights
+    bsz, _, q_len, kv_len = attn_weights.shape
     if getattr(lm, "_sim_require_square", True) and q_len != kv_len:
-        return attn_logits
+        return attn_weights
 
-    out = attn_logits.clone()
-
-    local_calls = 0
-    local_pos = 0
-    local_before = 0.0
-    local_after = 0.0
-
+    out = attn_weights.clone()
+    calls = 0
+    pos_count = 0
+    before_sum = 0.0
+    after_sum = 0.0
     for b in range(min(bsz, len(positions_by_batch))):
         pos = positions_by_batch[b]
-        if pos is None:
-            continue
         if not torch.is_tensor(pos):
-            pos = torch.tensor(pos, device=out.device, dtype=torch.long)
+            pos = torch.tensor(pos, dtype=torch.long, device=out.device)
         else:
             pos = pos.to(device=out.device, dtype=torch.long)
         pos = pos[(pos >= 0) & (pos < kv_len)]
         if pos.numel() == 0:
             continue
-
         before = out[b, :, -1:, pos].detach().float().sum().item()
         out[b, :, -1:, pos] *= weight
         after = out[b, :, -1:, pos].detach().float().sum().item()
+        calls += 1
+        pos_count += int(pos.numel())
+        before_sum += before
+        after_sum += after
 
-        local_calls += 1
-        local_pos += int(pos.numel())
-        local_before += before
-        local_after += after
-
-    if local_calls:
-        lm._sim_modified_calls = getattr(lm, "_sim_modified_calls", 0) + local_calls
-        lm._sim_modified_pos_count = getattr(lm, "_sim_modified_pos_count", 0) + local_pos
-        lm._sim_logit_sum_before = getattr(lm, "_sim_logit_sum_before", 0.0) + local_before
-        lm._sim_logit_sum_after = getattr(lm, "_sim_logit_sum_after", 0.0) + local_after
-
+    if calls:
+        lm._sim_modified_calls = getattr(lm, "_sim_modified_calls", 0) + calls
+        lm._sim_modified_pos_count = getattr(lm, "_sim_modified_pos_count", 0) + pos_count
+        lm._sim_logit_sum_before = getattr(lm, "_sim_logit_sum_before", 0.0) + before_sum
+        lm._sim_logit_sum_after = getattr(lm, "_sim_logit_sum_after", 0.0) + after_sum
     return out
 
 
-def install_softmax_patch(language_model):
-    global _ORIG_SOFTMAX, _PATCH_INSTALLED
-
-    if not getattr(language_model, "_sim_forward_patched", False):
-        old_forward = language_model.forward
-
-        def patched_forward(*args, **kwargs):
-            language_model._sim_in_lm_forward = True
-            try:
-                return old_forward(*args, **kwargs)
-            finally:
-                language_model._sim_in_lm_forward = False
-
-        language_model.forward = patched_forward
-        language_model._sim_forward_patched = True
-        language_model._sim_in_lm_forward = False
-
-    if not _PATCH_INSTALLED:
-        _ORIG_SOFTMAX = F.softmax
-
-        def patched_softmax(input, dim=None, _stacklevel=3, dtype=None):
-            lm = getattr(patched_softmax, "language_model", None)
-            if (
-                lm is not None
-                and getattr(lm, "_sim_in_lm_forward", False)
-                and getattr(lm, "_sim_enable", False)
-                and input.dim() == 4
-                and dim in (-1, input.dim() - 1)
-            ):
-                input = _scale_attention_logits(input, lm)
-
-            if dtype is None:
-                try:
-                    return _ORIG_SOFTMAX(input, dim=dim, _stacklevel=_stacklevel)
-                except TypeError:
-                    return _ORIG_SOFTMAX(input, dim=dim)
-            try:
-                return _ORIG_SOFTMAX(input, dim=dim, _stacklevel=_stacklevel, dtype=dtype)
-            except TypeError:
-                return _ORIG_SOFTMAX(input, dim=dim, dtype=dtype)
-
-        F.softmax = patched_softmax
-        _PATCH_INSTALLED = True
-
-    F.softmax.language_model = language_model
-
-
-def set_sim_state(language_model, enable, weight, input_ids, image_token_id, image_seq_len, image_pos_shift, require_square=True):
-    language_model._sim_enable = bool(enable)
-    language_model._sim_weight = float(weight)
-    language_model._sim_require_square = bool(require_square)
-
-    language_model._sim_modified_calls = 0
-    language_model._sim_modified_pos_count = 0
-    language_model._sim_logit_sum_before = 0.0
-    language_model._sim_logit_sum_after = 0.0
-
-    positions = []
-    for b in range(input_ids.shape[0]):
-        pos = torch.nonzero(input_ids[b] == int(image_token_id), as_tuple=False).view(-1)
-        if pos.numel() == 1:
-            start = int(pos.item()) + int(image_pos_shift)
-            positions.append(torch.arange(start, start + int(image_seq_len), dtype=torch.long))
-        else:
-            positions.append(pos.detach().cpu() + int(image_pos_shift))
-    language_model._sim_image_positions = positions
-    language_model._sim_last_positions = positions
-
-
-def get_trace(language_model):
-    pos = getattr(language_model, "_sim_last_positions", None)
-    if pos is None:
-        lens = None
-    else:
-        lens = [int(p.numel()) for p in pos]
+def get_trace(lm):
+    pos = getattr(lm, "_sim_last_positions", None)
+    lens = None if pos is None else [int(p.numel()) for p in pos]
     return {
         "image_pos_lens": lens,
-        "modified_calls": int(getattr(language_model, "_sim_modified_calls", 0)),
-        "modified_pos_count": int(getattr(language_model, "_sim_modified_pos_count", 0)),
-        "logit_sum_before": float(getattr(language_model, "_sim_logit_sum_before", 0.0)),
-        "logit_sum_after": float(getattr(language_model, "_sim_logit_sum_after", 0.0)),
+        "modified_calls": int(getattr(lm, "_sim_modified_calls", 0)),
+        "modified_pos_count": int(getattr(lm, "_sim_modified_pos_count", 0)),
+        "logit_sum_before": float(getattr(lm, "_sim_logit_sum_before", 0.0)),
+        "logit_sum_after": float(getattr(lm, "_sim_logit_sum_after", 0.0)),
     }
 
 
-# ============================================================
-# Manual greedy: simulates change_greedy_to_add_weight()
-# ============================================================
-@torch.no_grad()
-def manual_greedy(
-    model,
-    processor,
-    inputs,
-    image_token_id,
-    image_seq_len,
-    max_new_tokens,
-    weight,
-    enable_intervention,
-    intervention_scope,
-    image_pos_shift,
-    require_square,
-):
-    lm = get_language_model(model)
+def patch_llama_attention_raw_logits(language_model, max_layers=32):
+    language_model._sim_max_layers = int(max_layers)
+    if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
+        layers = language_model.model.layers
+    elif hasattr(language_model, "layers"):
+        layers = language_model.layers
+    else:
+        raise RuntimeError("Cannot find LLaMA layers under language_model.")
 
+    def make_forward(attn_module, layer_idx):
+        def forward(
+            self,
+            hidden_states,
+            attention_mask=None,
+            position_ids=None,
+            past_key_value=None,
+            output_attentions=False,
+            use_cache=False,
+            cache_position=None,
+            position_embeddings=None,
+            **kwargs,
+        ):
+            bsz, q_len, _ = hidden_states.size()
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+
+            num_heads = getattr(self, "num_heads")
+            head_dim = getattr(self, "head_dim")
+            num_kv_heads = getattr(self, "num_key_value_heads", num_heads)
+            num_kv_groups = getattr(self, "num_key_value_groups", num_heads // num_kv_heads)
+
+            query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+            key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+            value_states = value_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+
+            kv_seq_len = key_states.shape[-2]
+            if past_key_value is not None:
+                try:
+                    kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+                except Exception:
+                    pass
+
+            if position_embeddings is not None:
+                cos, sin = position_embeddings
+            else:
+                try:
+                    cos, sin = self.rotary_emb(value_states, position_ids)
+                except TypeError:
+                    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+            if past_key_value is not None:
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                try:
+                    key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                except Exception:
+                    pass
+
+            key_states = repeat_kv(key_states, num_kv_groups)
+            value_states = repeat_kv(value_states, num_kv_groups)
+
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
+
+            # Critical placement: raw logits are modified BEFORE attention_mask.
+            attn_weights = apply_sim_intervention(attn_weights, language_model, layer_idx)
+
+            if attention_mask is not None:
+                causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+                attn_weights = attn_weights + causal_mask
+
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_output = torch.matmul(attn_weights, value_states)
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, num_heads * head_dim)
+            attn_output = self.o_proj(attn_output)
+            return attn_output, (attn_weights if output_attentions else None), past_key_value
+
+        return types.MethodType(forward, attn_module)
+
+    patched = 0
+    for idx, layer in enumerate(layers):
+        if hasattr(layer, "self_attn"):
+            layer.self_attn.forward = make_forward(layer.self_attn, idx)
+            patched += 1
+    print(f"patched raw-logit attention layers: {patched}")
+
+
+@torch.no_grad()
+def manual_greedy(model, processor, inputs, image_token_id, image_seq_len, max_new_tokens, weight,
+                  enable_intervention, intervention_scope, image_pos_shift, require_square):
+    lm = get_language_model(model)
     input_ids = inputs["input_ids"].clone()
     attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids)).clone()
+    model_kwargs = {k: v for k, v in inputs.items() if k not in {"input_ids", "attention_mask"}}
 
-    model_kwargs = {}
-    for k, v in inputs.items():
-        if k not in {"input_ids", "attention_mask"}:
-            model_kwargs[k] = v
-
-    generated_ids = []
-    scores = []
-    traces = []
-
+    generated = []
+    score_list = []
+    trace_list = []
     eos_id = processor.tokenizer.eos_token_id
 
     for step in range(int(max_new_tokens)):
@@ -362,31 +348,14 @@ def manual_greedy(
         else:
             raise ValueError(intervention_scope)
 
-        set_sim_state(
-            lm,
-            enable=enable_now,
-            weight=weight,
-            input_ids=input_ids,
-            image_token_id=image_token_id,
-            image_seq_len=image_seq_len,
-            image_pos_shift=image_pos_shift,
-            require_square=require_square,
-        )
+        set_sim_state(lm, enable_now, weight, input_ids, image_token_id, image_seq_len, image_pos_shift, require_square)
 
-        out = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            return_dict=True,
-            **model_kwargs,
-        )
-
+        out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True, **model_kwargs)
         logits = out.logits[:, -1, :]
-        scores.append(logits.detach())
+        score_list.append(logits.detach())
         next_token = torch.argmax(logits, dim=-1, keepdim=True)
-
-        generated_ids.append(next_token)
-        traces.append(get_trace(lm))
+        generated.append(next_token)
+        trace_list.append(get_trace(lm))
 
         input_ids = torch.cat([input_ids, next_token], dim=1)
         attention_mask = torch.cat([attention_mask, torch.ones_like(next_token)], dim=1)
@@ -394,38 +363,26 @@ def manual_greedy(
         if eos_id is not None and int(next_token[0, 0].item()) == int(eos_id):
             break
 
-    if generated_ids:
-        gen_ids = torch.cat(generated_ids, dim=1)
-    else:
-        gen_ids = torch.empty((input_ids.shape[0], 0), dtype=input_ids.dtype, device=input_ids.device)
-
+    gen_ids = torch.cat(generated, dim=1) if generated else torch.empty((input_ids.shape[0], 0), dtype=input_ids.dtype, device=input_ids.device)
     text = processor.batch_decode(gen_ids, skip_special_tokens=True)[0].strip()
-    first_conf = float(F.softmax(scores[0][0].float(), dim=-1).max().item()) if scores else 0.0
-
+    first_conf = float(F.softmax(score_list[0][0].float(), dim=-1).max().item()) if score_list else 0.0
     total_trace = {
-        "steps": len(traces),
-        "modified_calls": sum(t["modified_calls"] for t in traces),
-        "modified_pos_count": sum(t["modified_pos_count"] for t in traces),
-        "logit_sum_before": sum(t["logit_sum_before"] for t in traces),
-        "logit_sum_after": sum(t["logit_sum_after"] for t in traces),
-        "first_step_trace": traces[0] if traces else None,
-        "last_step_trace": traces[-1] if traces else None,
+        "steps": len(trace_list),
+        "modified_calls": sum(t["modified_calls"] for t in trace_list),
+        "modified_pos_count": sum(t["modified_pos_count"] for t in trace_list),
+        "logit_sum_before": sum(t["logit_sum_before"] for t in trace_list),
+        "logit_sum_after": sum(t["logit_sum_after"] for t in trace_list),
+        "first_step_trace": trace_list[0] if trace_list else None,
+        "last_step_trace": trace_list[-1] if trace_list else None,
     }
-
-    return text, first_conf, scores, total_trace
+    return text, first_conf, total_trace
 
 
 def build_inputs(processor, image, prompt, device, pad_mode, max_length):
     if pad_mode == "none":
         inputs = processor(text=prompt, images=image, return_tensors="pt")
     elif pad_mode == "max77":
-        inputs = processor(
-            text=prompt,
-            images=image,
-            padding="max_length",
-            max_length=int(max_length),
-            return_tensors="pt",
-        )
+        inputs = processor(text=prompt, images=image, padding="max_length", max_length=int(max_length), return_tensors="pt")
     else:
         raise ValueError(pad_mode)
     return inputs.to(device)
@@ -440,21 +397,18 @@ def main():
     ap.add_argument("--dataset", default="Controlled_Images_A")
     ap.add_argument("--subset", default="A")
     ap.add_argument("--option", default="four")
-
     ap.add_argument("--prompt_mode", choices=["raw", "clean_mainaro", "clean_hf"], default="raw")
     ap.add_argument("--pad_mode", choices=["none", "max77"], default="none")
     ap.add_argument("--max_length", type=int, default=77)
     ap.add_argument("--max_new_tokens", type=int, default=16)
-
     ap.add_argument("--weight1", type=float, default=0.5)
     ap.add_argument("--weight2", type=float, default=1.5)
     ap.add_argument("--threshold", type=float, default=0.4)
     ap.add_argument("--round_confidence", action="store_true")
-
-    ap.add_argument("--intervention_scope", choices=["first_step", "all_steps", "none"], default="first_step")
+    ap.add_argument("--intervention_scope", choices=["first_step", "all_steps", "none"], default="all_steps")
     ap.add_argument("--image_pos_shift", type=int, default=0)
     ap.add_argument("--no_square_required", action="store_true")
-
+    ap.add_argument("--max_layers", type=int, default=32)
     ap.add_argument("--limit", type=int, default=-1)
     ap.add_argument("--print_every", type=int, default=20)
     ap.add_argument("--score_mode", choices=["mainaro", "predidx"], default="mainaro")
@@ -462,20 +416,13 @@ def main():
 
     setup_cache(args.cache_dir)
     Path("outputs").mkdir(exist_ok=True)
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
     revision = none_if_needed(args.revision)
 
     print("args:", vars(args))
     print("device:", device)
 
-    dataset = Controlled_Images(
-        image_preprocess=None,
-        root_dir=args.root_dir,
-        download=True,
-        subset=args.subset,
-    )
-
+    dataset = Controlled_Images(image_preprocess=None, root_dir=args.root_dir, download=True, subset=args.subset)
     prompt_file = f"prompts/{args.dataset}_with_answer_{args.option}_options.jsonl"
     raw_prompts, answers = [], []
     with open(prompt_file, "r", encoding="utf-8") as f:
@@ -489,12 +436,7 @@ def main():
         n_total = min(n_total, args.limit)
 
     proc_kwargs = dict(cache_dir=none_if_needed(args.cache_dir))
-    model_kwargs = dict(
-        cache_dir=none_if_needed(args.cache_dir),
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        attn_implementation="eager",
-    )
+    model_kwargs = dict(cache_dir=none_if_needed(args.cache_dir), torch_dtype=torch.float16, low_cpu_mem_usage=True, attn_implementation="eager")
     if revision is not None:
         proc_kwargs["revision"] = revision
         model_kwargs["revision"] = revision
@@ -504,7 +446,7 @@ def main():
     model.requires_grad_(False)
 
     lm = get_language_model(model)
-    install_softmax_patch(lm)
+    patch_llama_attention_raw_logits(lm, max_layers=args.max_layers)
 
     image_token_id = get_image_token_id(model, processor)
     image_seq_len = get_image_seq_len(model)
@@ -514,7 +456,7 @@ def main():
 
     model_tag = args.model_id.replace("/", "_").replace("-", "_")
     out_tag = (
-        f"llava15_sim_scal_greedy_{model_tag}_{args.dataset}"
+        f"llava15_sim_rawattn_greedy_{model_tag}_{args.dataset}"
         f"_prompt{args.prompt_mode}_pad{args.pad_mode}_scope{args.intervention_scope}"
         f"_max{args.max_new_tokens}_shift{args.image_pos_shift}_rev{args.revision}"
         f"_w1{args.weight1}_w2{args.weight2}_thr{args.threshold}"
@@ -527,7 +469,6 @@ def main():
     main_correct = 0
     strict_correct = 0
     unparsed = 0
-
     require_square = not args.no_square_required
 
     for i in tqdm(range(n_total), total=n_total):
@@ -537,51 +478,23 @@ def main():
         prompt = make_prompt(raw_prompts[i], args.prompt_mode)
         gold = norm_gold(answers[i])
         caption_options = d["caption_options"]
+        inputs = build_inputs(processor, image, prompt, device, args.pad_mode, args.max_length)
 
-        inputs = build_inputs(
-            processor=processor,
-            image=image,
-            prompt=prompt,
-            device=device,
-            pad_mode=args.pad_mode,
-            max_length=args.max_length,
-        )
-
-        # Probe: no intervention, get first-token confidence.
-        probe_text, probe_conf, _, probe_trace = manual_greedy(
-            model=model,
-            processor=processor,
-            inputs=inputs,
-            image_token_id=image_token_id,
-            image_seq_len=image_seq_len,
-            max_new_tokens=args.max_new_tokens,
-            weight=1.0,
-            enable_intervention=False,
-            intervention_scope="none",
-            image_pos_shift=args.image_pos_shift,
-            require_square=require_square,
+        probe_text, probe_conf, probe_trace = manual_greedy(
+            model, processor, inputs, image_token_id, image_seq_len, args.max_new_tokens,
+            1.0, False, "none", args.image_pos_shift, require_square
         )
         conf_used = round(probe_conf, 2) if args.round_confidence else probe_conf
         chosen_weight = args.weight1 if conf_used < args.threshold else args.weight2
 
-        final_text, final_conf, _, final_trace = manual_greedy(
-            model=model,
-            processor=processor,
-            inputs=inputs,
-            image_token_id=image_token_id,
-            image_seq_len=image_seq_len,
-            max_new_tokens=args.max_new_tokens,
-            weight=chosen_weight,
-            enable_intervention=True,
-            intervention_scope=args.intervention_scope,
-            image_pos_shift=args.image_pos_shift,
-            require_square=require_square,
+        final_text, final_conf, final_trace = manual_greedy(
+            model, processor, inputs, image_token_id, image_seq_len, args.max_new_tokens,
+            chosen_weight, True, args.intervention_scope, args.image_pos_shift, require_square
         )
 
         main_ok = mainaro_is_correct(gold, final_text)
         pred = parse_prep(final_text)
         pred_idx, strict_ok = pred_to_option_index(pred, gold, caption_options)
-
         if pred is None:
             unparsed += 1
         main_correct += int(main_ok)
@@ -639,7 +552,6 @@ def main():
 
     main_acc = main_correct / max(n_total, 1)
     strict_acc = strict_correct / max(n_total, 1)
-
     summary = {
         "args": vars(args),
         "n": n_total,
@@ -647,7 +559,7 @@ def main():
         "strict_parse_direct_acc": strict_acc,
         "unparsed": unparsed,
         "out_records": str(out_records),
-        "definition": "No native AdaptVis imports. Simulates change_greedy via manual greedy loop and simulates Scal via stock HF LLaVA pre-softmax attention-logit patch.",
+        "definition": "No native AdaptVis imports. Manual greedy + raw-attention-logit patch before attention_mask.",
     }
     with open(out_summary, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -664,7 +576,7 @@ def main():
             scores=scores_arr,
             path="outputs",
             dataset=args.dataset,
-            model=model_tag + "_sim_scal_greedy",
+            model=model_tag + "_sim_rawattn_greedy",
             method="adapt_vis",
             weight=1.0,
             sampled_indices=[],
