@@ -504,8 +504,9 @@ def llava_lm_forward_core(
     outputs = lm(
         inputs_embeds=merged_embeds,
         attention_mask=merged_attention_mask,
-        position_ids=position_ids,
-        use_cache=False,
+        # Match native Scal: modeling_llava_scal.py computes position_ids but does not pass it.
+        # position_ids=position_ids,
+        use_cache=True,
         output_attentions=False,
         output_hidden_states=False,
         return_dict=True,
@@ -530,48 +531,126 @@ def manual_greedy_core(
     require_square,
     max_layers,
 ):
+    """
+    Native-like generation:
+      - Step 0: manually merge image tokens, pass merged image_mask, optionally intervene.
+      - Step >0: use KV cache and only pass the newly generated token.
+                No image mask / intervention, matching q_len != kv_len native behavior.
+    """
+    lm = get_language_model(model)
+
     generated = []
     score_list = []
     trace_list = []
     mask_sums = []
 
-    cur_input_ids = input_ids.clone()
-    cur_attention_mask = attention_mask.clone()
     eos_id = processor.tokenizer.eos_token_id
 
-    for step in range(int(max_new_tokens)):
-        if intervention_scope == "first_step":
-            enable_now = bool(enable_intervention and step == 0)
-        elif intervention_scope == "all_steps":
-            enable_now = bool(enable_intervention)
-        elif intervention_scope == "none":
-            enable_now = False
-        else:
-            raise ValueError(intervention_scope)
+    # ---------- step 0: full merged prompt ----------
+    enable_now = bool(enable_intervention and intervention_scope in {"first_step", "all_steps"})
 
-        logits, trace, image_mask = llava_lm_forward_core(
-            model=model,
-            input_ids=cur_input_ids,
-            attention_mask=cur_attention_mask,
-            pixel_values=pixel_values,
-            image_token_id=image_token_id,
-            pad_token_id=pad_token_id,
-            enable_intervention=enable_now,
+    inputs_embeds = model.get_input_embeddings()(input_ids)
+    image_features = get_llava_image_features(model, pixel_values)
+
+    merged_embeds, merged_attention_mask, _position_ids, image_mask = merge_input_ids_with_image_features_exact_core(
+        model=model,
+        image_features=image_features,
+        inputs_embeds=inputs_embeds,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=None,
+        image_token_id=image_token_id,
+        pad_token_id=pad_token_id,
+    )
+
+    set_adaptvis_state(
+        lm=lm,
+        enable=enable_now,
+        weight=weight,
+        image_mask=image_mask,
+        require_square=require_square,
+        max_layers=max_layers,
+    )
+
+    out = lm(
+        inputs_embeds=merged_embeds,
+        attention_mask=merged_attention_mask,
+        # Critical: native Scal computes position_ids but comments it out in language_model call.
+        # position_ids=_position_ids,
+        use_cache=True,
+        output_attentions=False,
+        output_hidden_states=False,
+        return_dict=True,
+    )
+
+    next_logits = out.logits[:, -1, :]
+    next_token = torch.argmax(next_logits, dim=-1, keepdim=True)
+
+    score_list.append(next_logits.detach())
+    generated.append(next_token)
+    trace_list.append(get_adaptvis_trace(lm))
+    mask_sums.append([int(x) for x in image_mask.sum(dim=-1).detach().cpu().tolist()])
+
+    past_key_values = out.past_key_values
+    cur_attention_mask = torch.cat(
+        [merged_attention_mask, torch.ones((merged_attention_mask.shape[0], 1), dtype=merged_attention_mask.dtype, device=merged_attention_mask.device)],
+        dim=-1,
+    )
+
+    if eos_id is not None and int(next_token[0, 0].item()) == int(eos_id):
+        gen_ids = torch.cat(generated, dim=-1)
+        text = processor.batch_decode(gen_ids, skip_special_tokens=True)[0].strip()
+        first_conf = float(F.softmax(score_list[0][0].float(), dim=-1).max().item())
+        total_trace = {
+            "steps": len(trace_list),
+            "modified_calls": sum(t["modified_calls"] for t in trace_list),
+            "modified_pos_count": sum(t["modified_pos_count"] for t in trace_list),
+            "logit_sum_before": sum(t["logit_sum_before"] for t in trace_list),
+            "logit_sum_after": sum(t["logit_sum_after"] for t in trace_list),
+            "first_step_trace": trace_list[0] if trace_list else None,
+            "last_step_trace": trace_list[-1] if trace_list else None,
+            "mask_sums_by_step": mask_sums[:3],
+        }
+        return text, first_conf, total_trace
+
+    # ---------- later steps: cache path, no merge ----------
+    # This is much closer to native generate than recomputing the whole merged prefix.
+    # Since q_len=1 and kv_len>1, native AdaptVis condition q_len==kv_len would skip intervention.
+    cur_input_ids = next_token
+
+    for step in range(1, int(max_new_tokens)):
+        set_adaptvis_state(
+            lm=lm,
+            enable=False,
             weight=weight,
+            image_mask=None,
             require_square=require_square,
             max_layers=max_layers,
         )
 
-        next_logits = logits[:, -1, :]
+        out = lm(
+            input_ids=cur_input_ids,
+            attention_mask=cur_attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+
+        next_logits = out.logits[:, -1, :]
         next_token = torch.argmax(next_logits, dim=-1, keepdim=True)
 
         score_list.append(next_logits.detach())
         generated.append(next_token)
-        trace_list.append(trace)
-        mask_sums.append([int(x) for x in image_mask.sum(dim=-1).detach().cpu().tolist()])
+        trace_list.append(get_adaptvis_trace(lm))
 
-        cur_input_ids = torch.cat([cur_input_ids, next_token], dim=-1)
-        cur_attention_mask = torch.cat([cur_attention_mask, torch.ones_like(next_token)], dim=-1)
+        past_key_values = out.past_key_values
+        cur_attention_mask = torch.cat(
+            [cur_attention_mask, torch.ones((cur_attention_mask.shape[0], 1), dtype=cur_attention_mask.dtype, device=cur_attention_mask.device)],
+            dim=-1,
+        )
+        cur_input_ids = next_token
 
         if eos_id is not None and int(next_token[0, 0].item()) == int(eos_id):
             break
@@ -814,7 +893,7 @@ def main():
         "strict_parse_direct_acc": strict_acc,
         "unparsed": unparsed,
         "out_records": str(out_records),
-        "definition": "Core-copy AdaptVis: stock HF LLaVA + manual LLaVA merge with image_to_overwrite mask + raw-logit attention intervention + manual greedy.",
+        "definition": "Core-copy AdaptVis v2: stock HF LLaVA + manual LLaVA merge mask + raw-logit attention intervention + native-like KV-cache greedy + no explicit position_ids.",
     }
     with open(out_summary, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
