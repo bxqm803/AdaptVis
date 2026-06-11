@@ -143,6 +143,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--config-patch",
+        default="",
+        help=(
+            "Comma-separated config fields copied from the opposite config. "
+            "With --text-config checkpoint, selected fields come from custom; "
+            "with --text-config custom, selected fields are restored from the "
+            "checkpoint. Aliases: norm, position, tokens, all. Example: "
+            "--text-config checkpoint --config-patch rms_norm_eps"
+        ),
+    )
+    parser.add_argument(
         "--method",
         default="base",
         choices=["base", "scaling_vis", "adapt_vis"],
@@ -290,8 +301,91 @@ CONFIG_FIELDS = (
 )
 
 
+SAFE_CONFIG_PATCH_FIELDS = (
+    "rms_norm_eps",
+    "max_position_embeddings",
+    "pad_token_id",
+    "bos_token_id",
+    "eos_token_id",
+    "use_cache",
+    "pretraining_tp",
+    "tie_word_embeddings",
+    "rope_theta",
+    "rope_scaling",
+    "attention_bias",
+    "attention_dropout",
+)
+
+CONFIG_PATCH_ALIASES = {
+    "norm": ("rms_norm_eps",),
+    "position": ("max_position_embeddings", "rope_theta", "rope_scaling"),
+    "tokens": ("pad_token_id", "bos_token_id", "eos_token_id"),
+}
+
+
 def config_snapshot(config: LlamaConfig) -> Dict[str, Any]:
     return {name: getattr(config, name, None) for name in CONFIG_FIELDS}
+
+
+def resolve_config_patch_fields(
+    patch_spec: str,
+    checkpoint_config: LlamaConfig,
+    custom_config: LlamaConfig,
+) -> List[str]:
+    spec = str(patch_spec or "").strip()
+    if not spec:
+        return []
+
+    requested = [item.strip() for item in spec.split(",") if item.strip()]
+    fields: List[str] = []
+    for item in requested:
+        if item == "all":
+            for field in SAFE_CONFIG_PATCH_FIELDS:
+                if getattr(checkpoint_config, field, None) != getattr(
+                    custom_config, field, None
+                ):
+                    fields.append(field)
+            continue
+        if item in CONFIG_PATCH_ALIASES:
+            fields.extend(CONFIG_PATCH_ALIASES[item])
+            continue
+        if item not in SAFE_CONFIG_PATCH_FIELDS:
+            raise ValueError(
+                f"Unsupported --config-patch field {item!r}. Allowed fields: "
+                f"{', '.join(SAFE_CONFIG_PATCH_FIELDS)}; aliases: "
+                f"{', '.join(CONFIG_PATCH_ALIASES)}, all."
+            )
+        fields.append(item)
+
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(fields))
+
+
+def build_active_text_config(
+    *,
+    base_mode: str,
+    patch_spec: str,
+    checkpoint_config: LlamaConfig,
+) -> Tuple[LlamaConfig, List[str], str]:
+    custom_config = build_custom_equivalent_hf_llama_config()
+    if base_mode == "custom":
+        active = copy.deepcopy(custom_config)
+        patch_source = checkpoint_config
+        patch_source_name = "checkpoint"
+    elif base_mode == "checkpoint":
+        active = copy.deepcopy(checkpoint_config)
+        patch_source = custom_config
+        patch_source_name = "custom"
+    else:
+        raise ValueError(f"Unsupported text config mode: {base_mode}")
+
+    patch_fields = resolve_config_patch_fields(
+        patch_spec, checkpoint_config, custom_config
+    )
+    for field in patch_fields:
+        setattr(active, field, copy.deepcopy(getattr(patch_source, field)))
+
+    return active, patch_fields, patch_source_name
 
 
 def print_config_comparison(
@@ -830,9 +924,17 @@ def load_hf_model(
         trust_remote_code=args.trust_remote_code,
     )
     checkpoint_text_config = copy.deepcopy(llava_config.text_config)
+    active_text_config, patch_fields, patch_source_name = build_active_text_config(
+        base_mode=args.text_config,
+        patch_spec=args.config_patch,
+        checkpoint_config=checkpoint_text_config,
+    )
+    llava_config.text_config = active_text_config
 
-    if args.text_config == "custom":
-        llava_config.text_config = build_custom_equivalent_hf_llama_config()
+    print(
+        f"Config base={args.text_config}; patch fields={patch_fields or 'none'}; "
+        f"patch source={patch_source_name if patch_fields else 'none'}"
+    )
 
     # AdaptVis needs access to raw QK logits, so force eager attention.
     llava_config._attn_implementation = "eager"
@@ -1202,6 +1304,8 @@ def evaluate(
         "implementation": "transformers.LlavaForConditionalGeneration",
         "language_model_implementation": "transformers.LlamaForCausalLM",
         "text_config_mode": args.text_config,
+        "config_patch": args.config_patch,
+        "active_text_config": config_snapshot(model.language_model.config),
         "method": args.method,
         "weight": args.weight,
         "weight1": args.weight1,
@@ -1250,10 +1354,19 @@ def default_output_path(args: argparse.Namespace) -> Path:
             f"_thr_{args.threshold:g}"
         )
 
+    patch_suffix = ""
+    if args.config_patch:
+        safe_patch = (
+            args.config_patch.replace(",", "+")
+            .replace(" ", "")
+            .replace("/", "-")
+        )
+        patch_suffix = f"_patch_{safe_patch}"
+
     return Path(
         "output/"
         f"hf_llava15_{args.dataset}_"
-        f"{args.text_config}_config_{method_suffix}.json"
+        f"{args.text_config}_config{patch_suffix}_{method_suffix}.json"
     )
 
 
