@@ -1,43 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Pure Hugging Face LLaVA-1.5 RMSNorm-epsilon ablation.
+Pure Hugging Face LLaVA-1.5 RMSNorm-epsilon ablation with RMSNorm tracing.
 
-The model is loaded with the checkpoint's original LlavaConfig and text_config.
-No custom LLaMAConfig is constructed and no text-config fields are replaced.
+This runner keeps the official HF LlavaConfig / LlamaConfig and only changes
+LlamaRMSNorm.variance_epsilon after loading the checkpoint. For AdaptVis, it
+patches eager HF LLaMA attention only during the multimodal prefill pass:
+the raw QK logits from the final query token to merged image-token keys are
+multiplied before the causal mask and softmax.
 
-After from_pretrained finishes, this script changes only:
-    LlamaRMSNorm.variance_epsilon
+When --trace-rmsnorm is enabled, every LlamaRMSNorm layer records, for the
+last query token:
+  m = mean(x^2)
+  gain = 1 / sqrt(m + eps)
+  RMS before / after RMSNorm
 
-It also mirrors the value into:
-    model.language_model.config.rms_norm_eps
-    model.config.text_config.rms_norm_eps
+For AdaptVis, the first weight=1.0 probe is stored as the reference. The final
+weight=0.5 or 1.5 run stores per-layer input/output differences against that
+reference. This lets you identify the first RMSNorm whose input differs after
+the attention intervention.
 
-Those config assignments are for consistency/logging; the actual computation is
-controlled by each LlamaRMSNorm module's variance_epsilon attribute.
-
-Methods:
-  - base: native HF model.generate; no attention patch is installed.
-  - scaling_vis/adapt_vis: native HF LLaVA merge and generation are retained,
-    while the existing pre-softmax AdaptVis intervention is installed in eager
-    HF LLaMA attention.
-
-Examples
---------
-Checkpoint epsilon (normally 1e-5) + HF AdaptVis:
-
-python3 run_llava15_hf_rmsnorm_eps_ablation.py \
-  --dataset Controlled_Images_A \
-  --rms-norm-eps 1e-5 \
-  --method adapt_vis \
-  --weight1 0.5 \
-  --weight2 1.5 \
-  --threshold 0.4 \
-  --device cuda \
-  --dtype float32 \
-  --download
-
-Only change RMSNorm epsilon to 1e-6:
+Example: trace a single sample with final multiplier fixed to 1.5
 
 python3 run_llava15_hf_rmsnorm_eps_ablation.py \
   --dataset Controlled_Images_A \
@@ -45,10 +28,14 @@ python3 run_llava15_hf_rmsnorm_eps_ablation.py \
   --method adapt_vis \
   --weight1 0.5 \
   --weight2 1.5 \
-  --threshold 0.4 \
-  --device cuda \
+  --threshold -1 \
+  --max-layers 32 \
   --dtype float32 \
-  --download
+  --device cuda \
+  --limit 1 \
+  --max-new-tokens 1 \
+  --trace-rmsnorm \
+  --output output/rms_trace_eps1e6_weight1p5_sid0.json
 """
 
 from __future__ import annotations
@@ -58,7 +45,7 @@ import json
 import math
 import random
 import types
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -68,12 +55,13 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import transformers
-from transformers import (
-    AutoProcessor,
-    LlavaConfig,
-    LlavaForConditionalGeneration,
-)
-from transformers.cache_utils import Cache
+from transformers import AutoProcessor, LlavaConfig, LlavaForConditionalGeneration
+
+try:
+    from transformers.cache_utils import Cache
+except Exception:  # Older transformers releases.
+    Cache = Any  # type: ignore[misc,assignment]
+
 from transformers.models.llama.modeling_llama import (
     LlamaRMSNorm,
     apply_rotary_pos_emb,
@@ -83,7 +71,7 @@ from transformers.models.llama.modeling_llama import (
 from dataset_zoo import get_dataset
 
 try:
-    # main_aro.py uses the repository collate function when image_preprocess=None.
+    # This is the collate function used by main_aro.py when image_preprocess=None.
     from misc import _default_collate as repository_default_collate
 except Exception:
     repository_default_collate = None
@@ -96,8 +84,8 @@ DEFAULT_REVISION = "a272c74"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate standard HF LLaVA-1.5 while changing only the "
-            "LlamaRMSNorm epsilon."
+            "Evaluate standard HF LLaVA-1.5 while changing only "
+            "LlamaRMSNorm epsilon, optionally tracing RMSNorm statistics."
         )
     )
     parser.add_argument(
@@ -105,19 +93,12 @@ def parse_args() -> argparse.Namespace:
         default="Controlled_Images_A",
         choices=["Controlled_Images_A", "Controlled_Images_B"],
     )
-    parser.add_argument(
-        "--option",
-        default="four",
-        choices=["two", "four", "six"],
-    )
+    parser.add_argument("--option", default="four", choices=["two", "four", "six"])
     parser.add_argument(
         "--rms-norm-eps",
         default=1e-6,
         type=float,
-        help=(
-            "Value assigned to every HF LlamaRMSNorm. Use 1e-5 for the "
-            "checkpoint-equivalent control and 1e-6 for the custom value."
-        ),
+        help="Value assigned to every HF LlamaRMSNorm.variance_epsilon.",
     )
     parser.add_argument(
         "--method",
@@ -151,19 +132,22 @@ def parse_args() -> argparse.Namespace:
         "--dtype",
         default="float32",
         choices=["float32", "float16", "bfloat16", "auto"],
-        help=(
-            "Use the same dtype for all compared runs. float32 is the closest "
-            "match to the repository's default from_pretrained path."
-        ),
+        help="Use the same dtype for all compared runs.",
     )
     parser.add_argument("--max-new-tokens", default=100, type=int)
     parser.add_argument("--num-workers", default=0, type=int)
     parser.add_argument("--seed", default=1, type=int)
     parser.add_argument(
+        "--start-index",
+        default=0,
+        type=int,
+        help="Skip dataset samples before this zero-based index.",
+    )
+    parser.add_argument(
         "--limit",
         default=None,
         type=int,
-        help="Evaluate only the first N samples.",
+        help="Evaluate this many samples after --start-index.",
     )
     parser.add_argument(
         "--download",
@@ -178,20 +162,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ignore-mismatched-sizes",
         action="store_true",
-        help=(
-            "Allow mismatched checkpoint tensors. Leave disabled for a clean "
-            "configuration ablation unless the original experiment requires it."
-        ),
+        help="Allow mismatched checkpoint tensors. Leave disabled for a clean ablation.",
     )
-    parser.add_argument(
-        "--trust-remote-code",
-        action="store_true",
-    )
+    parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument(
         "--print-first",
         default=5,
         type=int,
-        help="Print detailed diagnostics for the first N samples.",
+        help="Print detailed diagnostics for the first N evaluated samples.",
+    )
+    parser.add_argument(
+        "--trace-rmsnorm",
+        action="store_true",
+        help="Record prefill RMSNorm statistics and scaled-vs-unscaled differences.",
+    )
+    parser.add_argument(
+        "--trace-image-tokens",
+        action="store_true",
+        help="Also save aggregate RMSNorm-input statistics over merged image tokens.",
     )
     return parser.parse_args()
 
@@ -214,6 +202,10 @@ def resolve_torch_dtype(name: str):
     }[name]
 
 
+def scalar(value: torch.Tensor) -> float:
+    return float(value.detach().float().cpu().item())
+
+
 def set_llama_rmsnorm_epsilon(
     model: LlavaForConditionalGeneration,
     epsilon: float,
@@ -224,23 +216,19 @@ def set_llama_rmsnorm_epsilon(
         for module in model.language_model.modules()
         if isinstance(module, LlamaRMSNorm)
     ]
-    before = sorted(
-        {float(module.variance_epsilon) for module in norms}
-    )
+    before = sorted({float(module.variance_epsilon) for module in norms})
 
     for module in norms:
         module.variance_epsilon = float(epsilon)
 
-    # Keep config metadata consistent. These assignments do not rebuild modules.
+    # These are metadata / logging fields. The module attribute above controls forward.
     model.language_model.config.rms_norm_eps = float(epsilon)
     model.config.text_config.rms_norm_eps = float(epsilon)
 
-    after = sorted(
-        {float(module.variance_epsilon) for module in norms}
-    )
-    print("RMSNorm modules:", len(norms))
-    print("RMSNorm epsilon before override:", before)
-    print("RMSNorm epsilon after override:", after)
+    after = sorted({float(module.variance_epsilon) for module in norms})
+    print("RMSNorm modules:", len(norms), flush=True)
+    print("RMSNorm epsilon before override:", before, flush=True)
+    print("RMSNorm epsilon after override:", after, flush=True)
 
     if not norms:
         raise RuntimeError("No HF LlamaRMSNorm modules were found.")
@@ -248,7 +236,6 @@ def set_llama_rmsnorm_epsilon(
         raise RuntimeError(
             f"Failed to set all RMSNorm epsilons to {epsilon}; got {after}."
         )
-
     return len(norms), before
 
 
@@ -260,13 +247,11 @@ class GenerationDiagnostics:
     merged_sequence_length: int
     image_start: Optional[int]
     image_end: Optional[int]
+    rmsnorm_trace: Optional[Dict[str, Any]] = None
 
 
 class HFAdaptVisController:
-    """
-    Runtime state shared by the patched native HF LLaVA merge and HF LLaMA
-    attention modules.
-    """
+    """Runtime state shared by native HF LLaVA merge and LLaMA attention."""
 
     def __init__(self, max_layers: int = 32) -> None:
         self.max_layers = int(max_layers)
@@ -317,21 +302,21 @@ def compute_hf_merged_image_mask(
     num_image_patches: int,
 ) -> torch.Tensor:
     """
-    Reproduce the image_to_overwrite mask constructed by transformers 4.39.1
-    LlavaForConditionalGeneration._merge_input_ids_with_image_features.
+    Reproduce the image_to_overwrite mask used by HF LLaVA's merge function.
+    Compatible with transformers 4.39.x LLaVA-1.5.
     """
+    del attention_mask  # The original merge uses token layout / padding convention.
+
     if input_ids.ndim != 2:
         raise ValueError(f"Expected input_ids [B,L], got {tuple(input_ids.shape)}")
 
     batch_size, sequence_length = input_ids.shape
     target_device = input_ids.device
-
     pad_value = torch.tensor(pad_token_id, device=target_device)
     left_padding = not bool(torch.sum(input_ids[:, -1] == pad_value).item())
 
     special_image_token_mask = input_ids == int(image_token_index)
     num_special_image_tokens = torch.sum(special_image_token_mask, dim=-1)
-
     if int(num_special_image_tokens.max().item()) == 0:
         return torch.zeros(
             batch_size,
@@ -346,26 +331,15 @@ def compute_hf_merged_image_mask(
             + sequence_length
         ).item()
     )
-
-    batch_indices, non_image_indices = torch.where(
-        input_ids != int(image_token_index)
-    )
-
-    increments = (
-        special_image_token_mask.to(torch.long) * (int(num_image_patches) - 1)
-        + 1
-    )
+    batch_indices, non_image_indices = torch.where(input_ids != int(image_token_index))
+    increments = special_image_token_mask.to(torch.long) * (int(num_image_patches) - 1) + 1
     new_token_positions = torch.cumsum(increments, dim=-1) - 1
     nb_image_pad = max_embed_dim - 1 - new_token_positions[:, -1]
 
     if left_padding:
         new_token_positions = new_token_positions + nb_image_pad[:, None]
 
-    text_to_overwrite = new_token_positions[
-        batch_indices,
-        non_image_indices,
-    ]
-
+    text_to_overwrite = new_token_positions[batch_indices, non_image_indices]
     image_to_overwrite = torch.ones(
         batch_size,
         max_embed_dim,
@@ -385,7 +359,6 @@ def compute_hf_merged_image_mask(
             "Failed to reconstruct HF merged image mask: "
             f"expected {expected} image positions, found {actual}."
         )
-
     return image_to_overwrite
 
 
@@ -393,10 +366,7 @@ def install_merge_capture(
     model: LlavaForConditionalGeneration,
     controller: HFAdaptVisController,
 ) -> None:
-    """
-    Wrap the native HF merge without changing its outputs. The wrapper only
-    reconstructs and stores the exact merged image-token mask.
-    """
+    """Wrap native HF merge without changing its outputs."""
     original_merge = model._merge_input_ids_with_image_features
 
     def wrapped_merge(
@@ -405,7 +375,9 @@ def install_merge_capture(
         inputs_embeds,
         input_ids,
         attention_mask,
-        labels,
+        labels=None,
+        *args,
+        **kwargs,
     ):
         outputs = original_merge(
             image_features,
@@ -413,9 +385,10 @@ def install_merge_capture(
             input_ids,
             attention_mask,
             labels,
+            *args,
+            **kwargs,
         )
         final_embedding = outputs[0]
-
         mask = compute_hf_merged_image_mask(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -427,10 +400,44 @@ def install_merge_capture(
         controller.merged_sequence_length = int(final_embedding.shape[1])
         return outputs
 
-    model._merge_input_ids_with_image_features = types.MethodType(
-        wrapped_merge,
-        model,
-    )
+    model._merge_input_ids_with_image_features = types.MethodType(wrapped_merge, model)
+
+
+def _delegate_original_attention(
+    original,
+    *,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    position_ids: Optional[torch.LongTensor],
+    past_key_value: Optional[Cache],
+    output_attentions: bool,
+    use_cache: bool,
+    cache_position: Optional[torch.LongTensor],
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    kwargs: Dict[str, Any],
+):
+    """Call original attention across transformers 4.39+ signatures."""
+    call_kwargs: Dict[str, Any] = {
+        "hidden_states": hidden_states,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "past_key_value": past_key_value,
+        "output_attentions": output_attentions,
+        "use_cache": use_cache,
+    }
+    if cache_position is not None:
+        call_kwargs["cache_position"] = cache_position
+    if position_embeddings is not None:
+        call_kwargs["position_embeddings"] = position_embeddings
+    call_kwargs.update(kwargs)
+
+    try:
+        return original(**call_kwargs)
+    except TypeError:
+        # transformers 4.39.1 does not accept cache_position / position_embeddings.
+        call_kwargs.pop("cache_position", None)
+        call_kwargs.pop("position_embeddings", None)
+        return original(**call_kwargs)
 
 
 def install_hf_adaptvis_attention(
@@ -438,11 +445,10 @@ def install_hf_adaptvis_attention(
     controller: HFAdaptVisController,
 ) -> None:
     """
-    Patch native HF eager LLaMA attention modules.
+    Patch native eager HF LLaMA attention only for a non-unit AdaptVis weight.
 
-    For base/weight=1.0, the saved original HF forward is called unchanged.
-    For a non-unit weight, only initial prefill calls whose q_len equals the
-    captured merged sequence length enter the custom path.
+    The baseline probe (weight=1) remains byte-for-byte on original HF attention
+    wherever the installed transformers implementation permits it.
     """
     layers = model.language_model.model.layers
 
@@ -459,14 +465,12 @@ def install_hf_adaptvis_attention(
                 output_attentions: bool = False,
                 use_cache: bool = False,
                 cache_position: Optional[torch.LongTensor] = None,
-                position_embeddings: Optional[
-                    Tuple[torch.Tensor, torch.Tensor]
-                ] = None,
+                position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 **kwargs,
             ):
                 bsz, q_len, _ = hidden_states.size()
-
                 mask = controller.image_mask
+
                 should_intervene = (
                     controller.enabled
                     and controller.weight != 1.0
@@ -478,9 +482,9 @@ def install_hf_adaptvis_attention(
                     and controller.merged_sequence_length == q_len
                     and q_len > 1
                 )
-
                 if not should_intervene:
-                    call_kwargs = dict(
+                    return _delegate_original_attention(
+                        original,
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
                         position_ids=position_ids,
@@ -488,20 +492,9 @@ def install_hf_adaptvis_attention(
                         output_attentions=output_attentions,
                         use_cache=use_cache,
                         cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                        kwargs=kwargs,
                     )
-                    # position_embeddings was added in newer Transformers.
-                    if position_embeddings is not None:
-                        call_kwargs["position_embeddings"] = position_embeddings
-                    call_kwargs.update(kwargs)
-                    try:
-                        return original(**call_kwargs)
-                    except TypeError as exc:
-                        # Compatibility with 4.39.1, which does not accept
-                        # position_embeddings.
-                        if "position_embeddings" in call_kwargs:
-                            call_kwargs.pop("position_embeddings")
-                            return original(**call_kwargs)
-                        raise exc
 
                 config = attn.config
                 num_heads = int(attn.num_heads)
@@ -536,54 +529,32 @@ def install_hf_adaptvis_attention(
                     value_states = attn.v_proj(hidden_states)
 
                 query_states = query_states.view(
-                    bsz,
-                    q_len,
-                    num_heads,
-                    head_dim,
+                    bsz, q_len, num_heads, head_dim
                 ).transpose(1, 2)
                 key_states = key_states.view(
-                    bsz,
-                    q_len,
-                    num_kv_heads,
-                    head_dim,
+                    bsz, q_len, num_kv_heads, head_dim
                 ).transpose(1, 2)
                 value_states = value_states.view(
-                    bsz,
-                    q_len,
-                    num_kv_heads,
-                    head_dim,
+                    bsz, q_len, num_kv_heads, head_dim
                 ).transpose(1, 2)
 
-                past_key_value = getattr(
-                    attn,
-                    "past_key_value",
-                    past_key_value,
-                )
-
+                effective_past = getattr(attn, "past_key_value", past_key_value)
                 if position_embeddings is not None:
                     cos, sin = position_embeddings
                 else:
                     try:
-                        # Transformers 4.39.1 path.
-                        cos, sin = attn.rotary_emb(
-                            value_states,
-                            position_ids,
-                        )
+                        cos, sin = attn.rotary_emb(value_states, position_ids)
                     except TypeError:
-                        # Compatibility fallback for older implementations.
                         kv_seq_len = key_states.shape[-2]
-                        if past_key_value is not None:
+                        if effective_past is not None:
                             try:
-                                kv_seq_len += past_key_value.get_usable_length(
+                                kv_seq_len += effective_past.get_usable_length(
                                     kv_seq_len,
                                     getattr(attn, "layer_idx", idx),
                                 )
                             except Exception:
                                 pass
-                        cos, sin = attn.rotary_emb(
-                            value_states,
-                            seq_len=kv_seq_len,
-                        )
+                        cos, sin = attn.rotary_emb(value_states, seq_len=kv_seq_len)
 
                 try:
                     query_states, key_states = apply_rotary_pos_emb(
@@ -601,30 +572,23 @@ def install_hf_adaptvis_attention(
                         position_ids,
                     )
 
-                present_key_value = past_key_value
-                if past_key_value is not None:
-                    if hasattr(past_key_value, "update"):
+                present_key_value = effective_past
+                if effective_past is not None:
+                    if hasattr(effective_past, "update"):
                         cache_kwargs = {
                             "sin": sin,
                             "cos": cos,
                             "cache_position": cache_position,
                         }
-                        key_states, value_states = past_key_value.update(
+                        key_states, value_states = effective_past.update(
                             key_states,
                             value_states,
                             getattr(attn, "layer_idx", idx),
                             cache_kwargs,
                         )
                     else:
-                        # Legacy tuple fallback.
-                        key_states = torch.cat(
-                            [past_key_value[0], key_states],
-                            dim=2,
-                        )
-                        value_states = torch.cat(
-                            [past_key_value[1], value_states],
-                            dim=2,
-                        )
+                        key_states = torch.cat([effective_past[0], key_states], dim=2)
+                        value_states = torch.cat([effective_past[1], value_states], dim=2)
                         present_key_value = (
                             (key_states, value_states) if use_cache else None
                         )
@@ -637,19 +601,14 @@ def install_hf_adaptvis_attention(
                     key_states.transpose(2, 3),
                 ) / math.sqrt(head_dim)
 
-                image_mask = mask.to(
-                    device=attn_weights.device,
-                    dtype=torch.bool,
-                )
+                image_mask = mask.to(device=attn_weights.device, dtype=torch.bool)
                 if image_mask.shape[0] == 1 and bsz > 1:
                     image_mask = image_mask.expand(bsz, -1)
-
                 kv_len = int(attn_weights.shape[-1])
                 if image_mask.shape[-1] != kv_len:
                     raise RuntimeError(
                         "AdaptVis image mask and attention KV length differ: "
-                        f"mask={image_mask.shape[-1]}, kv={kv_len}, "
-                        f"layer={idx}."
+                        f"mask={image_mask.shape[-1]}, kv={kv_len}, layer={idx}."
                     )
 
                 weight = float(controller.weight)
@@ -675,16 +634,10 @@ def install_hf_adaptvis_attention(
                         index=image_indices,
                         source=selected * weight,
                     )
-
-                controller.modified_calls += 1
+                    controller.modified_calls += 1
 
                 if attention_mask is not None:
-                    causal_mask = attention_mask[
-                        :,
-                        :,
-                        :,
-                        : key_states.shape[-2],
-                    ]
+                    causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
                     attn_weights = attn_weights + causal_mask
 
                 attn_weights = F.softmax(
@@ -697,19 +650,13 @@ def install_hf_adaptvis_attention(
                     p=float(attn.attention_dropout),
                     training=attn.training,
                 )
-
                 attn_output = torch.matmul(attn_weights, value_states)
-                expected_shape = (
-                    bsz,
-                    num_heads,
-                    q_len,
-                    head_dim,
-                )
+
+                expected_shape = (bsz, num_heads, q_len, head_dim)
                 if tuple(attn_output.shape) != expected_shape:
                     raise RuntimeError(
-                        f"Unexpected attention output shape "
-                        f"{tuple(attn_output.shape)}; expected "
-                        f"{expected_shape}."
+                        f"Unexpected attention output shape {tuple(attn_output.shape)}; "
+                        f"expected {expected_shape}."
                     )
 
                 attn_output = (
@@ -717,17 +664,10 @@ def install_hf_adaptvis_attention(
                     .contiguous()
                     .reshape(bsz, q_len, num_heads * head_dim)
                 )
-
                 if getattr(config, "pretraining_tp", 1) > 1:
                     tp = int(config.pretraining_tp)
-                    split_outputs = attn_output.split(
-                        attn.hidden_size // tp,
-                        dim=2,
-                    )
-                    o_slices = attn.o_proj.weight.split(
-                        attn.hidden_size // tp,
-                        dim=1,
-                    )
+                    split_outputs = attn_output.split(attn.hidden_size // tp, dim=2)
+                    o_slices = attn.o_proj.weight.split(attn.hidden_size // tp, dim=1)
                     attn_output = sum(
                         F.linear(split_outputs[i], o_slices[i])
                         for i in range(tp)
@@ -735,18 +675,174 @@ def install_hf_adaptvis_attention(
                 else:
                     attn_output = attn.o_proj(attn_output)
 
-                returned_weights = (
-                    attn_weights if output_attentions else None
-                )
+                returned_weights = attn_weights if output_attentions else None
                 return attn_output, returned_weights, present_key_value
 
             return forward
 
-        attn_module.forward = make_forward(
-            attn_module,
-            original_forward,
-            layer_index,
-        )
+        attn_module.forward = make_forward(attn_module, original_forward, layer_index)
+
+
+class RMSNormTracer:
+    """
+    Forward-hook recorder for native HF LlamaRMSNorm modules.
+
+    A trace is recorded only for multimodal prefill (q_len equals the captured
+    merged sequence length). Generation steps with q_len=1 are ignored.
+    """
+
+    def __init__(
+        self,
+        language_model: torch.nn.Module,
+        controller: HFAdaptVisController,
+        trace_image_tokens: bool,
+    ) -> None:
+        self.controller = controller
+        self.trace_image_tokens = bool(trace_image_tokens)
+        self.active = False
+        self.weight = 1.0
+        self.records: List[Dict[str, Any]] = []
+        self.reference: Dict[str, Dict[str, torch.Tensor]] = {}
+        self.handles = []
+
+        for name, module in language_model.named_modules():
+            if isinstance(module, LlamaRMSNorm):
+                self.handles.append(module.register_forward_hook(self._make_hook(name)))
+
+        if not self.handles:
+            raise RuntimeError("RMSNormTracer could not find LlamaRMSNorm modules.")
+
+    @staticmethod
+    def _compare(reference: torch.Tensor, current: torch.Tensor) -> Dict[str, float]:
+        reference = reference.detach().float().flatten()
+        current = current.detach().float().flatten()
+        delta = current - reference
+        ref_norm = reference.norm().clamp_min(1e-12)
+        current_norm = current.norm().clamp_min(1e-12)
+        return {
+            "relative_l2": scalar(delta.norm() / ref_norm),
+            "max_abs_delta": scalar(delta.abs().max()),
+            "mean_abs_delta": scalar(delta.abs().mean()),
+            "cosine": scalar(torch.dot(reference, current) / (ref_norm * current_norm)),
+        }
+
+    @staticmethod
+    def _token_summary(states: torch.Tensor, eps: float) -> Optional[Dict[str, float]]:
+        if states.numel() == 0:
+            return None
+        states = states.detach().float()
+        mean_x2 = states.pow(2).mean(dim=-1)
+        gain = torch.rsqrt(mean_x2 + eps)
+        normalized_rms = torch.sqrt(mean_x2 / (mean_x2 + eps))
+        eps_over_m = eps / mean_x2.clamp_min(1e-30)
+        return {
+            "token_count": int(mean_x2.numel()),
+            "mean_x2_mean": scalar(mean_x2.mean()),
+            "mean_x2_median": scalar(mean_x2.median()),
+            "mean_x2_min": scalar(mean_x2.min()),
+            "mean_x2_max": scalar(mean_x2.max()),
+            "gain_mean": scalar(gain.mean()),
+            "gain_median": scalar(gain.median()),
+            "normalized_rms_before_gamma_mean": scalar(normalized_rms.mean()),
+            "eps_over_mean_x2_median": scalar(eps_over_m.median()),
+        }
+
+    def _make_hook(self, name: str):
+        def hook(module: torch.nn.Module, inputs: Tuple[Any, ...], output: Any) -> None:
+            if not self.active or not inputs:
+                return
+            hidden_states = inputs[0]
+            if not torch.is_tensor(hidden_states) or hidden_states.ndim != 3:
+                return
+
+            _, q_len, _ = hidden_states.shape
+            if (
+                q_len <= 1
+                or self.controller.merged_sequence_length <= 1
+                or q_len != self.controller.merged_sequence_length
+            ):
+                return
+
+            if not torch.is_tensor(output) or output.ndim != 3:
+                return
+
+            eps = float(getattr(module, "variance_epsilon"))
+            input_last = hidden_states[0, -1].detach().float().cpu()
+            output_last = output[0, -1].detach().float().cpu()
+
+            input_mean_x2 = input_last.pow(2).mean()
+            input_rms = input_mean_x2.sqrt()
+            gain = torch.rsqrt(input_mean_x2 + eps)
+            norm_rms_before_gamma = torch.sqrt(input_mean_x2 / (input_mean_x2 + eps))
+            output_mean_y2 = output_last.pow(2).mean()
+
+            record: Dict[str, Any] = {
+                "name": name,
+                "epsilon": eps,
+                "last_query": {
+                    "input_mean_x2": scalar(input_mean_x2),
+                    "input_rms": scalar(input_rms),
+                    "eps_over_input_mean_x2": scalar(
+                        torch.tensor(eps) / input_mean_x2.clamp_min(1e-30)
+                    ),
+                    "normalization_gain": scalar(gain),
+                    "normalized_rms_before_gamma": scalar(norm_rms_before_gamma),
+                    "output_mean_y2_after_gamma": scalar(output_mean_y2),
+                    "output_rms_after_gamma": scalar(output_mean_y2.sqrt()),
+                },
+                "all_prefill_tokens": self._token_summary(
+                    hidden_states.reshape(-1, hidden_states.shape[-1]),
+                    eps,
+                ),
+            }
+
+            if self.trace_image_tokens:
+                image_mask = self.controller.image_mask
+                if (
+                    image_mask is not None
+                    and tuple(image_mask.shape) == tuple(hidden_states.shape[:2])
+                ):
+                    image_states = hidden_states[
+                        image_mask.to(hidden_states.device, dtype=torch.bool)
+                    ]
+                    record["image_prefill_tokens"] = self._token_summary(image_states, eps)
+                else:
+                    record["image_prefill_tokens"] = None
+
+            if abs(self.weight - 1.0) < 1e-12:
+                self.reference[name] = {
+                    "input": input_last.clone(),
+                    "output": output_last.clone(),
+                }
+            else:
+                baseline = self.reference.get(name)
+                if baseline is not None:
+                    record["vs_weight_1"] = {
+                        "input": self._compare(baseline["input"], input_last),
+                        "output": self._compare(baseline["output"], output_last),
+                    }
+                else:
+                    record["vs_weight_1"] = None
+
+            self.records.append(record)
+
+        return hook
+
+    def begin_generation(self, weight: float) -> None:
+        self.active = True
+        self.weight = float(weight)
+        self.records = []
+        if abs(self.weight - 1.0) < 1e-12:
+            # Every probe is a baseline reference for its own sample.
+            self.reference = {}
+
+    def finish_generation(self) -> Dict[str, Any]:
+        result = {
+            "weight": float(self.weight),
+            "prefill_rmsnorm_records": self.records,
+        }
+        self.active = False
+        return result
 
 
 def load_hf_model(
@@ -756,10 +852,13 @@ def load_hf_model(
     AutoProcessor,
     Dict[str, Any],
     HFAdaptVisController,
+    Optional[RMSNormTracer],
 ]:
-    print(f"transformers version: {transformers.__version__}")
-    print(f"Loading top-level LLaVA config from {args.model}@{args.revision}")
-
+    print(f"transformers version: {transformers.__version__}", flush=True)
+    print(
+        f"Loading top-level LLaVA config from {args.model}@{args.revision}",
+        flush=True,
+    )
     llava_config = LlavaConfig.from_pretrained(
         args.model,
         revision=args.revision,
@@ -767,11 +866,10 @@ def load_hf_model(
         trust_remote_code=args.trust_remote_code,
     )
     checkpoint_rms_norm_eps = float(llava_config.text_config.rms_norm_eps)
-    print("Checkpoint text_config.rms_norm_eps:", checkpoint_rms_norm_eps)
-    print("Requested RMSNorm epsilon:", float(args.rms_norm_eps))
+    print("Checkpoint text_config.rms_norm_eps:", checkpoint_rms_norm_eps, flush=True)
+    print("Requested RMSNorm epsilon:", float(args.rms_norm_eps), flush=True)
 
-    # The HF eager implementation is required only for pre-softmax AdaptVis.
-    # Both epsilon groups use the same attention implementation.
+    # Pre-softmax intervention requires eager LLaMA attention.
     if args.method != "base":
         llava_config._attn_implementation = "eager"
         try:
@@ -787,7 +885,6 @@ def load_hf_model(
         "output_loading_info": True,
         "trust_remote_code": args.trust_remote_code,
     }
-
     dtype = resolve_torch_dtype(args.dtype)
     if args.dtype != "float32":
         load_kwargs["torch_dtype"] = dtype
@@ -797,22 +894,22 @@ def load_hf_model(
         **load_kwargs,
     )
 
-    print("\n" + "=" * 100)
-    print("CHECKPOINT LOADING INFORMATION")
-    print("=" * 100)
+    print("\n" + "=" * 100, flush=True)
+    print("CHECKPOINT LOADING INFORMATION", flush=True)
+    print("=" * 100, flush=True)
     for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs"):
         values = loading_info.get(key, [])
-        print(f"{key}: {len(values)}")
+        print(f"{key}: {len(values)}", flush=True)
         for item in values[:20]:
-            print(f"  {item}")
+            print(f"  {item}", flush=True)
         if len(values) > 20:
-            print(f"  ... {len(values) - 20} more")
-    print("=" * 100 + "\n")
+            print(f"  ... {len(values) - 20} more", flush=True)
+    print("=" * 100 + "\n", flush=True)
 
     if loading_info.get("missing_keys") or loading_info.get("mismatched_keys"):
         print(
-            "[WARNING] Some tensors were not loaded exactly. Interpret the "
-            "result only after checking the entries above."
+            "[WARNING] Some tensors were not loaded exactly. Inspect the report above.",
+            flush=True,
         )
 
     rmsnorm_count, rmsnorm_eps_before = set_llama_rmsnorm_epsilon(
@@ -825,6 +922,7 @@ def load_hf_model(
 
     model.eval()
     model.to(args.device)
+    model.requires_grad_(False)
 
     processor = AutoProcessor.from_pretrained(
         args.model,
@@ -838,44 +936,49 @@ def load_hf_model(
         install_merge_capture(model, controller)
         install_hf_adaptvis_attention(model, controller)
 
-    print("Active model classes:")
-    print(f"  LLaVA: {type(model).__module__}.{type(model).__name__}")
+    tracer: Optional[RMSNormTracer] = None
+    if args.trace_rmsnorm:
+        tracer = RMSNormTracer(
+            model.language_model,
+            controller,
+            trace_image_tokens=args.trace_image_tokens,
+        )
+
+    print("Active model classes:", flush=True)
+    print(
+        f"  LLaVA: {type(model).__module__}.{type(model).__name__}",
+        flush=True,
+    )
     print(
         "  language_model: "
         f"{type(model.language_model).__module__}."
-        f"{type(model.language_model).__name__}"
+        f"{type(model.language_model).__name__}",
+        flush=True,
     )
-    print(f"  language text config: {type(model.language_model.config).__name__}")
     print(
         "  attention implementation: "
-        f"{getattr(model.config, '_attn_implementation', 'checkpoint default')}"
+        f"{getattr(model.config, '_attn_implementation', 'checkpoint default')}",
+        flush=True,
     )
-    print(f"  first parameter dtype: {next(model.parameters()).dtype}")
-    print(f"  AdaptVis layers: [0, {controller.max_layers})")
-    print(f"  generation pad token: {model.generation_config.pad_token_id}")
-    print(f"  generation bos token: {model.generation_config.bos_token_id}")
-    print(f"  generation eos token: {model.generation_config.eos_token_id}")
+    print("  first parameter dtype:", next(model.parameters()).dtype, flush=True)
+    print(f"  AdaptVis layers: [0, {controller.max_layers})", flush=True)
+    print("  trace RMSNorm:", bool(tracer is not None), flush=True)
 
-    return model, processor, loading_info, controller
+    return model, processor, loading_info, controller, tracer
 
 
 def norm_gold(value: Any) -> str:
     if isinstance(value, (list, tuple)):
-        return str(value[0]).strip() if value else ""
-    return str(value).strip()
+        return str(value[0]).strip() if len(value) else ""
+    return str(value).strip() if value else ""
 
 
 def is_correct(gold: Any, generation: str) -> bool:
     gold_text = norm_gold(gold)
     generation_text = str(generation).strip()
-
     if not gold_text:
         return False
-
-    correct = (
-        gold_text in generation_text
-        or gold_text.lower() in generation_text.lower()
-    )
+    correct = gold_text in generation_text or gold_text.lower() in generation_text.lower()
     if gold_text.lower() == "on" and "front" in generation_text.lower():
         correct = False
     return bool(correct)
@@ -886,14 +989,9 @@ def decode_generated(
     output: Any,
     prompt_length: int,
 ) -> str:
-    sequences = (
-        output.sequences
-        if hasattr(output, "sequences")
-        else output.get("sequences")
-    )
+    sequences = output.sequences if hasattr(output, "sequences") else output.get("sequences")
     if sequences is None:
         return ""
-
     return processor.decode(
         sequences[0][int(prompt_length):],
         skip_special_tokens=True,
@@ -912,10 +1010,8 @@ def load_prompts(dataset: str, option: str) -> Tuple[List[str], List[Any]]:
     path = Path(f"prompts/{dataset}_with_answer_{option}_options.jsonl")
     if not path.exists():
         raise FileNotFoundError(
-            f"Prompt file not found: {path}. Run this script from the "
-            "AdaptVis repository root."
+            f"Prompt file not found: {path}. Run this script from the AdaptVis root."
         )
-
     prompts: List[str] = []
     answers: List[Any] = []
     with path.open("r", encoding="utf-8") as file:
@@ -927,15 +1023,45 @@ def load_prompts(dataset: str, option: str) -> Tuple[List[str], List[Any]]:
 
 
 def extract_images_from_batch(batch: Dict[str, Any]) -> Iterable[Any]:
-    """
-    Match model_zoo/llava15.py:
-        for image_option in batch["image_options"]:
-            for image in image_option:
-                ...
-    """
+    """Match model_zoo/llava15.py's image_options iteration."""
     for image_option in batch["image_options"]:
         for image in image_option:
             yield image
+
+
+def brief_trace_print(trace: Optional[Dict[str, Any]]) -> None:
+    if not trace:
+        return
+    records = trace.get("prefill_rmsnorm_records", [])
+    if not records:
+        print("[RMSNorm trace] no prefill records captured", flush=True)
+        return
+
+    print("\n" + "=" * 132, flush=True)
+    print(f"RMSNorm prefill trace | AdaptVis weight={trace['weight']:g}", flush=True)
+    print(
+        "module                                                     "
+        "m=mean(x^2)   eps/m        gain         out_rms      "
+        "vs-w1 input relL2",
+        flush=True,
+    )
+    print("-" * 132, flush=True)
+    for record in records:
+        q = record["last_query"]
+        diff = record.get("vs_weight_1")
+        rel_l2 = float("nan")
+        if diff is not None:
+            rel_l2 = diff["input"]["relative_l2"]
+        print(
+            f"{record['name']:<58} "
+            f"{q['input_mean_x2']:.3e} "
+            f"{q['eps_over_input_mean_x2']:.3e} "
+            f"{q['normalization_gain']:.3e} "
+            f"{q['output_rms_after_gamma']:.3e} "
+            f"{rel_l2:.3e}",
+            flush=True,
+        )
+    print("=" * 132 + "\n", flush=True)
 
 
 @torch.inference_mode()
@@ -944,10 +1070,13 @@ def generate_once(
     model: LlavaForConditionalGeneration,
     inputs: Dict[str, torch.Tensor],
     controller: HFAdaptVisController,
+    tracer: Optional[RMSNormTracer],
     weight: float,
     max_new_tokens: int,
 ) -> Tuple[Any, GenerationDiagnostics]:
     controller.begin_generation(weight)
+    if tracer is not None:
+        tracer.begin_generation(weight)
 
     output = model.generate(
         **inputs,
@@ -958,6 +1087,8 @@ def generate_once(
     )
 
     diagnostics = controller.finish_generation()
+    if tracer is not None:
+        diagnostics.rmsnorm_trace = tracer.finish_generation()
     return output, diagnostics
 
 
@@ -967,15 +1098,14 @@ def evaluate(
     model: LlavaForConditionalGeneration,
     processor: AutoProcessor,
     controller: HFAdaptVisController,
+    tracer: Optional[RMSNormTracer],
 ) -> Dict[str, Any]:
     prompts, answers = load_prompts(args.dataset, args.option)
-
     dataset = get_dataset(
         args.dataset,
         image_preprocess=None,
         download=args.download,
     )
-
     loader = DataLoader(
         dataset,
         batch_size=1,
@@ -985,39 +1115,44 @@ def evaluate(
     )
 
     total_available = min(len(prompts), len(dataset))
-    total_target = (
-        min(total_available, args.limit)
-        if args.limit is not None
-        else total_available
-    )
+    start_index = max(0, int(args.start_index))
+    if start_index >= total_available:
+        raise ValueError(
+            f"--start-index={start_index} is outside dataset length {total_available}."
+        )
+    end_index = total_available
+    if args.limit is not None:
+        end_index = min(total_available, start_index + max(0, int(args.limit)))
 
     model_dtype = next(model.parameters()).dtype
     records: List[Dict[str, Any]] = []
     correct_count = 0
-    sample_index = 0
-
+    evaluated = 0
+    global_index = 0
     progress = tqdm(
-        total=total_target,
+        total=end_index - start_index,
         desc=f"HF LLaVA {args.method}",
     )
 
+    stop = False
     for batch in loader:
         for image in extract_images_from_batch(batch):
-            if sample_index >= total_target:
+            if global_index < start_index:
+                global_index += 1
+                continue
+            if global_index >= end_index:
+                stop = True
                 break
 
-            prompt = prompts[sample_index]
-            gold = norm_gold(answers[sample_index])
-
+            prompt = prompts[global_index]
+            gold = norm_gold(answers[global_index])
             inputs = processor(
                 text=prompt,
                 images=image,
                 padding="max_length",
                 return_tensors="pt",
                 max_length=77,
-            )
-            inputs = inputs.to(args.device)
-
+            ).to(args.device)
             if "pixel_values" in inputs:
                 inputs["pixel_values"] = inputs["pixel_values"].to(
                     device=args.device,
@@ -1025,7 +1160,6 @@ def evaluate(
                 )
 
             prompt_length = int(inputs["input_ids"].shape[-1])
-
             probe_generation: Optional[str] = None
             probe_confidence: Optional[float] = None
             rounded_confidence: Optional[float] = None
@@ -1040,14 +1174,11 @@ def evaluate(
                     model=model,
                     inputs=inputs,
                     controller=controller,
+                    tracer=tracer,
                     weight=1.0,
                     max_new_tokens=args.max_new_tokens,
                 )
-                probe_generation = decode_generated(
-                    processor,
-                    probe_output,
-                    prompt_length,
-                )
+                probe_generation = decode_generated(processor, probe_output, prompt_length)
                 probe_confidence = first_step_confidence(probe_output)
                 rounded_confidence = float(np.round(probe_confidence, 2))
                 selected_weight = (
@@ -1062,15 +1193,11 @@ def evaluate(
                 model=model,
                 inputs=inputs,
                 controller=controller,
+                tracer=tracer,
                 weight=selected_weight,
                 max_new_tokens=args.max_new_tokens,
             )
-
-            generation = decode_generated(
-                processor,
-                final_output,
-                prompt_length,
-            )
+            generation = decode_generated(processor, final_output, prompt_length)
             final_confidence = first_step_confidence(final_output)
             correct = is_correct(gold, generation)
             correct_count += int(correct)
@@ -1080,65 +1207,81 @@ def evaluate(
                 rounded_confidence = float(np.round(final_confidence, 2))
 
             record: Dict[str, Any] = {
-                "sid": sample_index,
+                "sid": global_index,
                 "prompt": prompt,
                 "gold": gold,
                 "method": args.method,
-                "selected_weight": selected_weight,
+                "selected_weight": float(selected_weight),
                 "generation": generation,
-                "correct": correct,
-                "first_step_confidence": final_confidence,
+                "correct": bool(correct),
+                "first_step_confidence": float(final_confidence),
                 "probe_generation": probe_generation,
                 "probe_confidence": probe_confidence,
                 "rounded_probe_confidence": rounded_confidence,
-                "probe_diagnostics": (
-                    vars(probe_diag) if probe_diag is not None else None
-                ),
-                "final_diagnostics": vars(final_diag),
+                "probe_diagnostics": asdict(probe_diag) if probe_diag is not None else None,
+                "final_diagnostics": asdict(final_diag),
             }
             records.append(record)
 
-            if sample_index < args.print_first:
-                print("\n" + "-" * 100)
-                print(f"[SID {sample_index}] gold={gold!r}")
+            if evaluated < args.print_first:
+                print("\n" + "-" * 100, flush=True)
+                print(f"[SID {global_index}] gold={gold!r}", flush=True)
                 if args.method == "adapt_vis":
                     print(
                         f"probe={probe_generation!r} "
                         f"conf={probe_confidence:.6f} "
-                        f"rounded={rounded_confidence:.2f}"
+                        f"rounded={rounded_confidence:.2f}",
+                        flush=True,
                     )
                 print(
                     f"selected_weight={selected_weight} "
-                    f"pred={generation!r} correct={correct}"
+                    f"pred={generation!r} correct={correct}",
+                    flush=True,
                 )
                 print(
                     "image tokens="
                     f"{final_diag.image_token_count}, "
-                    f"range=[{final_diag.image_start},"
-                    f"{final_diag.image_end}), "
+                    f"range=[{final_diag.image_start},{final_diag.image_end}), "
                     f"merged_len={final_diag.merged_sequence_length}, "
-                    f"modified_calls={final_diag.modified_calls}"
+                    f"modified_calls={final_diag.modified_calls}",
+                    flush=True,
                 )
+                if args.trace_rmsnorm:
+                    print("[probe / unscaled]", flush=True)
+                    brief_trace_print(
+                        probe_diag.rmsnorm_trace if probe_diag is not None else None
+                    )
+                    print("[final / selected weight]", flush=True)
+                    brief_trace_print(final_diag.rmsnorm_trace)
 
-            sample_index += 1
+            evaluated += 1
+            global_index += 1
             progress.update(1)
 
-        if sample_index >= total_target:
+        if stop:
             break
 
     progress.close()
-
-    accuracy = correct_count / max(sample_index, 1)
-    low_branch_count = sum(
-        int(r["selected_weight"] == float(args.weight1))
-        for r in records
-    ) if args.method == "adapt_vis" else None
-    high_branch_count = sum(
-        int(r["selected_weight"] == float(args.weight2))
-        for r in records
-    ) if args.method == "adapt_vis" else None
+    accuracy = correct_count / max(evaluated, 1)
+    low_branch_count = (
+        sum(
+            int(record["selected_weight"] == float(args.weight1))
+            for record in records
+        )
+        if args.method == "adapt_vis"
+        else None
+    )
+    high_branch_count = (
+        sum(
+            int(record["selected_weight"] == float(args.weight2))
+            for record in records
+        )
+        if args.method == "adapt_vis"
+        else None
+    )
 
     summary = {
+        "args": vars(args),
         "model": args.model,
         "revision": args.revision,
         "transformers_version": transformers.__version__,
@@ -1146,19 +1289,11 @@ def evaluate(
         "option": args.option,
         "implementation": "transformers.LlavaForConditionalGeneration",
         "language_model_implementation": "transformers.LlamaForCausalLM",
-        "checkpoint_rms_norm_eps": getattr(
-            model, "_rmsnorm_checkpoint_eps", None
-        ),
+        "checkpoint_rms_norm_eps": getattr(model, "_rmsnorm_checkpoint_eps", None),
         "requested_rms_norm_eps": float(args.rms_norm_eps),
-        "rmsnorm_module_count": getattr(
-            model, "_rmsnorm_ablation_count", None
-        ),
-        "rmsnorm_eps_before_override": getattr(
-            model, "_rmsnorm_ablation_before", None
-        ),
-        "active_rms_norm_eps": float(
-            model.language_model.config.rms_norm_eps
-        ),
+        "rmsnorm_module_count": getattr(model, "_rmsnorm_ablation_count", None),
+        "rmsnorm_eps_before_override": getattr(model, "_rmsnorm_ablation_before", None),
+        "active_rms_norm_eps": float(model.language_model.config.rms_norm_eps),
         "method": args.method,
         "weight": args.weight,
         "weight1": args.weight1,
@@ -1168,11 +1303,13 @@ def evaluate(
         "max_layers": args.max_layers,
         "intervention": (
             "prefill only; final query to merged image-token keys; "
-            "raw QK logits multiplied before mask and softmax"
+            "raw QK logits multiplied before causal mask and softmax"
         ),
         "dtype_argument": args.dtype,
         "model_parameter_dtype": str(model_dtype),
-        "num_samples": sample_index,
+        "start_index": start_index,
+        "end_index": end_index,
+        "num_samples": evaluated,
         "num_correct": correct_count,
         "accuracy": accuracy,
         "low_branch_count": low_branch_count,
@@ -1180,20 +1317,21 @@ def evaluate(
         "records": records,
     }
 
-    print("\n" + "=" * 100)
+    print("\n" + "=" * 100, flush=True)
     print(
-        f"RESULT: {correct_count}/{sample_index} "
+        f"RESULT: {correct_count}/{evaluated} "
         f"accuracy={accuracy:.6f} "
         f"rms_norm_eps={args.rms_norm_eps:g} "
-        f"method={args.method}"
+        f"method={args.method}",
+        flush=True,
     )
     if args.method == "adapt_vis":
         print(
             f"branches: weight1({args.weight1})={low_branch_count}, "
-            f"weight2({args.weight2})={high_branch_count}"
+            f"weight2({args.weight2})={high_branch_count}",
+            flush=True,
         )
-    print("=" * 100)
-
+    print("=" * 100, flush=True)
     return summary
 
 
@@ -1203,15 +1341,14 @@ def default_output_path(args: argparse.Namespace) -> Path:
         method_suffix += f"_w{args.weight:g}"
     elif args.method == "adapt_vis":
         method_suffix += (
-            f"_w1_{args.weight1:g}_w2_{args.weight2:g}"
-            f"_thr_{args.threshold:g}"
+            f"_w1_{args.weight1:g}_w2_{args.weight2:g}_thr_{args.threshold:g}"
         )
-
     eps_suffix = f"{args.rms_norm_eps:.0e}".replace("-", "m")
+    trace_suffix = "_rms_trace" if args.trace_rmsnorm else ""
     return Path(
         "output/"
-        f"hf_llava15_{args.dataset}_"
-        f"rms_eps_{eps_suffix}_{method_suffix}.json"
+        f"hf_llava15_{args.dataset}_rms_eps_{eps_suffix}_"
+        f"{method_suffix}{trace_suffix}.json"
     )
 
 
@@ -1220,23 +1357,20 @@ def main() -> None:
     seed_all(args.seed)
 
     if args.device.startswith("cuda") and not torch.cuda.is_available():
-        raise RuntimeError(
-            "CUDA was requested but torch.cuda.is_available() is False."
-        )
+        raise RuntimeError("CUDA was requested but torch.cuda.is_available() is False.")
+    if args.rms_norm_eps <= 0:
+        raise ValueError("--rms-norm-eps must be positive.")
+    if args.max_layers <= 0:
+        raise ValueError("--max-layers must be positive.")
 
-    model, processor, _, controller = load_hf_model(args)
-    summary = evaluate(args, model, processor, controller)
+    model, processor, _, controller, tracer = load_hf_model(args)
+    summary = evaluate(args, model, processor, controller, tracer)
 
-    output_path = (
-        Path(args.output)
-        if args.output
-        else default_output_path(args)
-    )
+    output_path = Path(args.output) if args.output else default_output_path(args)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as file:
         json.dump(summary, file, ensure_ascii=False, indent=2)
-
-    print(f"Saved results to: {output_path}")
+    print(f"Saved results to: {output_path}", flush=True)
 
 
 if __name__ == "__main__":
