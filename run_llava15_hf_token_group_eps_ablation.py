@@ -1,55 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-HF LLaVA-1.5 last-query-only RMSNorm-epsilon control.
+HF LLaVA-1.5 token-group RMSNorm-epsilon ablation.
 
-The model is loaded with the checkpoint's original LlavaConfig and text_config.
-No custom LLaMAConfig is constructed and no text-config fields are replaced.
-After from_pretrained finishes, this script changes only:
+The base epsilon is set globally exactly as in the original RMSNorm-epsilon
+ablation. Optionally, during the *initial multimodal prefill only*, a selected
+token group is recomputed with a target epsilon while every other token stays
+on the base-epsilon forward path.
 
-    LlamaRMSNorm.variance_epsilon
+This isolates which prefill token populations carry the epsilon-sensitive
+signal. It does not modify the attention intervention, routing rule, model
+weights, prompts, or decode-time q_len=1 RMSNorm calls.
 
-It also mirrors the value into:
+Token groups:
+  - all: every prefill position (sanity control; should approach full-epsilon
+    behaviour if decode-time epsilon is not material).
+  - image: only the merged 576 image tokens.
+  - text: all non-image valid prompt tokens, including the final query token.
+  - text_prefix: text tokens except the final valid prompt/query token.
+  - last_query: only the final valid prompt/query token.
+  - image_plus_last_query: image tokens plus final query token.
+  - image_plus_text_prefix: all image tokens plus prior text tokens, but not
+    the final query token.
 
-    model.language_model.config.rms_norm_eps
-    model.config.text_config.rms_norm_eps
-
-Those config assignments are for consistency/logging; the actual computation is
-controlled by each LlamaRMSNorm module's variance_epsilon attribute.
-
-Methods:
-  - base: native HF model.generate; no attention patch is installed.
-  - scaling_vis/adapt_vis: native HF LLaVA merge and generation are retained,
-    while the existing pre-softmax AdaptVis intervention is installed in eager
-    HF LLaMA attention.
-
-Examples
---------
-Checkpoint epsilon (normally 1e-5) + HF AdaptVis:
-
-python3 run_llava15_hf_last_query_eps_ablation.py \
-  --dataset Controlled_Images_A \
-  --rms-norm-eps 1e-5 \
-  --method adapt_vis \
-  --weight1 0.5 \
-  --weight2 1.5 \
-  --threshold 0.4 \
-  --device cuda \
-  --dtype float32 \
-  --download
-
-Only change RMSNorm epsilon to 1e-6:
-
-python3 run_llava15_hf_last_query_eps_ablation.py \
-  --dataset Controlled_Images_A \
-  --rms-norm-eps 1e-6 \
-  --method adapt_vis \
-  --weight1 0.5 \
-  --weight2 1.5 \
-  --threshold 0.4 \
-  --device cuda \
-  --dtype float32 \
-  --download
+The group override can be restricted to a layer interval and RMSNorm sites for
+hierarchical localization after the first token-group sweep.
 """
 
 from __future__ import annotations
@@ -58,6 +33,7 @@ import argparse
 import json
 import math
 import random
+import re
 import types
 from dataclasses import dataclass
 from pathlib import Path
@@ -122,15 +98,49 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--last-query-rms-norm-eps",
+        "--target-rms-norm-eps",
         default=None,
         type=float,
         help=(
-            "Optional epsilon used only for the final token of the initial "
-            "multimodal prefill at every LlamaRMSNorm. All other tokens and "
-            "all decode-time tokens keep --rms-norm-eps. Use this only as a "
-            "causal diagnostic, e.g. base --rms-norm-eps 1e-5 plus "
-            "--last-query-rms-norm-eps 1e-6."
+            "Optional target epsilon used only for --target-token-group during "
+            "the initial multimodal prefill. All other tokens and all decode "
+            "q_len=1 calls remain at --rms-norm-eps."
+        ),
+    )
+    parser.add_argument(
+        "--target-token-group",
+        default="last_query",
+        choices=[
+            "all",
+            "image",
+            "text",
+            "text_prefix",
+            "last_query",
+            "image_plus_last_query",
+            "image_plus_text_prefix",
+        ],
+        help=(
+            "Prefill token group recomputed with --target-rms-norm-eps. "
+            "Use all first as a sanity control, then image / text_prefix / "
+            "image_plus_last_query to localize the effect."
+        ),
+    )
+    parser.add_argument(
+        "--target-layer-range",
+        default="0:32",
+        help=(
+            "Decoder-layer interval [start,end) whose input/post-attention "
+            "RMSNorm modules are eligible for the group override. Examples: "
+            "0:32, 0:4, 4:8. model.norm is controlled separately by "
+            "--target-norm-sites."
+        ),
+    )
+    parser.add_argument(
+        "--target-norm-sites",
+        default="all",
+        help=(
+            "Comma-separated RMSNorm sites to target: all, input, post_attn, "
+            "final; e.g. input,post_attn or input."
         ),
     )
     parser.add_argument(
@@ -268,7 +278,8 @@ def set_llama_rmsnorm_epsilon(
 class GenerationDiagnostics:
     requested_weight: float
     modified_calls: int
-    last_query_norm_calls: int
+    target_group_norm_module_calls: int
+    target_group_norm_token_positions: int
     image_token_count: int
     merged_sequence_length: int
     image_start: Optional[int]
@@ -277,8 +288,8 @@ class GenerationDiagnostics:
 
 class HFAdaptVisController:
     """
-    Runtime state shared by the patched native HF LLaVA merge and HF LLaMA
-    attention modules.
+    Runtime state shared by the native HF LLaVA merge, group RMSNorm override,
+    and HF LLaMA attention modules.
     """
 
     def __init__(self, max_layers: int = 32) -> None:
@@ -286,16 +297,20 @@ class HFAdaptVisController:
         self.enabled = False
         self.weight = 1.0
         self.image_mask: Optional[torch.Tensor] = None
+        self.valid_mask: Optional[torch.Tensor] = None
         self.modified_calls = 0
-        self.last_query_norm_calls = 0
+        self.target_group_norm_module_calls = 0
+        self.target_group_norm_token_positions = 0
         self.merged_sequence_length = 0
 
     def begin_generation(self, weight: float) -> None:
         self.weight = float(weight)
         self.enabled = self.weight != 1.0
         self.image_mask = None
+        self.valid_mask = None
         self.modified_calls = 0
-        self.last_query_norm_calls = 0
+        self.target_group_norm_module_calls = 0
+        self.target_group_norm_token_positions = 0
         self.merged_sequence_length = 0
 
     def finish_generation(self) -> GenerationDiagnostics:
@@ -313,7 +328,8 @@ class HFAdaptVisController:
         result = GenerationDiagnostics(
             requested_weight=float(self.weight),
             modified_calls=int(self.modified_calls),
-            last_query_norm_calls=int(self.last_query_norm_calls),
+            target_group_norm_module_calls=int(self.target_group_norm_module_calls),
+            target_group_norm_token_positions=int(self.target_group_norm_token_positions),
             image_token_count=count,
             merged_sequence_length=int(self.merged_sequence_length),
             image_start=start,
@@ -431,6 +447,13 @@ def install_merge_capture(
             num_image_patches=int(image_features.shape[1]),
         )
         controller.image_mask = mask.to(final_embedding.device)
+        # HF merge returns final_attention_mask as the second tuple item.
+        # It excludes right/left padding after multimodal expansion.
+        final_attention_mask = outputs[1]
+        controller.valid_mask = final_attention_mask.to(
+            device=final_embedding.device,
+            dtype=torch.bool,
+        )
         controller.merged_sequence_length = int(final_embedding.shape[1])
         return outputs
 
@@ -441,43 +464,167 @@ def install_merge_capture(
 
 
 
-def install_last_query_rmsnorm_override(
+def parse_layer_range(spec: str, total_layers: int) -> Tuple[int, int]:
+    match = re.fullmatch(r"\s*(\d+)\s*:\s*(\d+)\s*", str(spec))
+    if match is None:
+        raise ValueError(
+            "--target-layer-range must use start:end, e.g. 0:4 or 0:32; "
+            f"got {spec!r}."
+        )
+    start, end = int(match.group(1)), int(match.group(2))
+    if not (0 <= start <= end <= total_layers):
+        raise ValueError(
+            f"Invalid --target-layer-range {spec!r} for {total_layers} layers."
+        )
+    return start, end
+
+
+def parse_norm_sites(spec: str) -> set[str]:
+    allowed = {"input", "post_attn", "final"}
+    requested = {part.strip() for part in str(spec).split(",") if part.strip()}
+    if not requested or requested == {"all"}:
+        return set(allowed)
+    if "all" in requested or not requested.issubset(allowed):
+        raise ValueError(
+            "--target-norm-sites accepts all or a comma-separated subset of "
+            "input,post_attn,final; got "
+            f"{spec!r}."
+        )
+    return requested
+
+
+def rmsnorm_site_from_name(module_name: str) -> Tuple[Optional[int], str]:
+    if module_name == "model.norm":
+        return None, "final"
+    match = re.fullmatch(
+        r"model\.layers\.(\d+)\.(input_layernorm|post_attention_layernorm)",
+        module_name,
+    )
+    if match is None:
+        return None, "unknown"
+    layer_index = int(match.group(1))
+    site = "input" if match.group(2) == "input_layernorm" else "post_attn"
+    return layer_index, site
+
+
+def make_last_valid_mask(valid_mask: torch.Tensor) -> torch.Tensor:
+    """Return [B,T] with one True position: the final valid prefill token."""
+    batch_size, q_len = valid_mask.shape
+    positions = torch.arange(q_len, device=valid_mask.device).view(1, -1)
+    positions = positions.expand(batch_size, -1)
+    last_indices = positions.masked_fill(~valid_mask, -1).max(dim=1).values
+    if torch.any(last_indices < 0):
+        raise RuntimeError("Could not locate final valid text/query token.")
+    result = torch.zeros_like(valid_mask, dtype=torch.bool)
+    result.scatter_(1, last_indices[:, None], True)
+    return result
+
+
+def select_target_token_mask(
+    *,
+    hidden_states: torch.Tensor,
+    controller: HFAdaptVisController,
+    token_group: str,
+) -> torch.Tensor:
+    """Build a [B,T] target mask for one initial multimodal prefill call."""
+    batch_size, q_len, _ = hidden_states.shape
+    device = hidden_states.device
+
+    image_mask = controller.image_mask
+    if (
+        image_mask is None
+        or image_mask.ndim != 2
+        or image_mask.shape[-1] != q_len
+    ):
+        raise RuntimeError(
+            "Token-group RMSNorm override requires the merged image mask. "
+            "The LLaVA merge capture did not match this prefill call."
+        )
+    image_mask = image_mask.to(device=device, dtype=torch.bool)
+    if image_mask.shape[0] == 1 and batch_size > 1:
+        image_mask = image_mask.expand(batch_size, -1)
+    if image_mask.shape[0] != batch_size:
+        raise RuntimeError(
+            "Image-mask batch dimension mismatch: "
+            f"mask={tuple(image_mask.shape)}, states={tuple(hidden_states.shape)}."
+        )
+
+    valid_mask = controller.valid_mask
+    if valid_mask is None or tuple(valid_mask.shape) != (batch_size, q_len):
+        valid_mask = torch.ones(batch_size, q_len, device=device, dtype=torch.bool)
+    else:
+        valid_mask = valid_mask.to(device=device, dtype=torch.bool)
+
+    # `all` deliberately includes padded positions, matching the true global
+    # epsilon override as closely as possible. All other groups exclude pads.
+    if token_group == "all":
+        return torch.ones(batch_size, q_len, device=device, dtype=torch.bool)
+
+    text_mask = valid_mask & ~image_mask
+    last_query_mask = make_last_valid_mask(text_mask)
+    text_prefix_mask = text_mask & ~last_query_mask
+
+    if token_group == "image":
+        return image_mask & valid_mask
+    if token_group == "text":
+        return text_mask
+    if token_group == "text_prefix":
+        return text_prefix_mask
+    if token_group == "last_query":
+        return last_query_mask
+    if token_group == "image_plus_last_query":
+        return (image_mask & valid_mask) | last_query_mask
+    if token_group == "image_plus_text_prefix":
+        return (image_mask & valid_mask) | text_prefix_mask
+
+    raise ValueError(f"Unknown target token group: {token_group!r}")
+
+
+def install_token_group_rmsnorm_override(
     model: LlavaForConditionalGeneration,
     controller: HFAdaptVisController,
     target_epsilon: Optional[float],
+    token_group: str,
+    layer_range: Tuple[int, int],
+    norm_sites: set[str],
 ) -> int:
     """
-    Keep every LlamaRMSNorm module at its configured base epsilon, but replace
-    the RMSNorm output for the final token of the *initial multimodal prefill*
-    with the output obtained using target_epsilon.
-
-    All preceding text tokens, all image tokens, and all decode-time q_len=1
-    tokens stay bit-for-bit on the original module forward path. The final
-    prompt token is the same token whose image-key logits are changed by
-    AdaptVis in the initial prefill.
+    Keep every LlamaRMSNorm module at its configured base epsilon. During only
+    the initial multimodal prefill, recompute a chosen token group with
+    target_epsilon at selected RMSNorm modules. Every unselected token stays on
+    the exact original module-forward path; q_len=1 decode calls are untouched.
     """
     if target_epsilon is None:
         return 0
-
     target_epsilon = float(target_epsilon)
     if target_epsilon <= 0.0:
         raise ValueError(
-            "--last-query-rms-norm-eps must be positive, got "
+            "--target-rms-norm-eps must be positive, got "
             f"{target_epsilon}."
         )
 
+    start_layer, end_layer = layer_range
     patched = 0
     for module_name, module in model.language_model.named_modules():
         if not isinstance(module, LlamaRMSNorm):
             continue
 
+        layer_index, site = rmsnorm_site_from_name(module_name)
+        if site not in norm_sites:
+            continue
+        if site != "final" and (
+            layer_index is None
+            or layer_index < start_layer
+            or layer_index >= end_layer
+        ):
+            continue
+
         original_forward = module.forward
 
-        def make_forward(original, name):
+        def make_forward(original, display_name):
             def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-                # The LLaVA merge wrapper has already recorded the expanded
-                # multimodal sequence length when the language model receives
-                # its first prefill tensor. Do not touch later decode steps.
+                # Only initial multimodal prefill. The normal decode path with
+                # q_len=1 is intentionally unchanged.
                 if (
                     hidden_states.ndim != 3
                     or hidden_states.shape[1] <= 1
@@ -485,45 +632,59 @@ def install_last_query_rmsnorm_override(
                 ):
                     return original(hidden_states)
 
-                # First compute the genuine base-epsilon output for every
-                # position. This leaves all non-final tokens on the exact
-                # native forward path.
                 output = original(hidden_states)
+                target_mask = select_target_token_mask(
+                    hidden_states=hidden_states,
+                    controller=controller,
+                    token_group=token_group,
+                )
+                if not bool(target_mask.any().item()):
+                    return output
 
-                # Replace only [:, -1, :] with the target-epsilon formula.
-                # This matches HF LlamaRMSNorm's arithmetic for that position.
+                # This exactly matches HF LlamaRMSNorm arithmetic for the
+                # selected positions, but uses target_epsilon only there.
                 input_dtype = hidden_states.dtype
-                last_hidden = hidden_states[:, -1:, :].to(torch.float32)
-                variance = last_hidden.pow(2).mean(-1, keepdim=True)
-                last_output = last_hidden * torch.rsqrt(
+                states_fp32 = hidden_states.to(torch.float32)
+                variance = states_fp32.pow(2).mean(-1, keepdim=True)
+                target_output = states_fp32 * torch.rsqrt(
                     variance + target_epsilon
                 )
-                last_output = self.weight * last_output.to(input_dtype)
+                target_output = self.weight * target_output.to(input_dtype)
 
-                # Avoid in-place modification of a tensor retained elsewhere
-                # by autograd/generation internals.
                 output = output.clone()
-                output[:, -1:, :] = last_output
-                controller.last_query_norm_calls += 1
+                expanded_mask = target_mask.unsqueeze(-1).expand_as(output)
+                output = torch.where(expanded_mask, target_output, output)
+                controller.target_group_norm_module_calls += 1
+                controller.target_group_norm_token_positions += int(
+                    target_mask.sum().item()
+                )
                 return output
 
             return forward
 
-        module.forward = types.MethodType(make_forward(original_forward, module_name), module)
+        module.forward = types.MethodType(
+            make_forward(original_forward, module_name),
+            module,
+        )
         patched += 1
 
     if patched == 0:
-        raise RuntimeError("No HF LlamaRMSNorm modules were found to patch.")
+        raise RuntimeError(
+            "No RMSNorm modules matched --target-layer-range and "
+            "--target-norm-sites."
+        )
 
     print(
-        "Installed last-query-only RMSNorm override: "
-        f"{patched} modules; target epsilon={target_epsilon:g}."
+        "Installed token-group RMSNorm override: "
+        f"modules={patched}; group={token_group}; target_eps={target_epsilon:g}; "
+        f"layers=[{start_layer},{end_layer}); sites={sorted(norm_sites)}."
     )
     print(
-        "All other tokens and all decode-time q_len=1 calls retain "
+        "All unselected tokens and all decode-time q_len=1 calls retain "
         "--rms-norm-eps exactly."
     )
     return patched
+
 
 def install_hf_adaptvis_attention(
     model: LlavaForConditionalGeneration,
@@ -859,10 +1020,10 @@ def load_hf_model(
     checkpoint_rms_norm_eps = float(llava_config.text_config.rms_norm_eps)
     print("Checkpoint text_config.rms_norm_eps:", checkpoint_rms_norm_eps)
     print("Requested base RMSNorm epsilon:", float(args.rms_norm_eps))
-    print(
-        "Requested last-query-only RMSNorm epsilon:",
-        args.last_query_rms_norm_eps,
-    )
+    print("Requested target-group RMSNorm epsilon:", args.target_rms_norm_eps)
+    print("Requested target token group:", args.target_token_group)
+    print("Requested target layer range:", args.target_layer_range)
+    print("Requested target norm sites:", args.target_norm_sites)
 
     # The HF eager implementation is required only for pre-softmax AdaptVis.
     # Both epsilon groups use the same attention implementation.
@@ -927,15 +1088,26 @@ def load_hf_model(
     )
 
     controller = HFAdaptVisController(max_layers=args.max_layers)
-    if args.method != "base" or args.last_query_rms_norm_eps is not None:
+    target_layer_range = parse_layer_range(
+        args.target_layer_range,
+        total_layers=len(model.language_model.model.layers),
+    )
+    target_norm_sites = parse_norm_sites(args.target_norm_sites)
+    if args.method != "base" or args.target_rms_norm_eps is not None:
         install_merge_capture(model, controller)
-    last_query_norm_module_count = install_last_query_rmsnorm_override(
+    target_group_norm_module_count = install_token_group_rmsnorm_override(
         model,
         controller,
-        args.last_query_rms_norm_eps,
+        args.target_rms_norm_eps,
+        args.target_token_group,
+        target_layer_range,
+        target_norm_sites,
     )
-    model._last_query_rmsnorm_eps = args.last_query_rms_norm_eps
-    model._last_query_rmsnorm_module_count = last_query_norm_module_count
+    model._target_group_rmsnorm_eps = args.target_rms_norm_eps
+    model._target_group_name = args.target_token_group
+    model._target_group_layer_range = target_layer_range
+    model._target_group_norm_sites = sorted(target_norm_sites)
+    model._target_group_rmsnorm_module_count = target_group_norm_module_count
     if args.method != "base":
         install_hf_adaptvis_attention(model, controller)
 
@@ -954,8 +1126,14 @@ def load_hf_model(
     print(f"  first parameter dtype: {next(model.parameters()).dtype}")
     print(f"  AdaptVis layers: [0, {controller.max_layers})")
     print(
-        "  last-query RMSNorm target epsilon: "
-        f"{getattr(model, '_last_query_rmsnorm_eps', None)}"
+        "  token-group RMSNorm target epsilon: "
+        f"{getattr(model, '_target_group_rmsnorm_eps', None)}"
+    )
+    print(
+        "  token group / layers / sites: "
+        f"{getattr(model, '_target_group_name', None)} / "
+        f"{getattr(model, '_target_group_layer_range', None)} / "
+        f"{getattr(model, '_target_group_norm_sites', None)}"
     )
     print(f"  generation pad token: {model.generation_config.pad_token_id}")
     print(f"  generation bos token: {model.generation_config.bos_token_id}")
@@ -1212,7 +1390,10 @@ def evaluate(
                     f"{final_diag.image_end}), "
                     f"merged_len={final_diag.merged_sequence_length}, "
                     f"modified_calls={final_diag.modified_calls}, "
-                    f"last_query_norm_calls={final_diag.last_query_norm_calls}"
+                    f"target_group_norm_module_calls="
+                    f"{final_diag.target_group_norm_module_calls}, "
+                    f"target_group_norm_token_positions="
+                    f"{final_diag.target_group_norm_token_positions}"
                 )
 
             sample_index += 1
@@ -1259,14 +1440,17 @@ def evaluate(
         "active_rms_norm_eps": float(
             model.language_model.config.rms_norm_eps
         ),
-        "last_query_rms_norm_eps": getattr(
+        "target_rms_norm_eps": getattr(
             model,
-            "_last_query_rmsnorm_eps",
+            "_target_group_rmsnorm_eps",
             None,
         ),
-        "last_query_rmsnorm_module_count": getattr(
+        "target_token_group": getattr(model, "_target_group_name", None),
+        "target_layer_range": getattr(model, "_target_group_layer_range", None),
+        "target_norm_sites": getattr(model, "_target_group_norm_sites", None),
+        "target_rmsnorm_module_count": getattr(
             model,
-            "_last_query_rmsnorm_module_count",
+            "_target_group_rmsnorm_module_count",
             0,
         ),
         "method": args.method,
@@ -1295,7 +1479,8 @@ def evaluate(
         f"RESULT: {correct_count}/{sample_index} "
         f"accuracy={accuracy:.6f} "
         f"base_rms_norm_eps={args.rms_norm_eps:g} "
-        f"last_query_rms_norm_eps={args.last_query_rms_norm_eps} "
+        f"target_rms_norm_eps={args.target_rms_norm_eps} "
+        f"target_group={args.target_token_group} "
         f"method={args.method}"
     )
     if args.method == "adapt_vis":
@@ -1319,9 +1504,14 @@ def default_output_path(args: argparse.Namespace) -> Path:
 
     base_eps_suffix = f"{args.rms_norm_eps:.0e}".replace("-", "m")
     suffix = f"rms_base_{base_eps_suffix}"
-    if args.last_query_rms_norm_eps is not None:
-        last_eps_suffix = f"{args.last_query_rms_norm_eps:.0e}".replace("-", "m")
-        suffix += f"_lastq_{last_eps_suffix}"
+    if args.target_rms_norm_eps is not None:
+        target_eps_suffix = f"{args.target_rms_norm_eps:.0e}".replace("-", "m")
+        layer_suffix = args.target_layer_range.replace(":", "to")
+        sites_suffix = args.target_norm_sites.replace(",", "-")
+        suffix += (
+            f"_target_{target_eps_suffix}_{args.target_token_group}"
+            f"_layers{layer_suffix}_sites{sites_suffix}"
+        )
     return Path(
         "output/"
         f"hf_llava15_{args.dataset}_"
