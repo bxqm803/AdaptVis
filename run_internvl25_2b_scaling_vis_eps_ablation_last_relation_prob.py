@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-InternVL2.5-2B fixed-weight AdaptVis-style epsilon ablation with restricted four-way first-token probabilities.
+InternVL2.5-2B fixed-weight AdaptVis-style epsilon ablation with last-relation-token restricted probabilities.
 
 This runner evaluates OpenGVLab/InternVL2_5-2B on the repository's Controlled
 Images A/B tasks. It keeps the model's native visual pipeline:
@@ -18,10 +18,12 @@ variance_epsilon inside the language decoder.
 There is deliberately no adaptive gate in this runner. It is for the direct
 comparison requested here: fixed weight=0.5 across an epsilon sweep.
 
-In addition to the original full-vocabulary first-token maximum probability,
-the runner records a restricted four-way probability over the single-token
-candidates ``left``, ``right``, ``under``, and ``on`` at the same first
-answer position. The four restricted probabilities sum to one.
+The runner records the logits at the generation step that emits the final
+relation token in the natural-language answer (the last generated occurrence
+of ``left``, ``right``, ``under``, or ``on``). It then applies a restricted
+four-way softmax over those single-token candidates. The four probabilities
+sum to one. This avoids treating the sentence opener (often ``The``) as the
+relation-decision position.
 
 Run from the AdaptVis repository root, where dataset_zoo.py and prompts/ exist.
 """
@@ -75,29 +77,38 @@ class GenerationDiagnostics:
 
 
 @dataclass
-class FirstStepProbabilityDiagnostics:
-    """First-token statistics plus a restricted four-way relation distribution."""
+class LastRelationProbabilityDiagnostics:
+    """Four-way relation probabilities at the final relation-token generation step."""
 
-    top_token_id: int
-    top_token_text: str
-    top_token_probability: float
-    top5: List[Dict[str, Any]]
     relation_token_ids: Dict[str, int]
     relation_token_texts: Dict[str, str]
-    relation_logits: Dict[str, float]
-    relation_probabilities: Dict[str, float]
-    relation_prediction: str
-    relation_confidence: float
+    generated_token_ids: List[int]
+    generated_token_texts: List[str]
+    generated_text_from_token_ids: str
+    relation_generated_positions: List[int]
+    relation_generated_labels: List[str]
+    selected_relation_position: Optional[int]
+    selected_relation_label: Optional[str]
+    selected_relation_token_id: Optional[int]
+    selected_relation_token_text: Optional[str]
+    selected_step_top_token_id: Optional[int]
+    selected_step_top_token_text: Optional[str]
+    selected_step_top_token_probability: Optional[float]
+    selected_step_top5: List[Dict[str, Any]]
+    relation_logits: Optional[Dict[str, float]]
+    relation_probabilities: Optional[Dict[str, float]]
+    relation_prediction: Optional[str]
+    relation_confidence: Optional[float]
 
 
-class FirstStepLogitCapture:
+class RelationStepLogitCapture:
     """
-    Read-only hook on the language-model output head.
+    Read-only capture of every decoder output distribution during natural generation.
 
-    During generation, the first language-model forward is the multimodal
-    prefill. Its final sequence position is exactly the distribution used to
-    select the first generated token. Capturing this tensor does not alter
-    generation, attention, or decoding.
+    Index i in ``step_logits`` is the distribution that generated token i in
+    ``generated_token_ids``: prefill supplies i=0, and each cached decoding step
+    supplies the next index. The selected relation position is the last generated
+    token whose id matches a single-token relation candidate.
     """
 
     RELATION_CANDIDATES: Tuple[str, ...] = ("left", "right", "under", "on")
@@ -106,8 +117,10 @@ class FirstStepLogitCapture:
         self.language_model = language_model
         self.tokenizer = tokenizer
         self.active = False
-        self.first_step_logits: Optional[torch.Tensor] = None
+        self.step_logits: List[torch.Tensor] = []
+        self.generated_token_ids: Optional[List[int]] = None
         self.relation_token_ids = self._resolve_relation_token_ids()
+        self.inverse_relation_token_ids = {token_id: name for name, token_id in self.relation_token_ids.items()}
         self.output_head_name, output_head = self._resolve_output_head()
         self._handle = output_head.register_forward_hook(self._forward_hook)
 
@@ -149,7 +162,7 @@ class FirstStepLogitCapture:
             return candidates[0]
         if not candidates:
             raise RuntimeError(
-                "Could not identify the language-model output head for first-step probability capture."
+                "Could not identify the language-model output head for relation-step probability capture."
             )
         preferred = [
             pair for pair in candidates
@@ -159,47 +172,115 @@ class FirstStepLogitCapture:
             return preferred[0]
         names = [name for name, _ in candidates]
         raise RuntimeError(
-            "Ambiguous language-model output-head candidates for first-step probability capture: "
+            "Ambiguous language-model output-head candidates for relation-step probability capture: "
             f"{names}"
         )
 
     def _forward_hook(self, _module: nn.Module, _inputs: Tuple[Any, ...], output: Any) -> None:
-        if not self.active or self.first_step_logits is not None:
+        if not self.active:
             return
         logits = output[0] if isinstance(output, tuple) else output
         if not isinstance(logits, torch.Tensor):
             return
-        # The initial multimodal prefill is [B, prompt_len, vocab]. Later decode
-        # steps are [B, 1, vocab], which arrive only after this has been captured.
-        if logits.ndim == 3 and logits.shape[0] == 1 and logits.shape[1] > 1:
-            self.first_step_logits = logits[:, -1, :].detach().to(dtype=torch.float32, device="cpu")
+        if logits.ndim != 3 or logits.shape[0] != 1 or logits.shape[1] < 1:
+            return
+        # Prefill is [1, prompt_len, vocab]; cached decode is [1, 1, vocab].
+        # In both cases the final row is the next-token distribution.
+        self.step_logits.append(logits[0, -1, :].detach().to(dtype=torch.float32, device="cpu"))
 
     def begin_generation(self) -> None:
         self.active = True
-        self.first_step_logits = None
+        self.step_logits = []
+        self.generated_token_ids = None
 
-    def finish_generation(self) -> FirstStepProbabilityDiagnostics:
-        self.active = False
-        if self.first_step_logits is None:
+    def capture_generate_output(self, input_ids: torch.Tensor, output_ids: Any) -> None:
+        if not self.active:
+            return
+        sequences = getattr(output_ids, "sequences", output_ids)
+        if not isinstance(sequences, torch.Tensor) or sequences.ndim != 2 or sequences.shape[0] != 1:
             raise RuntimeError(
-                "Failed to capture the initial-prefill first-token logits. "
-                "The InternVL generation path may have changed."
+                "InternVL generate did not return a [1, sequence_length] token tensor; "
+                f"got type={type(sequences)}, shape={getattr(sequences, 'shape', None)}."
+            )
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise RuntimeError(f"Unexpected InternVL generate input_ids shape: {tuple(input_ids.shape)}")
+        prompt_len = int(input_ids.shape[1])
+        if int(sequences.shape[1]) < prompt_len:
+            raise RuntimeError(
+                "Generated sequence is shorter than the input prompt: "
+                f"sequence_len={sequences.shape[1]}, prompt_len={prompt_len}."
+            )
+        self.generated_token_ids = [int(x) for x in sequences[0, prompt_len:].detach().cpu().tolist()]
+
+    def _token_text(self, token_id: int) -> str:
+        try:
+            return str(self.tokenizer.decode([int(token_id)], skip_special_tokens=False))
+        except Exception:
+            return str(self.tokenizer.convert_ids_to_tokens(int(token_id)))
+
+    def finish_generation(self) -> LastRelationProbabilityDiagnostics:
+        self.active = False
+        if self.generated_token_ids is None:
+            raise RuntimeError(
+                "Failed to capture generated token ids from InternVL generate. "
+                "The model.chat / generate path may have changed."
+            )
+        if not self.step_logits:
+            raise RuntimeError("No decoder output logits were captured during InternVL generation.")
+
+        generated_ids = list(self.generated_token_ids)
+        # Standard greedy generation has one score distribution per generated token.
+        # Keep a hard failure rather than silently misaligning a relation position.
+        if len(self.step_logits) != len(generated_ids):
+            raise RuntimeError(
+                "Generation-logit alignment mismatch: "
+                f"captured_step_logits={len(self.step_logits)}, generated_token_ids={len(generated_ids)}."
             )
 
-        logits = self.first_step_logits[0]
-        probs = torch.softmax(logits, dim=-1)
-        top_probs, top_ids = torch.topk(probs, k=min(5, int(probs.numel())))
+        generated_token_texts = [self._token_text(token_id) for token_id in generated_ids]
+        generated_text = str(self.tokenizer.decode(generated_ids, skip_special_tokens=True))
+        relation_positions = [
+            index for index, token_id in enumerate(generated_ids)
+            if token_id in self.inverse_relation_token_ids
+        ]
+        relation_labels = [self.inverse_relation_token_ids[generated_ids[index]] for index in relation_positions]
+        relation_token_texts = {
+            name: self._token_text(token_id) for name, token_id in self.relation_token_ids.items()
+        }
 
-        def token_text(token_id: int) -> str:
-            try:
-                return str(self.tokenizer.decode([int(token_id)], skip_special_tokens=False))
-            except Exception:
-                return str(self.tokenizer.convert_ids_to_tokens(int(token_id)))
+        if not relation_positions:
+            return LastRelationProbabilityDiagnostics(
+                relation_token_ids=dict(self.relation_token_ids),
+                relation_token_texts=relation_token_texts,
+                generated_token_ids=generated_ids,
+                generated_token_texts=generated_token_texts,
+                generated_text_from_token_ids=generated_text,
+                relation_generated_positions=[],
+                relation_generated_labels=[],
+                selected_relation_position=None,
+                selected_relation_label=None,
+                selected_relation_token_id=None,
+                selected_relation_token_text=None,
+                selected_step_top_token_id=None,
+                selected_step_top_token_text=None,
+                selected_step_top_token_probability=None,
+                selected_step_top5=[],
+                relation_logits=None,
+                relation_probabilities=None,
+                relation_prediction=None,
+                relation_confidence=None,
+            )
 
-        top5 = [
+        selected_position = int(relation_positions[-1])
+        selected_token_id = int(generated_ids[selected_position])
+        selected_label = self.inverse_relation_token_ids[selected_token_id]
+        logits = self.step_logits[selected_position]
+        full_probs = torch.softmax(logits, dim=-1)
+        top_probs, top_ids = torch.topk(full_probs, k=min(5, int(full_probs.numel())))
+        selected_step_top5 = [
             {
                 "token_id": int(token_id),
-                "token": token_text(int(token_id)),
+                "token": self._token_text(int(token_id)),
                 "probability": float(prob),
             }
             for prob, token_id in zip(top_probs.tolist(), top_ids.tolist())
@@ -223,17 +304,23 @@ class FirstStepLogitCapture:
         best_index = int(torch.argmax(relation_probs_tensor).item())
         relation_prediction = ordered_candidates[best_index]
         relation_confidence = float(relation_probs_tensor[best_index].item())
-        relation_token_texts = {
-            name: token_text(self.relation_token_ids[name]) for name in ordered_candidates
-        }
 
-        return FirstStepProbabilityDiagnostics(
-            top_token_id=int(top_ids[0].item()),
-            top_token_text=token_text(int(top_ids[0].item())),
-            top_token_probability=float(top_probs[0].item()),
-            top5=top5,
+        return LastRelationProbabilityDiagnostics(
             relation_token_ids=dict(self.relation_token_ids),
             relation_token_texts=relation_token_texts,
+            generated_token_ids=generated_ids,
+            generated_token_texts=generated_token_texts,
+            generated_text_from_token_ids=generated_text,
+            relation_generated_positions=[int(x) for x in relation_positions],
+            relation_generated_labels=relation_labels,
+            selected_relation_position=selected_position,
+            selected_relation_label=selected_label,
+            selected_relation_token_id=selected_token_id,
+            selected_relation_token_text=self._token_text(selected_token_id),
+            selected_step_top_token_id=int(top_ids[0].item()),
+            selected_step_top_token_text=self._token_text(int(top_ids[0].item())),
+            selected_step_top_token_probability=float(top_probs[0].item()),
+            selected_step_top5=selected_step_top5,
             relation_logits=relation_logits,
             relation_probabilities=relation_probabilities,
             relation_prediction=relation_prediction,
@@ -308,7 +395,7 @@ class InternVLAdaptVisController:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="InternVL2.5-2B fixed-weight pre-softmax image-attention + RMSNorm-epsilon ablation with restricted four-way first-token probabilities."
+        description="InternVL2.5-2B fixed-weight pre-softmax image-attention + RMSNorm-epsilon ablation with restricted four-way probabilities at the final generated relation token."
     )
     parser.add_argument(
         "--dataset",
@@ -631,25 +718,29 @@ def get_decoder_layers(model: Any) -> Sequence[nn.Module]:
     return layers
 
 
-def install_generate_input_capture(model: Any, controller: InternVLAdaptVisController) -> None:
-    """Capture the exact native <IMG_CONTEXT> positions that model.chat passes to generate."""
+def install_generate_input_capture(
+    model: Any,
+    controller: InternVLAdaptVisController,
+    relation_step_capture: RelationStepLogitCapture,
+) -> None:
+    """Capture exact visual-token positions and generated token ids from native InternVL generate."""
     original_generate = model.generate
 
     def wrapped_generate(*args: Any, **kwargs: Any) -> Any:
         input_ids = kwargs.get("input_ids")
         if input_ids is None and args:
-            # InternVL's native chat path currently passes input_ids by keyword.
-            # This fallback keeps a clear error for future incompatible changes.
             raise RuntimeError("InternVL generate was called without keyword input_ids; cannot capture image token span.")
         if controller.active:
             context_id = getattr(model, "img_context_token_id", None)
             if context_id is None:
                 raise RuntimeError("model.img_context_token_id was not initialized before generation.")
             controller.capture_image_mask(input_ids, int(context_id))
-        return original_generate(*args, **kwargs)
+        output_ids = original_generate(*args, **kwargs)
+        if controller.active:
+            relation_step_capture.capture_generate_output(input_ids, output_ids)
+        return output_ids
 
     model.generate = wrapped_generate
-
 
 def install_eager_internlm2_adaptvis(model: Any, controller: InternVLAdaptVisController) -> None:
     """
@@ -811,7 +902,7 @@ def install_eager_internlm2_adaptvis(model: Any, controller: InternVLAdaptVisCon
 
 def load_model_and_tokenizer(
     args: argparse.Namespace,
-) -> Tuple[Any, Any, InternVLAdaptVisController, FirstStepLogitCapture]:
+) -> Tuple[Any, Any, InternVLAdaptVisController, RelationStepLogitCapture]:
     require_supported_transformers()
     dtype = resolve_dtype(args.dtype)
     print(f"transformers version: {transformers.__version__}")
@@ -838,8 +929,8 @@ def load_model_and_tokenizer(
     num_norms, rms_before, rms_after = configure_language_rmsnorm_eps(model, args.rms_norm_eps)
     decoder_layers = get_decoder_layers(model)
     controller = InternVLAdaptVisController(args.max_layers, len(decoder_layers))
-    first_step_capture = FirstStepLogitCapture(model.language_model, tokenizer)
-    install_generate_input_capture(model, controller)
+    relation_step_capture = RelationStepLogitCapture(model.language_model, tokenizer)
+    install_generate_input_capture(model, controller, relation_step_capture)
     install_eager_internlm2_adaptvis(model, controller)
 
     image_size = int(getattr(model, "config").force_image_size or getattr(model, "config").vision_config.image_size)
@@ -852,10 +943,10 @@ def load_model_and_tokenizer(
     print(f"Attention classes: {attention_classes}")
     print(f"vision input size: {image_size}; visual tokens per tile: {num_image_token}")
     print(f"model parameter dtype: {next(model.parameters()).dtype}")
-    print(f"first-step probability output head: {first_step_capture.output_head_name}")
+    print(f"relation-step probability output head: {relation_step_capture.output_head_name}")
     print(
         "restricted four-way token ids: "
-        f"{first_step_capture.relation_token_ids}"
+        f"{relation_step_capture.relation_token_ids}"
     )
 
     model._adaptvis_language_rmsnorm_count = int(num_norms)
@@ -863,7 +954,7 @@ def load_model_and_tokenizer(
     model._adaptvis_rmsnorm_after = list(rms_after)
     model._adaptvis_image_size = int(image_size)
     model._adaptvis_num_image_token = int(num_image_token)
-    return model, tokenizer, controller, first_step_capture
+    return model, tokenizer, controller, relation_step_capture
 
 
 @torch.inference_mode()
@@ -872,14 +963,14 @@ def generate_once(
     model: Any,
     tokenizer: Any,
     controller: InternVLAdaptVisController,
-    first_step_capture: FirstStepLogitCapture,
+    relation_step_capture: RelationStepLogitCapture,
     image: Image.Image,
     question: str,
     weight: float,
     max_num: int,
     use_thumbnail: bool,
     max_new_tokens: int,
-) -> Tuple[str, GenerationDiagnostics, FirstStepProbabilityDiagnostics]:
+) -> Tuple[str, GenerationDiagnostics, LastRelationProbabilityDiagnostics]:
     image_size = int(model._adaptvis_image_size)
     pixel_values = preprocess_image(
         image,
@@ -889,7 +980,7 @@ def generate_once(
     ).to(device=next(model.parameters()).device, dtype=next(model.parameters()).dtype)
 
     controller.begin_generation(weight=weight, num_image_tiles=int(pixel_values.shape[0]))
-    first_step_capture.begin_generation()
+    relation_step_capture.begin_generation()
     generation_config = {
         "num_beams": 1,
         "max_new_tokens": int(max_new_tokens),
@@ -908,8 +999,8 @@ def generate_once(
         )
     finally:
         diagnostics = controller.finish_generation()
-        first_step_prob = first_step_capture.finish_generation()
-    return str(response).strip(), diagnostics, first_step_prob
+        relation_step_prob = relation_step_capture.finish_generation()
+    return str(response).strip(), diagnostics, relation_step_prob
 
 
 @torch.inference_mode()
@@ -918,7 +1009,7 @@ def evaluate(
     model: Any,
     tokenizer: Any,
     controller: InternVLAdaptVisController,
-    first_step_capture: FirstStepLogitCapture,
+    relation_step_capture: RelationStepLogitCapture,
 ) -> Dict[str, Any]:
     prompts, answers = load_prompts(args.dataset, args.option)
     dataset = get_dataset(args.dataset, image_preprocess=None, download=args.download)
@@ -936,6 +1027,8 @@ def evaluate(
 
     records: List[Dict[str, Any]] = []
     correct_count = 0
+    last_relation_correct_count = 0
+    last_relation_covered_count = 0
     sid = 0
     progress = tqdm(total=total_target, desc=f"InternVL2.5 {args.method}")
 
@@ -948,11 +1041,11 @@ def evaluate(
             image = ensure_rgb(raw_image)
             gold = norm_gold(answers[sid])
 
-            generation, diagnostics, first_step_prob = generate_once(
+            generation, diagnostics, relation_step_prob = generate_once(
                 model=model,
                 tokenizer=tokenizer,
                 controller=controller,
-                first_step_capture=first_step_capture,
+                relation_step_capture=relation_step_capture,
                 image=image,
                 question=question,
                 weight=requested_weight,
@@ -962,6 +1055,15 @@ def evaluate(
             )
             correct = is_correct(gold, generation)
             correct_count += int(correct)
+
+            selected_relation_label = relation_step_prob.selected_relation_label
+            last_relation_correct: Optional[bool]
+            if selected_relation_label is None:
+                last_relation_correct = None
+            else:
+                last_relation_covered_count += 1
+                last_relation_correct = selected_relation_label == gold.lower()
+                last_relation_correct_count += int(last_relation_correct)
 
             if requested_weight != 1.0 and diagnostics.modified_calls != diagnostics.expected_modified_calls:
                 raise RuntimeError(
@@ -987,16 +1089,26 @@ def evaluate(
                     "generation": generation,
                     "relation_mentions": extract_relation_mentions(generation),
                     "correct": bool(correct),
-                    "first_step_top_token_id": first_step_prob.top_token_id,
-                    "first_step_top_token": first_step_prob.top_token_text,
-                    "first_step_top_probability": first_step_prob.top_token_probability,
-                    "first_step_top5": first_step_prob.top5,
-                    "four_way_relation_token_ids": first_step_prob.relation_token_ids,
-                    "four_way_relation_token_texts": first_step_prob.relation_token_texts,
-                    "four_way_relation_logits": first_step_prob.relation_logits,
-                    "four_way_relation_probs": first_step_prob.relation_probabilities,
-                    "four_way_relation_pred": first_step_prob.relation_prediction,
-                    "four_way_relation_confidence": first_step_prob.relation_confidence,
+                    "last_relation_correct": last_relation_correct,
+                    "relation_step_token_ids": relation_step_prob.relation_token_ids,
+                    "relation_step_token_texts": relation_step_prob.relation_token_texts,
+                    "generated_token_ids": relation_step_prob.generated_token_ids,
+                    "generated_token_texts": relation_step_prob.generated_token_texts,
+                    "generated_text_from_token_ids": relation_step_prob.generated_text_from_token_ids,
+                    "relation_generated_positions": relation_step_prob.relation_generated_positions,
+                    "relation_generated_labels": relation_step_prob.relation_generated_labels,
+                    "last_relation_position": relation_step_prob.selected_relation_position,
+                    "last_relation_label": relation_step_prob.selected_relation_label,
+                    "last_relation_token_id": relation_step_prob.selected_relation_token_id,
+                    "last_relation_token_text": relation_step_prob.selected_relation_token_text,
+                    "last_relation_step_top_token_id": relation_step_prob.selected_step_top_token_id,
+                    "last_relation_step_top_token": relation_step_prob.selected_step_top_token_text,
+                    "last_relation_step_top_probability": relation_step_prob.selected_step_top_token_probability,
+                    "last_relation_step_top5": relation_step_prob.selected_step_top5,
+                    "last_relation_four_way_logits": relation_step_prob.relation_logits,
+                    "last_relation_four_way_probs": relation_step_prob.relation_probabilities,
+                    "last_relation_four_way_pred": relation_step_prob.relation_prediction,
+                    "last_relation_four_way_confidence": relation_step_prob.relation_confidence,
                     "diagnostics": asdict(diagnostics),
                 }
             )
@@ -1007,15 +1119,25 @@ def evaluate(
                 print(f"internvl_question={question!r}")
                 print(f"weight={requested_weight} pred={generation!r} correct={correct}")
                 print(
-                    f"first-step top token={first_step_prob.top_token_text!r} "
-                    f"prob={first_step_prob.top_token_probability:.6f}"
+                    "last relation token "
+                    f"pos={relation_step_prob.selected_relation_position} "
+                    f"label={relation_step_prob.selected_relation_label!r} "
+                    f"last_relation_correct={last_relation_correct} "
+                    f"all_relation_labels={relation_step_prob.relation_generated_labels}"
                 )
-                print(
-                    "four-way relation probs="
-                    f"{first_step_prob.relation_probabilities} "
-                    f"pred={first_step_prob.relation_prediction!r} "
-                    f"conf={first_step_prob.relation_confidence:.6f}"
-                )
+                if relation_step_prob.selected_relation_label is None:
+                    print("last-relation four-way probabilities: unavailable (no generated relation token)")
+                else:
+                    print(
+                        f"last-relation-step top token={relation_step_prob.selected_step_top_token_text!r} "
+                        f"prob={relation_step_prob.selected_step_top_token_probability:.6f}"
+                    )
+                    print(
+                        "last-relation four-way probs="
+                        f"{relation_step_prob.relation_probabilities} "
+                        f"pred={relation_step_prob.relation_prediction!r} "
+                        f"conf={relation_step_prob.relation_confidence:.6f}"
+                    )
                 print(
                     "image tiles/tokens="
                     f"{diagnostics.num_image_tiles}/{diagnostics.image_token_count}, "
@@ -1031,13 +1153,19 @@ def evaluate(
 
     progress.close()
     accuracy = correct_count / max(sid, 1)
+    last_relation_accuracy = (
+        last_relation_correct_count / max(last_relation_covered_count, 1)
+        if last_relation_covered_count
+        else None
+    )
     summary = {
         "model": args.model,
         "revision": args.revision,
         "transformers_version": transformers.__version__,
         "implementation": (
             "InternVL2.5 fixed-weight pre-softmax eager InternLM2 final-query-to-all-visual-token "
-            "raw-logit scaling with optional language RMSNorm epsilon override"
+            "raw-logit scaling with optional language RMSNorm epsilon override; restricted four-way "
+            "probabilities captured at the final naturally generated relation token"
         ),
         "dataset": args.dataset,
         "option": args.option,
@@ -1055,16 +1183,21 @@ def evaluate(
         "max_new_tokens": args.max_new_tokens,
         "dtype_argument": args.dtype,
         "model_parameter_dtype": str(next(model.parameters()).dtype),
-        "restricted_four_way_candidates": list(first_step_capture.RELATION_CANDIDATES),
-        "restricted_four_way_token_ids": dict(first_step_capture.relation_token_ids),
+        "restricted_four_way_candidates": list(relation_step_capture.RELATION_CANDIDATES),
+        "restricted_four_way_token_ids": dict(relation_step_capture.relation_token_ids),
         "num_samples": sid,
         "num_correct": correct_count,
         "accuracy": accuracy,
+        "num_last_relation_covered": last_relation_covered_count,
+        "num_last_relation_correct": last_relation_correct_count,
+        "last_relation_accuracy": last_relation_accuracy,
         "records": records,
     }
     print("\n" + "=" * 104)
     print(
         f"RESULT: {correct_count}/{sid} accuracy={accuracy:.6f} "
+        f"last_relation={last_relation_correct_count}/{last_relation_covered_count} "
+        f"last_relation_accuracy={last_relation_accuracy} "
         f"method={args.method} weight={requested_weight} "
         f"rms_norm_eps={getattr(model, '_adaptvis_rmsnorm_after', None)}"
     )
@@ -1082,7 +1215,7 @@ def default_output_path(args: argparse.Namespace) -> Path:
         tag += f"_w{args.weight:g}"
     if args.rms_norm_eps is not None:
         tag += f"_eps{_float_tag(args.rms_norm_eps)}"
-    return Path("output") / f"{tag}_fourwayprob.json"
+    return Path("output") / f"{tag}_lastrelationprob.json"
 
 
 def main() -> None:
@@ -1095,8 +1228,8 @@ def main() -> None:
     if args.max_num <= 0:
         raise ValueError("--max-num must be positive.")
 
-    model, tokenizer, controller, first_step_capture = load_model_and_tokenizer(args)
-    summary = evaluate(args, model, tokenizer, controller, first_step_capture)
+    model, tokenizer, controller, relation_step_capture = load_model_and_tokenizer(args)
+    summary = evaluate(args, model, tokenizer, controller, relation_step_capture)
     output_path = Path(args.output) if args.output else default_output_path(args)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as output_file:
