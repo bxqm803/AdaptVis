@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-InternVL2.5-2B fixed-weight AdaptVis-style epsilon ablation.
+InternVL2.5-2B fixed-weight AdaptVis-style epsilon ablation with restricted four-way first-token probabilities.
 
 This runner evaluates OpenGVLab/InternVL2_5-2B on the repository's Controlled
 Images A/B tasks. It keeps the model's native visual pipeline:
@@ -17,6 +17,11 @@ variance_epsilon inside the language decoder.
 
 There is deliberately no adaptive gate in this runner. It is for the direct
 comparison requested here: fixed weight=0.5 across an epsilon sweep.
+
+In addition to the original full-vocabulary first-token maximum probability,
+the runner records a restricted four-way probability over the single-token
+candidates ``left``, ``right``, ``under``, and ``on`` at the same first
+answer position. The four restricted probabilities sum to one.
 
 Run from the AdaptVis repository root, where dataset_zoo.py and prompts/ exist.
 """
@@ -71,12 +76,18 @@ class GenerationDiagnostics:
 
 @dataclass
 class FirstStepProbabilityDiagnostics:
-    """First generated-token statistics used by the original AdaptVis gate."""
+    """First-token statistics plus a restricted four-way relation distribution."""
 
     top_token_id: int
     top_token_text: str
     top_token_probability: float
     top5: List[Dict[str, Any]]
+    relation_token_ids: Dict[str, int]
+    relation_token_texts: Dict[str, str]
+    relation_logits: Dict[str, float]
+    relation_probabilities: Dict[str, float]
+    relation_prediction: str
+    relation_confidence: float
 
 
 class FirstStepLogitCapture:
@@ -89,13 +100,32 @@ class FirstStepLogitCapture:
     generation, attention, or decoding.
     """
 
+    RELATION_CANDIDATES: Tuple[str, ...] = ("left", "right", "under", "on")
+
     def __init__(self, language_model: Any, tokenizer: Any) -> None:
         self.language_model = language_model
         self.tokenizer = tokenizer
         self.active = False
         self.first_step_logits: Optional[torch.Tensor] = None
+        self.relation_token_ids = self._resolve_relation_token_ids()
         self.output_head_name, output_head = self._resolve_output_head()
         self._handle = output_head.register_forward_hook(self._forward_hook)
+
+    def _resolve_relation_token_ids(self) -> Dict[str, int]:
+        """Require each restricted relation candidate to be exactly one tokenizer token."""
+        token_ids: Dict[str, int] = {}
+        for candidate in self.RELATION_CANDIDATES:
+            ids = self.tokenizer.encode(candidate, add_special_tokens=False)
+            if len(ids) != 1:
+                tokens = self.tokenizer.convert_ids_to_tokens(ids)
+                raise RuntimeError(
+                    f"Restricted candidate {candidate!r} is not a single token: "
+                    f"ids={ids}, tokens={tokens}. This runner intentionally requires single-token candidates."
+                )
+            token_ids[candidate] = int(ids[0])
+        if len(set(token_ids.values())) != len(token_ids):
+            raise RuntimeError(f"Restricted relation candidates share token ids: {token_ids}")
+        return token_ids
 
     def _resolve_output_head(self) -> Tuple[str, nn.Module]:
         output_head = None
@@ -155,7 +185,9 @@ class FirstStepLogitCapture:
                 "Failed to capture the initial-prefill first-token logits. "
                 "The InternVL generation path may have changed."
             )
-        probs = torch.softmax(self.first_step_logits[0], dim=-1)
+
+        logits = self.first_step_logits[0]
+        probs = torch.softmax(logits, dim=-1)
         top_probs, top_ids = torch.topk(probs, k=min(5, int(probs.numel())))
 
         def token_text(token_id: int) -> str:
@@ -172,11 +204,40 @@ class FirstStepLogitCapture:
             }
             for prob, token_id in zip(top_probs.tolist(), top_ids.tolist())
         ]
+
+        ordered_candidates = list(self.RELATION_CANDIDATES)
+        relation_ids = torch.tensor(
+            [self.relation_token_ids[name] for name in ordered_candidates],
+            dtype=torch.long,
+        )
+        relation_logits_tensor = logits.index_select(0, relation_ids)
+        relation_probs_tensor = torch.softmax(relation_logits_tensor, dim=0)
+        relation_logits = {
+            name: float(value)
+            for name, value in zip(ordered_candidates, relation_logits_tensor.tolist())
+        }
+        relation_probabilities = {
+            name: float(value)
+            for name, value in zip(ordered_candidates, relation_probs_tensor.tolist())
+        }
+        best_index = int(torch.argmax(relation_probs_tensor).item())
+        relation_prediction = ordered_candidates[best_index]
+        relation_confidence = float(relation_probs_tensor[best_index].item())
+        relation_token_texts = {
+            name: token_text(self.relation_token_ids[name]) for name in ordered_candidates
+        }
+
         return FirstStepProbabilityDiagnostics(
             top_token_id=int(top_ids[0].item()),
             top_token_text=token_text(int(top_ids[0].item())),
             top_token_probability=float(top_probs[0].item()),
             top5=top5,
+            relation_token_ids=dict(self.relation_token_ids),
+            relation_token_texts=relation_token_texts,
+            relation_logits=relation_logits,
+            relation_probabilities=relation_probabilities,
+            relation_prediction=relation_prediction,
+            relation_confidence=relation_confidence,
         )
 
 class InternVLAdaptVisController:
@@ -247,7 +308,7 @@ class InternVLAdaptVisController:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="InternVL2.5-2B fixed-weight pre-softmax image-attention + RMSNorm-epsilon ablation."
+        description="InternVL2.5-2B fixed-weight pre-softmax image-attention + RMSNorm-epsilon ablation with restricted four-way first-token probabilities."
     )
     parser.add_argument(
         "--dataset",
@@ -792,6 +853,10 @@ def load_model_and_tokenizer(
     print(f"vision input size: {image_size}; visual tokens per tile: {num_image_token}")
     print(f"model parameter dtype: {next(model.parameters()).dtype}")
     print(f"first-step probability output head: {first_step_capture.output_head_name}")
+    print(
+        "restricted four-way token ids: "
+        f"{first_step_capture.relation_token_ids}"
+    )
 
     model._adaptvis_language_rmsnorm_count = int(num_norms)
     model._adaptvis_rmsnorm_before = list(rms_before)
@@ -926,6 +991,12 @@ def evaluate(
                     "first_step_top_token": first_step_prob.top_token_text,
                     "first_step_top_probability": first_step_prob.top_token_probability,
                     "first_step_top5": first_step_prob.top5,
+                    "four_way_relation_token_ids": first_step_prob.relation_token_ids,
+                    "four_way_relation_token_texts": first_step_prob.relation_token_texts,
+                    "four_way_relation_logits": first_step_prob.relation_logits,
+                    "four_way_relation_probs": first_step_prob.relation_probabilities,
+                    "four_way_relation_pred": first_step_prob.relation_prediction,
+                    "four_way_relation_confidence": first_step_prob.relation_confidence,
                     "diagnostics": asdict(diagnostics),
                 }
             )
@@ -938,6 +1009,12 @@ def evaluate(
                 print(
                     f"first-step top token={first_step_prob.top_token_text!r} "
                     f"prob={first_step_prob.top_token_probability:.6f}"
+                )
+                print(
+                    "four-way relation probs="
+                    f"{first_step_prob.relation_probabilities} "
+                    f"pred={first_step_prob.relation_prediction!r} "
+                    f"conf={first_step_prob.relation_confidence:.6f}"
                 )
                 print(
                     "image tiles/tokens="
@@ -978,6 +1055,8 @@ def evaluate(
         "max_new_tokens": args.max_new_tokens,
         "dtype_argument": args.dtype,
         "model_parameter_dtype": str(next(model.parameters()).dtype),
+        "restricted_four_way_candidates": list(first_step_capture.RELATION_CANDIDATES),
+        "restricted_four_way_token_ids": dict(first_step_capture.relation_token_ids),
         "num_samples": sid,
         "num_correct": correct_count,
         "accuracy": accuracy,
@@ -1003,7 +1082,7 @@ def default_output_path(args: argparse.Namespace) -> Path:
         tag += f"_w{args.weight:g}"
     if args.rms_norm_eps is not None:
         tag += f"_eps{_float_tag(args.rms_norm_eps)}"
-    return Path("output") / f"{tag}.json"
+    return Path("output") / f"{tag}_fourwayprob.json"
 
 
 def main() -> None:
