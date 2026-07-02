@@ -119,6 +119,7 @@ class RelationStepLogitCapture:
         self.active = False
         self.step_logits: List[torch.Tensor] = []
         self.generated_token_ids: Optional[List[int]] = None
+        self.generated_id_return_mode: Optional[str] = None
         self.relation_token_ids = self._resolve_relation_token_ids()
         self.inverse_relation_token_ids = {token_id: name for name, token_id in self.relation_token_ids.items()}
         self.output_head_name, output_head = self._resolve_output_head()
@@ -192,6 +193,7 @@ class RelationStepLogitCapture:
         self.active = True
         self.step_logits = []
         self.generated_token_ids = None
+        self.generated_id_return_mode = None
 
     def capture_generate_output(self, input_ids: torch.Tensor, output_ids: Any) -> None:
         if not self.active:
@@ -205,12 +207,20 @@ class RelationStepLogitCapture:
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise RuntimeError(f"Unexpected InternVL generate input_ids shape: {tuple(input_ids.shape)}")
         prompt_len = int(input_ids.shape[1])
-        if int(sequences.shape[1]) < prompt_len:
-            raise RuntimeError(
-                "Generated sequence is shorter than the input prompt: "
-                f"sequence_len={sequences.shape[1]}, prompt_len={prompt_len}."
-            )
-        self.generated_token_ids = [int(x) for x in sequences[0, prompt_len:].detach().cpu().tolist()]
+        sequence_len = int(sequences.shape[1])
+
+        # InternVL's native chat() calls generate() with inputs_embeds. In that
+        # path, HF generation returns only newly generated ids rather than
+        # [prompt ids | generated ids]. When input_ids are used directly, it
+        # returns the usual full sequence. Support both return conventions.
+        if sequence_len >= prompt_len:
+            generated = sequences[0, prompt_len:]
+            self.generated_id_return_mode = "prompt_plus_generated"
+        else:
+            generated = sequences[0]
+            self.generated_id_return_mode = "generated_only"
+
+        self.generated_token_ids = [int(x) for x in generated.detach().cpu().tolist()]
 
     def _token_text(self, token_id: int) -> str:
         try:
@@ -234,7 +244,8 @@ class RelationStepLogitCapture:
         if len(self.step_logits) != len(generated_ids):
             raise RuntimeError(
                 "Generation-logit alignment mismatch: "
-                f"captured_step_logits={len(self.step_logits)}, generated_token_ids={len(generated_ids)}."
+                f"captured_step_logits={len(self.step_logits)}, generated_token_ids={len(generated_ids)}, "
+                f"return_mode={self.generated_id_return_mode}."
             )
 
         generated_token_texts = [self._token_text(token_id) for token_id in generated_ids]
