@@ -68,6 +68,117 @@ class GenerationDiagnostics:
     num_image_tiles: int
 
 
+
+@dataclass
+class FirstStepProbabilityDiagnostics:
+    """First generated-token statistics used by the original AdaptVis gate."""
+
+    top_token_id: int
+    top_token_text: str
+    top_token_probability: float
+    top5: List[Dict[str, Any]]
+
+
+class FirstStepLogitCapture:
+    """
+    Read-only hook on the language-model output head.
+
+    During generation, the first language-model forward is the multimodal
+    prefill. Its final sequence position is exactly the distribution used to
+    select the first generated token. Capturing this tensor does not alter
+    generation, attention, or decoding.
+    """
+
+    def __init__(self, language_model: Any, tokenizer: Any) -> None:
+        self.language_model = language_model
+        self.tokenizer = tokenizer
+        self.active = False
+        self.first_step_logits: Optional[torch.Tensor] = None
+        self.output_head_name, output_head = self._resolve_output_head()
+        self._handle = output_head.register_forward_hook(self._forward_hook)
+
+    def _resolve_output_head(self) -> Tuple[str, nn.Module]:
+        output_head = None
+        getter = getattr(self.language_model, "get_output_embeddings", None)
+        if callable(getter):
+            output_head = getter()
+
+        if isinstance(output_head, nn.Module):
+            for name, module in self.language_model.named_modules():
+                if module is output_head:
+                    return name or "<root>", output_head
+            return "<unregistered-output-head>", output_head
+
+        vocab_size = int(getattr(getattr(self.language_model, "config", None), "vocab_size", 0))
+        candidates = [
+            (name, module)
+            for name, module in self.language_model.named_modules()
+            if isinstance(module, nn.Linear) and vocab_size > 0 and int(module.out_features) == vocab_size
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+        if not candidates:
+            raise RuntimeError(
+                "Could not identify the language-model output head for first-step probability capture."
+            )
+        preferred = [
+            pair for pair in candidates
+            if pair[0].endswith(("lm_head", "output")) or pair[0] in {"lm_head", "output"}
+        ]
+        if len(preferred) == 1:
+            return preferred[0]
+        names = [name for name, _ in candidates]
+        raise RuntimeError(
+            "Ambiguous language-model output-head candidates for first-step probability capture: "
+            f"{names}"
+        )
+
+    def _forward_hook(self, _module: nn.Module, _inputs: Tuple[Any, ...], output: Any) -> None:
+        if not self.active or self.first_step_logits is not None:
+            return
+        logits = output[0] if isinstance(output, tuple) else output
+        if not isinstance(logits, torch.Tensor):
+            return
+        # The initial multimodal prefill is [B, prompt_len, vocab]. Later decode
+        # steps are [B, 1, vocab], which arrive only after this has been captured.
+        if logits.ndim == 3 and logits.shape[0] == 1 and logits.shape[1] > 1:
+            self.first_step_logits = logits[:, -1, :].detach().to(dtype=torch.float32, device="cpu")
+
+    def begin_generation(self) -> None:
+        self.active = True
+        self.first_step_logits = None
+
+    def finish_generation(self) -> FirstStepProbabilityDiagnostics:
+        self.active = False
+        if self.first_step_logits is None:
+            raise RuntimeError(
+                "Failed to capture the initial-prefill first-token logits. "
+                "The InternVL generation path may have changed."
+            )
+        probs = torch.softmax(self.first_step_logits[0], dim=-1)
+        top_probs, top_ids = torch.topk(probs, k=min(5, int(probs.numel())))
+
+        def token_text(token_id: int) -> str:
+            try:
+                return str(self.tokenizer.decode([int(token_id)], skip_special_tokens=False))
+            except Exception:
+                return str(self.tokenizer.convert_ids_to_tokens(int(token_id)))
+
+        top5 = [
+            {
+                "token_id": int(token_id),
+                "token": token_text(int(token_id)),
+                "probability": float(prob),
+            }
+            for prob, token_id in zip(top_probs.tolist(), top_ids.tolist())
+        ]
+        return FirstStepProbabilityDiagnostics(
+            top_token_id=int(top_ids[0].item()),
+            top_token_text=token_text(int(top_ids[0].item())),
+            top_token_probability=float(top_probs[0].item()),
+            top5=top5,
+        )
+
 class InternVLAdaptVisController:
     """Per-generation state used by the patched InternLM2 attention layers."""
 
@@ -639,7 +750,7 @@ def install_eager_internlm2_adaptvis(model: Any, controller: InternVLAdaptVisCon
 
 def load_model_and_tokenizer(
     args: argparse.Namespace,
-) -> Tuple[Any, Any, InternVLAdaptVisController]:
+) -> Tuple[Any, Any, InternVLAdaptVisController, FirstStepLogitCapture]:
     require_supported_transformers()
     dtype = resolve_dtype(args.dtype)
     print(f"transformers version: {transformers.__version__}")
@@ -666,6 +777,7 @@ def load_model_and_tokenizer(
     num_norms, rms_before, rms_after = configure_language_rmsnorm_eps(model, args.rms_norm_eps)
     decoder_layers = get_decoder_layers(model)
     controller = InternVLAdaptVisController(args.max_layers, len(decoder_layers))
+    first_step_capture = FirstStepLogitCapture(model.language_model, tokenizer)
     install_generate_input_capture(model, controller)
     install_eager_internlm2_adaptvis(model, controller)
 
@@ -679,13 +791,14 @@ def load_model_and_tokenizer(
     print(f"Attention classes: {attention_classes}")
     print(f"vision input size: {image_size}; visual tokens per tile: {num_image_token}")
     print(f"model parameter dtype: {next(model.parameters()).dtype}")
+    print(f"first-step probability output head: {first_step_capture.output_head_name}")
 
     model._adaptvis_language_rmsnorm_count = int(num_norms)
     model._adaptvis_rmsnorm_before = list(rms_before)
     model._adaptvis_rmsnorm_after = list(rms_after)
     model._adaptvis_image_size = int(image_size)
     model._adaptvis_num_image_token = int(num_image_token)
-    return model, tokenizer, controller
+    return model, tokenizer, controller, first_step_capture
 
 
 @torch.inference_mode()
@@ -694,13 +807,14 @@ def generate_once(
     model: Any,
     tokenizer: Any,
     controller: InternVLAdaptVisController,
+    first_step_capture: FirstStepLogitCapture,
     image: Image.Image,
     question: str,
     weight: float,
     max_num: int,
     use_thumbnail: bool,
     max_new_tokens: int,
-) -> Tuple[str, GenerationDiagnostics]:
+) -> Tuple[str, GenerationDiagnostics, FirstStepProbabilityDiagnostics]:
     image_size = int(model._adaptvis_image_size)
     pixel_values = preprocess_image(
         image,
@@ -710,23 +824,27 @@ def generate_once(
     ).to(device=next(model.parameters()).device, dtype=next(model.parameters()).dtype)
 
     controller.begin_generation(weight=weight, num_image_tiles=int(pixel_values.shape[0]))
+    first_step_capture.begin_generation()
     generation_config = {
         "num_beams": 1,
         "max_new_tokens": int(max_new_tokens),
         "do_sample": False,
     }
-    response = model.chat(
-        tokenizer,
-        pixel_values,
-        question,
-        generation_config,
-        history=None,
-        return_history=False,
-        num_patches_list=[int(pixel_values.shape[0])],
-        verbose=False,
-    )
-    diagnostics = controller.finish_generation()
-    return str(response).strip(), diagnostics
+    try:
+        response = model.chat(
+            tokenizer,
+            pixel_values,
+            question,
+            generation_config,
+            history=None,
+            return_history=False,
+            num_patches_list=[int(pixel_values.shape[0])],
+            verbose=False,
+        )
+    finally:
+        diagnostics = controller.finish_generation()
+        first_step_prob = first_step_capture.finish_generation()
+    return str(response).strip(), diagnostics, first_step_prob
 
 
 @torch.inference_mode()
@@ -735,6 +853,7 @@ def evaluate(
     model: Any,
     tokenizer: Any,
     controller: InternVLAdaptVisController,
+    first_step_capture: FirstStepLogitCapture,
 ) -> Dict[str, Any]:
     prompts, answers = load_prompts(args.dataset, args.option)
     dataset = get_dataset(args.dataset, image_preprocess=None, download=args.download)
@@ -764,10 +883,11 @@ def evaluate(
             image = ensure_rgb(raw_image)
             gold = norm_gold(answers[sid])
 
-            generation, diagnostics = generate_once(
+            generation, diagnostics, first_step_prob = generate_once(
                 model=model,
                 tokenizer=tokenizer,
                 controller=controller,
+                first_step_capture=first_step_capture,
                 image=image,
                 question=question,
                 weight=requested_weight,
@@ -802,6 +922,10 @@ def evaluate(
                     "generation": generation,
                     "relation_mentions": extract_relation_mentions(generation),
                     "correct": bool(correct),
+                    "first_step_top_token_id": first_step_prob.top_token_id,
+                    "first_step_top_token": first_step_prob.top_token_text,
+                    "first_step_top_probability": first_step_prob.top_token_probability,
+                    "first_step_top5": first_step_prob.top5,
                     "diagnostics": asdict(diagnostics),
                 }
             )
@@ -811,6 +935,10 @@ def evaluate(
                 print(f"[SID {sid}] gold={gold!r}")
                 print(f"internvl_question={question!r}")
                 print(f"weight={requested_weight} pred={generation!r} correct={correct}")
+                print(
+                    f"first-step top token={first_step_prob.top_token_text!r} "
+                    f"prob={first_step_prob.top_token_probability:.6f}"
+                )
                 print(
                     "image tiles/tokens="
                     f"{diagnostics.num_image_tiles}/{diagnostics.image_token_count}, "
@@ -888,8 +1016,8 @@ def main() -> None:
     if args.max_num <= 0:
         raise ValueError("--max-num must be positive.")
 
-    model, tokenizer, controller = load_model_and_tokenizer(args)
-    summary = evaluate(args, model, tokenizer, controller)
+    model, tokenizer, controller, first_step_capture = load_model_and_tokenizer(args)
+    summary = evaluate(args, model, tokenizer, controller, first_step_capture)
     output_path = Path(args.output) if args.output else default_output_path(args)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as output_file:
