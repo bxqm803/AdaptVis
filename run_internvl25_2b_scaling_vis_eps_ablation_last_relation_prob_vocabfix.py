@@ -19,10 +19,11 @@ There is deliberately no adaptive gate in this runner. It is for the direct
 comparison requested here: fixed weight=0.5 across an epsilon sweep.
 
 The runner records the logits at the generation step that emits the final
-relation token in the natural-language answer (the last generated occurrence
-of ``left``, ``right``, ``under``, or ``on``). It then applies a restricted
-four-way softmax over those single-token candidates. The four probabilities
-sum to one. This avoids treating the sentence opener (often ``The``) as the
+relation token in the natural-language answer. It resolves word-boundary token
+variants directly from the tokenizer vocabulary (for example ``▁on`` rather
+than an initial-position ``on`` token), then applies a restricted four-way
+softmax over matched single-token candidates. The four probabilities sum to
+one. This avoids treating the sentence opener (often ``The``) as the
 relation-decision position.
 
 Run from the AdaptVis repository root, where dataset_zoo.py and prompts/ exist.
@@ -103,15 +104,17 @@ class LastRelationProbabilityDiagnostics:
 
 class RelationStepLogitCapture:
     """
-    Read-only capture of every decoder output distribution during natural generation.
+    Read-only capture of decoder logits at the last naturally generated relation token.
 
-    Index i in ``step_logits`` is the distribution that generated token i in
-    ``generated_token_ids``: prefill supplies i=0, and each cached decoding step
-    supplies the next index. The selected relation position is the last generated
-    token whose id matches a single-token relation candidate.
+    InternVL's tokenizer can use different token ids for a relation word at the
+    beginning of a sequence and after a word boundary (for example, a
+    SentencePiece ``▁on`` token).  Therefore this class resolves relation
+    candidates directly from the tokenizer vocabulary rather than assuming
+    ``tokenizer.encode("on")`` is the id emitted inside a sentence.
     """
 
     RELATION_CANDIDATES: Tuple[str, ...] = ("left", "right", "under", "on")
+    _STYLE_PRIORITY: Tuple[str, ...] = ("sentencepiece", "gpt_space", "literal_space", "bare")
 
     def __init__(self, language_model: Any, tokenizer: Any) -> None:
         self.language_model = language_model
@@ -120,26 +123,99 @@ class RelationStepLogitCapture:
         self.step_logits: List[torch.Tensor] = []
         self.generated_token_ids: Optional[List[int]] = None
         self.generated_id_return_mode: Optional[str] = None
-        self.relation_token_ids = self._resolve_relation_token_ids()
-        self.inverse_relation_token_ids = {token_id: name for name, token_id in self.relation_token_ids.items()}
+
+        self.candidate_id_sets, self.id_to_relation = self._resolve_relation_vocabulary()
+        self.primary_style = self._choose_primary_style()
+        self.relation_token_ids = dict(self.candidate_id_sets[self.primary_style])
+        self.inverse_relation_token_ids = {
+            token_id: name for token_id, (name, _style) in self.id_to_relation.items()
+        }
+
         self.output_head_name, output_head = self._resolve_output_head()
         self._handle = output_head.register_forward_hook(self._forward_hook)
 
-    def _resolve_relation_token_ids(self) -> Dict[str, int]:
-        """Require each restricted relation candidate to be exactly one tokenizer token."""
-        token_ids: Dict[str, int] = {}
-        for candidate in self.RELATION_CANDIDATES:
-            ids = self.tokenizer.encode(candidate, add_special_tokens=False)
-            if len(ids) != 1:
-                tokens = self.tokenizer.convert_ids_to_tokens(ids)
-                raise RuntimeError(
-                    f"Restricted candidate {candidate!r} is not a single token: "
-                    f"ids={ids}, tokens={tokens}. This runner intentionally requires single-token candidates."
-                )
-            token_ids[candidate] = int(ids[0])
-        if len(set(token_ids.values())) != len(token_ids):
-            raise RuntimeError(f"Restricted relation candidates share token ids: {token_ids}")
-        return token_ids
+    @staticmethod
+    def _parse_vocab_token(token: str) -> Tuple[Optional[str], Optional[str]]:
+        """Return (relation_label, token_style) for an exact one-token relation word."""
+        raw = str(token)
+        style = "bare"
+        surface = raw
+
+        if raw.startswith("▁"):
+            style = "sentencepiece"
+            surface = raw[1:]
+        elif raw.startswith("Ġ"):
+            style = "gpt_space"
+            surface = raw[1:]
+        elif raw.startswith(" "):
+            style = "literal_space"
+            surface = raw[1:]
+
+        label = surface.lower()
+        if label in {"left", "right", "under", "on"}:
+            return label, style
+        return None, None
+
+    def _resolve_relation_vocabulary(
+        self,
+    ) -> Tuple[Dict[str, Dict[str, int]], Dict[int, Tuple[str, str]]]:
+        """
+        Find exact single-token relation words in the tokenizer's actual vocab.
+
+        This avoids the earlier failure mode where ``encode('on')`` resolved an
+        initial-position token while natural generation emitted a distinct
+        word-boundary token such as ``▁on``.
+        """
+        try:
+            vocab = self.tokenizer.get_vocab()
+        except Exception as exc:
+            raise RuntimeError("Tokenizer does not expose get_vocab(); cannot resolve relation-token variants.") from exc
+
+        variants: Dict[str, Dict[str, int]] = {}
+        id_to_relation: Dict[int, Tuple[str, str]] = {}
+
+        for token, token_id_raw in vocab.items():
+            label, style = self._parse_vocab_token(str(token))
+            if label is None or style is None:
+                continue
+            token_id = int(token_id_raw)
+            per_style = variants.setdefault(style, {})
+            # Keep the vocabulary entry whose decoded form exactly matches the
+            # target token; duplicate aliases are not useful for a one-step logit.
+            if label not in per_style:
+                per_style[label] = token_id
+
+        complete_sets = {
+            style: ids
+            for style, ids in variants.items()
+            if all(name in ids for name in self.RELATION_CANDIDATES)
+        }
+        if not complete_sets:
+            preview = {
+                style: sorted(ids)
+                for style, ids in variants.items()
+            }
+            raise RuntimeError(
+                "Could not find a complete one-token left/right/under/on candidate set in the tokenizer vocabulary. "
+                f"Observed relation-like variants: {preview}"
+            )
+
+        for style, ids in complete_sets.items():
+            for label, token_id in ids.items():
+                previous = id_to_relation.get(token_id)
+                if previous is not None and previous != (label, style):
+                    raise RuntimeError(
+                        f"Ambiguous relation-token id {token_id}: {previous} vs {(label, style)}"
+                    )
+                id_to_relation[token_id] = (label, style)
+
+        return complete_sets, id_to_relation
+
+    def _choose_primary_style(self) -> str:
+        for style in self._STYLE_PRIORITY:
+            if style in self.candidate_id_sets:
+                return style
+        return sorted(self.candidate_id_sets)[0]
 
     def _resolve_output_head(self) -> Tuple[str, nn.Module]:
         output_head = None
@@ -186,7 +262,7 @@ class RelationStepLogitCapture:
         if logits.ndim != 3 or logits.shape[0] != 1 or logits.shape[1] < 1:
             return
         # Prefill is [1, prompt_len, vocab]; cached decode is [1, 1, vocab].
-        # In both cases the final row is the next-token distribution.
+        # In both cases the final row is the distribution for the next token.
         self.step_logits.append(logits[0, -1, :].detach().to(dtype=torch.float32, device="cpu"))
 
     def begin_generation(self) -> None:
@@ -209,10 +285,9 @@ class RelationStepLogitCapture:
         prompt_len = int(input_ids.shape[1])
         sequence_len = int(sequences.shape[1])
 
-        # InternVL's native chat() calls generate() with inputs_embeds. In that
-        # path, HF generation returns only newly generated ids rather than
-        # [prompt ids | generated ids]. When input_ids are used directly, it
-        # returns the usual full sequence. Support both return conventions.
+        # Native InternVL chat() calls generate(inputs_embeds=...). In that
+        # path, HF returns generated-only ids. Input-id generation instead
+        # returns [prompt ids | generated ids]. Support both conventions.
         if sequence_len >= prompt_len:
             generated = sequences[0, prompt_len:]
             self.generated_id_return_mode = "prompt_plus_generated"
@@ -228,6 +303,21 @@ class RelationStepLogitCapture:
         except Exception:
             return str(self.tokenizer.convert_ids_to_tokens(int(token_id)))
 
+    def _candidate_ids_for_selected_token(self, selected_token_id: int) -> Dict[str, int]:
+        metadata = self.id_to_relation.get(int(selected_token_id))
+        if metadata is not None:
+            _label, style = metadata
+            return self.candidate_id_sets[style]
+
+        raw = str(self.tokenizer.convert_ids_to_tokens(int(selected_token_id)))
+        if raw.startswith("▁") and "sentencepiece" in self.candidate_id_sets:
+            return self.candidate_id_sets["sentencepiece"]
+        if raw.startswith("Ġ") and "gpt_space" in self.candidate_id_sets:
+            return self.candidate_id_sets["gpt_space"]
+        if raw.startswith(" ") and "literal_space" in self.candidate_id_sets:
+            return self.candidate_id_sets["literal_space"]
+        return self.candidate_id_sets[self.primary_style]
+
     def finish_generation(self) -> LastRelationProbabilityDiagnostics:
         self.active = False
         if self.generated_token_ids is None:
@@ -239,8 +329,6 @@ class RelationStepLogitCapture:
             raise RuntimeError("No decoder output logits were captured during InternVL generation.")
 
         generated_ids = list(self.generated_token_ids)
-        # Standard greedy generation has one score distribution per generated token.
-        # Keep a hard failure rather than silently misaligning a relation position.
         if len(self.step_logits) != len(generated_ids):
             raise RuntimeError(
                 "Generation-logit alignment mismatch: "
@@ -250,16 +338,26 @@ class RelationStepLogitCapture:
 
         generated_token_texts = [self._token_text(token_id) for token_id in generated_ids]
         generated_text = str(self.tokenizer.decode(generated_ids, skip_special_tokens=True))
-        relation_positions = [
-            index for index, token_id in enumerate(generated_ids)
-            if token_id in self.inverse_relation_token_ids
-        ]
-        relation_labels = [self.inverse_relation_token_ids[generated_ids[index]] for index in relation_positions]
-        relation_token_texts = {
-            name: self._token_text(token_id) for name, token_id in self.relation_token_ids.items()
-        }
 
+        relation_positions: List[int] = []
+        relation_labels: List[str] = []
+        relation_styles: List[str] = []
+        for index, token_id in enumerate(generated_ids):
+            metadata = self.id_to_relation.get(int(token_id))
+            if metadata is None:
+                continue
+            label, style = metadata
+            relation_positions.append(index)
+            relation_labels.append(label)
+            relation_styles.append(style)
+
+        # A genuine one-token relation word should be found through the vocab map.
+        # Keep a fallback for tokenizer implementations whose vocab aliases are
+        # unusual, but do not fabricate a relation position when none exists.
         if not relation_positions:
+            relation_token_texts = {
+                name: self._token_text(token_id) for name, token_id in self.relation_token_ids.items()
+            }
             return LastRelationProbabilityDiagnostics(
                 relation_token_ids=dict(self.relation_token_ids),
                 relation_token_texts=relation_token_texts,
@@ -284,7 +382,8 @@ class RelationStepLogitCapture:
 
         selected_position = int(relation_positions[-1])
         selected_token_id = int(generated_ids[selected_position])
-        selected_label = self.inverse_relation_token_ids[selected_token_id]
+        selected_label, selected_style = self.id_to_relation[selected_token_id]
+        candidate_ids_by_label = self._candidate_ids_for_selected_token(selected_token_id)
         logits = self.step_logits[selected_position]
         full_probs = torch.softmax(logits, dim=-1)
         top_probs, top_ids = torch.topk(full_probs, k=min(5, int(full_probs.numel())))
@@ -299,7 +398,7 @@ class RelationStepLogitCapture:
 
         ordered_candidates = list(self.RELATION_CANDIDATES)
         relation_ids = torch.tensor(
-            [self.relation_token_ids[name] for name in ordered_candidates],
+            [candidate_ids_by_label[name] for name in ordered_candidates],
             dtype=torch.long,
         )
         relation_logits_tensor = logits.index_select(0, relation_ids)
@@ -315,9 +414,12 @@ class RelationStepLogitCapture:
         best_index = int(torch.argmax(relation_probs_tensor).item())
         relation_prediction = ordered_candidates[best_index]
         relation_confidence = float(relation_probs_tensor[best_index].item())
+        relation_token_texts = {
+            name: self._token_text(token_id) for name, token_id in candidate_ids_by_label.items()
+        }
 
         return LastRelationProbabilityDiagnostics(
-            relation_token_ids=dict(self.relation_token_ids),
+            relation_token_ids=dict(candidate_ids_by_label),
             relation_token_texts=relation_token_texts,
             generated_token_ids=generated_ids,
             generated_token_texts=generated_token_texts,
@@ -337,6 +439,7 @@ class RelationStepLogitCapture:
             relation_prediction=relation_prediction,
             relation_confidence=relation_confidence,
         )
+
 
 class InternVLAdaptVisController:
     """Per-generation state used by the patched InternLM2 attention layers."""
@@ -956,8 +1059,12 @@ def load_model_and_tokenizer(
     print(f"model parameter dtype: {next(model.parameters()).dtype}")
     print(f"relation-step probability output head: {relation_step_capture.output_head_name}")
     print(
-        "restricted four-way token ids: "
+        "restricted four-way primary token ids: "
         f"{relation_step_capture.relation_token_ids}"
+    )
+    print(
+        "restricted four-way token-id variants by style: "
+        f"{relation_step_capture.candidate_id_sets}"
     )
 
     model._adaptvis_language_rmsnorm_count = int(num_norms)
