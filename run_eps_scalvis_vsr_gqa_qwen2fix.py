@@ -494,59 +494,167 @@ def load_qwen(args: argparse.Namespace, dtype: torch.dtype) -> Tuple[Any, Any]:
 
 
 def install_qwen2_scalvis(model: Any, controller: ScalingVisController) -> None:
-    """Patch the exact Transformers 4.49 eager Qwen2 attention helper."""
-    from transformers.models.qwen2 import modeling_qwen2 as qwen2_mod
+    """
+    Patch Qwen2-VL's own eager decoder attention.
 
-    original = qwen2_mod.eager_attention_forward
+    Qwen2-VL does NOT route its language decoder through
+    transformers.models.qwen2.modeling_qwen2.eager_attention_forward. Its
+    Qwen2VLAttention class is implemented in modeling_qwen2_vl.py and has a
+    separate multimodal-RoPE forward path. Therefore patch each self_attn
+    module directly at the raw, pre-softmax attention logits.
+    """
+    from transformers.models.qwen2_vl import modeling_qwen2_vl as qwen2vl_mod
 
-    def patched_eager_attention_forward(
-        module: nn.Module,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        scaling: float,
-        dropout: float = 0.0,
-        **kwargs: Any,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        layer_idx = int(getattr(module, "layer_idx", -1))
-        q_len = int(query.shape[-2])
-        kv_len = int(key.shape[-2])
-        if not controller.should_apply(layer_idx, q_len, kv_len, int(query.shape[0])):
-            return original(
-                module,
-                query,
-                key,
-                value,
-                attention_mask,
-                scaling,
-                dropout=dropout,
-                **kwargs,
+    language_model = locate_language_model(model, "qwen2vl")
+    for layer_idx, layer in enumerate(language_model.layers):
+        attn = getattr(layer, "self_attn", None)
+        if attn is None:
+            raise RuntimeError(f"Qwen2-VL layer {layer_idx} has no self_attn.")
+        if type(attn).__name__ != "Qwen2VLAttention":
+            raise RuntimeError(
+                f"Expected eager Qwen2VLAttention, got {type(attn).__name__}. "
+                "Load with attn_implementation='eager'."
             )
 
-        key_states = qwen2_mod.repeat_kv(key, module.num_key_value_groups)
-        value_states = qwen2_mod.repeat_kv(value, module.num_key_value_groups)
-        attn_logits = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-        controller.apply(attn_logits, layer_idx)
-        if attention_mask is not None:
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_logits = attn_logits + causal_mask
-        attn_weights = nn.functional.softmax(
-            attn_logits,
-            dim=-1,
-            dtype=torch.float32,
-        ).to(query.dtype)
-        attn_weights = nn.functional.dropout(
-            attn_weights,
-            p=dropout,
-            training=module.training,
-        )
-        attn_output = torch.matmul(attn_weights, value_states)
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        return attn_output, attn_weights
+        original_forward = attn.forward
 
-    qwen2_mod.eager_attention_forward = patched_eager_attention_forward
-    model._scalvis_qwen2_original_eager = original
+        def make_forward(attn_module: Any, native_forward: Any, idx: int):
+            def patched_forward(
+                self: Any,
+                hidden_states: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None,
+                position_ids: Optional[torch.LongTensor] = None,
+                past_key_value: Optional[Any] = None,
+                output_attentions: bool = False,
+                use_cache: bool = False,
+                cache_position: Optional[torch.LongTensor] = None,
+                position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+            ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Any]]:
+                bsz, q_len, _ = hidden_states.size()
+
+                # Intercept only the initial multimodal prefill. Cached decode
+                # steps remain checkpoint-native.
+                if not controller.should_apply(idx, q_len, q_len, bsz):
+                    return native_forward(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_value,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                    )
+
+                if position_embeddings is None:
+                    raise RuntimeError(
+                        "Qwen2-VL ScalingVis prefill patch requires position_embeddings."
+                    )
+
+                query_states = attn_module.q_proj(hidden_states)
+                key_states = attn_module.k_proj(hidden_states)
+                value_states = attn_module.v_proj(hidden_states)
+
+                query_states = query_states.view(
+                    bsz, q_len, -1, attn_module.head_dim
+                ).transpose(1, 2)
+                key_states = key_states.view(
+                    bsz, q_len, -1, attn_module.head_dim
+                ).transpose(1, 2)
+                value_states = value_states.view(
+                    bsz, q_len, -1, attn_module.head_dim
+                ).transpose(1, 2)
+
+                cos, sin = position_embeddings
+                query_states, key_states = qwen2vl_mod.apply_multimodal_rotary_pos_emb(
+                    query_states,
+                    key_states,
+                    cos,
+                    sin,
+                    attn_module.rope_scaling["mrope_section"],
+                )
+
+                # In generation, HF creates DynamicCache before initial prefill.
+                if past_key_value is not None:
+                    cache_kwargs = {
+                        "sin": sin,
+                        "cos": cos,
+                        "cache_position": cache_position,
+                    }
+                    key_states, value_states = past_key_value.update(
+                        key_states,
+                        value_states,
+                        attn_module.layer_idx,
+                        cache_kwargs,
+                    )
+
+                key_states = qwen2vl_mod.repeat_kv(
+                    key_states,
+                    attn_module.num_key_value_groups,
+                )
+                value_states = qwen2vl_mod.repeat_kv(
+                    value_states,
+                    attn_module.num_key_value_groups,
+                )
+
+                attn_logits = torch.matmul(
+                    query_states,
+                    key_states.transpose(2, 3),
+                ) / math.sqrt(attn_module.head_dim)
+
+                # Scale only [all heads, final prompt query, image-token keys],
+                # before causal mask addition and softmax.
+                controller.apply(attn_logits, idx)
+
+                if attention_mask is not None:
+                    causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+                    attn_logits = attn_logits + causal_mask
+
+                if query_states.dtype == torch.float16:
+                    attn_logits = torch.where(
+                        torch.isinf(attn_logits),
+                        torch.zeros_like(attn_logits),
+                        attn_logits,
+                    )
+
+                attn_weights = nn.functional.softmax(
+                    attn_logits,
+                    dim=-1,
+                    dtype=torch.float32,
+                ).to(query_states.dtype)
+                attn_weights = nn.functional.dropout(
+                    attn_weights,
+                    p=attn_module.attention_dropout,
+                    training=attn_module.training,
+                )
+                attn_output = torch.matmul(attn_weights, value_states)
+
+                expected = (
+                    bsz,
+                    attn_module.num_heads,
+                    q_len,
+                    attn_module.head_dim,
+                )
+                if tuple(attn_output.size()) != expected:
+                    raise RuntimeError(
+                        f"Unexpected Qwen2-VL attention output: "
+                        f"{tuple(attn_output.size())}; expected {expected}."
+                    )
+
+                attn_output = attn_output.transpose(1, 2).contiguous()
+                attn_output = attn_output.reshape(bsz, q_len, -1)
+                attn_output = attn_module.o_proj(attn_output)
+
+                if not output_attentions:
+                    attn_weights = None
+                return attn_output, attn_weights, past_key_value
+
+            return patched_forward
+
+        attn.forward = types.MethodType(
+            make_forward(attn, original_forward, layer_idx),
+            attn,
+        )
 
 
 def install_qwen25_scalvis(model: Any, controller: ScalingVisController) -> None:
