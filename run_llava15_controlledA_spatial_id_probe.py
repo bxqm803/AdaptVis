@@ -531,7 +531,13 @@ def load_model_and_processor(args: argparse.Namespace):
 
     feature_strategy = getattr(model.config, "vision_feature_select_strategy", "default")
     processor.vision_feature_select_strategy = str(feature_strategy)
-    processor.num_additional_image_tokens = 1 if feature_strategy == "full" else 0
+
+    # CLIP's vision tower has one CLS token in addition to the 24 x 24 patch grid.
+    # Recent LlavaProcessor versions subtract this token internally when
+    # vision_feature_select_strategy == "default".  Therefore this must stay 1
+    # even for the default strategy: 24*24 + 1 - 1 = 576 placeholders, which
+    # matches model.config.image_seq_length for llava-hf/llava-1.5-7b-hf.
+    processor.num_additional_image_tokens = 1
 
     return model, processor
 
