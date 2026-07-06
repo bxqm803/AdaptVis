@@ -517,6 +517,22 @@ def load_model_and_processor(args: argparse.Namespace):
         revision=args.revision,
         cache_dir=args.cache_dir,
     )
+
+    # The old LLaVA-1.5 processor checkpoint does not serialize these fields,
+    # but recent Transformers versions require them to expand <image> into the
+    # correct number of visual placeholder tokens.
+    vision_config = getattr(model.config, "vision_config", None)
+    patch_size = getattr(vision_config, "patch_size", None)
+    if patch_size is None:
+        raise RuntimeError(
+            "Could not recover the vision patch size from model.config.vision_config."
+        )
+    processor.patch_size = int(patch_size)
+
+    feature_strategy = getattr(model.config, "vision_feature_select_strategy", "default")
+    processor.vision_feature_select_strategy = str(feature_strategy)
+    processor.num_additional_image_tokens = 1 if feature_strategy == "full" else 0
+
     return model, processor
 
 
