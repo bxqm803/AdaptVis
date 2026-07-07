@@ -6,10 +6,10 @@ This version supports both spatial axes:
   * horizontal: left <-> right
   * vertical:   under/bottom <-> on/top
 
-When --fit-all is used with both axes, it also reports a four-way relation
-reconstruction accuracy.  For each image, it compares the calibrated absolute
-pair displacement along the horizontal and vertical axes; the stronger axis
-chooses the relation family and its sign chooses the relation.
+When --fit-all is used with both axes, it also reports a joint four-way
+relation reconstruction analysis.  Unlike the legacy decoder, it uses one
+shared per-object baseline for both axes and dual-basis coordinates to remove
+x/y cross-talk before testing a cardinal spatial readout.
 
 It can run in two modes:
   * --fit-all: estimate each axis, its object means, and its threshold from all
@@ -806,6 +806,307 @@ def score_four_way_axis_decoder(
         artifacts = {}
     return summary, artifacts
 
+
+
+def _shared_object_means(
+    records: Sequence[SampleRecord],
+    *,
+    layer: int,
+) -> Dict[str, np.ndarray]:
+    """Fit one object-specific baseline from *all* relation families.
+
+    Unlike the legacy four-way decoder, this uses the same per-object mean for
+    x and y.  This is required before cross-axis magnitudes can be compared:
+    otherwise horizontal and vertical coordinates are measured relative to two
+    incompatible object baselines.
+    """
+    by_object: Dict[str, List[np.ndarray]] = defaultdict(list)
+    for record in records:
+        if record.relation not in ALL_RELATIONS:
+            continue
+        by_object[record.subject].append(record.states[layer]["subject"])
+        by_object[record.reference].append(record.states[layer]["reference"])
+    return {
+        name: np.mean(np.stack(vectors, axis=0), axis=0).astype(np.float32)
+        for name, vectors in by_object.items()
+        if vectors
+    }
+
+
+def _shared_pair_residual(
+    record: SampleRecord,
+    *,
+    layer: int,
+    object_means: Mapping[str, np.ndarray],
+) -> Optional[np.ndarray]:
+    """Return the object-centred subject-minus-reference residual."""
+    subject_mean = object_means.get(record.subject)
+    reference_mean = object_means.get(record.reference)
+    if subject_mean is None or reference_mean is None:
+        return None
+    return (
+        (record.states[layer]["subject"] - subject_mean)
+        - (record.states[layer]["reference"] - reference_mean)
+    ).astype(np.float32)
+
+
+def _classification_payload(
+    rows: Sequence[Tuple[int, str, str]],
+) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
+    labels = ("left", "right", "on", "under")
+    confusion: Dict[str, Dict[str, int]] = {
+        gt: {pred: 0 for pred in labels}
+        for gt in labels
+    }
+    correct: List[bool] = []
+    for _, gt, pred in rows:
+        confusion[gt][pred] += 1
+        correct.append(gt == pred)
+
+    per_relation: Dict[str, Dict[str, Optional[float]]] = {}
+    for relation in labels:
+        total = int(sum(confusion[relation].values()))
+        per_relation[relation] = {
+            "n": total,
+            "accuracy": (float(confusion[relation][relation] / total) if total else None),
+        }
+
+    summary = {
+        "accuracy": float(np.mean(correct)) if correct else None,
+        "evaluation_n": int(len(rows)),
+        "per_relation": per_relation,
+        "confusion_matrix": confusion,
+    }
+    artifacts = {
+        "sid": np.array([sid for sid, _, _ in rows], dtype=np.int64),
+        "ground_truth": np.array([gt for _, gt, _ in rows], dtype=object),
+        "prediction": np.array([pred for _, _, pred in rows], dtype=object),
+    }
+    return summary, artifacts
+
+
+def score_four_way_joint_coordinate_decoder(
+    records: Sequence[SampleRecord],
+    *,
+    layer: int,
+) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
+    """Evaluate a properly calibrated 2D spatial-coordinate readout.
+
+    This replaces the legacy max(|x|, |y|) decoder whose x/y coordinates were
+    fitted against different per-object means.  The procedure is:
+
+      1. Fit one shared object baseline using all four relation families.
+      2. Build horizontal and vertical relation directions from centred
+         subject-minus-reference residuals.
+      3. Use the dual basis (D^T D)^(-1) D^T to remove x/y cross-talk when
+         the two directions are not orthogonal.
+      4. Standardise the resulting x/y coordinates with endpoint margins.
+
+    The ``geometric`` decoder then chooses the best cardinal direction.  The
+    optional ``prototype`` decoder is deliberately reported separately: it
+    tells us whether the *joint 2D state* contains four relation clusters,
+    but it is not evidence for a clean Cartesian coordinate system.
+    """
+    usable = [record for record in records if record.relation in ALL_RELATIONS]
+    object_means = _shared_object_means(usable, layer=layer)
+
+    rows_raw: List[Tuple[SampleRecord, np.ndarray]] = []
+    by_relation: Dict[str, List[np.ndarray]] = defaultdict(list)
+    for record in usable:
+        delta = _shared_pair_residual(record, layer=layer, object_means=object_means)
+        if delta is None:
+            continue
+        rows_raw.append((record, delta))
+        by_relation[record.relation].append(delta)
+
+    missing = [label for label in ("left", "right", "on", "under") if not by_relation[label]]
+    if missing:
+        raise RuntimeError(f"Layer {layer}: cannot fit joint four-way decoder; missing labels: {missing}")
+
+    relation_means = {
+        label: np.mean(np.stack(by_relation[label], axis=0), axis=0).astype(np.float32)
+        for label in ("left", "right", "on", "under")
+    }
+
+    # Cardinal directions in the hidden-state space.
+    x_raw = relation_means["right"] - relation_means["left"]
+    y_raw = relation_means["on"] - relation_means["under"]
+    x_norm = float(np.linalg.norm(x_raw))
+    y_norm = float(np.linalg.norm(y_raw))
+    if x_norm < 1e-8 or y_norm < 1e-8:
+        raise RuntimeError(f"Layer {layer}: a joint spatial direction has near-zero norm.")
+    x_axis = (x_raw / x_norm).astype(np.float32)
+    y_axis = (y_raw / y_norm).astype(np.float32)
+
+    # D contains unit-but-not-necessarily-orthogonal directions.  The dual
+    # basis gives coefficients in this span instead of raw dot products, which
+    # prevents y leakage into x (and vice versa) when axes are correlated.
+    D = np.stack([x_axis, y_axis], axis=1).astype(np.float64)  # [hidden, 2]
+    gram = D.T @ D
+    gram_eig = np.linalg.eigvalsh(gram)
+    if float(np.min(gram_eig)) < 1e-6:
+        raise RuntimeError(
+            f"Layer {layer}: horizontal/vertical directions are nearly collinear "
+            f"(min Gram eigenvalue={float(np.min(gram_eig)):.3e})."
+        )
+    dual = np.linalg.inv(gram) @ D.T  # [2, hidden]
+    axis_cosine = float(np.dot(x_axis, y_axis))
+    gram_condition = float(np.linalg.cond(gram))
+
+    raw_coordinates: List[Tuple[SampleRecord, np.ndarray]] = []
+    coords_by_relation: Dict[str, List[np.ndarray]] = defaultdict(list)
+    for record, delta in rows_raw:
+        coeff = (dual @ delta.astype(np.float64)).astype(np.float32)
+        raw_coordinates.append((record, coeff))
+        coords_by_relation[record.relation].append(coeff)
+
+    def _endpoint_calibration(
+        negative: str,
+        positive: str,
+        dim: int,
+    ) -> Tuple[float, float, float]:
+        neg_mean = float(np.mean([coord[dim] for coord in coords_by_relation[negative]]))
+        pos_mean = float(np.mean([coord[dim] for coord in coords_by_relation[positive]]))
+        center = 0.5 * (neg_mean + pos_mean)
+        half_margin = 0.5 * abs(pos_mean - neg_mean)
+        if half_margin < 1e-8:
+            raise RuntimeError(f"Layer {layer}: joint coordinate margin is near zero.")
+        orientation = 1.0 if pos_mean >= neg_mean else -1.0
+        return center, half_margin, orientation
+
+    x_center, x_half_margin, x_orientation = _endpoint_calibration("left", "right", 0)
+    y_center, y_half_margin, y_orientation = _endpoint_calibration("under", "on", 1)
+
+    coordinate_rows: List[Tuple[int, str, float, float]] = []
+    geometric_rows: List[Tuple[int, str, str]] = []
+    route_horizontal: List[bool] = []
+    route_vertical: List[bool] = []
+
+    standardized: List[Tuple[SampleRecord, np.ndarray]] = []
+    for record, coeff in raw_coordinates:
+        zx = x_orientation * (float(coeff[0]) - x_center) / x_half_margin
+        zy = y_orientation * (float(coeff[1]) - y_center) / y_half_margin
+        z = np.array([zx, zy], dtype=np.float32)
+        standardized.append((record, z))
+        coordinate_rows.append((record.sid, record.relation, zx, zy))
+
+        scores = {
+            "left": -zx,
+            "right": zx,
+            "under": -zy,
+            "on": zy,
+        }
+        predicted = max(scores, key=scores.get)
+        geometric_rows.append((record.sid, record.relation, predicted))
+
+        routed_horizontal = abs(zx) >= abs(zy)
+        if record.relation in {"left", "right"}:
+            route_horizontal.append(routed_horizontal)
+        else:
+            route_vertical.append(not routed_horizontal)
+
+    geometric_summary, geometric_artifacts = _classification_payload(geometric_rows)
+    geometric_summary.update(
+        {
+            "decoder": "shared_mean_dual_basis_cardinal_decoder",
+            "description": (
+                "Shared all-relation object baseline; dual-basis coordinates "
+                "remove x/y cross-talk; endpoint-standardised coordinates then "
+                "select the cardinal relation with the largest signed score."
+            ),
+            "horizontal_routing_accuracy": float(np.mean(route_horizontal)) if route_horizontal else None,
+            "vertical_routing_accuracy": float(np.mean(route_vertical)) if route_vertical else None,
+        }
+    )
+
+    # Four class prototypes in the calibrated 2D coordinate space.  This is
+    # intentionally a diagnostic supervised readout, not the geometric result.
+    z_by_relation: Dict[str, List[np.ndarray]] = defaultdict(list)
+    for record, z in standardized:
+        z_by_relation[record.relation].append(z)
+    prototypes = {
+        label: np.mean(np.stack(z_by_relation[label], axis=0), axis=0).astype(np.float64)
+        for label in ("left", "right", "on", "under")
+    }
+    residuals = []
+    for record, z in standardized:
+        residuals.append(z.astype(np.float64) - prototypes[record.relation])
+    covariance = np.cov(np.stack(residuals, axis=0), rowvar=False)
+    if covariance.ndim == 0:
+        covariance = np.eye(2, dtype=np.float64)
+    regularizer = max(1e-5, 1e-3 * float(np.trace(covariance)) / 2.0)
+    covariance = covariance + regularizer * np.eye(2, dtype=np.float64)
+    covariance_inv = np.linalg.inv(covariance)
+
+    prototype_rows: List[Tuple[int, str, str]] = []
+    for record, z in standardized:
+        z64 = z.astype(np.float64)
+        distances = {
+            label: float((z64 - proto).T @ covariance_inv @ (z64 - proto))
+            for label, proto in prototypes.items()
+        }
+        predicted = min(distances, key=distances.get)
+        prototype_rows.append((record.sid, record.relation, predicted))
+    prototype_summary, prototype_artifacts = _classification_payload(prototype_rows)
+    prototype_summary.update(
+        {
+            "decoder": "four_class_mahalanobis_prototype_readout",
+            "description": (
+                "A supervised diagnostic readout in calibrated 2D coordinate space. "
+                "It allows each relation to have its own prototype and therefore "
+                "does not test the stronger dominant-axis Cartesian assumption."
+            ),
+        }
+    )
+
+    summary: Dict[str, Any] = {
+        "layer": int(layer),
+        "evaluation_n": int(len(standardized)),
+        "joint_fit": {
+            "objects_with_shared_baseline": int(len(object_means)),
+            "x_axis_cosine_with_y": axis_cosine,
+            "axis_gram_condition_number": gram_condition,
+            "x_center": x_center,
+            "x_half_margin": x_half_margin,
+            "x_orientation": x_orientation,
+            "y_center": y_center,
+            "y_half_margin": y_half_margin,
+            "y_orientation": y_orientation,
+        },
+        "geometric_cardinal_decoder": geometric_summary,
+        "prototype_diagnostic_decoder": prototype_summary,
+        "note": (
+            "With --fit-all these are full-data reconstruction scores. "
+            "The geometric decoder tests a joint coordinate system; the "
+            "prototype decoder is only a diagnostic for relation-cluster separability."
+        ),
+    }
+
+    artifacts: Dict[str, np.ndarray] = {
+        "joint_object_names": np.array(sorted(object_means), dtype=object),
+        "joint_object_means": np.stack([object_means[name] for name in sorted(object_means)], axis=0).astype(np.float32),
+        "joint_x_axis": x_axis.astype(np.float32),
+        "joint_y_axis": y_axis.astype(np.float32),
+        "joint_dual_basis": dual.astype(np.float32),
+        "joint_gram": gram.astype(np.float32),
+        "joint_relation_names": np.array(["left", "right", "on", "under"], dtype=object),
+        "joint_relation_means": np.stack([relation_means[name] for name in ("left", "right", "on", "under")], axis=0).astype(np.float32),
+        "joint_sid": np.array([sid for sid, _, _, _ in coordinate_rows], dtype=np.int64),
+        "joint_ground_truth": np.array([gt for _, gt, _, _ in coordinate_rows], dtype=object),
+        "joint_zx": np.array([zx for _, _, zx, _ in coordinate_rows], dtype=np.float32),
+        "joint_zy": np.array([zy for _, _, _, zy in coordinate_rows], dtype=np.float32),
+        "joint_prototype_names": np.array(["left", "right", "on", "under"], dtype=object),
+        "joint_prototypes": np.stack([prototypes[name] for name in ("left", "right", "on", "under")], axis=0).astype(np.float32),
+        "joint_prototype_covariance": covariance.astype(np.float32),
+    }
+    for prefix, source in (
+        ("geometric", geometric_artifacts),
+        ("prototype", prototype_artifacts),
+    ):
+        for name, value in source.items():
+            artifacts[f"{prefix}_{name}"] = value
+    return summary, artifacts
+
 def load_model_and_processor(args: argparse.Namespace):
     dtype = resolve_dtype(args.dtype)
     model = LlavaForConditionalGeneration.from_pretrained(
@@ -1058,16 +1359,13 @@ def main() -> None:
             for name, value in layer_artifacts.items():
                 artifacts[f"layer_{layer}_{axis_name}_{name}"] = value
 
-    # The requested four-way decoder is only meaningful when both fitted axes
-    # use the same full-data estimation pool.  In held-out mode the per-axis
-    # splits can differ, so retain the separate-axis metrics instead.
+    # A joint four-way decoder is only meaningful in full-data mode here,
+    # because it needs one common estimation pool for both coordinate axes.
     if args.fit_all and {"horizontal", "vertical"}.issubset(set(axes)):
         for layer in layers:
-            four_summary, four_artifacts = score_four_way_axis_decoder(
+            four_summary, four_artifacts = score_four_way_joint_coordinate_decoder(
                 records,
                 layer=layer,
-                horizontal_artifacts=fitted_axis_artifacts[layer]["horizontal"],
-                vertical_artifacts=fitted_axis_artifacts[layer]["vertical"],
             )
             four_way_results[str(layer)] = four_summary
             for name, value in four_artifacts.items():
@@ -1089,8 +1387,9 @@ def main() -> None:
             "split_unit": None if args.fit_all else args.split_unit,
             "test_fraction": None if args.fit_all else args.test_fraction,
             "interpretation": (
-                "For each axis, vectors are object-centred using estimated per-object means. "
-                "The axis is the positive-position residual mean minus the negative-position residual mean. "
+                "Separate-axis metrics use object-centred residual means within each axis family. "
+                "The joint four-way analysis instead uses one all-relation object baseline and "
+                "dual-basis coordinates so horizontal/vertical evidence is comparable. "
                 "With --fit-all, all reported accuracy is full-data descriptive alignment, not held-out generalization."
             ),
         },
@@ -1105,7 +1404,7 @@ def main() -> None:
         },
         "debug_first_samples": debug_first,
         "results": per_layer,
-        "four_way_axis_decoder": four_way_results,
+        "joint_four_way_coordinate_decoder": four_way_results,
     }
 
     json_path = output_base.with_suffix(".json")
@@ -1130,9 +1429,19 @@ def main() -> None:
             )
         if str(layer) in four_way_results:
             result = four_way_results[str(layer)]
+            joint = result["joint_fit"]
+            geometric = result["geometric_cardinal_decoder"]
+            prototype = result["prototype_diagnostic_decoder"]
             print(
-                f"    four-way  acc={fmt(result['four_way_axis_decoding_accuracy'])} "
-                f"(n={result['evaluation_n']}; decoder=max(|x|, |y|) after margin normalization)"
+                f"    joint-coordinate geometric acc={fmt(geometric['accuracy'])} "
+                f"(n={geometric['evaluation_n']}; route h={fmt(geometric['horizontal_routing_accuracy'])}, "
+                f"v={fmt(geometric['vertical_routing_accuracy'])}; "
+                f"cos(x,y)={fmt(joint['x_axis_cosine_with_y'])}, "
+                f"cond={joint['axis_gram_condition_number']:.2f})"
+            )
+            print(
+                f"    joint-coordinate prototype acc={fmt(prototype['accuracy'])} "
+                f"(diagnostic only; not a Cartesian-coordinate claim)"
             )
     print(f"Saved summary: {json_path}")
 
