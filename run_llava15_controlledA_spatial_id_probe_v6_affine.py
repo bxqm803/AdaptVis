@@ -1059,6 +1059,94 @@ def score_four_way_joint_coordinate_decoder(
         }
     )
 
+
+    # Constrained affine-axis decoder.
+    #
+    # A strict Cartesian readout assumes all four relation directions emanate
+    # from one common origin.  The observed data can instead have two affine
+    # relation families:
+    #
+    #   left/right : c_h + t * u_h
+    #   under/on   : c_v + t * u_v
+    #
+    # where c_h and c_v need not coincide.  This decoder selects the nearer
+    # affine line using the same pooled Mahalanobis metric as the prototype
+    # diagnostic, then uses signed coordinate along that line for polarity.
+    def _line_distance_and_coordinate(
+        z: np.ndarray,
+        center: np.ndarray,
+        direction: np.ndarray,
+    ) -> Tuple[float, float]:
+        v = z.astype(np.float64) - center.astype(np.float64)
+        u = direction.astype(np.float64)
+        denom = float(u.T @ covariance_inv @ u)
+        if denom < 1e-12:
+            raise RuntimeError(f"Layer {layer}: affine-line direction has near-zero metric norm.")
+        coord = float((v.T @ covariance_inv @ u) / denom)
+        dist_sq = float(v.T @ covariance_inv @ v - ((v.T @ covariance_inv @ u) ** 2) / denom)
+        return max(0.0, dist_sq), coord
+
+    horizontal_center = 0.5 * (prototypes["left"] + prototypes["right"])
+    vertical_center = 0.5 * (prototypes["under"] + prototypes["on"])
+    horizontal_direction = prototypes["right"] - prototypes["left"]
+    vertical_direction = prototypes["on"] - prototypes["under"]
+
+    affine_rows: List[Tuple[int, str, str]] = []
+    affine_route_horizontal: List[bool] = []
+    affine_route_vertical: List[bool] = []
+    affine_distances: List[Tuple[int, str, float, float, str]] = []
+
+    for record, z in standardized:
+        dist_h, coord_h = _line_distance_and_coordinate(z, horizontal_center, horizontal_direction)
+        dist_v, coord_v = _line_distance_and_coordinate(z, vertical_center, vertical_direction)
+
+        choose_horizontal = dist_h <= dist_v
+        if choose_horizontal:
+            predicted = "right" if coord_h >= 0.0 else "left"
+        else:
+            predicted = "on" if coord_v >= 0.0 else "under"
+
+        affine_rows.append((record.sid, record.relation, predicted))
+        affine_distances.append((record.sid, record.relation, dist_h, dist_v, predicted))
+
+        if record.relation in {"left", "right"}:
+            affine_route_horizontal.append(choose_horizontal)
+        else:
+            affine_route_vertical.append(not choose_horizontal)
+
+    affine_summary, affine_artifacts = _classification_payload(affine_rows)
+    affine_summary.update(
+        {
+            "decoder": "two_affine_relation_axes_mahalanobis",
+            "description": (
+                "Two relation families are modeled as separate affine lines: "
+                "left/right share one centre and direction; under/on share another. "
+                "Routing chooses the closer line under the pooled Mahalanobis metric, "
+                "then polarity is decoded by the signed line coordinate. "
+                "This is stronger than a four-prototype classifier but weaker than "
+                "a single-origin Cartesian-coordinate claim."
+            ),
+            "horizontal_routing_accuracy": (
+                float(np.mean(affine_route_horizontal)) if affine_route_horizontal else None
+            ),
+            "vertical_routing_accuracy": (
+                float(np.mean(affine_route_vertical)) if affine_route_vertical else None
+            ),
+            "family_center_mahalanobis_distance": float(
+                np.sqrt(
+                    max(
+                        0.0,
+                        float(
+                            (horizontal_center - vertical_center).T
+                            @ covariance_inv
+                            @ (horizontal_center - vertical_center)
+                        ),
+                    )
+                )
+            ),
+        }
+    )
+
     summary: Dict[str, Any] = {
         "layer": int(layer),
         "evaluation_n": int(len(standardized)),
@@ -1074,6 +1162,7 @@ def score_four_way_joint_coordinate_decoder(
             "y_orientation": y_orientation,
         },
         "geometric_cardinal_decoder": geometric_summary,
+        "affine_axis_decoder": affine_summary,
         "prototype_diagnostic_decoder": prototype_summary,
         "note": (
             "With --fit-all these are full-data reconstruction scores. "
@@ -1099,8 +1188,24 @@ def score_four_way_joint_coordinate_decoder(
         "joint_prototypes": np.stack([prototypes[name] for name in ("left", "right", "on", "under")], axis=0).astype(np.float32),
         "joint_prototype_covariance": covariance.astype(np.float32),
     }
+    artifacts["joint_affine_horizontal_center"] = horizontal_center.astype(np.float32)
+    artifacts["joint_affine_vertical_center"] = vertical_center.astype(np.float32)
+    artifacts["joint_affine_horizontal_direction"] = horizontal_direction.astype(np.float32)
+    artifacts["joint_affine_vertical_direction"] = vertical_direction.astype(np.float32)
+    artifacts["joint_affine_sid"] = np.array([sid for sid, _, _, _, _ in affine_distances], dtype=np.int64)
+    artifacts["joint_affine_ground_truth"] = np.array([gt for _, gt, _, _, _ in affine_distances], dtype=object)
+    artifacts["joint_affine_distance_horizontal"] = np.array(
+        [dist_h for _, _, dist_h, _, _ in affine_distances], dtype=np.float32
+    )
+    artifacts["joint_affine_distance_vertical"] = np.array(
+        [dist_v for _, _, _, dist_v, _ in affine_distances], dtype=np.float32
+    )
+    artifacts["joint_affine_prediction"] = np.array(
+        [pred for _, _, _, _, pred in affine_distances], dtype=object
+    )
     for prefix, source in (
         ("geometric", geometric_artifacts),
+        ("affine", affine_artifacts),
         ("prototype", prototype_artifacts),
     ):
         for name, value in source.items():
@@ -1431,6 +1536,7 @@ def main() -> None:
             result = four_way_results[str(layer)]
             joint = result["joint_fit"]
             geometric = result["geometric_cardinal_decoder"]
+            affine = result["affine_axis_decoder"]
             prototype = result["prototype_diagnostic_decoder"]
             print(
                 f"    joint-coordinate geometric acc={fmt(geometric['accuracy'])} "
@@ -1438,6 +1544,12 @@ def main() -> None:
                 f"v={fmt(geometric['vertical_routing_accuracy'])}; "
                 f"cos(x,y)={fmt(joint['x_axis_cosine_with_y'])}, "
                 f"cond={joint['axis_gram_condition_number']:.2f})"
+            )
+            print(
+                f"    two-affine-axis acc={fmt(affine['accuracy'])} "
+                f"(route h={fmt(affine['horizontal_routing_accuracy'])}, "
+                f"v={fmt(affine['vertical_routing_accuracy'])}; "
+                f"family-centre Mahalanobis dist={affine['family_center_mahalanobis_distance']:.2f})"
             )
             print(
                 f"    joint-coordinate prototype acc={fmt(prototype['accuracy'])} "
