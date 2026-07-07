@@ -142,23 +142,56 @@ def canonical_phrase(text: str) -> str:
 
 
 def parse_relation_caption(caption: str) -> Optional[Tuple[str, str, str]]:
-    """Return canonical (subject, reference, relation) from a gold caption.
+    """Return canonical ``(subject, reference, relation)`` from a gold caption.
 
-    The repository's COCO/VG two-object JSON stores [image_id, gold_caption,
-    opposite_caption]. The parser intentionally only trusts the gold caption.
-    It handles the standard ARO forms and records all failures for auditing.
+    ARO two-object captions commonly use both sentence-style templates
+    (``A is to the left of B``) and noun-phrase templates
+    (``A photo of A to the left of B``).  The parser accepts both, while
+    retaining only the relation stated in the gold caption.
     """
     text = caption.strip().lower()
     text = re.sub(r"\s+", " ", text)
     text = text.strip(" .,!?:;\n\t")
 
+    # Remove common dataset wrappers so that both of the following reduce to
+    # the same relation phrase:
+    #   "A photo of a cup to the left of a book"
+    #   "A cup is to the left of a book"
+    text = re.sub(
+        r"^(?:a|an|the)?\s*(?:photo|picture|image)\s+of\s+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # The verbal copula is optional because ARO annotations are often noun
+    # phrases rather than full sentences after the wrapper is removed.
+    copula = r"(?:(?:is|are)\s+)?"
     patterns: List[Tuple[str, str]] = [
-        (r"^(?P<s>.+?)\s+(?:is|are)\s+(?:to\s+the\s+)?(?P<r>left|right)\s+of\s+(?P<o>.+)$", "lr"),
-        (r"^(?P<s>.+?)\s+(?:is|are)\s+(?:in\s+)?front\s+of\s+(?P<o>.+)$", "front"),
-        (r"^(?P<s>.+?)\s+(?:is|are)\s+(?P<r>behind)\s+(?P<o>.+)$", "behind"),
-        (r"^(?P<s>.+?)\s+(?:is|are)\s+(?:on\s+)?top\s+of\s+(?P<o>.+)$", "top"),
-        (r"^(?P<s>.+?)\s+(?:is|are)\s+at\s+the\s+(?P<r>top|bottom)\s+of\s+(?P<o>.+)$", "tb"),
-        (r"^(?P<s>.+?)\s+(?:is|are)\s+(?P<r>above|below|under|underneath)\s+(?P<o>.+)$", "vertical"),
+        (
+            rf"^(?P<s>.+?)\s+{copula}(?:to\s+the\s+)?(?P<r>left|right)\s+of\s+(?P<o>.+)$",
+            "lr",
+        ),
+        (
+            rf"^(?P<s>.+?)\s+{copula}(?:in\s+)?front\s+of\s+(?P<o>.+)$",
+            "front",
+        ),
+        (
+            rf"^(?P<s>.+?)\s+{copula}(?P<r>behind)\s+(?P<o>.+)$",
+            "behind",
+        ),
+        (
+            rf"^(?P<s>.+?)\s+{copula}(?:on\s+)?top\s+of\s+(?P<o>.+)$",
+            "top",
+        ),
+        (
+            rf"^(?P<s>.+?)\s+{copula}at\s+the\s+(?P<r>top|bottom)\s+of\s+(?P<o>.+)$",
+            "tb",
+        ),
+        (
+            rf"^(?P<s>.+?)\s+{copula}(?P<r>above|below|under|underneath)\s+(?P<o>.+)$",
+            "vertical",
+        ),
     ]
     for pattern, fixed_relation in patterns:
         match = re.match(pattern, text, flags=re.IGNORECASE)
@@ -178,7 +211,6 @@ def parse_relation_caption(caption: str) -> Optional[Tuple[str, str, str]]:
             return None
         return subject, reference, REL_ALIAS[relation]
     return None
-
 
 def load_records(dataset: str, data_root: Path, max_samples: Optional[int]) -> Tuple[List[Record], List[Dict[str, Any]]]:
     if dataset == "coco_two":
