@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Compare Controlled A relation directions with textual left/right/on/under vectors.
+"""Sample-level similarity between Controlled A object-difference vectors and direction word tokens.
 
-Standalone LLaVA-1.5 script.
+For each sample and layer, compare:
 
-It does NOT feed images. This avoids LLaVA image-token mismatch and measures the
-language-side option-word vectors in the same question text context:
+  raw:
+      cos( r_i, h_i(word_c) )
 
-  USER: Where is A in relation to B? Answer with left, right, on or under.
-  ASSISTANT:
+  centered:
+      cos( r_i - mean_j r_j, h_i(word_c) - mean_{w in {left,right,on,under}} h_i(w) )
 
-For each layer:
-  1) relation directions from existing states.npz:
-       d_c = normalize(mean_{y=c}(r_i - mean(r)))
-  2) textual word vectors from the model hidden states:
-       raw:             mean_i h_i(word_c)
-       prompt_centered: mean_i [h_i(word_c) - mean_c h_i(word_c)]
-  3) cosine matrix D @ W^T.
+where r_i = h(subject_i) - h(reference_i) is loaded from an existing Controlled A states.npz.
+The direction word vectors are extracted from a text-only LLaVA prompt, so no image is fed.
+
+Outputs per layer:
+  - mean 4x4 similarity matrices, rows=true relation, cols=word candidate
+  - sample-level argmax accuracy over the four word candidates
+  - per-sample CSV scores
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 import traceback
@@ -39,6 +40,7 @@ except Exception as exc:
     raise SystemExit(f"Unable to import transformers: {exc}")
 
 RELATIONS = ["left", "right", "on", "under"]
+REL_TO_ID = {r: i for i, r in enumerate(RELATIONS)}
 REL_MAP = {
     "left": "left",
     "right": "right",
@@ -96,8 +98,8 @@ def l2norm(x: np.ndarray, axis: int = -1, eps: float = 1e-12) -> np.ndarray:
 
 
 def normalize_relation(x: Any) -> str:
-    if isinstance(x, (list, tuple)):
-        x = x[0] if x else ""
+    if isinstance(x, (list, tuple, np.ndarray)):
+        x = x[0] if len(x) else ""
     return REL_MAP.get(str(x).strip().lower(), str(x).strip().lower())
 
 
@@ -113,11 +115,9 @@ def load_prompt_rows(path: Path) -> List[Dict[str, Any]]:
 
 
 def clean_question_text(q: str) -> str:
-    """Remove image/chat wrappers but keep the actual question/options text."""
     text = str(q).strip()
     text = text.replace("<image>", " ")
     text = re.sub(r"\bUSER\s*:\s*", " ", text, flags=re.IGNORECASE)
-    # Drop everything after ASSISTANT: because we only want prompt-side option words.
     text = re.split(r"\bASSISTANT\s*:\s*", text, flags=re.IGNORECASE)[0]
     text = re.sub(r"\s+", " ", text).strip()
     lower = text.lower()
@@ -137,7 +137,7 @@ def find_subsequence(haystack: Sequence[int], needle: Sequence[int]) -> List[int
     n = len(needle)
     h = list(haystack)
     nd = list(needle)
-    return [i for i in range(len(h) - n + 1) if h[i:i+n] == nd]
+    return [i for i in range(len(h) - n + 1) if h[i:i + n] == nd]
 
 
 def find_word_last_token(tokenizer: Any, input_ids: Sequence[int], word: str) -> int:
@@ -155,7 +155,6 @@ def find_word_last_token(tokenizer: Any, input_ids: Sequence[int], word: str) ->
     if not matches:
         decoded = tokenizer.decode(list(input_ids), skip_special_tokens=False)
         raise ValueError(f"Could not find relation word token for {word!r}. prompt={decoded!r}")
-    # Last occurrence targets the explicit option-list word.
     return max(matches, key=lambda x: x[0])[1]
 
 
@@ -182,7 +181,7 @@ def parse_layers(raw: str, available: Sequence[int]) -> List[int]:
     return wanted
 
 
-def compute_relation_directions(npz_path: Path, layers: List[int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int]]:
+def load_relation_vectors(npz_path: Path, layers: List[int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int]]:
     with np.load(npz_path, allow_pickle=True) as z:
         all_layers = [int(v) for v in z["decoder_block_index"].tolist()]
         layer_to_col = {L: i for i, L in enumerate(all_layers)}
@@ -195,20 +194,10 @@ def compute_relation_directions(npz_path: Path, layers: List[int]) -> Tuple[np.n
             sid = z["sid"].astype(np.int64)
         else:
             sid = np.arange(X.shape[0], dtype=np.int64)
-
-    D = []
-    for li, _L in enumerate(layers):
-        Xl = X[:, li, :]
-        center = Xl.mean(axis=0, keepdims=True)
-        Xc = Xl - center
-        dirs = []
-        for rel in RELATIONS:
-            mask = y == rel
-            if mask.sum() == 0:
-                raise ValueError(f"No samples for relation {rel}")
-            dirs.append(Xc[mask].mean(axis=0))
-        D.append(l2norm(np.stack(dirs, axis=0), axis=1))
-    return np.stack(D, axis=0), y, sid, layers
+    bad = sorted(set(y.tolist()) - set(RELATIONS))
+    if bad:
+        raise ValueError(f"Unexpected relation labels: {bad}")
+    return X, y, sid, layers
 
 
 def move_batch(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
@@ -218,7 +207,7 @@ def move_batch(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
     return out
 
 
-def write_csv(path: Path, matrix: np.ndarray, row_labels: List[str], col_labels: List[str]) -> None:
+def write_matrix_csv(path: Path, matrix: np.ndarray, row_labels: List[str], col_labels: List[str]) -> None:
     lines = ["," + ",".join(col_labels)]
     for r, vals in zip(row_labels, matrix):
         lines.append(r + "," + ",".join(f"{float(v):.6f}" for v in vals))
@@ -228,22 +217,28 @@ def write_csv(path: Path, matrix: np.ndarray, row_labels: List[str], col_labels:
 def plot_heatmap(path: Path, matrix: np.ndarray, title: str, row_labels: List[str], col_labels: List[str]) -> None:
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(5.6, 4.8), dpi=200)
-    im = ax.imshow(matrix, vmin=-1.0, vmax=1.0)
+    fig, ax = plt.subplots(figsize=(5.8, 4.8), dpi=200)
+    im = ax.imshow(matrix, vmin=-0.15, vmax=0.15)
     ax.set_xticks(np.arange(len(col_labels)))
     ax.set_yticks(np.arange(len(row_labels)))
     ax.set_xticklabels(col_labels)
     ax.set_yticklabels(row_labels)
-    ax.set_xlabel("text relation word vector")
-    ax.set_ylabel("relation direction")
+    ax.set_xlabel("candidate direction word token")
+    ax.set_ylabel("true relation of object difference")
     ax.set_title(title)
     for i in range(matrix.shape[0]):
         for j in range(matrix.shape[1]):
-            ax.text(j, i, f"{matrix[i, j]:.2f}", ha="center", va="center", fontsize=8)
+            ax.text(j, i, f"{matrix[i, j]:.3f}", ha="center", va="center", fontsize=8)
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
+
+
+def safe_max_offdiag(row: np.ndarray, true_idx: int) -> float:
+    tmp = row.copy()
+    tmp[true_idx] = -np.inf
+    return float(np.max(tmp))
 
 
 def main() -> None:
@@ -255,21 +250,35 @@ def main() -> None:
     with np.load(npz_path, allow_pickle=True) as z:
         available_layers = [int(v) for v in z["decoder_block_index"].tolist()]
     layers = parse_layers(args.layers, available_layers)
-    D, y, sids, layers = compute_relation_directions(npz_path, layers)
+    X, y, sids, layers = load_relation_vectors(npz_path, layers)
+
     if args.max_samples is not None:
+        X = X[: args.max_samples]
+        y = y[: args.max_samples]
         sids = sids[: args.max_samples]
 
+    # Raw and globally-centered object-difference vectors.
+    X_raw = l2norm(X, axis=2)
+    X_centered = l2norm(X - X.mean(axis=0, keepdims=True), axis=2)
+
     prompt_rows = load_prompt_rows(Path(args.prompt_path))
-    prompts = []
-    used_sids = []
-    for sid in sids:
+    prompts: List[str] = []
+    used_row_indices: List[int] = []
+    used_sids: List[int] = []
+    for local_i, sid in enumerate(sids):
         sid_int = int(sid)
         if 0 <= sid_int < len(prompt_rows):
             prompts.append(build_text_only_prompt(prompt_rows[sid_int]["question"]))
+            used_row_indices.append(local_i)
             used_sids.append(sid_int)
 
     if not prompts:
         raise RuntimeError("No prompt rows matched npz sample_index/sid")
+
+    # Keep X/y in the exact prompt extraction order.
+    X_raw = X_raw[used_row_indices]
+    X_centered = X_centered[used_row_indices]
+    y_used = y[used_row_indices]
 
     spec = SPECS[args.model]
     model_cls = getattr(transformers, spec.model_class, None)
@@ -289,7 +298,10 @@ def main() -> None:
     print(f"Model: {args.model} ({spec.repo_id})")
     print(f"Layers: {layers}")
     print(f"Relations/words: {RELATIONS}")
-    print(f"Text-only prompts: {len(prompts)}")
+    print(f"Samples: {len(prompts)}")
+    print("Modes:")
+    print("  raw      = cos(r_i, h_i(word_c))")
+    print("  centered = cos(r_i-mean(r), h_i(word_c)-mean_words(h_i))")
 
     model = model_cls.from_pretrained(spec.repo_id, **load_kwargs)
     model.eval()
@@ -303,14 +315,21 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
 
     device = torch.device(args.device)
-    H = int(D.shape[-1])
+    H = int(X_raw.shape[-1])
     Lnum = len(layers)
-    sum_raw = np.zeros((Lnum, len(RELATIONS), H), dtype=np.float64)
-    sum_centered = np.zeros_like(sum_raw)
-    count = 0
+
+    # Per-layer, per-mode accumulators.
+    modes = ["raw", "centered"]
+    score_sum = {m: np.zeros((Lnum, len(RELATIONS), len(RELATIONS)), dtype=np.float64) for m in modes}
+    score_count = {m: np.zeros((Lnum, len(RELATIONS), len(RELATIONS)), dtype=np.int64) for m in modes}
+    correct = {m: np.zeros(Lnum, dtype=np.int64) for m in modes}
+    total = {m: np.zeros(Lnum, dtype=np.int64) for m in modes}
+    diag_sum = {m: np.zeros(Lnum, dtype=np.float64) for m in modes}
+    margin_sum = {m: np.zeros(Lnum, dtype=np.float64) for m in modes}
+    per_sample_rows: Dict[Tuple[int, str], List[Dict[str, Any]]] = {(L, m): [] for L in layers for m in modes}
     errors: List[Dict[str, Any]] = []
 
-    for sid, prompt in tqdm(list(zip(used_sids, prompts)), desc="Extracting text-only word states"):
+    for idx, (sid, prompt) in enumerate(tqdm(list(zip(used_sids, prompts)), desc="Scoring object-diff vs word tokens")):
         try:
             enc = tokenizer([prompt], return_tensors="pt", add_special_tokens=True)
             enc = move_batch(dict(enc), device)
@@ -321,20 +340,44 @@ def main() -> None:
                 outputs = model(**enc, output_hidden_states=True, use_cache=False, return_dict=True)
             states = hidden_tuple(outputs)
 
-            per_layer_words = []
-            for block in layers:
-                # hidden_states[0] is embedding output; block index L maps to hidden_states[L+1]
-                hw = torch.stack([states[block + 1][0, p] for p in word_pos], dim=0).detach().float().cpu().numpy()
-                if hw.shape != (len(RELATIONS), H):
-                    raise RuntimeError(f"Unexpected word hidden shape {hw.shape}, expected {(len(RELATIONS), H)}")
-                per_layer_words.append(hw)
-            W = np.stack(per_layer_words, axis=0)
-            sum_raw += W
-            sum_centered += W - W.mean(axis=1, keepdims=True)
-            count += 1
+            true_rel = str(y_used[idx])
+            true_idx = REL_TO_ID[true_rel]
+
+            for li, block in enumerate(layers):
+                W = torch.stack([states[block + 1][0, p] for p in word_pos], dim=0).detach().float().cpu().numpy()
+                if W.shape != (len(RELATIONS), H):
+                    raise RuntimeError(f"Unexpected word hidden shape {W.shape}, expected {(len(RELATIONS), H)}")
+
+                W_raw = l2norm(W.astype(np.float32), axis=1)
+                W_centered = l2norm((W - W.mean(axis=0, keepdims=True)).astype(np.float32), axis=1)
+
+                for mode_name, rv, wv in [
+                    ("raw", X_raw[idx, li], W_raw),
+                    ("centered", X_centered[idx, li], W_centered),
+                ]:
+                    s = (rv[None, :] @ wv.T).reshape(-1).astype(np.float64)
+                    pred_idx = int(np.argmax(s))
+                    pred_rel = RELATIONS[pred_idx]
+                    margin = float(s[true_idx] - safe_max_offdiag(s, true_idx))
+
+                    score_sum[mode_name][li, true_idx, :] += s
+                    score_count[mode_name][li, true_idx, :] += 1
+                    correct[mode_name][li] += int(pred_idx == true_idx)
+                    total[mode_name][li] += 1
+                    diag_sum[mode_name][li] += float(s[true_idx])
+                    margin_sum[mode_name][li] += margin
+
+                    per_sample_rows[(block, mode_name)].append({
+                        "sample_index": int(sid),
+                        "true_relation": true_rel,
+                        "pred_word": pred_rel,
+                        "correct": int(pred_idx == true_idx),
+                        "margin": margin,
+                        **{f"score_{r}": float(s[j]) for j, r in enumerate(RELATIONS)},
+                    })
 
             del outputs, states, enc
-            if torch.cuda.is_available() and count % 50 == 0:
+            if torch.cuda.is_available() and (idx + 1) % 50 == 0:
                 torch.cuda.empty_cache()
         except Exception as exc:
             errors.append({
@@ -347,69 +390,76 @@ def main() -> None:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    if count == 0:
-        raise RuntimeError(f"No word states extracted. First errors: {errors[:3]}")
-
-    W_raw = l2norm((sum_raw / count).astype(np.float32), axis=2)
-    W_centered = l2norm((sum_centered / count).astype(np.float32), axis=2)
-
     summary: Dict[str, Any] = {
         "npz": str(npz_path),
         "model": args.model,
         "repo_id": spec.repo_id,
         "layers_order": layers,
         "relations": RELATIONS,
-        "word_context": "text_only_prompt",
-        "n_word_records_used": int(count),
+        "comparison": {
+            "raw": "cos(r_i, h_i(word_c))",
+            "centered": "cos(r_i - global_mean_r, h_i(word_c) - mean_words_i)",
+        },
+        "n_samples_requested": int(len(prompts)),
         "n_errors": int(len(errors)),
         "layers": {},
         "results": {},
     }
 
     for li, L in enumerate(layers):
-        layer_dict: Dict[str, Any] = {}
-        for mode_name, Wmode in [("raw", W_raw), ("prompt_centered", W_centered)]:
-            S = D[li] @ Wmode[li].T
-            diag = np.diag(S)
-            off = S.copy()
-            np.fill_diagonal(off, -np.inf)
-            margin = diag - off.max(axis=1)
-            row_argmax = [RELATIONS[int(j)] for j in S.argmax(axis=1)]
-            row_match = [row_argmax[i] == RELATIONS[i] for i in range(len(RELATIONS))]
+        layer_info: Dict[str, Any] = {}
+        for mode_name in modes:
+            mat = score_sum[mode_name][li] / np.maximum(score_count[mode_name][li], 1)
+            acc = float(correct[mode_name][li] / max(int(total[mode_name][li]), 1))
+            diag_mean = float(diag_sum[mode_name][li] / max(int(total[mode_name][li]), 1))
+            margin_mean = float(margin_sum[mode_name][li] / max(int(total[mode_name][li]), 1))
+            row_argmax = [RELATIONS[int(j)] for j in mat.argmax(axis=1)]
+            row_match_acc = float(np.mean([row_argmax[i] == RELATIONS[i] for i in range(len(RELATIONS))]))
+            diag_by_class = {r: float(mat[i, i]) for i, r in enumerate(RELATIONS)}
             info = {
-                "matrix": S.tolist(),
-                "diag_mean": float(diag.mean()),
-                "diag_min": float(diag.min()),
-                "diag_margin_mean": float(margin.mean()),
-                "mean_margin": float(margin.mean()),
+                "matrix": mat.tolist(),
+                "sample_argmax_acc": acc,
+                "diag_mean": diag_mean,
+                "sample_margin_mean": margin_mean,
                 "row_argmax": row_argmax,
-                "row_match_acc": float(np.mean(row_match)),
+                "row_match_acc": row_match_acc,
+                "diag_by_class": diag_by_class,
+                "n_scored": int(total[mode_name][li]),
             }
-            layer_dict[mode_name] = info
+            layer_info[mode_name] = info
             summary["results"][f"L{L}_{mode_name}"] = info
 
-            csv_path = out_dir / f"direction_word_similarity_L{L}_{mode_name}.csv"
-            png_path = out_dir / f"direction_word_similarity_L{L}_{mode_name}.png"
-            write_csv(csv_path, S, RELATIONS, RELATIONS)
+            write_matrix_csv(out_dir / f"sample_relation_word_mean_matrix_L{L}_{mode_name}.csv", mat, RELATIONS, RELATIONS)
+            with (out_dir / f"sample_relation_word_scores_L{L}_{mode_name}.csv").open("w", newline="", encoding="utf-8") as f:
+                fieldnames = ["sample_index", "true_relation", "pred_word", "correct", "margin"] + [f"score_{r}" for r in RELATIONS]
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(per_sample_rows[(L, mode_name)])
             if args.save_plots:
-                plot_heatmap(png_path, S, f"{args.model} Controlled A L{L} ({mode_name})", RELATIONS, RELATIONS)
+                plot_heatmap(
+                    out_dir / f"sample_relation_word_mean_matrix_L{L}_{mode_name}.png",
+                    mat,
+                    f"{args.model} Controlled A L{L} object-diff vs word ({mode_name})",
+                    RELATIONS,
+                    RELATIONS,
+                )
 
-        summary["layers"][str(L)] = layer_dict
-        pc = layer_dict["prompt_centered"]
-        raw = layer_dict["raw"]
+        summary["layers"][str(L)] = layer_info
+        raw = layer_info["raw"]
+        cen = layer_info["centered"]
         print(
             f"L{L}: "
-            f"raw diag={raw['diag_mean']:.3f} margin={raw['diag_margin_mean']:.3f} match={raw['row_match_acc']:.2f} | "
-            f"centered diag={pc['diag_mean']:.3f} margin={pc['diag_margin_mean']:.3f} match={pc['row_match_acc']:.2f}"
+            f"raw acc={raw['sample_argmax_acc']:.3f} diag={raw['diag_mean']:.3f} margin={raw['sample_margin_mean']:.3f} rowmatch={raw['row_match_acc']:.2f} | "
+            f"centered acc={cen['sample_argmax_acc']:.3f} diag={cen['diag_mean']:.3f} margin={cen['sample_margin_mean']:.3f} rowmatch={cen['row_match_acc']:.2f}"
         )
 
-    (out_dir / "direction_word_similarity_summary.json").write_text(
+    (out_dir / "sample_relation_word_similarity_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    (out_dir / "direction_word_similarity_errors.json").write_text(
+    (out_dir / "sample_relation_word_similarity_errors.json").write_text(
         json.dumps(errors, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    print(f"Saved summary: {out_dir / 'direction_word_similarity_summary.json'}")
+    print(f"Saved summary: {out_dir / 'sample_relation_word_similarity_summary.json'}")
     print(f"Errors: {len(errors)}")
 
 
