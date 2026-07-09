@@ -1,52 +1,42 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Compare Controlled A four relation directions with textual relation-word vectors.
+"""Compare Controlled A relation directions with textual left/right/on/under vectors.
 
-This script is standalone: it does not import previous extractor/analyzer scripts.
+Standalone LLaVA-1.5 script.
 
-For LLaVA-1.5 + Controlled A:
-  1) load relation_vectors from an existing Controlled A states.npz;
-  2) compute four full-data relation directions d_left/d_right/d_on/d_under;
-  3) run the same model on Controlled A prompts and extract hidden states of
-     the textual words left/right/on/under in the question/options;
-  4) compare cosine similarities between relation directions and word vectors.
+It does NOT feed images. This avoids LLaVA image-token mismatch and measures the
+language-side option-word vectors in the same question text context:
 
-The main diagnostic is prompt-centered word vectors:
-    w_c = mean_i [ h_i(word_c) - mean_{c' in words} h_i(word_{c'}) ]
-This removes common prompt/image context shared by all four option words.
+  USER: Where is A in relation to B? Answer with left, right, on or under.
+  ASSISTANT:
+
+For each layer:
+  1) relation directions from existing states.npz:
+       d_c = normalize(mean_{y=c}(r_i - mean(r)))
+  2) textual word vectors from the model hidden states:
+       raw:             mean_i h_i(word_c)
+       prompt_centered: mean_i [h_i(word_c) - mean_c h_i(word_c)]
+  3) cosine matrix D @ W^T.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
-from PIL import Image
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 try:
     import transformers
-    from transformers import AutoProcessor
+    from transformers import AutoProcessor, AutoTokenizer
 except Exception as exc:
     raise SystemExit(f"Unable to import transformers: {exc}")
-
-try:
-    from dataset_zoo import get_dataset
-except Exception as exc:
-    raise SystemExit(f"Unable to import dataset_zoo.get_dataset. Run from AdaptVis repo root. Error: {exc}")
-
-try:
-    from misc import _default_collate as repository_default_collate
-except Exception:
-    repository_default_collate = None
 
 RELATIONS = ["left", "right", "on", "under"]
 REL_MAP = {
@@ -86,29 +76,6 @@ SPECS = {
     ),
 }
 
-QUESTION_PATTERNS = [
-    re.compile(
-        r"Where\s+(?P<verb>is|are)\s+(?:the\s+)?(?P<subject>.+?)\s+"
-        r"in\s+relation\s+to\s+(?:the\s+)?(?P<reference>.+?)\?\s*Answer",
-        flags=re.IGNORECASE | re.DOTALL,
-    ),
-    re.compile(
-        r"Where\s+(?P<verb>is|are)\s+(?:the\s+)?(?P<subject>.+?)\s+"
-        r"relative\s+to\s+(?:the\s+)?(?P<reference>.+?)\?",
-        flags=re.IGNORECASE | re.DOTALL,
-    ),
-]
-
-
-@dataclass(frozen=True)
-class Record:
-    sid: int
-    relation: str
-    subject: str
-    reference: str
-    question: str
-    image: Image.Image
-
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
@@ -117,12 +84,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--attn-impl", choices=["sdpa", "eager", "flash_attention_2", "none"], default="sdpa")
     p.add_argument("--prompt-path", default="prompts/Controlled_Images_A_with_answer_four_options.jsonl")
-    p.add_argument("--download", action="store_true")
-    p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--layers", default="auto", help="auto or comma-separated decoder block indices")
     p.add_argument("--max-samples", type=int, default=None)
-    p.add_argument("--append-options-if-missing", action="store_true", default=True)
     p.add_argument("--output-dir", required=True)
+    p.add_argument("--save-plots", action="store_true", default=True)
     return p.parse_args()
 
 
@@ -130,26 +95,10 @@ def l2norm(x: np.ndarray, axis: int = -1, eps: float = 1e-12) -> np.ndarray:
     return x / np.maximum(np.linalg.norm(x, axis=axis, keepdims=True), eps)
 
 
-def canonical_object(text: str) -> str:
-    text = str(text).strip().lower()
-    text = re.sub(r"[\s\.,;:!?]+$", "", text)
-    text = re.sub(r"^(?:the|a|an)\s+", "", text)
-    text = re.sub(r"\s+", " ", text)
-    return text
-
-
 def normalize_relation(x: Any) -> str:
     if isinstance(x, (list, tuple)):
         x = x[0] if x else ""
     return REL_MAP.get(str(x).strip().lower(), str(x).strip().lower())
-
-
-def parse_prompt_objects(question: str) -> Tuple[str, str]:
-    for pat in QUESTION_PATTERNS:
-        m = pat.search(str(question))
-        if m is not None:
-            return canonical_object(m.group("subject")), canonical_object(m.group("reference"))
-    return "", ""
 
 
 def load_prompt_rows(path: Path) -> List[Dict[str, Any]]:
@@ -163,111 +112,36 @@ def load_prompt_rows(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
-def extract_images_from_batch(batch: Mapping[str, Any]) -> Iterable[Any]:
-    if "image_options" in batch:
-        for image_option in batch["image_options"]:
-            for image in image_option:
-                yield image
-    elif "images" in batch:
-        for image in batch["images"]:
-            yield image
-    elif "image" in batch:
-        vals = batch["image"]
-        if isinstance(vals, (list, tuple)):
-            yield from vals
-        else:
-            yield vals
-    else:
-        raise KeyError(f"Cannot find images in batch keys={list(batch.keys())}")
-
-
-def ensure_pil_rgb(image: Any) -> Image.Image:
-    if isinstance(image, Image.Image):
-        return image.convert("RGB")
-    arr = np.asarray(image)
-    if arr.ndim == 3:
-        return Image.fromarray(arr.astype(np.uint8)).convert("RGB")
-    raise TypeError(f"Unsupported image type: {type(image)} shape={getattr(arr, 'shape', None)}")
-
-
-def load_records(prompt_path: Path, download: bool, num_workers: int) -> Dict[int, Record]:
-    prompt_rows = load_prompt_rows(prompt_path)
-    dataset = get_dataset("Controlled_Images_A", image_preprocess=None, download=download)
-    total = min(len(dataset), len(prompt_rows))
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=num_workers, collate_fn=repository_default_collate)
-
-    records: Dict[int, Record] = {}
-    sid = 0
-    pbar = tqdm(total=total, desc="Loading Controlled_A")
-    for batch in loader:
-        for raw_img in extract_images_from_batch(batch):
-            if sid >= total:
-                break
-            row = prompt_rows[sid]
-            try:
-                relation = normalize_relation(row.get("answer", ""))
-                if relation not in RELATIONS:
-                    sid += 1
-                    pbar.update(1)
-                    continue
-                subject, reference = parse_prompt_objects(str(row["question"]))
-                records[sid] = Record(
-                    sid=sid,
-                    relation=relation,
-                    subject=subject,
-                    reference=reference,
-                    question=str(row["question"]),
-                    image=ensure_pil_rgb(raw_img),
-                )
-            finally:
-                sid += 1
-                pbar.update(1)
-        if sid >= total:
-            break
-    pbar.close()
-    return records
-
-
-def configure_processor(model: Any, processor: Any) -> None:
-    config = getattr(model, "config", None)
-    vision_config = getattr(config, "vision_config", None)
-    if vision_config is not None and hasattr(processor, "patch_size") and hasattr(vision_config, "patch_size"):
-        processor.patch_size = int(vision_config.patch_size)
-    strategy = getattr(config, "vision_feature_select_strategy", None)
-    if strategy is not None and hasattr(processor, "vision_feature_select_strategy"):
-        processor.vision_feature_select_strategy = str(strategy)
-    if getattr(config, "model_type", "") == "llava" and hasattr(processor, "num_additional_image_tokens"):
-        processor.num_additional_image_tokens = 1
-
-
-def build_chat_prompt(processor: Any, question: str, append_options_if_missing: bool = True) -> str:
-    text = str(question).strip()
-    if append_options_if_missing:
-        lower = text.lower()
-        if not all(re.search(rf"\b{re.escape(w)}\b", lower) for w in RELATIONS):
-            text = text.rstrip() + " Options: left, right, on, under."
-    messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": text}]}]
-    if hasattr(processor, "apply_chat_template"):
-        return processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+def clean_question_text(q: str) -> str:
+    """Remove image/chat wrappers but keep the actual question/options text."""
+    text = str(q).strip()
+    text = text.replace("<image>", " ")
+    text = re.sub(r"\bUSER\s*:\s*", " ", text, flags=re.IGNORECASE)
+    # Drop everything after ASSISTANT: because we only want prompt-side option words.
+    text = re.split(r"\bASSISTANT\s*:\s*", text, flags=re.IGNORECASE)[0]
+    text = re.sub(r"\s+", " ", text).strip()
+    lower = text.lower()
+    if not all(re.search(rf"\b{re.escape(w)}\b", lower) for w in RELATIONS):
+        text = text.rstrip(" .") + ". Answer with left, right, on or under."
     return text
 
 
-def move_batch(batch: Mapping[str, Any], device: torch.device) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for k, v in batch.items():
-        out[k] = v.to(device) if torch.is_tensor(v) else v
-    return out
+def build_text_only_prompt(question: str) -> str:
+    q = clean_question_text(question)
+    return f"USER: {q}\nASSISTANT:"
 
 
 def find_subsequence(haystack: Sequence[int], needle: Sequence[int]) -> List[int]:
     if not needle:
         return []
     n = len(needle)
-    return [i for i in range(len(haystack) - n + 1) if list(haystack[i:i+n]) == list(needle)]
+    h = list(haystack)
+    nd = list(needle)
+    return [i for i in range(len(h) - n + 1) if h[i:i+n] == nd]
 
 
 def find_word_last_token(tokenizer: Any, input_ids: Sequence[int], word: str) -> int:
-    matches: List[Tuple[int, int]] = []
+    matches: List[Tuple[int, int, str, List[int]]] = []
     seen = set()
     variants = [word, " " + word, ", " + word, ": " + word, "(" + word, "\n" + word]
     for v in variants:
@@ -277,10 +151,11 @@ def find_word_last_token(tokenizer: Any, input_ids: Sequence[int], word: str) ->
             continue
         seen.add(key)
         for start in find_subsequence(input_ids, ids):
-            matches.append((start, start + len(ids) - 1))
+            matches.append((start, start + len(ids) - 1, v, ids))
     if not matches:
-        raise ValueError(f"Could not find relation word token for {word!r}")
-    # Last occurrence is usually the options/list word, not earlier text.
+        decoded = tokenizer.decode(list(input_ids), skip_special_tokens=False)
+        raise ValueError(f"Could not find relation word token for {word!r}. prompt={decoded!r}")
+    # Last occurrence targets the explicit option-list word.
     return max(matches, key=lambda x: x[0])[1]
 
 
@@ -307,14 +182,19 @@ def parse_layers(raw: str, available: Sequence[int]) -> List[int]:
     return wanted
 
 
-def compute_relation_directions(npz_path: Path, layers: List[int]) -> Tuple[np.ndarray, np.ndarray, List[int], np.ndarray, np.ndarray]:
+def compute_relation_directions(npz_path: Path, layers: List[int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int]]:
     with np.load(npz_path, allow_pickle=True) as z:
         all_layers = [int(v) for v in z["decoder_block_index"].tolist()]
         layer_to_col = {L: i for i, L in enumerate(all_layers)}
         cols = [layer_to_col[L] for L in layers]
         X = z["relation_vectors"][:, cols, :].astype(np.float32)
-        y = np.asarray([str(v) for v in z["relation"].tolist()], dtype=object)
-        sid = z["sample_index"].astype(np.int64) if "sample_index" in z else z["sid"].astype(np.int64)
+        y = np.asarray([normalize_relation(v) for v in z["relation"].tolist()], dtype=object)
+        if "sample_index" in z:
+            sid = z["sample_index"].astype(np.int64)
+        elif "sid" in z:
+            sid = z["sid"].astype(np.int64)
+        else:
+            sid = np.arange(X.shape[0], dtype=np.int64)
 
     D = []
     for li, _L in enumerate(layers):
@@ -328,8 +208,14 @@ def compute_relation_directions(npz_path: Path, layers: List[int]) -> Tuple[np.n
                 raise ValueError(f"No samples for relation {rel}")
             dirs.append(Xc[mask].mean(axis=0))
         D.append(l2norm(np.stack(dirs, axis=0), axis=1))
-    D_arr = np.stack(D, axis=0)  # [L, 4, H]
-    return D_arr, y, layers, sid, X
+    return np.stack(D, axis=0), y, sid, layers
+
+
+def move_batch(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in batch.items():
+        out[k] = v.to(device) if torch.is_tensor(v) else v
+    return out
 
 
 def write_csv(path: Path, matrix: np.ndarray, row_labels: List[str], col_labels: List[str]) -> None:
@@ -369,25 +255,27 @@ def main() -> None:
     with np.load(npz_path, allow_pickle=True) as z:
         available_layers = [int(v) for v in z["decoder_block_index"].tolist()]
     layers = parse_layers(args.layers, available_layers)
-    D, y, layers, sids, _X = compute_relation_directions(npz_path, layers)
+    D, y, sids, layers = compute_relation_directions(npz_path, layers)
     if args.max_samples is not None:
-        sids = sids[:args.max_samples]
+        sids = sids[: args.max_samples]
 
-    print(f"Input npz: {npz_path}")
-    print(f"Model: {args.model}")
-    print(f"Layers: {layers}")
-    print(f"Relations/words: {RELATIONS}")
+    prompt_rows = load_prompt_rows(Path(args.prompt_path))
+    prompts = []
+    used_sids = []
+    for sid in sids:
+        sid_int = int(sid)
+        if 0 <= sid_int < len(prompt_rows):
+            prompts.append(build_text_only_prompt(prompt_rows[sid_int]["question"]))
+            used_sids.append(sid_int)
 
-    records_by_sid = load_records(Path(args.prompt_path), download=args.download, num_workers=args.num_workers)
-    records = [records_by_sid[int(sid)] for sid in sids if int(sid) in records_by_sid]
-    if not records:
-        raise RuntimeError("No records matched npz sample_index/sid")
-    print(f"Matched records: {len(records)}")
+    if not prompts:
+        raise RuntimeError("No prompt rows matched npz sample_index/sid")
 
     spec = SPECS[args.model]
     model_cls = getattr(transformers, spec.model_class, None)
     if model_cls is None:
         raise RuntimeError(f"transformers=={transformers.__version__} has no {spec.model_class}")
+
     load_kwargs: Dict[str, Any] = {
         "torch_dtype": spec.dtype,
         "low_cpu_mem_usage": True,
@@ -397,12 +285,24 @@ def main() -> None:
     if args.attn_impl != "none":
         load_kwargs["attn_implementation"] = args.attn_impl
 
+    print(f"Input npz: {npz_path}")
+    print(f"Model: {args.model} ({spec.repo_id})")
+    print(f"Layers: {layers}")
+    print(f"Relations/words: {RELATIONS}")
+    print(f"Text-only prompts: {len(prompts)}")
+
     model = model_cls.from_pretrained(spec.repo_id, **load_kwargs)
     model.eval()
-    processor = AutoProcessor.from_pretrained(spec.repo_id, trust_remote_code=spec.trust_remote_code)
-    configure_processor(model, processor)
-    device = torch.device(args.device)
 
+    try:
+        processor = AutoProcessor.from_pretrained(spec.repo_id, trust_remote_code=spec.trust_remote_code)
+        tokenizer = processor.tokenizer
+    except Exception:
+        tokenizer = AutoTokenizer.from_pretrained(spec.repo_id, trust_remote_code=spec.trust_remote_code)
+    if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    device = torch.device(args.device)
     H = int(D.shape[-1])
     Lnum = len(layers)
     sum_raw = np.zeros((Lnum, len(RELATIONS), H), dtype=np.float64)
@@ -410,45 +310,42 @@ def main() -> None:
     count = 0
     errors: List[Dict[str, Any]] = []
 
-    for rec in tqdm(records, desc="Extracting relation-word hidden states"):
+    for sid, prompt in tqdm(list(zip(used_sids, prompts)), desc="Extracting text-only word states"):
         try:
-            rendered = build_chat_prompt(processor, rec.question, append_options_if_missing=args.append_options_if_missing)
-            batch = processor(text=[rendered], images=[rec.image], return_tensors="pt")
-            batch = move_batch(batch, device)
-            input_ids = batch["input_ids"][0].detach().cpu().tolist()
-            word_pos = [find_word_last_token(processor.tokenizer, input_ids, w) for w in RELATIONS]
+            enc = tokenizer([prompt], return_tensors="pt", add_special_tokens=True)
+            enc = move_batch(dict(enc), device)
+            input_ids = enc["input_ids"][0].detach().cpu().tolist()
+            word_pos = [find_word_last_token(tokenizer, input_ids, w) for w in RELATIONS]
 
             with torch.inference_mode():
-                outputs = model(**batch, output_hidden_states=True, use_cache=False, return_dict=True)
+                outputs = model(**enc, output_hidden_states=True, use_cache=False, return_dict=True)
             states = hidden_tuple(outputs)
-            if int(states[-1].shape[1]) != len(input_ids):
-                raise RuntimeError(f"hidden/input length mismatch: hidden={states[-1].shape[1]}, input={len(input_ids)}")
 
             per_layer_words = []
-            for li, block in enumerate(layers):
+            for block in layers:
+                # hidden_states[0] is embedding output; block index L maps to hidden_states[L+1]
                 hw = torch.stack([states[block + 1][0, p] for p in word_pos], dim=0).detach().float().cpu().numpy()
                 if hw.shape != (len(RELATIONS), H):
                     raise RuntimeError(f"Unexpected word hidden shape {hw.shape}, expected {(len(RELATIONS), H)}")
                 per_layer_words.append(hw)
-            W = np.stack(per_layer_words, axis=0)  # [L, 4, H]
+            W = np.stack(per_layer_words, axis=0)
             sum_raw += W
             sum_centered += W - W.mean(axis=1, keepdims=True)
             count += 1
 
-            del outputs, states, batch
+            del outputs, states, enc
             if torch.cuda.is_available() and count % 50 == 0:
                 torch.cuda.empty_cache()
         except Exception as exc:
             errors.append({
-                "sid": rec.sid,
-                "question": rec.question,
+                "sid": int(sid),
+                "prompt": prompt,
                 "error_type": type(exc).__name__,
                 "error": str(exc),
                 "traceback_tail": traceback.format_exc().splitlines()[-8:],
             })
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            continue
 
     if count == 0:
         raise RuntimeError(f"No word states extracted. First errors: {errors[:3]}")
@@ -460,14 +357,17 @@ def main() -> None:
         "npz": str(npz_path),
         "model": args.model,
         "repo_id": spec.repo_id,
-        "layers": layers,
+        "layers_order": layers,
         "relations": RELATIONS,
-        "n_word_records_used": count,
-        "n_errors": len(errors),
+        "word_context": "text_only_prompt",
+        "n_word_records_used": int(count),
+        "n_errors": int(len(errors)),
+        "layers": {},
         "results": {},
     }
 
     for li, L in enumerate(layers):
+        layer_dict: Dict[str, Any] = {}
         for mode_name, Wmode in [("raw", W_raw), ("prompt_centered", W_centered)]:
             S = D[li] @ Wmode[li].T
             diag = np.diag(S)
@@ -475,26 +375,32 @@ def main() -> None:
             np.fill_diagonal(off, -np.inf)
             margin = diag - off.max(axis=1)
             row_argmax = [RELATIONS[int(j)] for j in S.argmax(axis=1)]
-            key = f"L{L}_{mode_name}"
-            summary["results"][key] = {
+            row_match = [row_argmax[i] == RELATIONS[i] for i in range(len(RELATIONS))]
+            info = {
                 "matrix": S.tolist(),
                 "diag_mean": float(diag.mean()),
                 "diag_min": float(diag.min()),
                 "diag_margin_mean": float(margin.mean()),
+                "mean_margin": float(margin.mean()),
                 "row_argmax": row_argmax,
-                "row_match_acc": float(np.mean([row_argmax[i] == RELATIONS[i] for i in range(len(RELATIONS))])),
+                "row_match_acc": float(np.mean(row_match)),
             }
+            layer_dict[mode_name] = info
+            summary["results"][f"L{L}_{mode_name}"] = info
+
             csv_path = out_dir / f"direction_word_similarity_L{L}_{mode_name}.csv"
             png_path = out_dir / f"direction_word_similarity_L{L}_{mode_name}.png"
             write_csv(csv_path, S, RELATIONS, RELATIONS)
-            plot_heatmap(png_path, S, f"{args.model} Controlled A L{L} ({mode_name})", RELATIONS, RELATIONS)
+            if args.save_plots:
+                plot_heatmap(png_path, S, f"{args.model} Controlled A L{L} ({mode_name})", RELATIONS, RELATIONS)
 
-        pc = summary["results"][f"L{L}_prompt_centered"]
-        raw = summary["results"][f"L{L}_raw"]
+        summary["layers"][str(L)] = layer_dict
+        pc = layer_dict["prompt_centered"]
+        raw = layer_dict["raw"]
         print(
-            f"L{L}: prompt_centered diag_mean={pc['diag_mean']:.3f} "
-            f"margin={pc['diag_margin_mean']:.3f} row_match={pc['row_match_acc']:.2f} | "
-            f"raw diag_mean={raw['diag_mean']:.3f} margin={raw['diag_margin_mean']:.3f} row_match={raw['row_match_acc']:.2f}"
+            f"L{L}: "
+            f"raw diag={raw['diag_mean']:.3f} margin={raw['diag_margin_mean']:.3f} match={raw['row_match_acc']:.2f} | "
+            f"centered diag={pc['diag_mean']:.3f} margin={pc['diag_margin_mean']:.3f} match={pc['row_match_acc']:.2f}"
         )
 
     (out_dir / "direction_word_similarity_summary.json").write_text(
