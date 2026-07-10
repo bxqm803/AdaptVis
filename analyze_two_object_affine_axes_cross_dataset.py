@@ -49,6 +49,9 @@ def parse_args() -> argparse.Namespace:
                         help="Training npz used to fit spatial axes. Enables cross-dataset transfer mode.")
     parser.add_argument("--test-npz", default=None,
                         help="Test npz evaluated with axes learned from train-npz.")
+    parser.add_argument("--axis", default="all",
+                        choices=["all", "horizontal", "vertical", "depth"],
+                        help="Select spatial axis for transfer evaluation.")
     parser.add_argument("--cv-folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--label-shuffle-repeats", type=int, default=20)
@@ -252,13 +255,19 @@ def full_diagnostic(vectors: np.ndarray, labels: np.ndarray, axes: Sequence[Tupl
 
 def load_states(npz_path: str):
     source = Path(npz_path)
+
     with np.load(source, allow_pickle=True) as loaded:
         metadata = json.loads(str(loaded["metadata_json"].item()))
-        labels = np.asarray([str(x) for x in loaded["relation"].tolist()], dtype=object)
-        groups = np.asarray([str(x) for x in loaded["image_id"].tolist()], dtype=object)
+        labels = np.asarray(
+            [str(x) for x in loaded["relation"].tolist()],
+            dtype=object
+        )
         vectors = loaded["relation_vectors"].astype(np.float32)
-        block_ids = [int(v) for v in loaded["decoder_block_index"].tolist()]
-    return source, metadata, labels, groups, vectors, block_ids
+        block_ids = [
+            int(v) for v in loaded["decoder_block_index"].tolist()
+        ]
+
+    return source, metadata, labels, vectors, block_ids
 
 
 def evaluate_transfer(
@@ -295,10 +304,12 @@ def main() -> None:
     args = parse_args()
 
     if args.train_npz is not None and args.test_npz is not None:
-        train_source, train_meta, train_labels, _, train_vectors, train_blocks = load_states(args.train_npz)
-        test_source, test_meta, test_labels, _, test_vectors, _ = load_states(args.test_npz)
+        train_source, train_meta, train_labels, train_vectors, train_blocks = load_states(args.train_npz)
+        test_source, test_meta, test_labels, test_vectors, _ = load_states(args.test_npz)
 
         axes = available_axes(train_labels.tolist())
+        if args.axis != "all":
+            axes = [x for x in axes if x[0] == args.axis]
         if not axes:
             raise RuntimeError(f"No complete opposing axis pair found in train labels: {Counter(train_labels.tolist())}")
 
