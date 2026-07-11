@@ -354,7 +354,17 @@ def main() -> None:
     with np.load(source, allow_pickle=True) as loaded:
         metadata = json.loads(str(loaded["metadata_json"].item()))
         labels = np.asarray([str(x) for x in loaded["relation"].tolist()], dtype=object)
-        groups = np.asarray([str(x) for x in loaded["image_id"].tolist()], dtype=object)
+
+        # Some extracted states do not save image_id.
+        # For fixed train/test split mode, image grouping is unnecessary.
+        if "image_id" in loaded.files:
+            groups = np.asarray(
+                [str(x) for x in loaded["image_id"].tolist()],
+                dtype=object
+            )
+        else:
+            groups = np.arange(len(labels)).astype(object)
+
         vectors = loaded["relation_vectors"].astype(np.float32)
         block_ids = [int(v) for v in loaded["decoder_block_index"].tolist()]
 
