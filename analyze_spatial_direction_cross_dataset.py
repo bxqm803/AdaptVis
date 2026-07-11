@@ -189,6 +189,27 @@ def main():
         a.test_npz
     )
 
+    # Keep only requested relations.
+    # Example: VG -> Controlled A left/right transfer.
+    train_mask = np.isin(
+        y_train,
+        relations
+    )
+
+    test_mask = np.isin(
+        y_test,
+        relations
+    )
+
+    y_train = y_train[train_mask]
+    X_train = X_train[train_mask]
+
+    y_test = y_test[test_mask]
+    X_test = X_test[test_mask]
+
+    print("Train relation counts:", Counter(y_train.tolist()))
+    print("Test relation counts:", Counter(y_test.tolist()))
+
     layers = sorted(
         set(layers_train).intersection(
             set(layers_test)
