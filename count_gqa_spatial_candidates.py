@@ -1,503 +1,238 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Count GQA two-object basic spatial-relation candidates.
-
-Expected official GQA files:
-  train_sceneGraphs.json
-  train_balanced_questions.json
-
-The script streams large JSON dictionaries with ijson.
-
-It reports several stages:
-  1. relation questions with exactly one relate operation
-  2. two grounded objects
-  3. positive (yes) direct questions
-  4. both object boxes >= min-area-ratio of the image
-  5. scene-graph relation agrees with the question program
-  6. strict unique-name subset (automatic approximation of manual ambiguity filtering)
-
-Canonical labels:
-  left, right, above, below, on, under, front, behind
-
-It does not merge above->on or below->under. Both raw and canonical
-relation counts are retained so you can decide the final benchmark taxonomy.
-"""
-
 import argparse
 import json
 import re
-import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+
+import ijson
 
 
-TARGET_RELATIONS = (
-    "left",
-    "right",
-    "above",
-    "below",
-    "on",
-    "under",
-    "front",
-    "behind",
-)
+REL_PATTERNS = [
+    (r"\bto the left of\b", "left"),
+    (r"\bon the left of\b", "left"),
+    (r"\bleft of\b", "left"),
+    (r"\bto the right of\b", "right"),
+    (r"\bon the right of\b", "right"),
+    (r"\bright of\b", "right"),
+    (r"\bin front of\b", "front"),
+    (r"\bon top of\b", "on"),
+    (r"\bunderneath\b", "under"),
+    (r"\bbeneath\b", "under"),
+    (r"\bbehind\b", "behind"),
+    (r"\babove\b", "above"),
+    (r"\bbelow\b", "below"),
+    (r"\bunder\b", "under"),
+]
 
-REL_ALIASES = {
-    # horizontal
-    "left": "left",
-    "left of": "left",
-    "to left of": "left",
-    "to the left of": "left",
-    "on the left of": "left",
+TARGETS = ("left", "right", "above", "below", "on", "under", "front", "behind")
 
-    "right": "right",
-    "right of": "right",
-    "to right of": "right",
-    "to the right of": "right",
-    "on the right of": "right",
-
-    # vertical: keep geometric and support-like predicates separate
-    "above": "above",
-    "over": "above",
-
-    "below": "below",
-    "beneath": "below",
-
-    "on": "on",
-    "on top of": "on",
-
-    "under": "under",
-    "underneath": "under",
-
-    # depth
-    "in front of": "front",
-    "in front": "front",
-    "front of": "front",
-    "front": "front",
-
+SG_REL = {
+    "left": "left", "left of": "left", "to the left of": "left",
+    "right": "right", "right of": "right", "to the right of": "right",
+    "above": "above", "below": "below",
+    "on": "on", "on top of": "on",
+    "under": "under", "underneath": "under", "beneath": "under",
+    "in front of": "front", "front of": "front",
     "behind": "behind",
-    "in back of": "behind",
-    "in the back of": "behind",
 }
 
 INVERSE = {
-    "left": "right",
-    "right": "left",
-    "above": "below",
-    "below": "above",
-    "on": "under",
-    "under": "on",
-    "front": "behind",
-    "behind": "front",
+    "left": "right", "right": "left",
+    "above": "below", "below": "above",
+    "on": "under", "under": "on",
+    "front": "behind", "behind": "front",
 }
 
-ID_RE = re.compile(r"\((\d+)\)")
+
+def norm(x):
+    x = str(x or "").strip().lower().replace("_", " ").replace("-", " ")
+    return re.sub(r"\s+", " ", x)
 
 
-def norm_text(x: Any) -> str:
-    s = str(x or "").strip().lower()
-    s = s.replace("_", " ").replace("-", " ")
-    s = re.sub(r"\s+", " ", s)
-    return s
+def iter_dict(path):
+    with open(path, "rb") as f:
+        yield from ijson.kvitems(f, "")
 
 
-def norm_relation(x: Any) -> Optional[str]:
-    s = norm_text(x)
-    return REL_ALIASES.get(s)
+def find_relation(text):
+    text = str(text)
+    for pattern, label in REL_PATTERNS:
+        m = re.search(pattern, text, flags=re.I)
+        if m:
+            return label, m.group(0)
+    return None
 
 
-def require_ijson():
-    try:
-        import ijson  # type: ignore
-        return ijson
-    except ImportError as exc:
-        raise SystemExit(
-            "Missing dependency 'ijson'. Install it with:\n"
-            "  pip install ijson\n"
-        ) from exc
+def span_start(x):
+    m = re.match(r"(\d+)", str(x))
+    return int(m.group(1)) if m else 10**9
 
 
-def iter_json_dict(path: Path) -> Iterator[Tuple[str, Dict[str, Any]]]:
-    ijson = require_ijson()
-    with path.open("rb") as f:
-        for key, value in ijson.kvitems(f, ""):
-            if isinstance(value, dict):
-                yield str(key), value
+def grounded_ids(question):
+    annotations = question.get("annotations", {})
+    qann = annotations.get("question", {}) if isinstance(annotations, dict) else {}
+    if not isinstance(qann, dict):
+        return []
 
+    rows = []
+    for span, value in qann.items():
+        ids = re.findall(r"\d+", str(value))
+        if ids:
+            rows.append((span_start(span), str(span), ids[0]))
 
-def extract_ids_from_value(value: Any) -> List[str]:
-    out: List[str] = []
-
-    if value is None:
-        return out
-    if isinstance(value, str):
-        # Annotation values are often bare object IDs.
-        if value.isdigit():
-            out.append(value)
-        out.extend(ID_RE.findall(value))
-        return out
-    if isinstance(value, (int, float)):
-        if int(value) == value:
-            out.append(str(int(value)))
-        return out
-    if isinstance(value, dict):
-        for v in value.values():
-            out.extend(extract_ids_from_value(v))
-        return out
-    if isinstance(value, (list, tuple)):
-        for v in value:
-            out.extend(extract_ids_from_value(v))
-        return out
-
+    rows.sort()
+    out, seen = [], set()
+    for _, span, oid in rows:
+        if oid not in seen:
+            out.append((span, oid))
+            seen.add(oid)
     return out
 
 
-def semantic_object_ids(question: Dict[str, Any]) -> List[str]:
-    ids: List[str] = []
-
-    annotations = question.get("annotations", {})
-    if isinstance(annotations, dict):
-        ids.extend(
-            extract_ids_from_value(annotations.get("question", {}))
-        )
-
-    for step in question.get("semantic", []) or []:
-        if isinstance(step, dict):
-            ids.extend(ID_RE.findall(str(step.get("argument", ""))))
-
-    return list(dict.fromkeys(ids))
+def iter_relations(obj):
+    rels = obj.get("relations", [])
+    if isinstance(rels, dict):
+        rels = rels.values()
+    for item in rels:
+        if isinstance(item, dict) and item.get("object") is not None:
+            yield SG_REL.get(norm(item.get("name"))), str(item["object"])
 
 
-def parse_relate_argument(argument: Any) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Typical GQA form:
-      "on, subject, apple (271881)"
-      "left of, object, table (279472)"
-
-    Returns:
-      canonical_relation, role(subject/object/None), related_object_id
-    """
-    text = str(argument or "").strip()
-    parts = [p.strip() for p in text.split(",")]
-
-    raw_rel = parts[0] if parts else text
-    relation = norm_relation(raw_rel)
-
-    role: Optional[str] = None
-    for part in parts[1:]:
-        p = norm_text(part)
-        if p in {"subject", "object"}:
-            role = p
-            break
-
-    ids = ID_RE.findall(text)
-    related_id = ids[-1] if ids else None
-    return relation, role, related_id
-
-
-def step_primary_id(step: Dict[str, Any]) -> Optional[str]:
-    ids = ID_RE.findall(str(step.get("argument", "")))
-    return ids[-1] if ids else None
-
-
-def infer_direct_relation(
-    question: Dict[str, Any],
-) -> Optional[Tuple[str, str, str, str]]:
-    """
-    Infer (relation, subject_id, reference_id, raw_relate_argument)
-    for a direct single-relate program.
-
-    Returns None when orientation cannot be recovered reliably.
-    """
-    semantic = question.get("semantic", []) or []
-    if not isinstance(semantic, list):
-        return None
-
-    relate_positions = [
-        i
-        for i, step in enumerate(semantic)
-        if isinstance(step, dict)
-        and norm_text(step.get("operation")) == "relate"
-    ]
-    if len(relate_positions) != 1:
-        return None
-
-    rel_pos = relate_positions[0]
-    rel_step = semantic[rel_pos]
-    raw_argument = str(rel_step.get("argument", ""))
-    relation, role, related_id = parse_relate_argument(raw_argument)
-
-    if relation not in TARGET_RELATIONS or related_id is None:
-        return None
-
-    # Resolve the selected/base object through dependencies first.
-    base_id: Optional[str] = None
-    dependencies = rel_step.get("dependencies", [])
-    if isinstance(dependencies, list):
-        for dep in reversed(dependencies):
-            try:
-                dep_i = int(dep)
-            except Exception:
-                continue
-            if 0 <= dep_i < len(semantic):
-                candidate = step_primary_id(semantic[dep_i])
-                if candidate and candidate != related_id:
-                    base_id = candidate
-                    break
-
-    # Some GQA programs omit dependencies; use the nearest prior grounded step.
-    if base_id is None:
-        for prior in reversed(semantic[:rel_pos]):
-            if not isinstance(prior, dict):
-                continue
-            candidate = step_primary_id(prior)
-            if candidate and candidate != related_id:
-                base_id = candidate
-                break
-
-    # Final fallback: exactly two grounded object IDs in question/program.
-    if base_id is None:
-        object_ids = semantic_object_ids(question)
-        alternatives = [x for x in object_ids if x != related_id]
-        if len(alternatives) == 1:
-            base_id = alternatives[0]
-
-    if base_id is None or base_id == related_id:
-        return None
-
-    if role == "subject":
-        subject_id, reference_id = related_id, base_id
-    elif role == "object":
-        subject_id, reference_id = base_id, related_id
-    else:
-        # Cannot safely orient the relation.
-        return None
-
-    return relation, subject_id, reference_id, raw_argument
-
-
-def iter_relations(obj: Dict[str, Any]) -> Iterator[Tuple[str, str]]:
-    relations = obj.get("relations", [])
-    if isinstance(relations, dict):
-        iterable = relations.values()
-    elif isinstance(relations, list):
-        iterable = relations
-    else:
-        iterable = []
-
-    for rel in iterable:
-        if not isinstance(rel, dict):
-            continue
-        name = str(rel.get("name", ""))
-        target = rel.get("object")
-        if target is None:
-            continue
-        yield name, str(target)
-
-
-def scene_relation_matches(
-    objects: Dict[str, Any],
-    subject_id: str,
-    reference_id: str,
-    relation: str,
-) -> bool:
-    subject = objects.get(subject_id)
-    reference = objects.get(reference_id)
-    if not isinstance(subject, dict) or not isinstance(reference, dict):
+def relation_agrees(objects, sid, rid, relation):
+    s = objects.get(sid)
+    r = objects.get(rid)
+    if not isinstance(s, dict) or not isinstance(r, dict):
         return False
 
-    # Direct edge subject -> reference.
-    for raw_name, target_id in iter_relations(subject):
-        if target_id == reference_id and norm_relation(raw_name) == relation:
+    for rel, target in iter_relations(s):
+        if rel == relation and target == rid:
             return True
 
-    # Equivalent inverse edge reference -> subject.
-    inverse = INVERSE.get(relation)
-    if inverse is not None:
-        for raw_name, target_id in iter_relations(reference):
-            if target_id == subject_id and norm_relation(raw_name) == inverse:
-                return True
+    inv = INVERSE[relation]
+    for rel, target in iter_relations(r):
+        if rel == inv and target == sid:
+            return True
 
     return False
 
 
-def object_area_ratio(obj: Dict[str, Any], width: float, height: float) -> float:
+def area_ratio(obj, width, height):
     try:
-        w = float(obj["w"])
-        h = float(obj["h"])
+        return float(obj["w"]) * float(obj["h"]) / max(float(width) * float(height), 1.0)
     except Exception:
         return 0.0
 
-    image_area = max(width * height, 1.0)
-    return max(w, 0.0) * max(h, 0.0) / image_area
 
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--scene-graphs", required=True)
+    p.add_argument("--questions", required=True, nargs="+")
+    p.add_argument("--min-area-ratio", type=float, default=0.03)
+    p.add_argument("--require-balanced", action="store_true")
+    p.add_argument("--output-report", required=True)
+    p.add_argument("--output-candidates")
+    p.add_argument("--progress-every", type=int, default=200000)
+    a = p.parse_args()
 
-def normalized_name(obj: Dict[str, Any]) -> str:
-    return norm_text(obj.get("name", ""))
-
-
-def add_count(stage_counts: Dict[str, Counter], stage: str, relation: str) -> None:
-    stage_counts[stage][relation] += 1
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--scene-graphs", required=True)
-    parser.add_argument(
-        "--questions",
-        required=True,
-        nargs="+",
-        help="One or more question JSON files.",
-    )
-    parser.add_argument("--min-area-ratio", type=float, default=0.03)
-    parser.add_argument(
-        "--require-balanced",
-        action="store_true",
-        help="Require question['isBalanced'] == true.",
-    )
-    parser.add_argument(
-        "--output-report",
-        required=True,
-    )
-    parser.add_argument(
-        "--output-candidates",
-        default=None,
-        help="Optional JSON containing strict unique-name candidates.",
-    )
-    parser.add_argument(
-        "--progress-every",
-        type=int,
-        default=200000,
-    )
-    args = parser.parse_args()
-
-    scene_path = Path(args.scene_graphs)
-    question_paths = [Path(p) for p in args.questions]
-    report_path = Path(args.output_report)
-
-    for path in [scene_path, *question_paths]:
-        if not path.exists():
-            raise FileNotFoundError(path)
-
+    semantic_types = Counter()
+    structural_types = Counter()
     funnel = Counter()
-    question_stage_counts: Dict[str, Counter] = defaultdict(Counter)
-    candidates_by_image: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    phrase_counts = Counter()
+    candidates_by_image = defaultdict(list)
+    examples = defaultdict(list)
 
-    total_questions = 0
+    for qpath in a.questions:
+        print(f"[INFO] scanning questions: {qpath}", flush=True)
 
-    for question_path in question_paths:
-        print(f"[INFO] scanning questions: {question_path}", flush=True)
-
-        for qid, q in iter_json_dict(question_path):
-            total_questions += 1
-            funnel["questions_total"] += 1
-
-            if args.require_balanced and not bool(q.get("isBalanced", False)):
-                continue
-            funnel["balanced_or_not_required"] += 1
+        for qid, q in iter_dict(qpath):
+            funnel["total"] += 1
 
             types = q.get("types", {})
-            if isinstance(types, dict):
-                if norm_text(types.get("semantic")) != "relation":
-                    continue
-            else:
+            semantic = norm(types.get("semantic"))
+            structural = norm(types.get("structural"))
+            semantic_types[semantic] += 1
+            structural_types[structural] += 1
+
+            if a.require_balanced and not bool(q.get("isBalanced", False)):
                 continue
-            funnel["semantic_relation"] += 1
+            funnel["balanced"] += 1
 
-            semantic = q.get("semantic", []) or []
-            relate_count = sum(
-                1
-                for step in semantic
-                if isinstance(step, dict)
-                and norm_text(step.get("operation")) == "relate"
-            )
-            if relate_count != 1:
+            # Correct GQA value: "rel", not "relation".
+            if semantic != "rel":
                 continue
-            funnel["single_relate"] += 1
+            funnel["semantic_rel"] += 1
 
-            inferred = infer_direct_relation(q)
-            if inferred is None:
+            # Original VG2-style questions are binary verification questions.
+            if structural != "verify":
                 continue
+            funnel["structural_verify"] += 1
 
-            relation, subject_id, reference_id, raw_argument = inferred
-            add_count(
-                question_stage_counts,
-                "direct_oriented",
-                relation,
-            )
-            funnel["direct_oriented"] += 1
-
-            grounded_ids = semantic_object_ids(q)
-            if len(set(grounded_ids)) != 2:
-                continue
-            funnel["exactly_two_grounded_objects"] += 1
-            add_count(
-                question_stage_counts,
-                "exactly_two_grounded_objects",
-                relation,
-            )
-
-            answer = norm_text(q.get("answer", ""))
-            if answer not in {"yes", "true"}:
+            if norm(q.get("answer")) not in {"yes", "true"}:
                 continue
             funnel["positive_yes"] += 1
-            add_count(
-                question_stage_counts,
-                "positive_yes",
-                relation,
-            )
+
+            found = find_relation(q.get("question", ""))
+            if found is None:
+                continue
+            relation, surface = found
+            phrase_counts[relation] += 1
+            funnel["target_relation_phrase"] += 1
+
+            ids = grounded_ids(q)
+            if len(ids) != 2:
+                continue
+            funnel["two_grounded_objects"] += 1
 
             image_id = str(q.get("imageId", ""))
             if not image_id:
                 continue
 
-            candidates_by_image[image_id].append(
-                {
-                    "question_id": qid,
-                    "image_id": image_id,
-                    "question": q.get("question", ""),
-                    "answer": q.get("answer", ""),
-                    "relation": relation,
-                    "subject_id": subject_id,
-                    "reference_id": reference_id,
-                    "raw_relate_argument": raw_argument,
-                }
-            )
+            # For direct "Is A REL B?" questions, annotation order follows text order.
+            rec = {
+                "question_id": str(qid),
+                "image_id": image_id,
+                "question": q.get("question", ""),
+                "answer": q.get("answer", ""),
+                "relation": relation,
+                "surface_relation": surface,
+                "subject_id": ids[0][1],
+                "reference_id": ids[1][1],
+                "subject_span": ids[0][0],
+                "reference_span": ids[1][0],
+                "semanticStr": q.get("semanticStr", ""),
+                "types": types,
+            }
+            candidates_by_image[image_id].append(rec)
 
-            if (
-                args.progress_every > 0
-                and total_questions % args.progress_every == 0
-            ):
+            if len(examples[relation]) < 5:
+                examples[relation].append(rec)
+
+            if a.progress_every and funnel["total"] % a.progress_every == 0:
                 print(
-                    f"[INFO] questions={total_questions:,} "
-                    f"positive_candidates={funnel['positive_yes']:,}",
+                    f"[INFO] total={funnel['total']:,} "
+                    f"question_candidates={sum(len(v) for v in candidates_by_image.values()):,}",
                     flush=True,
                 )
 
     print(
-        f"[INFO] positive direct questions={sum(len(v) for v in candidates_by_image.values()):,} "
+        f"[INFO] question candidates={sum(len(v) for v in candidates_by_image.values()):,} "
         f"across images={len(candidates_by_image):,}",
         flush=True,
     )
 
-    graph_stage_counts: Dict[str, Counter] = defaultdict(Counter)
-    strict_records: List[Dict[str, Any]] = []
-    strict_keys = set()
-    seen_candidate_images = set()
+    graph_counts = Counter()
+    strict = []
+    seen = set()
 
-    scanned_graphs = 0
-    print(f"[INFO] scanning scene graphs: {scene_path}", flush=True)
+    print(f"[INFO] scanning scene graphs: {a.scene_graphs}", flush=True)
 
-    for image_id, graph in iter_json_dict(scene_path):
-        scanned_graphs += 1
-        image_candidates = candidates_by_image.get(image_id)
-        if not image_candidates:
+    for image_id, graph in iter_dict(a.scene_graphs):
+        rows = candidates_by_image.get(str(image_id))
+        if not rows:
             continue
-
-        seen_candidate_images.add(image_id)
 
         objects = graph.get("objects", {})
         if not isinstance(objects, dict):
@@ -510,182 +245,101 @@ def main() -> None:
             continue
 
         name_counts = Counter(
-            normalized_name(obj)
+            norm(obj.get("name"))
             for obj in objects.values()
-            if isinstance(obj, dict) and normalized_name(obj)
+            if isinstance(obj, dict) and norm(obj.get("name"))
         )
 
-        for rec in image_candidates:
+        for rec in rows:
+            sid = rec["subject_id"]
+            rid = rec["reference_id"]
             relation = rec["relation"]
-            subject_id = rec["subject_id"]
-            reference_id = rec["reference_id"]
 
-            subject = objects.get(subject_id)
-            reference = objects.get(reference_id)
-            if not isinstance(subject, dict) or not isinstance(reference, dict):
+            sobj = objects.get(sid)
+            robj = objects.get(rid)
+            if not isinstance(sobj, dict) or not isinstance(robj, dict):
                 continue
+            graph_counts["objects_exist"] += 1
 
-            add_count(
-                graph_stage_counts,
-                "objects_exist",
-                relation,
-            )
-
-            subject_area = object_area_ratio(subject, width, height)
-            reference_area = object_area_ratio(reference, width, height)
-
-            if (
-                subject_area < args.min_area_ratio
-                or reference_area < args.min_area_ratio
-            ):
+            sa = area_ratio(sobj, width, height)
+            ra = area_ratio(robj, width, height)
+            if sa < a.min_area_ratio or ra < a.min_area_ratio:
                 continue
+            graph_counts["area_pass"] += 1
 
-            add_count(
-                graph_stage_counts,
-                "area_filtered",
-                relation,
-            )
-
-            if not scene_relation_matches(
-                objects,
-                subject_id,
-                reference_id,
-                relation,
-            ):
+            if not relation_agrees(objects, sid, rid, relation):
                 continue
+            graph_counts["scene_relation_agrees"] += 1
 
-            add_count(
-                graph_stage_counts,
-                "scene_relation_agrees",
-                relation,
-            )
-
-            subject_name = normalized_name(subject)
-            reference_name = normalized_name(reference)
-
-            unique_names = (
-                subject_name
-                and reference_name
-                and subject_name != reference_name
-                and name_counts[subject_name] == 1
-                and name_counts[reference_name] == 1
-            )
-
-            if not unique_names:
+            sname = norm(sobj.get("name"))
+            rname = norm(robj.get("name"))
+            if not sname or not rname or sname == rname:
                 continue
-
-            add_count(
-                graph_stage_counts,
-                "strict_unique_names",
-                relation,
-            )
-
-            dedupe_key = (
-                image_id,
-                subject_id,
-                reference_id,
-                relation,
-            )
-            if dedupe_key in strict_keys:
+            if name_counts[sname] != 1 or name_counts[rname] != 1:
                 continue
-            strict_keys.add(dedupe_key)
+            graph_counts["unique_names"] += 1
 
-            record = dict(rec)
-            record.update(
-                {
-                    "subject": subject_name,
-                    "reference": reference_name,
-                    "subject_box": [
-                        subject.get("x"),
-                        subject.get("y"),
-                        subject.get("w"),
-                        subject.get("h"),
-                    ],
-                    "reference_box": [
-                        reference.get("x"),
-                        reference.get("y"),
-                        reference.get("w"),
-                        reference.get("h"),
-                    ],
-                    "subject_area_ratio": subject_area,
-                    "reference_area_ratio": reference_area,
-                }
-            )
-            strict_records.append(record)
-            add_count(
-                graph_stage_counts,
-                "strict_unique_deduplicated",
-                relation,
-            )
+            key = (str(image_id), sid, rid, relation)
+            if key in seen:
+                continue
+            seen.add(key)
 
-    missing_graph_images = set(candidates_by_image).difference(
-        seen_candidate_images
-    )
+            out = dict(rec)
+            out.update({
+                "subject": sname,
+                "reference": rname,
+                "subject_box": [sobj.get("x"), sobj.get("y"), sobj.get("w"), sobj.get("h")],
+                "reference_box": [robj.get("x"), robj.get("y"), robj.get("w"), robj.get("h")],
+                "subject_area_ratio": sa,
+                "reference_area_ratio": ra,
+            })
+            strict.append(out)
+
+    final_counts = Counter(x["relation"] for x in strict)
 
     report = {
         "inputs": {
-            "scene_graphs": str(scene_path),
-            "questions": [str(p) for p in question_paths],
-            "min_area_ratio": args.min_area_ratio,
-            "require_balanced": bool(args.require_balanced),
+            "scene_graphs": a.scene_graphs,
+            "questions": a.questions,
+            "min_area_ratio": a.min_area_ratio,
+            "require_balanced": a.require_balanced,
         },
-        "target_relations": list(TARGET_RELATIONS),
         "funnel": dict(funnel),
-        "question_stage_counts": {
-            stage: dict(counter)
-            for stage, counter in question_stage_counts.items()
-        },
-        "graph_stage_counts": {
-            stage: dict(counter)
-            for stage, counter in graph_stage_counts.items()
-        },
-        "strict_unique_deduplicated_total": len(strict_records),
-        "strict_unique_deduplicated_counts": dict(
-            Counter(r["relation"] for r in strict_records)
-        ),
-        "unique_images_in_strict_set": len(
-            set(r["image_id"] for r in strict_records)
-        ),
-        "candidate_images_missing_from_scene_graphs": len(
-            missing_graph_images
-        ),
-        "notes": {
-            "strict_unique_names": (
-                "Automatic conservative approximation of the paper's manual "
-                "ambiguity filtering. It requires each target object name to "
-                "occur exactly once in the image."
-            ),
-            "positive_yes": (
-                "Negative yes/no questions are excluded because a false "
-                "stated relation does not uniquely determine the opposite."
-            ),
-            "vertical_labels": (
-                "above/below and on/under are counted separately."
-            ),
-        },
+        "semantic_types_top20": semantic_types.most_common(20),
+        "structural_types": dict(structural_types),
+        "question_phrase_counts": dict(phrase_counts),
+        "graph_counts": dict(graph_counts),
+        "strict_counts": dict(final_counts),
+        "strict_total": len(strict),
+        "strict_images": len(set(x["image_id"] for x in strict)),
+        "examples": dict(examples),
     }
 
+    report_path = Path(a.output_report)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
-    if args.output_candidates:
-        candidate_path = Path(args.output_candidates)
+    if a.output_candidates:
+        candidate_path = Path(a.output_candidates)
         candidate_path.parent.mkdir(parents=True, exist_ok=True)
         candidate_path.write_text(
-            json.dumps(strict_records, ensure_ascii=False, indent=2),
+            json.dumps(strict, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        print(f"[OK] strict candidates: {candidate_path}")
+        print(f"[OK] candidates: {candidate_path}")
 
-    print("\n=== STRICT UNIQUE-NAME DEDUPLICATED COUNTS ===")
-    strict_counts = Counter(r["relation"] for r in strict_records)
-    for relation in TARGET_RELATIONS:
-        print(f"{relation:>8}: {strict_counts[relation]:,}")
-    print(f"{'total':>8}: {len(strict_records):,}")
-    print(f"{'images':>8}: {report['unique_images_in_strict_set']:,}")
+    print("\n=== QUESTION PHRASE COUNTS ===")
+    for relation in TARGETS:
+        print(f"{relation:>8}: {phrase_counts[relation]:,}")
+
+    print("\n=== STRICT COUNTS ===")
+    for relation in TARGETS:
+        print(f"{relation:>8}: {final_counts[relation]:,}")
+    print(f"{'total':>8}: {len(strict):,}")
+    print(f"{'images':>8}: {len(set(x['image_id'] for x in strict)):,}")
     print(f"\n[OK] report: {report_path}")
 
 
