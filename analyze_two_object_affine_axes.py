@@ -1,324 +1,730 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Cross-validated opposing-affine-axis probe for COCO_two / VG_two states.
-
-Input is the .npz produced by extract_two_object_relation_states.py. For each
-stored decoder depth and each available opposing relation pair, this script
-fits on training folds only:
-
-  d_a = normalize(mean(r | positive_a) - mean(r | negative_a))
-  c_a = 0.5 * (mean(r | positive_a) + mean(r | negative_a))
-
-where r = h(subject) - h(reference). At test time it reports:
-  * conditional sign accuracy for each opposing axis;
-  * a multi-affine routing accuracy across all available axes;
-  * axis-direction cosine geometry;
-  * a train-label shuffle control.
-
-No VLM parameters are updated. The labels are only used inside each training
-fold to estimate the axis centres and directions.
 """
+Train/test probe for spatial relation vectors saved by
+extract_two_object_relation_states.py.
+
+Default mode is the four-direction cosine codebook required by the custom
+VG 800-sample dataset:
+
+    r = h(subject) - h(reference)
+
+For every selected decoder layer and every random split:
+  1. Stratify each relation independently.
+  2. Use --train-ratio of each relation for training (default: 0.30).
+  3. Compute one normalized direction vector for each relation from training.
+  4. Classify each test vector by maximum cosine similarity.
+
+With 200 samples per relation and --train-ratio 0.30, every split contains:
+  train: 60 x 4 = 240
+  test:  140 x 4 = 560
+
+The old opposing-affine-axis analysis remains available through:
+
+    --probe-mode affine_axes
+
+Expected NPZ fields:
+  relation
+  relation_vectors          [N, L, H]
+  decoder_block_index       [L]
+Optional fields:
+  image_id, subject, reference, metadata_json
+"""
+
 from __future__ import annotations
 
 import argparse
 import json
-import math
-from collections import Counter, defaultdict
+import re
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
 
-try:
-    from sklearn.model_selection import StratifiedGroupKFold
-except Exception as exc:  # pragma: no cover
-    raise SystemExit("scikit-learn with StratifiedGroupKFold is required: pip install -U scikit-learn") from exc
+EPS = 1e-12
 
-
-AXIS_CANDIDATES = [
+AXIS_CANDIDATES: List[Tuple[str, str, str]] = [
     ("horizontal", "left", "right"),
-    ("vertical", "below", "above"),
-    ("depth", "behind", "front"),
+    ("vertical", "under", "on"),
+    ("depth", "behind", "in_front"),
 ]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-npz", required=True)
-    parser.add_argument("--cv-folds", type=int, default=5)
+    parser.add_argument(
+        "--probe-mode",
+        choices=("four_direction", "affine_axes"),
+        default="four_direction",
+        help="four_direction: one cosine prototype per relation; "
+        "affine_axes: legacy opposing-axis probe.",
+    )
+    parser.add_argument(
+        "--relations",
+        default="left,right,on,under",
+        help="Comma-separated relation order used by four_direction mode.",
+    )
+    parser.add_argument(
+        "--train-ratio",
+        type=float,
+        default=0.30,
+        help="Fraction of every relation class used for training.",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=5,
+        help="Number of independent stratified 30/70 splits.",
+    )
+    parser.add_argument(
+        "--feature-centering",
+        choices=("global", "none"),
+        default="global",
+        help="Subtract the training-set global mean before fitting directions.",
+    )
+    parser.add_argument(
+        "--layers",
+        default="auto",
+        help="auto/all or comma-separated decoder block indices, e.g. 6,9,12.",
+    )
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--label-shuffle-repeats", type=int, default=20)
+    parser.add_argument(
+        "--label-shuffle-repeats",
+        type=int,
+        default=50,
+        help="Training-label shuffle repetitions per layer and split.",
+    )
     parser.add_argument("--no-label-shuffle", action="store_true")
-    parser.add_argument("--output", required=True, help="Output JSON path (or prefix without suffix).")
+    parser.add_argument(
+        "--output",
+        required=True,
+        help="Output JSON path or output prefix without .json.",
+    )
     return parser.parse_args()
 
 
-def safe_norm(x: np.ndarray) -> float:
-    return float(np.linalg.norm(x))
+def normalize_relation(value: Any) -> str:
+    text = str(value).strip().lower()
+    text = text.replace("-", "_")
+    text = re.sub(r"\s+", "_", text)
+    text = text.strip("._,")
+
+    aliases = {
+        "left_of": "left",
+        "to_left_of": "left",
+        "to_the_left_of": "left",
+        "right_of": "right",
+        "to_right_of": "right",
+        "to_the_right_of": "right",
+        "above": "on",
+        "above_of": "on",
+        "top": "on",
+        "top_of": "on",
+        "on_top": "on",
+        "on_top_of": "on",
+        "below": "under",
+        "below_of": "under",
+        "bottom": "under",
+        "beneath": "under",
+        "underneath": "under",
+        "infront": "in_front",
+        "front": "in_front",
+        "front_of": "in_front",
+        "in_front_of": "in_front",
+        "back": "behind",
+        "back_of": "behind",
+    }
+    return aliases.get(text, text)
 
 
-def unit(x: np.ndarray) -> np.ndarray:
-    norm = safe_norm(x)
-    if not np.isfinite(norm) or norm <= 1e-10:
-        raise RuntimeError("Degenerate opposing direction with near-zero norm.")
-    return x / norm
+def parse_layers(text: str, available: Sequence[int]) -> List[int]:
+    if text.strip().lower() in {"auto", "all"}:
+        return list(available)
+
+    requested = sorted(
+        {
+            int(token.strip().lstrip("Ll"))
+            for token in text.split(",")
+            if token.strip()
+        }
+    )
+    missing = [layer for layer in requested if layer not in available]
+    if missing:
+        raise RuntimeError(
+            f"Requested decoder blocks are absent: {missing}; available={list(available)}"
+        )
+    return requested
 
 
-def json_float(x: Any) -> Any:
-    if isinstance(x, np.floating):
-        return float(x)
-    if isinstance(x, np.integer):
-        return int(x)
-    if isinstance(x, np.ndarray):
-        return [json_float(v) for v in x.tolist()]
-    if isinstance(x, dict):
-        return {str(k): json_float(v) for k, v in x.items()}
-    if isinstance(x, (list, tuple)):
-        return [json_float(v) for v in x]
-    return x
+def json_value(value: Any) -> Any:
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.ndarray):
+        return [json_value(v) for v in value.tolist()]
+    if isinstance(value, dict):
+        return {str(k): json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_value(v) for v in value]
+    return value
+
+
+def normalize_rows(matrix: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    return matrix / np.maximum(norms, EPS)
+
+
+def unit(vector: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vector))
+    if not np.isfinite(norm) or norm <= EPS:
+        raise RuntimeError("Encountered a near-zero direction vector.")
+    return vector / norm
+
+
+def load_input(path: Path) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray, List[int]]:
+    with np.load(path, allow_pickle=True) as loaded:
+        keys = set(loaded.files)
+        required = {"relation", "relation_vectors", "decoder_block_index"}
+        missing = sorted(required - keys)
+        if missing:
+            raise RuntimeError(f"Missing NPZ fields {missing}; available={sorted(keys)}")
+
+        labels = np.asarray(
+            [normalize_relation(x) for x in loaded["relation"].tolist()],
+            dtype=object,
+        )
+        vectors = np.asarray(loaded["relation_vectors"], dtype=np.float32)
+        blocks = [int(x) for x in loaded["decoder_block_index"].tolist()]
+
+        metadata: Dict[str, Any] = {}
+        if "metadata_json" in keys:
+            try:
+                metadata = json.loads(str(loaded["metadata_json"].item()))
+            except Exception:
+                metadata = {"metadata_json_parse_error": True}
+
+    if vectors.ndim != 3:
+        raise RuntimeError(
+            f"Expected relation_vectors with shape [N,L,H], got {vectors.shape}"
+        )
+    if vectors.shape[0] != len(labels):
+        raise RuntimeError(
+            f"Sample count mismatch: labels={len(labels)}, vectors={vectors.shape[0]}"
+        )
+    if vectors.shape[1] != len(blocks):
+        raise RuntimeError(
+            f"Layer count mismatch: vectors L={vectors.shape[1]}, blocks={len(blocks)}"
+        )
+    if not np.all(np.isfinite(vectors)):
+        bad = int(np.size(vectors) - np.isfinite(vectors).sum())
+        raise RuntimeError(f"relation_vectors contains {bad} non-finite values.")
+
+    return metadata, labels, vectors, blocks
+
+
+def stratified_split(
+    labels: np.ndarray,
+    relation_order: Sequence[str],
+    train_ratio: float,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, int], Dict[str, int]]:
+    """Exact per-class stratified sample split.
+
+    For 200 samples and train_ratio=0.30 this chooses exactly 60 train samples
+    and 140 test samples for that class.
+    """
+    if not 0.0 < train_ratio < 1.0:
+        raise ValueError(f"--train-ratio must be between 0 and 1, got {train_ratio}")
+
+    rng = np.random.default_rng(seed)
+    train_indices: List[int] = []
+    test_indices: List[int] = []
+    train_counts: Dict[str, int] = {}
+    test_counts: Dict[str, int] = {}
+
+    for relation in relation_order:
+        indices = np.flatnonzero(labels == relation)
+        if len(indices) < 2:
+            raise RuntimeError(
+                f"Relation {relation!r} has only {len(indices)} sample(s); need >=2."
+            )
+
+        indices = rng.permutation(indices)
+        n_train = int(round(len(indices) * train_ratio))
+        n_train = min(max(n_train, 1), len(indices) - 1)
+
+        train_part = indices[:n_train]
+        test_part = indices[n_train:]
+
+        train_indices.extend(train_part.tolist())
+        test_indices.extend(test_part.tolist())
+        train_counts[relation] = int(len(train_part))
+        test_counts[relation] = int(len(test_part))
+
+    train_array = np.asarray(rng.permutation(train_indices), dtype=np.int64)
+    test_array = np.asarray(rng.permutation(test_indices), dtype=np.int64)
+
+    overlap = np.intersect1d(train_array, test_array)
+    if len(overlap):
+        raise RuntimeError(f"Internal split error: {len(overlap)} overlapping samples.")
+
+    return train_array, test_array, train_counts, test_counts
+
+
+def confusion_matrix(
+    true_indices: np.ndarray,
+    predicted_indices: np.ndarray,
+    n_classes: int,
+) -> List[List[int]]:
+    matrix = np.zeros((n_classes, n_classes), dtype=np.int64)
+    for true_value, pred_value in zip(true_indices.tolist(), predicted_indices.tolist()):
+        matrix[int(true_value), int(pred_value)] += 1
+    return matrix.tolist()
+
+
+def fit_direction_codebook(
+    train_vectors: np.ndarray,
+    train_labels: np.ndarray,
+    relation_order: Sequence[str],
+    feature_centering: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if feature_centering == "global":
+        center = np.mean(train_vectors, axis=0)
+    else:
+        center = np.zeros(train_vectors.shape[1], dtype=np.float32)
+
+    centered = train_vectors - center[None, :]
+    directions: List[np.ndarray] = []
+    raw_means: List[np.ndarray] = []
+
+    for relation in relation_order:
+        mask = train_labels == relation
+        if not np.any(mask):
+            raise RuntimeError(f"Training split is missing relation {relation!r}.")
+        mean_vector = np.mean(centered[mask], axis=0)
+        raw_means.append(mean_vector)
+        directions.append(unit(mean_vector))
+
+    return center, np.stack(directions), np.stack(raw_means)
+
+
+def evaluate_direction_codebook(
+    test_vectors: np.ndarray,
+    test_labels: np.ndarray,
+    center: np.ndarray,
+    directions: np.ndarray,
+    relation_order: Sequence[str],
+) -> Dict[str, Any]:
+    label_to_index = {label: index for index, label in enumerate(relation_order)}
+    true = np.asarray([label_to_index[x] for x in test_labels], dtype=np.int64)
+
+    scores = normalize_rows(test_vectors - center[None, :]) @ directions.T
+    predicted = np.argmax(scores, axis=1)
+    correct = predicted == true
+
+    true_scores = scores[np.arange(len(true)), true]
+    other_scores = scores.copy()
+    other_scores[np.arange(len(true)), true] = -np.inf
+    signed_margin = true_scores - np.max(other_scores, axis=1)
+
+    sorted_scores = np.sort(scores, axis=1)
+    top1_margin = sorted_scores[:, -1] - sorted_scores[:, -2]
+
+    per_class: Dict[str, Any] = {}
+    for relation, class_index in label_to_index.items():
+        mask = true == class_index
+        per_class[relation] = {
+            "n": int(mask.sum()),
+            "accuracy": float(np.mean(predicted[mask] == class_index)),
+            "mean_true_cosine": float(np.mean(true_scores[mask])),
+            "mean_signed_margin": float(np.mean(signed_margin[mask])),
+        }
+
+    return {
+        "accuracy": float(np.mean(correct)),
+        "n": int(len(true)),
+        "mean_signed_margin": float(np.mean(signed_margin)),
+        "mean_top1_margin": float(np.mean(top1_margin)),
+        "per_class": per_class,
+        "relation_order": list(relation_order),
+        "confusion_matrix": confusion_matrix(true, predicted, len(relation_order)),
+        "direction_cosine_gram": (directions @ directions.T).tolist(),
+    }
 
 
 def available_axes(labels: Sequence[str]) -> List[Tuple[str, str, str]]:
     values = set(labels)
-    return [axis for axis in AXIS_CANDIDATES if axis[1] in values and axis[2] in values]
+    return [
+        axis
+        for axis in AXIS_CANDIDATES
+        if axis[1] in values and axis[2] in values
+    ]
 
 
-def fit_axes(vectors: np.ndarray, labels: np.ndarray, axes: Sequence[Tuple[str, str, str]]) -> Dict[str, Dict[str, Any]]:
+def fit_affine_axes(
+    train_vectors: np.ndarray,
+    train_labels: np.ndarray,
+    axes: Sequence[Tuple[str, str, str]],
+) -> Dict[str, Dict[str, Any]]:
     fitted: Dict[str, Dict[str, Any]] = {}
+
     for name, negative, positive in axes:
-        neg = vectors[labels == negative]
-        pos = vectors[labels == positive]
-        if len(neg) == 0 or len(pos) == 0:
-            raise RuntimeError(f"Training split is missing {negative}/{positive} for axis {name}.")
-        mean_neg = np.mean(neg, axis=0)
-        mean_pos = np.mean(pos, axis=0)
-        direction = unit(mean_pos - mean_neg)
-        centre = 0.5 * (mean_pos + mean_neg)
-        train_delta = vectors[np.isin(labels, [negative, positive])] - centre
-        projection = train_delta @ direction
-        residual = train_delta - projection[:, None] * direction[None, :]
-        # A family-specific residual scale makes axis routing less sensitive to
-        # differences in intrinsic spread across horizontal / vertical / depth.
-        residual_scale = float(np.sqrt(np.mean(np.sum(residual * residual, axis=1))))
-        residual_scale = max(residual_scale, 1e-6)
+        negative_vectors = train_vectors[train_labels == negative]
+        positive_vectors = train_vectors[train_labels == positive]
+        if len(negative_vectors) == 0 or len(positive_vectors) == 0:
+            raise RuntimeError(
+                f"Training split is missing {negative}/{positive} for {name}."
+            )
+
+        mean_negative = np.mean(negative_vectors, axis=0)
+        mean_positive = np.mean(positive_vectors, axis=0)
+        direction = unit(mean_positive - mean_negative)
+        center = 0.5 * (mean_positive + mean_negative)
+
+        axis_train = train_vectors[
+            np.isin(train_labels, [negative, positive])
+        ]
+        delta = axis_train - center[None, :]
+        projection = delta @ direction
+        residual = delta - projection[:, None] * direction[None, :]
+        residual_scale = float(
+            np.sqrt(np.mean(np.sum(residual * residual, axis=1)))
+        )
+
         fitted[name] = {
             "negative": negative,
             "positive": positive,
             "direction": direction,
-            "centre": centre,
-            "residual_scale": residual_scale,
+            "center": center,
+            "residual_scale": max(residual_scale, 1e-6),
         }
+
     return fitted
 
 
-def predict(vectors: np.ndarray, fitted: Mapping[str, Mapping[str, Any]]) -> Tuple[np.ndarray, Dict[str, np.ndarray], Dict[str, np.ndarray]]:
-    names = list(fitted)
-    n = len(vectors)
-    family_dist: Dict[str, np.ndarray] = {}
-    projections: Dict[str, np.ndarray] = {}
-    per_axis_relation: Dict[str, np.ndarray] = {}
-    for name in names:
-        params = fitted[name]
-        centre = params["centre"]
-        direction = params["direction"]
-        delta = vectors - centre[None, :]
-        proj = delta @ direction
-        residual = delta - proj[:, None] * direction[None, :]
-        family_dist[name] = np.sqrt(np.sum(residual * residual, axis=1)) / float(params["residual_scale"])
-        projections[name] = proj
-        per_axis_relation[name] = np.where(proj >= 0.0, params["positive"], params["negative"])
-    dist_matrix = np.stack([family_dist[name] for name in names], axis=1)
-    picked = np.argmin(dist_matrix, axis=1)
-    predicted = np.asarray([per_axis_relation[names[p]][i] for i, p in enumerate(picked)], dtype=object)
-    return predicted, projections, family_dist
-
-
-def confusion(true: Sequence[str], pred: Sequence[str], labels: Sequence[str]) -> List[List[int]]:
-    index = {label: i for i, label in enumerate(labels)}
-    matrix = np.zeros((len(labels), len(labels)), dtype=np.int64)
-    for t, p in zip(true, pred):
-        if t in index and p in index:
-            matrix[index[t], index[p]] += 1
-    return matrix.tolist()
-
-
-def fold_splits(labels: np.ndarray, groups: np.ndarray, n_splits: int, seed: int):
-    counts = Counter(labels.tolist())
-    min_count = min(counts.values())
-    if min_count < n_splits:
-        raise RuntimeError(f"Smallest relation class has {min_count} samples; cannot use {n_splits}-fold stratification.")
-    splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    dummy = np.zeros(len(labels), dtype=np.int8)
-    return list(splitter.split(dummy, labels, groups))
-
-
-def evaluate_cv(
-    vectors: np.ndarray,
-    labels: np.ndarray,
-    groups: np.ndarray,
-    axes: Sequence[Tuple[str, str, str]],
-    splits: Sequence[Tuple[np.ndarray, np.ndarray]],
-    train_label_permutation: np.random.Generator | None = None,
+def evaluate_affine_axes(
+    test_vectors: np.ndarray,
+    test_labels: np.ndarray,
+    fitted: Mapping[str, Mapping[str, Any]],
 ) -> Dict[str, Any]:
-    all_true: List[str] = []
-    all_pred: List[str] = []
-    sign_correct: Dict[str, List[bool]] = {name: [] for name, _, _ in axes}
-    sign_scores: Dict[str, List[float]] = {name: [] for name, _, _ in axes}
-    geometry: List[np.ndarray] = []
-    centre_distances: List[Dict[str, float]] = []
+    axis_names = list(fitted)
+    family_distances: List[np.ndarray] = []
+    family_relations: List[np.ndarray] = []
+    projections: Dict[str, np.ndarray] = {}
 
-    for train_idx, test_idx in splits:
-        train_vectors = vectors[train_idx]
-        train_labels = labels[train_idx].copy()
-        if train_label_permutation is not None:
-            train_labels = train_label_permutation.permutation(train_labels)
-        fitted = fit_axes(train_vectors, train_labels, axes)
-        pred, projections, _ = predict(vectors[test_idx], fitted)
-        true = labels[test_idx]
-        all_true.extend(true.tolist())
-        all_pred.extend(pred.tolist())
-        for name, negative, positive in axes:
-            mask = np.isin(true, [negative, positive])
-            if not np.any(mask):
-                continue
-            expected_positive = true[mask] == positive
-            projected_positive = projections[name][mask] >= 0.0
-            sign_correct[name].extend((expected_positive == projected_positive).tolist())
-            sign_scores[name].extend(projections[name][mask].tolist())
+    for name in axis_names:
+        params = fitted[name]
+        delta = test_vectors - params["center"][None, :]
+        projection = delta @ params["direction"]
+        residual = delta - projection[:, None] * params["direction"][None, :]
+        distance = (
+            np.sqrt(np.sum(residual * residual, axis=1))
+            / float(params["residual_scale"])
+        )
+        relation = np.where(
+            projection >= 0.0,
+            params["positive"],
+            params["negative"],
+        )
+        family_distances.append(distance)
+        family_relations.append(relation)
+        projections[name] = projection
 
-        directions = [fitted[name]["direction"] for name, _, _ in axes]
-        geometry.append(np.asarray(directions) @ np.asarray(directions).T)
-        fold_dist: Dict[str, float] = {}
-        for a_idx, (a_name, _, _) in enumerate(axes):
-            for b_name, _, _ in axes[a_idx + 1 :]:
-                ca = fitted[a_name]["centre"]
-                cb = fitted[b_name]["centre"]
-                sa = fitted[a_name]["residual_scale"]
-                sb = fitted[b_name]["residual_scale"]
-                fold_dist[f"{a_name}__{b_name}"] = float(np.linalg.norm(ca - cb) / max(1e-6, 0.5 * (sa + sb)))
-        centre_distances.append(fold_dist)
+    distance_matrix = np.stack(family_distances, axis=1)
+    selected_axis = np.argmin(distance_matrix, axis=1)
+    predicted = np.asarray(
+        [family_relations[axis_index][i] for i, axis_index in enumerate(selected_axis)],
+        dtype=object,
+    )
 
-    labels_order = sorted(set(labels.tolist()))
-    per_axis = {}
-    for name, negative, positive in axes:
-        values = sign_correct[name]
+    relation_order = sorted(
+        {
+            str(params[side])
+            for params in fitted.values()
+            for side in ("negative", "positive")
+        }
+    )
+    label_to_index = {label: i for i, label in enumerate(relation_order)}
+    true_index = np.asarray([label_to_index[x] for x in test_labels], dtype=np.int64)
+    pred_index = np.asarray([label_to_index[x] for x in predicted], dtype=np.int64)
+
+    per_axis: Dict[str, Any] = {}
+    for name, params in fitted.items():
+        negative = str(params["negative"])
+        positive = str(params["positive"])
+        mask = np.isin(test_labels, [negative, positive])
+        expected_positive = test_labels[mask] == positive
+        predicted_positive = projections[name][mask] >= 0.0
         per_axis[name] = {
             "negative": negative,
             "positive": positive,
-            "n": len(values),
-            "sign_accuracy": float(np.mean(values)) if values else None,
-            "mean_signed_projection": float(np.mean(sign_scores[name])) if sign_scores[name] else None,
+            "n": int(mask.sum()),
+            "sign_accuracy": float(np.mean(expected_positive == predicted_positive)),
         }
-    centre_summary = {}
-    for key in sorted({key for item in centre_distances for key in item}):
-        vals = [item[key] for item in centre_distances if key in item]
-        centre_summary[key] = float(np.mean(vals)) if vals else None
 
-    result = {
-        "n": int(len(all_true)),
-        "affine_routing_accuracy": float(np.mean(np.asarray(all_true, dtype=object) == np.asarray(all_pred, dtype=object))),
-        "per_axis_sign_accuracy": per_axis,
-        "relation_order": labels_order,
-        "confusion_matrix": confusion(all_true, all_pred, labels_order),
-        "mean_axis_cosine_gram": np.mean(np.stack(geometry, axis=0), axis=0).tolist(),
-        "axis_order": [name for name, _, _ in axes],
-        "mean_family_centre_distance": centre_summary,
-    }
-    return result
-
-
-def full_diagnostic(vectors: np.ndarray, labels: np.ndarray, axes: Sequence[Tuple[str, str, str]]) -> Dict[str, Any]:
-    fitted = fit_axes(vectors, labels, axes)
-    pred, projections, _ = predict(vectors, fitted)
-    per_axis = {}
-    for name, negative, positive in axes:
-        mask = np.isin(labels, [negative, positive])
-        expected_positive = labels[mask] == positive
-        predicted_positive = projections[name][mask] >= 0.0
-        per_axis[name] = float(np.mean(expected_positive == predicted_positive))
-    dirs = np.asarray([fitted[name]["direction"] for name, _, _ in axes])
+    directions = np.stack([fitted[name]["direction"] for name in axis_names])
     return {
-        "affine_routing_accuracy": float(np.mean(pred == labels)),
+        "accuracy": float(np.mean(predicted == test_labels)),
+        "n": int(len(test_labels)),
         "per_axis_sign_accuracy": per_axis,
-        "axis_cosine_gram": (dirs @ dirs.T).tolist(),
-        "axis_order": [name for name, _, _ in axes],
+        "relation_order": relation_order,
+        "confusion_matrix": confusion_matrix(
+            true_index, pred_index, len(relation_order)
+        ),
+        "axis_order": axis_names,
+        "axis_cosine_gram": (directions @ directions.T).tolist(),
+    }
+
+
+def summarize_scalar(values: Sequence[float]) -> Dict[str, float]:
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "mean": float(np.mean(array)),
+        "std": float(np.std(array, ddof=0)),
+        "min": float(np.min(array)),
+        "max": float(np.max(array)),
     }
 
 
 def main() -> None:
     args = parse_args()
     source = Path(args.input_npz)
-    with np.load(source, allow_pickle=True) as loaded:
-        metadata = json.loads(str(loaded["metadata_json"].item()))
-        labels = np.asarray([str(x) for x in loaded["relation"].tolist()], dtype=object)
-        groups = np.asarray([str(x) for x in loaded["image_id"].tolist()], dtype=object)
-        vectors = loaded["relation_vectors"].astype(np.float32)
-        block_ids = [int(v) for v in loaded["decoder_block_index"].tolist()]
+    if not source.exists():
+        raise SystemExit(f"Missing input NPZ: {source}")
+    if args.repeats < 1:
+        raise SystemExit("--repeats must be >= 1")
 
-    if vectors.ndim != 3:
-        raise RuntimeError(f"Expected relation_vectors [N,L,H], got {vectors.shape}")
-    axes = available_axes(labels.tolist())
-    if not axes:
-        raise RuntimeError(f"No complete opposing axis pair found. Parsed labels: {Counter(labels.tolist())}")
+    metadata, all_labels, all_vectors, block_ids = load_input(source)
+    selected_blocks = parse_layers(args.layers, block_ids)
 
-    splits = fold_splits(labels, groups, args.cv_folds, args.seed)
+    requested_relations = [
+        normalize_relation(token)
+        for token in args.relations.split(",")
+        if token.strip()
+    ]
+    if len(set(requested_relations)) != len(requested_relations):
+        raise SystemExit(
+            f"Duplicate normalized relations in --relations: {requested_relations}"
+        )
+
+    if args.probe_mode == "four_direction":
+        relation_order = requested_relations
+    else:
+        axes = available_axes(all_labels.tolist())
+        if not axes:
+            raise SystemExit(
+                "No complete opposing relation pair found. "
+                f"Parsed labels={dict(Counter(all_labels.tolist()))}"
+            )
+        relation_order = []
+        for _, negative, positive in axes:
+            relation_order.extend([negative, positive])
+        relation_order = list(dict.fromkeys(relation_order))
+
+    keep_mask = np.isin(all_labels, relation_order)
+    labels = all_labels[keep_mask]
+    vectors = all_vectors[keep_mask]
+
+    counts = Counter(labels.tolist())
+    missing_relations = [
+        relation for relation in relation_order if counts.get(relation, 0) == 0
+    ]
+    if missing_relations:
+        raise SystemExit(
+            f"Missing requested relations {missing_relations}; counts={dict(counts)}"
+        )
+
+    # Generate splits once and reuse them for every decoder layer.
+    splits: List[Tuple[np.ndarray, np.ndarray, Dict[str, int], Dict[str, int]]] = []
+    for repeat in range(args.repeats):
+        splits.append(
+            stratified_split(
+                labels,
+                relation_order,
+                args.train_ratio,
+                args.seed + repeat * 1009,
+            )
+        )
+
     print(
-        f"{metadata.get('dataset')} / {metadata.get('model_alias')}: n={len(labels)}, "
-        f"groups={len(set(groups.tolist()))}, labels={dict(Counter(labels.tolist()))}, axes={[x[0] for x in axes]}"
+        f"Input={source} | mode={args.probe_mode} | n={len(labels)} | "
+        f"counts={dict(counts)}"
+    )
+    print(
+        f"Split: train_ratio={args.train_ratio:.2f}, "
+        f"test_ratio={1.0 - args.train_ratio:.2f}, repeats={args.repeats}"
+    )
+    print(f"Decoder blocks: {selected_blocks}")
+    first_split = splits[0]
+    print(
+        f"First split: train={len(first_split[0])} {first_split[2]} | "
+        f"test={len(first_split[1])} {first_split[3]}"
     )
 
     summary: Dict[str, Any] = {
         "input_npz": str(source),
         "metadata": metadata,
-        "cv_folds": args.cv_folds,
-        "group_unit": "image_id",
-        "relation_counts": dict(Counter(labels.tolist())),
-        "axes": [{"name": name, "negative": neg, "positive": pos} for name, neg, pos in axes],
+        "probe_mode": args.probe_mode,
+        "relations": relation_order,
+        "relation_counts": dict(counts),
+        "train_ratio": float(args.train_ratio),
+        "test_ratio": float(1.0 - args.train_ratio),
+        "repeats": int(args.repeats),
+        "feature_centering": args.feature_centering,
+        "seed": int(args.seed),
         "layers": {},
     }
 
-    rng = np.random.default_rng(args.seed + 913)
-    for layer_index, block in enumerate(block_ids):
-        layer_vectors = vectors[:, layer_index, :]
-        cv = evaluate_cv(layer_vectors, labels, groups, axes, splits)
-        full = full_diagnostic(layer_vectors, labels, axes)
-        layer_result: Dict[str, Any] = {
+    if args.probe_mode == "affine_axes":
+        summary["axes"] = [
+            {"name": name, "negative": negative, "positive": positive}
+            for name, negative, positive in axes
+        ]
+
+    block_to_position = {block: i for i, block in enumerate(block_ids)}
+    shuffle_rng = np.random.default_rng(args.seed + 99991)
+
+    for block in selected_blocks:
+        layer_vectors = vectors[:, block_to_position[block], :]
+        repeat_results: List[Dict[str, Any]] = []
+
+        for repeat, (train_idx, test_idx, train_counts, test_counts) in enumerate(splits):
+            train_vectors = layer_vectors[train_idx]
+            test_vectors = layer_vectors[test_idx]
+            train_labels = labels[train_idx]
+            test_labels = labels[test_idx]
+
+            if args.probe_mode == "four_direction":
+                center, directions, raw_means = fit_direction_codebook(
+                    train_vectors,
+                    train_labels,
+                    relation_order,
+                    args.feature_centering,
+                )
+                result = evaluate_direction_codebook(
+                    test_vectors,
+                    test_labels,
+                    center,
+                    directions,
+                    relation_order,
+                )
+                result["raw_class_mean_norms"] = {
+                    relation: float(np.linalg.norm(raw_means[i]))
+                    for i, relation in enumerate(relation_order)
+                }
+            else:
+                fitted = fit_affine_axes(train_vectors, train_labels, axes)
+                result = evaluate_affine_axes(
+                    test_vectors,
+                    test_labels,
+                    fitted,
+                )
+
+            result.update(
+                {
+                    "repeat": int(repeat),
+                    "split_seed": int(args.seed + repeat * 1009),
+                    "train_n": int(len(train_idx)),
+                    "test_n": int(len(test_idx)),
+                    "train_counts": train_counts,
+                    "test_counts": test_counts,
+                }
+            )
+
+            if not args.no_label_shuffle and args.label_shuffle_repeats > 0:
+                shuffle_scores: List[float] = []
+                for _ in range(args.label_shuffle_repeats):
+                    shuffled_labels = shuffle_rng.permutation(train_labels)
+                    if args.probe_mode == "four_direction":
+                        shuffled_center, shuffled_directions, _ = fit_direction_codebook(
+                            train_vectors,
+                            shuffled_labels,
+                            relation_order,
+                            args.feature_centering,
+                        )
+                        shuffled_result = evaluate_direction_codebook(
+                            test_vectors,
+                            test_labels,
+                            shuffled_center,
+                            shuffled_directions,
+                            relation_order,
+                        )
+                    else:
+                        shuffled_fitted = fit_affine_axes(
+                            train_vectors,
+                            shuffled_labels,
+                            axes,
+                        )
+                        shuffled_result = evaluate_affine_axes(
+                            test_vectors,
+                            test_labels,
+                            shuffled_fitted,
+                        )
+                    shuffle_scores.append(float(shuffled_result["accuracy"]))
+
+                result["train_label_shuffle_control"] = {
+                    "repeats": int(args.label_shuffle_repeats),
+                    "accuracy": summarize_scalar(shuffle_scores),
+                    "chance": float(1.0 / len(relation_order)),
+                }
+
+            repeat_results.append(result)
+
+            extra = ""
+            if "mean_signed_margin" in result:
+                extra = f" | margin={result['mean_signed_margin']:.3f}"
+            print(
+                f"L{block} rep{repeat}: train={len(train_idx)} test={len(test_idx)} "
+                f"acc={result['accuracy']:.3f}{extra}"
+            )
+
+        accuracies = [float(item["accuracy"]) for item in repeat_results]
+        layer_summary: Dict[str, Any] = {
             "decoder_block_index": int(block),
-            "pair_or_image_group_cv": cv,
-            "full_data_diagnostic": full,
+            "accuracy": summarize_scalar(accuracies),
+            "repeats": repeat_results,
         }
-        if not args.no_label_shuffle and args.label_shuffle_repeats > 0:
-            scores = []
-            for _ in range(args.label_shuffle_repeats):
-                shuffled = evaluate_cv(layer_vectors, labels, groups, axes, splits, train_label_permutation=rng)
-                scores.append(shuffled["affine_routing_accuracy"])
-            layer_result["train_label_shuffle_control"] = {
-                "repeats": int(args.label_shuffle_repeats),
-                "mean": float(np.mean(scores)),
-                "std": float(np.std(scores)),
-                "chance": float(1.0 / len(set(labels.tolist()))),
-            }
 
-        summary["layers"][str(block)] = layer_result
-        axis_text = " | ".join(
-            f"{name}={result['sign_accuracy']:.3f}"
-            for name, result in cv["per_axis_sign_accuracy"].items()
-            if result["sign_accuracy"] is not None
-        )
-        shuffle_text = ""
-        if "train_label_shuffle_control" in layer_result:
-            control = layer_result["train_label_shuffle_control"]
-            shuffle_text = f" | shuffle={control['mean']:.3f}±{control['std']:.3f}"
+        if args.probe_mode == "four_direction":
+            layer_summary["mean_signed_margin"] = summarize_scalar(
+                [float(item["mean_signed_margin"]) for item in repeat_results]
+            )
+            layer_summary["mean_top1_margin"] = summarize_scalar(
+                [float(item["mean_top1_margin"]) for item in repeat_results]
+            )
+
+        summary["layers"][str(block)] = layer_summary
         print(
-            f"L{block}: affine-routing={cv['affine_routing_accuracy']:.3f} | {axis_text}{shuffle_text}"
+            f"L{block} summary: "
+            f"acc={layer_summary['accuracy']['mean']:.3f}"
+            f"±{layer_summary['accuracy']['std']:.3f}"
         )
 
-    out = Path(args.output)
-    if out.suffix != ".json":
-        out = out.with_suffix(".json")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(json_float(summary), ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Saved summary: {out}")
+    output = Path(args.output)
+    if output.suffix != ".json":
+        output = output.with_suffix(".json")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(json_value(summary), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"Saved summary: {output}")
+
+    tsv_path = output.with_suffix(".tsv")
+    with tsv_path.open("w", encoding="utf-8") as handle:
+        handle.write(
+            "layer\taccuracy_mean\taccuracy_std\taccuracy_min\taccuracy_max\n"
+        )
+        for block, layer_info in summary["layers"].items():
+            accuracy = layer_info["accuracy"]
+            handle.write(
+                f"L{block}\t{accuracy['mean']:.8f}\t{accuracy['std']:.8f}\t"
+                f"{accuracy['min']:.8f}\t{accuracy['max']:.8f}\n"
+            )
+    print(f"Saved TSV: {tsv_path}")
 
 
 if __name__ == "__main__":
