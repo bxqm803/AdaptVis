@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Baseline vs. training-free object-token visual re-grounding.
+"""Standard-question baseline vs. training-free object-token re-grounding.
 
 Purpose
 -------
@@ -28,10 +28,12 @@ No trainable parameters are introduced. Ground-truth relations are read only
 when computing evaluation metrics after generation; they are never used to
 construct the patch.
 
-This first implementation deliberately uses object-token/image-token cosine
-similarity rather than output_attentions=True. Returning all decoder attention
-matrices can be prohibitively expensive for Qwen2.5-VL image sequences. The
-similarity grounding is model-agnostic and directly tests the core hypothesis.
+The question and GT answer are read directly from the dataset standard JSONL
+file, indexed by record sid/id. The script prints question, GT, raw generation,
+parsed prediction, correctness, and running accuracy for every processed sample.
+
+Object spans are parsed from the exact standard question text, preserving surface
+forms such as "TV" rather than relying on lower-cased annotation names.
 """
 from __future__ import annotations
 
@@ -63,6 +65,8 @@ try:
 except Exception as exc:  # pragma: no cover
     raise SystemExit(f"Unable to import transformers: {exc}")
 
+
+SCRIPT_VERSION = "standard-question-regrounding-full-v4"
 
 DEFAULT_PROMPT_FILES = {
     "coco_two": Path("prompts/COCO_QA_two_obj_with_answer_four_options.jsonl"),
@@ -221,6 +225,28 @@ def standard_answer_value(value: Any) -> Any:
     return value
 
 
+STANDARD_OBJECT_RE = re.compile(
+    r"Where\s+(?:is|are)\s+the\s+(.+?)\s+in\s+relation\s+to\s+the\s+(.+?)\?\s*Answer\s+with",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+
+def parse_standard_objects(question_text: str) -> Tuple[str, str]:
+    """Parse exact subject/reference surface strings from the standard question."""
+    compact = re.sub(r"\s+", " ", str(question_text)).strip()
+    match = STANDARD_OBJECT_RE.search(compact)
+    if not match:
+        raise ValueError(
+            "Could not parse subject/reference from standard question: "
+            f"{compact!r}"
+        )
+    subject = match.group(1).strip()
+    reference = match.group(2).strip()
+    if not subject or not reference:
+        raise ValueError(f"Empty subject/reference in question: {compact!r}")
+    return subject, reference
+
+
 def load_standard_prompts(path: Path) -> Dict[int, Dict[str, Any]]:
     rows: Dict[int, Dict[str, Any]] = {}
     with path.open("r", encoding="utf-8") as handle:
@@ -239,11 +265,15 @@ def load_standard_prompts(path: Path) -> Dict[int, Dict[str, Any]]:
             if sid in rows:
                 raise ValueError(f"Duplicate prompt id={sid} in {path}")
             raw_question = str(row["question"])
+            question_text = extract_standard_user_text(raw_question)
+            subject, reference = parse_standard_objects(question_text)
             rows[sid] = {
                 "id": sid,
                 "raw_question": raw_question,
-                "question_text": extract_standard_user_text(raw_question),
+                "question_text": question_text,
                 "answer_raw": standard_answer_value(row["answer"]),
+                "subject": subject,
+                "reference": reference,
             }
     if not rows:
         raise RuntimeError(f"No standard questions loaded from {path}")
@@ -324,6 +354,25 @@ def find_subsequence(haystack: Sequence[int], needle: Sequence[int]) -> List[int
     ]
 
 
+def phrase_surface_variants(phrase: str) -> List[str]:
+    """Return conservative case variants for token-span lookup.
+
+    Some chat templates/tokenizers normalize acronym-like object names, for
+    example the standard question may contain "TV" while the rendered prompt
+    tokenizes it as "tv".  These variants affect only span lookup; the standard
+    dataset question itself is kept unchanged.
+    """
+    raw = str(phrase).strip()
+    candidates = [
+        raw,
+        raw.lower(),
+        raw.upper(),
+        raw.title(),
+        raw.capitalize(),
+    ]
+    return list(dict.fromkeys(x for x in candidates if x))
+
+
 def find_phrase_spans(
     tokenizer: Any,
     input_ids: Sequence[int],
@@ -331,9 +380,11 @@ def find_phrase_spans(
     *,
     include_article_variants: bool = False,
 ) -> List[Tuple[int, int]]:
-    variants = [phrase, " " + phrase]
-    if include_article_variants:
-        variants.extend(["the " + phrase, " the " + phrase])
+    variants: List[str] = []
+    for surface in phrase_surface_variants(phrase):
+        variants.extend([surface, " " + surface])
+        if include_article_variants:
+            variants.extend(["the " + surface, " the " + surface])
 
     seen_ids = set()
     spans: List[Tuple[int, int]] = []
@@ -906,8 +957,10 @@ def make_batch(
     prompt_row: Dict[str, Any],
     device: torch.device,
 ) -> Tuple[Dict[str, Any], str, str, str, str, Any, Image.Image]:
-    subject = str(record.subject)
-    reference = str(record.reference)
+    # Use exact object surface forms parsed from the dataset standard question.
+    # This is required for reliable token-span lookup (for example, "TV" vs "tv").
+    subject = str(prompt_row["subject"])
+    reference = str(prompt_row["reference"])
     question_text = str(prompt_row["question_text"])
     raw_question = str(prompt_row["raw_question"])
     answer_raw = prompt_row["answer_raw"]
@@ -1004,30 +1057,56 @@ def summarize(
     baseline_rows: List[Dict[str, Any]],
     modified_rows: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    base_by_sid = {int(row["sid"]): row for row in baseline_rows if "error" not in row}
-    mod_by_sid = {int(row["sid"]): row for row in modified_rows if "error" not in row}
-    common = sorted(set(base_by_sid) & set(mod_by_sid))
+    """Summarize three independent signals and the paired intervention result.
 
-    baseline_valid = [base_by_sid[s] for s in common if base_by_sid[s].get("prediction")]
-    modified_valid = [mod_by_sid[s] for s in common if mod_by_sid[s].get("prediction")]
-    paired_valid = [
-        s
-        for s in common
-        if base_by_sid[s].get("prediction") and mod_by_sid[s].get("prediction")
+    Headline metrics:
+      1) baseline generation accuracy over every successfully parsed baseline row;
+      2) centroid-grounding accuracy over every baseline row with a valid centroid;
+      3) modified generation accuracy over every successfully parsed modified row.
+
+    Paired metrics are also reported so the before/after delta, fixed and broken
+    counts use exactly the same sample set.
+    """
+    base_by_sid = {
+        int(row["sid"]): row
+        for row in baseline_rows
+        if "error" not in row and "sid" in row
+    }
+    mod_by_sid = {
+        int(row["sid"]): row
+        for row in modified_rows
+        if "error" not in row and "sid" in row
+    }
+
+    baseline_valid_rows = [
+        row for row in base_by_sid.values() if row.get("prediction")
+    ]
+    modified_valid_rows = [
+        row for row in mod_by_sid.values() if row.get("prediction")
+    ]
+    grounding_rows = [
+        row for row in base_by_sid.values() if row.get("grounding_prediction")
     ]
 
-    def accuracy(rows: Iterable[Dict[str, Any]]) -> Optional[float]:
+    common = sorted(set(base_by_sid) & set(mod_by_sid))
+    paired_valid = [
+        sid
+        for sid in common
+        if base_by_sid[sid].get("prediction")
+        and mod_by_sid[sid].get("prediction")
+    ]
+
+    def accuracy(rows: Iterable[Dict[str, Any]], key: str = "correct") -> Optional[float]:
         rows = list(rows)
         if not rows:
             return None
-        return float(np.mean([bool(row.get("correct")) for row in rows]))
+        return float(np.mean([bool(row.get(key, False)) for row in rows]))
 
     fixed = 0
     broken = 0
     changed = 0
     both_correct = 0
     both_wrong = 0
-    per_relation: Dict[str, Dict[str, Any]] = {}
 
     rel_groups: Dict[str, List[int]] = defaultdict(list)
     for sid in paired_valid:
@@ -1045,21 +1124,22 @@ def summarize(
             both_wrong += 1
         rel_groups[str(b["gt"])].append(sid)
 
+    per_relation: Dict[str, Dict[str, Any]] = {}
     for rel, sids in sorted(rel_groups.items()):
+        grounding_rel_rows = [
+            base_by_sid[s]
+            for s in sids
+            if base_by_sid[s].get("grounding_prediction")
+        ]
         per_relation[rel] = {
-            "n": len(sids),
+            "n_paired": len(sids),
             "baseline_accuracy": accuracy(base_by_sid[s] for s in sids),
             "modified_accuracy": accuracy(mod_by_sid[s] for s in sids),
+            "grounding_n": len(grounding_rel_rows),
+            "grounding_accuracy": accuracy(
+                grounding_rel_rows, key="grounding_correct"
+            ),
         }
-
-    grounding_rows = [
-        base_by_sid[s]
-        for s in paired_valid
-        if base_by_sid[s].get("grounding_prediction")
-    ]
-    grounding_accuracy = accuracy(
-        {"correct": row.get("grounding_correct", False)} for row in grounding_rows
-    )
 
     confidence_values = [
         float(mod_by_sid[s].get("confidence", 0.0)) for s in paired_valid
@@ -1068,56 +1148,186 @@ def summarize(
         float(mod_by_sid[s].get("gamma_effective", 0.0)) for s in paired_valid
     ]
 
+    baseline_all_accuracy = accuracy(baseline_valid_rows)
+    modified_all_accuracy = accuracy(modified_valid_rows)
+    grounding_all_accuracy = accuracy(
+        grounding_rows, key="grounding_correct"
+    )
+
+    grounding_on_baseline_wrong_rows = [
+        row for row in grounding_rows
+        if row.get("prediction") and not bool(row.get("correct"))
+    ]
+    grounding_on_baseline_correct_rows = [
+        row for row in grounding_rows
+        if row.get("prediction") and bool(row.get("correct"))
+    ]
+    grounding_on_baseline_wrong_accuracy = accuracy(
+        grounding_on_baseline_wrong_rows, key="grounding_correct"
+    )
+    grounding_on_baseline_correct_accuracy = accuracy(
+        grounding_on_baseline_correct_rows, key="grounding_correct"
+    )
+    grounding_oracle_union_accuracy = (
+        float(np.mean([
+            bool(row.get("correct")) or bool(row.get("grounding_correct"))
+            for row in grounding_rows
+        ]))
+        if grounding_rows else None
+    )
+    grounding_agreement = (
+        float(np.mean([
+            row.get("prediction") == row.get("grounding_prediction")
+            for row in grounding_rows
+            if row.get("prediction")
+        ]))
+        if any(row.get("prediction") for row in grounding_rows)
+        else None
+    )
+
+    paired_baseline_accuracy = accuracy(base_by_sid[s] for s in paired_valid)
+    paired_modified_accuracy = accuracy(mod_by_sid[s] for s in paired_valid)
+
     return {
-        "n_baseline_rows": len(baseline_rows),
-        "n_modified_rows": len(modified_rows),
+        "n_baseline_rows": len(base_by_sid),
+        "n_modified_rows": len(mod_by_sid),
+        "n_baseline_valid": len(baseline_valid_rows),
+        "n_modified_valid": len(modified_valid_rows),
+        "n_grounding_valid": len(grounding_rows),
         "n_common": len(common),
         "n_paired_valid": len(paired_valid),
-        "baseline_parse_failures": len(common) - len(baseline_valid),
-        "modified_parse_failures": len(common) - len(modified_valid),
-        "baseline_accuracy": accuracy(base_by_sid[s] for s in paired_valid),
-        "modified_accuracy": accuracy(mod_by_sid[s] for s in paired_valid),
-        "grounding_accuracy": grounding_accuracy,
-        "n_grounding_valid": len(grounding_rows),
+
+        "baseline_accuracy": baseline_all_accuracy,
+        "modified_accuracy": modified_all_accuracy,
+        "grounding_accuracy": grounding_all_accuracy,
+        "grounding_accuracy_on_baseline_wrong": grounding_on_baseline_wrong_accuracy,
+        "n_grounding_on_baseline_wrong": len(grounding_on_baseline_wrong_rows),
+        "grounding_accuracy_on_baseline_correct": grounding_on_baseline_correct_accuracy,
+        "n_grounding_on_baseline_correct": len(grounding_on_baseline_correct_rows),
+        "baseline_or_grounding_oracle_accuracy": grounding_oracle_union_accuracy,
+        "baseline_grounding_agreement": grounding_agreement,
+
+        "paired_baseline_accuracy": paired_baseline_accuracy,
+        "paired_modified_accuracy": paired_modified_accuracy,
+        "paired_absolute_change": (
+            paired_modified_accuracy - paired_baseline_accuracy
+            if paired_baseline_accuracy is not None
+            and paired_modified_accuracy is not None
+            else None
+        ),
+
+        "baseline_parse_failures": len(base_by_sid) - len(baseline_valid_rows),
+        "modified_parse_failures": len(mod_by_sid) - len(modified_valid_rows),
         "fixed": fixed,
         "broken": broken,
         "net_fixed_minus_broken": fixed - broken,
         "changed_predictions": changed,
         "both_correct": both_correct,
         "both_wrong": both_wrong,
-        "mean_confidence": float(np.mean(confidence_values)) if confidence_values else None,
-        "mean_gamma_effective": float(np.mean(gamma_values)) if gamma_values else None,
+        "mean_confidence": (
+            float(np.mean(confidence_values)) if confidence_values else None
+        ),
+        "mean_gamma_effective": (
+            float(np.mean(gamma_values)) if gamma_values else None
+        ),
         "per_relation": per_relation,
     }
 
 
 def print_summary(summary: Dict[str, Any]) -> None:
-    print("\n" + "=" * 80)
-    print("BASELINE VS OBJECT-TOKEN RE-GROUNDING")
-    print("=" * 80)
-    print(f"paired valid:       {summary.get('n_paired_valid')}")
+    print("\n" + "=" * 88)
+    print("FULL COCO STANDARD-QUESTION DIAGNOSTICS")
+    print("=" * 88)
+
     bacc = summary.get("baseline_accuracy")
-    macc = summary.get("modified_accuracy")
-    print(f"baseline accuracy:  {bacc:.4f}" if bacc is not None else "baseline accuracy:  n/a")
-    print(f"modified accuracy:  {macc:.4f}" if macc is not None else "modified accuracy:  n/a")
-    if bacc is not None and macc is not None:
-        print(f"absolute change:    {macc - bacc:+.4f}")
     gacc = summary.get("grounding_accuracy")
-    if gacc is not None:
-        print(f"centroid grounding: {gacc:.4f} (n={summary.get('n_grounding_valid')})")
-    print(f"fixed:              {summary.get('fixed')}")
-    print(f"broken:             {summary.get('broken')}")
-    print(f"net fixed-broken:   {summary.get('net_fixed_minus_broken'):+d}")
-    print(f"prediction changed: {summary.get('changed_predictions')}")
-    print(f"baseline parse fail:{summary.get('baseline_parse_failures')}")
-    print(f"modified parse fail:{summary.get('modified_parse_failures')}")
-    print(f"mean confidence:    {summary.get('mean_confidence')}")
-    print(f"mean effective gamma:{summary.get('mean_gamma_effective')}")
-    print("\nPer relation:")
+    macc = summary.get("modified_accuracy")
+
+    print(
+        f"1) baseline generation: "
+        f"{bacc:.4f} (n={summary.get('n_baseline_valid')})"
+        if bacc is not None
+        else "1) baseline generation: n/a"
+    )
+    print(
+        f"2) centroid grounding:  "
+        f"{gacc:.4f} (n={summary.get('n_grounding_valid')})"
+        if gacc is not None
+        else "2) centroid grounding:  n/a"
+    )
+    print(
+        f"3) modified generation: "
+        f"{macc:.4f} (n={summary.get('n_modified_valid')})"
+        if macc is not None
+        else "3) modified generation: n/a"
+    )
+
+    gw = summary.get("grounding_accuracy_on_baseline_wrong")
+    gc = summary.get("grounding_accuracy_on_baseline_correct")
+    oracle = summary.get("baseline_or_grounding_oracle_accuracy")
+    agree = summary.get("baseline_grounding_agreement")
+    print("\nDoes grounding add information beyond the baseline?")
+    print(
+        f"grounding on baseline-wrong:   {gw:.4f} "
+        f"(n={summary.get('n_grounding_on_baseline_wrong')})"
+        if gw is not None else
+        "grounding on baseline-wrong:   n/a"
+    )
+    print(
+        f"grounding on baseline-correct: {gc:.4f} "
+        f"(n={summary.get('n_grounding_on_baseline_correct')})"
+        if gc is not None else
+        "grounding on baseline-correct: n/a"
+    )
+    print(
+        f"baseline ∪ grounding oracle:   {oracle:.4f}"
+        if oracle is not None else
+        "baseline ∪ grounding oracle:   n/a"
+    )
+    print(
+        f"baseline/grounding agreement:  {agree:.4f}"
+        if agree is not None else
+        "baseline/grounding agreement:  n/a"
+    )
+
+    pb = summary.get("paired_baseline_accuracy")
+    pm = summary.get("paired_modified_accuracy")
+    print("\nPaired before/after comparison:")
+    print(f"paired valid:          {summary.get('n_paired_valid')}")
+    print(
+        f"paired baseline:       {pb:.4f}"
+        if pb is not None else "paired baseline:       n/a"
+    )
+    print(
+        f"paired modified:       {pm:.4f}"
+        if pm is not None else "paired modified:       n/a"
+    )
+    delta = summary.get("paired_absolute_change")
+    print(
+        f"paired absolute change:{delta:+.4f}"
+        if delta is not None else "paired absolute change:n/a"
+    )
+
+    print(f"fixed:                 {summary.get('fixed')}")
+    print(f"broken:                {summary.get('broken')}")
+    print(f"net fixed-broken:      {summary.get('net_fixed_minus_broken'):+d}")
+    print(f"prediction changed:    {summary.get('changed_predictions')}")
+    print(f"baseline parse fail:   {summary.get('baseline_parse_failures')}")
+    print(f"modified parse fail:   {summary.get('modified_parse_failures')}")
+    print(f"mean confidence:       {summary.get('mean_confidence')}")
+    print(f"mean effective gamma:  {summary.get('mean_gamma_effective')}")
+
+    print("\nPer relation on paired samples:")
     for rel, stats in summary.get("per_relation", {}).items():
+        grounding_text = (
+            f"{stats['grounding_accuracy']:.4f}"
+            if stats.get("grounding_accuracy") is not None
+            else "n/a"
+        )
         print(
-            f"  {rel:6s} n={stats['n']:4d} | "
+            f"  {rel:6s} n={stats['n_paired']:4d} | "
             f"base={stats['baseline_accuracy']:.4f} | "
+            f"ground={grounding_text} (n={stats['grounding_n']}) | "
             f"modified={stats['modified_accuracy']:.4f}"
         )
 
@@ -1186,6 +1396,7 @@ def main() -> None:
     summary_path = output_dir / "summary.json"
 
     run_config = {
+        "script_version": SCRIPT_VERSION,
         "dataset": args.dataset,
         "data_root": str(args.data_root),
         "model": args.model,
@@ -1223,6 +1434,7 @@ def main() -> None:
     if args.attn_impl != "none":
         load_kwargs["attn_implementation"] = args.attn_impl
 
+    print(f"Script version: {SCRIPT_VERSION}")
     print(f"Loading {args.model}: {spec.repo_id}")
     model = model_cls.from_pretrained(spec.repo_id, **load_kwargs)
     model.eval()
@@ -1238,6 +1450,11 @@ def main() -> None:
     first_sid = int(records[0].sid)
     print(f"First standard question: {one_line(prompt_rows[first_sid]['question_text'])}")
     print(f"First standard answer: {prompt_rows[first_sid]['answer_raw']!r}")
+    print(
+        "First parsed objects: "
+        f"{prompt_rows[first_sid]['subject']!r} -> "
+        f"{prompt_rows[first_sid]['reference']!r}"
+    )
     print(
         f"Resolved decoder layers: {decoder_path}, n={len(decoder_layers)}, "
         f"target layer={layer}"
@@ -1318,6 +1535,8 @@ def main() -> None:
                         "sid": sid,
                         "subject": subject,
                         "reference": reference,
+                        "annotation_subject": str(getattr(record, "subject", "")),
+                        "annotation_reference": str(getattr(record, "reference", "")),
                         "gt": gt,
                         "prediction": baseline_prediction,
                         "correct": bool(
@@ -1357,10 +1576,12 @@ def main() -> None:
                         tqdm.write(
                             f"\n[BASE {baseline_seen}/{len(records)}] sid={sid} | "
                             f"{subject} -> {reference}\n"
-                            f"  question: {one_line(question_text)}\n"
-                            f"  gt={gt} | generation={baseline_text!r} | "
-                            f"pred={baseline_prediction} | correct={int(row['correct'])} | "
-                            f"running_acc={baseline_correct_count}/{baseline_seen}="
+                            f"  question   : {one_line(question_text)}\n"
+                            f"  gt         : {gt}\n"
+                            f"  generation : {baseline_text!r}\n"
+                            f"  pred       : {baseline_prediction}\n"
+                            f"  correct    : {int(row['correct'])}\n"
+                            f"  acc        : {baseline_correct_count}/{baseline_seen}="
                             f"{baseline_correct_count / baseline_seen:.4f}\n"
                             f"  grounding={patch.grounding_prediction or None} | "
                             f"confidence={patch.confidence:.3f}"
@@ -1462,6 +1683,8 @@ def main() -> None:
                         "sid": sid,
                         "subject": subject,
                         "reference": reference,
+                        "annotation_subject": str(getattr(record, "subject", "")),
+                        "annotation_reference": str(getattr(record, "reference", "")),
                         "gt": gt,
                         "prediction": modified_prediction,
                         "correct": bool(
@@ -1513,10 +1736,12 @@ def main() -> None:
                         tqdm.write(
                             f"\n[MOD  {modified_seen}/{len(records)}] sid={sid} | "
                             f"{subject} -> {reference}\n"
-                            f"  question: {one_line(question_text)}\n"
-                            f"  gt={gt} | generation={modified_text!r} | "
-                            f"pred={modified_prediction} | correct={int(row['correct'])} | "
-                            f"running_acc={modified_correct_count}/{modified_seen}="
+                            f"  question   : {one_line(question_text)}\n"
+                            f"  gt         : {gt}\n"
+                            f"  generation : {modified_text!r}\n"
+                            f"  pred       : {modified_prediction}\n"
+                            f"  correct    : {int(row['correct'])}\n"
+                            f"  acc        : {modified_correct_count}/{modified_seen}="
                             f"{modified_correct_count / modified_seen:.4f}\n"
                             f"  base={baseline_prediction} -> modified={modified_prediction} | "
                             f"{status} | fixed={fixed_running} | broken={broken_running} | "
