@@ -1,25 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Training-free coordinate-augmented autoregressive generation.
+"""Training-free latent spatial-carrier generation.
 
-The script evaluates three signals on the same standard two-object questions:
+This script evaluates four outputs on the same standard two-object questions:
 
 1) Baseline generation
-   The frozen VLM answers the dataset's standard question normally.
+   The frozen VLM answers the dataset question normally.
 
 2) Centroid grounding
-   At a selected decoder layer, the subject/reference object-word hidden states
-   are matched to visual-token hidden states by cosine similarity. Their two
-   weighted visual centroids provide a direct four-way spatial diagnosis.
+   Object-word hidden states are matched to visual-token hidden states by cosine
+   similarity. Their weighted visual centroids yield dx/dy and a direct spatial
+   diagnosis.
 
-3) Coordinate-augmented generation
-   The model performs a second completely normal ``model.generate`` call. The
-   prompt is augmented only with the two estimated object-center coordinates and
-   the coordinate convention. It is NOT given dx/dy, a direction label, the
-   centroid prediction, or the GT answer. No logits or hidden states are edited
-   during this second generation.
+3) Carrier control
+   The same model generates from a prompt with a neutral trailing marker
+   ("Spatial evidence:") but receives no hidden-state intervention. This isolates
+   the effect of merely changing the prompt.
 
-Ground-truth answers are used only after generation for evaluation.
+4) Spatial-carrier generation
+   At the selected decoder layer, the visual-token hidden states are regressed
+   against their known x/y grid coordinates, producing two per-image latent axes:
+   a_x for increasing x and a_y for increasing y. The centroid displacement
+   (dx, dy) is converted into a latent relation vector dx*a_x + dy*a_y and added
+   only to the neutral carrier token. Later decoder layers and the LM head then
+   generate normally.
+
+No model parameters or probes are trained. No per-sample GT label is used in
+centroid extraction, basis construction, carrier injection, or generation.
+Ground truth is read only after generation for evaluation.
 """
 from __future__ import annotations
 
@@ -52,7 +60,7 @@ except Exception as exc:  # pragma: no cover
     raise SystemExit(f"Unable to import transformers: {exc}")
 
 
-SCRIPT_VERSION = "coordinate-augmented-generation-v1"
+SCRIPT_VERSION = "latent-spatial-carrier-generation-v1"
 
 DEFAULT_PROMPT_FILES = {
     "coco_two": Path("prompts/COCO_QA_two_obj_with_answer_four_options.jsonl"),
@@ -70,15 +78,13 @@ AUTO_LAYERS = {
 
 
 @dataclass
-class PatchData:
+class CarrierData:
     sid: int
+    layer: int
     subject_index: int
     reference_index: int
-    input_length: int
-    layer: int
-    z_text: np.ndarray
-    z_visual: np.ndarray
-    confidence: float
+    baseline_input_length: int
+    spatial_vector: np.ndarray
     map_separation: float
     subject_entropy_confidence: float
     reference_entropy_confidence: float
@@ -93,6 +99,11 @@ class PatchData:
     delta_y: float
     axis_confidence: float
     grounding_prediction: str
+    basis_r2: float
+    basis_axis_cosine: float
+    basis_x_norm: float
+    basis_y_norm: float
+    spatial_vector_norm: float
 
 
 def parse_args() -> argparse.Namespace:
@@ -117,7 +128,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--layer",
         default="auto",
-        help="Zero-based decoder block index for centroid extraction, or 'auto'.",
+        help="Zero-based decoder block index for centroid/basis extraction.",
     )
     p.add_argument("--max-samples", type=int, default=None)
     p.add_argument("--max-new-tokens", type=int, default=8)
@@ -125,43 +136,45 @@ def parse_args() -> argparse.Namespace:
         "--temperature",
         type=float,
         default=0.07,
-        help="Softmax temperature for object-token/visual-token similarity maps.",
+        help="Softmax temperature for object-token/visual-token grounding.",
     )
     p.add_argument(
-        "--confidence-mode",
-        default="separation",
-        choices=["none", "separation", "entropy", "combined"],
-        help="Confidence stored with centroid grounding.",
+        "--basis-ridge",
+        type=float,
+        default=1e-4,
+        help="Ridge term for the per-image x/y latent-basis regression.",
     )
     p.add_argument(
-        "--coordinate-confidence-mode",
+        "--carrier-marker",
+        default="Spatial evidence:",
+        help="Neutral text marker whose final token receives the spatial vector.",
+    )
+    p.add_argument(
+        "--carrier-strength",
+        type=float,
+        default=0.5,
+        help=(
+            "Maximum injected-vector norm as a fraction of the carrier-token "
+            "hidden-state norm before label-free confidence scaling."
+        ),
+    )
+    p.add_argument(
+        "--carrier-confidence-mode",
         default="separation_axis",
         choices=["none", "separation", "axis", "separation_axis"],
-        help=(
-            "Label-free confidence used only to decide whether coordinate "
-            "evidence is appended to the second prompt."
-        ),
+        help="Label-free confidence used to scale carrier injection.",
     )
     p.add_argument(
-        "--min-coordinate-confidence",
+        "--min-carrier-confidence",
         type=float,
         default=0.0,
-        help=(
-            "Below this confidence, run the standard question unchanged in the "
-            "second pass. Default 0 appends coordinates to every valid sample."
-        ),
+        help="Disable hidden-state injection below this confidence.",
     )
     p.add_argument(
-        "--coordinate-decimals",
-        type=int,
-        default=3,
-        help="Number of decimal places shown for normalized coordinates.",
-    )
-    p.add_argument(
-        "--coordinate-wording",
-        default="compact",
-        choices=["compact", "explicit"],
-        help="Prompt wording for the auxiliary coordinate evidence.",
+        "--renorm-carrier",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Preserve the carrier token's original L2 norm after injection.",
     )
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--save-every", type=int, default=10)
@@ -169,17 +182,17 @@ def parse_args() -> argparse.Namespace:
         "--print-every",
         type=int,
         default=1,
-        help="Print one detailed sample every N completed samples; 0 disables.",
+        help="Print one detailed record every N completed records; 0 disables.",
     )
     p.add_argument("--output-dir", required=True)
     p.add_argument("--overwrite", action="store_true")
     p.add_argument(
         "--only",
-        choices=["both", "baseline", "coordinate"],
+        choices=["both", "baseline", "carrier"],
         default="both",
         help=(
-            "Run both passes, only baseline/centroid capture, or only coordinate "
-            "generation from saved centroids."
+            "Run both stages, only baseline/latent capture, or only carrier "
+            "control+guided generation from saved carrier data."
         ),
     )
     return p.parse_args()
@@ -752,7 +765,7 @@ def confidence_value(
     raise ValueError(f"Unsupported confidence mode: {mode}")
 
 
-def build_patch_data(
+def build_carrier_data(
     *,
     model: Any,
     processor: Any,
@@ -762,10 +775,12 @@ def build_patch_data(
     reference: str,
     layer: int,
     temperature: float,
-    confidence_mode: str,
-) -> PatchData:
+    basis_ridge: float,
+) -> CarrierData:
     if temperature <= 0:
         raise ValueError("--temperature must be positive")
+    if basis_ridge < 0:
+        raise ValueError("--basis-ridge must be non-negative")
 
     input_ids = batch["input_ids"][0].detach().cpu().tolist()
     subject_span, reference_span = locate_object_spans(
@@ -788,73 +803,100 @@ def build_patch_data(
     states = hidden_tuple(outputs)
     n_blocks = len(states) - 1
     if not (0 <= layer < n_blocks):
-        raise ValueError(f"Requested layer={layer}, but model has {n_blocks} decoder blocks")
+        raise ValueError(
+            f"Requested layer={layer}, but model has {n_blocks} decoder blocks"
+        )
 
     hidden = states[layer + 1][0].float()
     if int(hidden.shape[0]) != len(input_ids):
         raise RuntimeError(
-            f"Token/hidden mismatch: input={len(input_ids)}, hidden={int(hidden.shape[0])}"
+            f"Token/hidden mismatch: input={len(input_ids)}, "
+            f"hidden={int(hidden.shape[0])}"
         )
 
+    index_tensor = torch.as_tensor(
+        visual_indices,
+        device=hidden.device,
+        dtype=torch.long,
+    )
+    visual = hidden[index_tensor]
     hs = hidden[subject_index]
     hr = hidden[reference_index]
-    visual = hidden[torch.as_tensor(visual_indices, device=hidden.device, dtype=torch.long)]
 
-    # Object-token -> image-token grounding by normalized similarity.
+    # Object-token -> visual-token grounding.
     visual_norm = F.normalize(visual, dim=-1)
-    hs_norm = F.normalize(hs, dim=-1)
-    hr_norm = F.normalize(hr, dim=-1)
-    logits_s = torch.matmul(visual_norm, hs_norm) / float(temperature)
-    logits_r = torch.matmul(visual_norm, hr_norm) / float(temperature)
-    weights_s = torch.softmax(logits_s, dim=0)
-    weights_r = torch.softmax(logits_r, dim=0)
+    logits_s = torch.matmul(visual_norm, F.normalize(hs, dim=-1))
+    logits_r = torch.matmul(visual_norm, F.normalize(hr, dim=-1))
+    weights_s = torch.softmax(logits_s / float(temperature), dim=0)
+    weights_r = torch.softmax(logits_r / float(temperature), dim=0)
 
-    gs = torch.sum(weights_s[:, None] * visual, dim=0)
-    gr = torch.sum(weights_r[:, None] * visual, dim=0)
-
-    z_text = hs - hr
-    z_visual = gs - gr
-
-    # Match only the magnitude. The modified pass decides interpolation strength.
-    z_text_norm = z_text.norm().clamp_min(1e-8)
-    z_visual_norm = z_visual.norm().clamp_min(1e-8)
-    z_visual_matched = z_visual / z_visual_norm * z_text_norm
-
-    # Total variation distance between the two grounding maps, in [0, 1].
     separation = 0.5 * torch.sum(torch.abs(weights_s - weights_r))
     ent_s = entropy_confidence(weights_s)
     ent_r = entropy_confidence(weights_r)
-    conf = confidence_value(
-        confidence_mode,
-        float(separation.item()),
-        float(ent_s.item()),
-        float(ent_r.item()),
+
+    coords = visual_coordinates(
+        model,
+        batch,
+        len(visual_indices),
+        hidden.device,
+    )
+    if coords is None or int(coords.shape[0]) != len(visual_indices):
+        raise RuntimeError(
+            f"Could not construct visual coordinates for {len(visual_indices)} tokens"
+        )
+    coords = coords.float()
+
+    center_s = torch.sum(weights_s[:, None] * coords, dim=0)
+    center_r = torch.sum(weights_r[:, None] * coords, dim=0)
+    subject_x, subject_y = [float(x) for x in center_s.tolist()]
+    reference_x, reference_y = [float(x) for x in center_r.tolist()]
+    delta_x = subject_x - reference_x
+    delta_y = subject_y - reference_y
+    grounding_prediction, axis_confidence = relation_from_centroids(
+        delta_x,
+        delta_y,
     )
 
-    coords = visual_coordinates(model, batch, len(visual_indices), hidden.device)
-    if coords is not None and int(coords.shape[0]) == len(visual_indices):
-        center_s = torch.sum(weights_s[:, None] * coords, dim=0)
-        center_r = torch.sum(weights_r[:, None] * coords, dim=0)
-        subject_x, subject_y = [float(x) for x in center_s.tolist()]
-        reference_x, reference_y = [float(x) for x in center_r.tolist()]
-        delta_x = subject_x - reference_x
-        delta_y = subject_y - reference_y
-        grounding_prediction, axis_confidence = relation_from_centroids(delta_x, delta_y)
-    else:
-        subject_x = subject_y = reference_x = reference_y = float("nan")
-        delta_x = delta_y = float("nan")
-        axis_confidence = float("nan")
-        grounding_prediction = ""
+    # Per-image latent position basis:
+    # visual_j ~= mean_visual + (x_j-mean_x)*a_x + (y_j-mean_y)*a_y.
+    coord_centered = coords - coords.mean(dim=0, keepdim=True)
+    visual_centered = visual - visual.mean(dim=0, keepdim=True)
+    gram = coord_centered.T @ coord_centered
+    gram = gram + float(basis_ridge) * torch.eye(
+        2,
+        device=gram.device,
+        dtype=gram.dtype,
+    )
+    rhs = coord_centered.T @ visual_centered
+    basis = torch.linalg.solve(gram, rhs)  # [2, hidden_dim]
+    axis_x = basis[0]
+    axis_y = basis[1]
 
-    patch = PatchData(
+    spatial_vector = (
+        float(delta_x) * axis_x
+        + float(delta_y) * axis_y
+    )
+
+    fitted = coord_centered @ basis
+    residual_ss = torch.sum((visual_centered - fitted) ** 2)
+    total_ss = torch.sum(visual_centered ** 2).clamp_min(1e-12)
+    basis_r2 = float((1.0 - residual_ss / total_ss).item())
+    basis_axis_cosine = float(
+        F.cosine_similarity(axis_x[None], axis_y[None], dim=-1).item()
+    )
+    basis_x_norm = float(axis_x.norm().item())
+    basis_y_norm = float(axis_y.norm().item())
+    spatial_vector_norm = float(spatial_vector.norm().item())
+
+    data = CarrierData(
         sid=sid,
+        layer=layer,
         subject_index=subject_index,
         reference_index=reference_index,
-        input_length=len(input_ids),
-        layer=layer,
-        z_text=z_text.detach().cpu().numpy().astype(np.float16),
-        z_visual=z_visual_matched.detach().cpu().numpy().astype(np.float16),
-        confidence=conf,
+        baseline_input_length=len(input_ids),
+        spatial_vector=(
+            spatial_vector.detach().cpu().numpy().astype(np.float16)
+        ),
         map_separation=float(separation.item()),
         subject_entropy_confidence=float(ent_s.item()),
         reference_entropy_confidence=float(ent_r.item()),
@@ -869,62 +911,93 @@ def build_patch_data(
         delta_y=delta_y,
         axis_confidence=axis_confidence,
         grounding_prediction=grounding_prediction,
+        basis_r2=basis_r2,
+        basis_axis_cosine=basis_axis_cosine,
+        basis_x_norm=basis_x_norm,
+        basis_y_norm=basis_y_norm,
+        spatial_vector_norm=spatial_vector_norm,
     )
 
-    del outputs, states, hidden, visual, weights_s, weights_r, gs, gr
-    return patch
+    del outputs, states, hidden, visual, weights_s, weights_r
+    return data
 
-
-def save_patch(path: Path, patch: PatchData) -> None:
+def save_carrier_data(path: Path, data: CarrierData) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".npz.tmp")
     with tmp.open("wb") as handle:
         np.savez_compressed(
             handle,
-            sid=np.asarray(patch.sid, dtype=np.int64),
-            subject_index=np.asarray(patch.subject_index, dtype=np.int32),
-            reference_index=np.asarray(patch.reference_index, dtype=np.int32),
-            input_length=np.asarray(patch.input_length, dtype=np.int32),
-            layer=np.asarray(patch.layer, dtype=np.int32),
-            z_text=patch.z_text,
-            z_visual=patch.z_visual,
-            confidence=np.asarray(patch.confidence, dtype=np.float32),
-            map_separation=np.asarray(patch.map_separation, dtype=np.float32),
+            sid=np.asarray(data.sid, dtype=np.int64),
+            layer=np.asarray(data.layer, dtype=np.int32),
+            subject_index=np.asarray(data.subject_index, dtype=np.int32),
+            reference_index=np.asarray(data.reference_index, dtype=np.int32),
+            baseline_input_length=np.asarray(
+                data.baseline_input_length,
+                dtype=np.int32,
+            ),
+            spatial_vector=data.spatial_vector,
+            map_separation=np.asarray(data.map_separation, dtype=np.float32),
             subject_entropy_confidence=np.asarray(
-                patch.subject_entropy_confidence, dtype=np.float32
+                data.subject_entropy_confidence,
+                dtype=np.float32,
             ),
             reference_entropy_confidence=np.asarray(
-                patch.reference_entropy_confidence, dtype=np.float32
+                data.reference_entropy_confidence,
+                dtype=np.float32,
             ),
-            subject_peak_weight=np.asarray(patch.subject_peak_weight, dtype=np.float32),
-            reference_peak_weight=np.asarray(patch.reference_peak_weight, dtype=np.float32),
-            n_visual_tokens=np.asarray(patch.n_visual_tokens, dtype=np.int32),
-            subject_x=np.asarray(patch.subject_x, dtype=np.float32),
-            subject_y=np.asarray(patch.subject_y, dtype=np.float32),
-            reference_x=np.asarray(patch.reference_x, dtype=np.float32),
-            reference_y=np.asarray(patch.reference_y, dtype=np.float32),
-            delta_x=np.asarray(patch.delta_x, dtype=np.float32),
-            delta_y=np.asarray(patch.delta_y, dtype=np.float32),
-            axis_confidence=np.asarray(patch.axis_confidence, dtype=np.float32),
-            grounding_prediction=np.asarray(patch.grounding_prediction, dtype="<U8"),
+            subject_peak_weight=np.asarray(
+                data.subject_peak_weight,
+                dtype=np.float32,
+            ),
+            reference_peak_weight=np.asarray(
+                data.reference_peak_weight,
+                dtype=np.float32,
+            ),
+            n_visual_tokens=np.asarray(data.n_visual_tokens, dtype=np.int32),
+            subject_x=np.asarray(data.subject_x, dtype=np.float32),
+            subject_y=np.asarray(data.subject_y, dtype=np.float32),
+            reference_x=np.asarray(data.reference_x, dtype=np.float32),
+            reference_y=np.asarray(data.reference_y, dtype=np.float32),
+            delta_x=np.asarray(data.delta_x, dtype=np.float32),
+            delta_y=np.asarray(data.delta_y, dtype=np.float32),
+            axis_confidence=np.asarray(
+                data.axis_confidence,
+                dtype=np.float32,
+            ),
+            grounding_prediction=np.asarray(
+                data.grounding_prediction,
+                dtype="<U8",
+            ),
+            basis_r2=np.asarray(data.basis_r2, dtype=np.float32),
+            basis_axis_cosine=np.asarray(
+                data.basis_axis_cosine,
+                dtype=np.float32,
+            ),
+            basis_x_norm=np.asarray(data.basis_x_norm, dtype=np.float32),
+            basis_y_norm=np.asarray(data.basis_y_norm, dtype=np.float32),
+            spatial_vector_norm=np.asarray(
+                data.spatial_vector_norm,
+                dtype=np.float32,
+            ),
         )
     os.replace(tmp, path)
 
-
-def load_patch(path: Path) -> PatchData:
+def load_carrier_data(path: Path) -> CarrierData:
     with np.load(path, allow_pickle=False) as z:
-        return PatchData(
+        return CarrierData(
             sid=int(z["sid"].item()),
+            layer=int(z["layer"].item()),
             subject_index=int(z["subject_index"].item()),
             reference_index=int(z["reference_index"].item()),
-            input_length=int(z["input_length"].item()),
-            layer=int(z["layer"].item()),
-            z_text=z["z_text"],
-            z_visual=z["z_visual"],
-            confidence=float(z["confidence"].item()),
+            baseline_input_length=int(z["baseline_input_length"].item()),
+            spatial_vector=z["spatial_vector"],
             map_separation=float(z["map_separation"].item()),
-            subject_entropy_confidence=float(z["subject_entropy_confidence"].item()),
-            reference_entropy_confidence=float(z["reference_entropy_confidence"].item()),
+            subject_entropy_confidence=float(
+                z["subject_entropy_confidence"].item()
+            ),
+            reference_entropy_confidence=float(
+                z["reference_entropy_confidence"].item()
+            ),
             subject_peak_weight=float(z["subject_peak_weight"].item()),
             reference_peak_weight=float(z["reference_peak_weight"].item()),
             n_visual_tokens=int(z["n_visual_tokens"].item()),
@@ -936,8 +1009,12 @@ def load_patch(path: Path) -> PatchData:
             delta_y=float(z["delta_y"].item()),
             axis_confidence=float(z["axis_confidence"].item()),
             grounding_prediction=str(z["grounding_prediction"].item()),
+            basis_r2=float(z["basis_r2"].item()),
+            basis_axis_cosine=float(z["basis_axis_cosine"].item()),
+            basis_x_norm=float(z["basis_x_norm"].item()),
+            basis_y_norm=float(z["basis_y_norm"].item()),
+            spatial_vector_norm=float(z["spatial_vector_norm"].item()),
         )
-
 
 def append_jsonl(path: Path, row: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -993,99 +1070,18 @@ def make_batch(
 
 
 
-ANSWER_INSTRUCTION_RE = re.compile(
-    r"\s*Answer\s+with\s+left\s*,\s*right\s*,\s*above\s*,?\s*(?:or\s+)?below\s*\.\s*$",
-    flags=re.IGNORECASE | re.DOTALL,
-)
 
-
-def question_core(question_text: str) -> str:
-    """Remove only the four-option answer instruction from a standard question."""
-    text = str(question_text).strip()
-    core = ANSWER_INSTRUCTION_RE.sub("", text).strip()
-    if not core:
-        raise ValueError(f"Could not derive question core from: {question_text!r}")
-    return core
-
-
-def coordinate_confidence(patch: PatchData, mode: str) -> float:
-    separation = float(np.clip(patch.map_separation, 0.0, 1.0))
-    axis = float(patch.axis_confidence)
-    axis = float(np.clip(axis, 0.0, 1.0)) if np.isfinite(axis) else 0.0
-
-    if mode == "none":
-        return 1.0
-    if mode == "separation":
-        return separation
-    if mode == "axis":
-        return axis
-    if mode == "separation_axis":
-        return separation * axis
-    raise ValueError(f"Unsupported coordinate confidence mode: {mode}")
-
-
-def build_coordinate_question(
-    *,
+def carrier_question(
     standard_question: str,
-    subject: str,
-    reference: str,
-    patch: PatchData,
-    decimals: int,
-    wording: str,
+    marker: str,
 ) -> str:
-    """Append raw object-center estimates without giving a direction label."""
-    if decimals < 0 or decimals > 8:
-        raise ValueError("--coordinate-decimals must be in [0, 8]")
-
-    values = [
-        patch.subject_x,
-        patch.subject_y,
-        patch.reference_x,
-        patch.reference_y,
-    ]
-    if not all(np.isfinite(value) for value in values):
-        raise ValueError(
-            f"Invalid centroid coordinates for sid={patch.sid}: {values}"
-        )
-
-    sx = float(np.clip(patch.subject_x, 0.0, 1.0))
-    sy = float(np.clip(patch.subject_y, 0.0, 1.0))
-    rx = float(np.clip(patch.reference_x, 0.0, 1.0))
-    ry = float(np.clip(patch.reference_y, 0.0, 1.0))
-    fmt = f".{decimals}f"
-    core = question_core(standard_question)
-
-    if wording == "compact":
-        evidence = (
-            "Estimated visual centers (normalized image coordinates): "
-            f"{subject}=({format(sx, fmt)}, {format(sy, fmt)}); "
-            f"{reference}=({format(rx, fmt)}, {format(ry, fmt)}). "
-            "The first value is x and the second is y; x increases from left to "
-            "right and y increases from top to bottom. "
-            "Use the image and these estimates as supporting evidence."
-        )
-    elif wording == "explicit":
-        evidence = (
-            "Additional visual grounding evidence from the model's object tokens:\n"
-            f"- Estimated center of the {subject}: "
-            f"(x={format(sx, fmt)}, y={format(sy, fmt)}).\n"
-            f"- Estimated center of the {reference}: "
-            f"(x={format(rx, fmt)}, y={format(ry, fmt)}).\n"
-            "Coordinates are normalized from 0 to 1. x increases from left to "
-            "right, and y increases from top to bottom. These estimates may be "
-            "imperfect, so use them together with the image."
-        )
-    else:
-        raise ValueError(f"Unsupported coordinate wording: {wording}")
-
-    return (
-        f"{core}\n\n"
-        f"{evidence}\n\n"
-        "Answer with left, right, above, or below."
-    )
+    marker = str(marker).strip()
+    if not marker:
+        raise ValueError("--carrier-marker must not be empty")
+    return f"{str(standard_question).strip()}\n{marker}"
 
 
-def make_text_image_batch(
+def make_question_batch(
     *,
     processor: Any,
     image: Image.Image,
@@ -1101,65 +1097,270 @@ def make_text_image_batch(
     return move_batch(batch, device)
 
 
+def locate_carrier_index(
+    tokenizer: Any,
+    input_ids: Sequence[int],
+    marker: str,
+) -> Tuple[int, Tuple[int, int]]:
+    marker = str(marker).strip()
+    variants = [
+        marker,
+        " " + marker,
+        "\n" + marker,
+    ]
+    spans: List[Tuple[int, int]] = []
+    seen = set()
+    for variant in variants:
+        ids = tokenizer_ids(tokenizer, variant)
+        key = tuple(ids)
+        if not ids or key in seen:
+            continue
+        seen.add(key)
+        for start in find_subsequence(input_ids, ids):
+            spans.append((start, start + len(ids) - 1))
+    spans = sorted(set(spans))
+    if not spans:
+        raise ValueError(
+            f"Could not locate carrier marker {marker!r} in tokenized prompt"
+        )
+    span = max(spans, key=lambda item: item[1])
+    return int(span[1]), span
+
+
+def carrier_confidence(
+    data: CarrierData,
+    mode: str,
+) -> float:
+    separation = float(np.clip(data.map_separation, 0.0, 1.0))
+    axis = float(data.axis_confidence)
+    axis = float(np.clip(axis, 0.0, 1.0)) if np.isfinite(axis) else 0.0
+
+    if mode == "none":
+        return 1.0
+    if mode == "separation":
+        return separation
+    if mode == "axis":
+        return axis
+    if mode == "separation_axis":
+        return separation * axis
+    raise ValueError(f"Unsupported carrier confidence mode: {mode}")
+
+
+def carrier_guided_generate(
+    *,
+    model: Any,
+    processor: Any,
+    batch: Dict[str, Any],
+    decoder_layer: Any,
+    data: CarrierData,
+    carrier_index: int,
+    carrier_strength: float,
+    confidence_mode: str,
+    min_confidence: float,
+    renorm_carrier: bool,
+    max_new_tokens: int,
+) -> Tuple[str, Dict[str, Any]]:
+    confidence = carrier_confidence(data, confidence_mode)
+    enabled = bool(
+        confidence >= float(min_confidence)
+        and float(carrier_strength) != 0.0
+        and float(data.spatial_vector_norm) > 1e-8
+    )
+    effective_strength = (
+        float(carrier_strength) * float(confidence)
+        if enabled else 0.0
+    )
+
+    vector = torch.from_numpy(
+        data.spatial_vector.astype(np.float32)
+    ).to(batch["input_ids"].device)
+
+    state: Dict[str, Any] = {
+        "patched": False,
+        "carrier_norm_before": None,
+        "carrier_norm_after": None,
+        "delta_norm": None,
+    }
+
+    def hook(
+        _module: Any,
+        _inputs: Tuple[Any, ...],
+        output: Any,
+    ) -> Any:
+        if not enabled or state["patched"]:
+            return output
+
+        hidden = output[0] if isinstance(output, (tuple, list)) else output
+        if not torch.is_tensor(hidden) or hidden.ndim != 3:
+            return output
+        if int(hidden.shape[1]) <= int(carrier_index):
+            # Decode steps usually have sequence length 1; patch prefill only.
+            return output
+
+        hidden_new = hidden.clone()
+        carrier = hidden_new[:, carrier_index, :]
+        carrier_float = carrier.float()
+        carrier_norm = carrier_float.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+
+        direction = vector.to(
+            device=hidden.device,
+            dtype=torch.float32,
+        )
+        direction = direction / direction.norm().clamp_min(1e-8)
+        delta = (
+            effective_strength
+            * carrier_norm
+            * direction[None, :]
+        )
+        updated = carrier_float + delta
+
+        if renorm_carrier:
+            updated = (
+                updated
+                / updated.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+                * carrier_norm
+            )
+
+        hidden_new[:, carrier_index, :] = updated.to(hidden.dtype)
+
+        state["patched"] = True
+        state["carrier_norm_before"] = float(
+            carrier_norm.mean().item()
+        )
+        state["carrier_norm_after"] = float(
+            updated.norm(dim=-1).mean().item()
+        )
+        state["delta_norm"] = float(
+            delta.norm(dim=-1).mean().item()
+        )
+
+        if isinstance(output, tuple):
+            return (hidden_new,) + output[1:]
+        if isinstance(output, list):
+            return [hidden_new] + list(output[1:])
+        return hidden_new
+
+    handle = decoder_layer.register_forward_hook(hook)
+    try:
+        text = generate_text(
+            model,
+            processor,
+            batch,
+            max_new_tokens=max_new_tokens,
+        )
+    finally:
+        handle.remove()
+
+    if enabled and not state["patched"]:
+        raise RuntimeError(
+            "Carrier hook was registered but did not patch the prefill state"
+        )
+
+    metadata = {
+        "carrier_enabled": enabled,
+        "carrier_patched": bool(state["patched"]),
+        "carrier_confidence": float(confidence),
+        "carrier_confidence_mode": confidence_mode,
+        "carrier_strength": float(carrier_strength),
+        "effective_carrier_strength": float(effective_strength),
+        "renorm_carrier": bool(renorm_carrier),
+        "carrier_norm_before": state["carrier_norm_before"],
+        "carrier_norm_after": state["carrier_norm_after"],
+        "delta_norm": state["delta_norm"],
+    }
+    return text, metadata
+
+
+def accuracy(
+    rows: Iterable[Dict[str, Any]],
+    key: str = "correct",
+) -> Optional[float]:
+    rows = list(rows)
+    if not rows:
+        return None
+    return float(np.mean([bool(row.get(key, False)) for row in rows]))
+
+
+def paired_comparison(
+    reference_by_sid: Dict[int, Dict[str, Any]],
+    candidate_by_sid: Dict[int, Dict[str, Any]],
+) -> Dict[str, Any]:
+    paired = [
+        sid
+        for sid in sorted(set(reference_by_sid) & set(candidate_by_sid))
+        if reference_by_sid[sid].get("prediction")
+        and candidate_by_sid[sid].get("prediction")
+    ]
+    fixed = broken = changed = both_correct = both_wrong = 0
+    for sid in paired:
+        reference = reference_by_sid[sid]
+        candidate = candidate_by_sid[sid]
+        changed += int(
+            reference.get("prediction") != candidate.get("prediction")
+        )
+        if (not reference.get("correct")) and candidate.get("correct"):
+            fixed += 1
+        elif reference.get("correct") and (not candidate.get("correct")):
+            broken += 1
+        elif reference.get("correct") and candidate.get("correct"):
+            both_correct += 1
+        else:
+            both_wrong += 1
+
+    ref_acc = accuracy(reference_by_sid[sid] for sid in paired)
+    cand_acc = accuracy(candidate_by_sid[sid] for sid in paired)
+    return {
+        "n": len(paired),
+        "reference_accuracy": ref_acc,
+        "candidate_accuracy": cand_acc,
+        "absolute_change": (
+            cand_acc - ref_acc
+            if ref_acc is not None and cand_acc is not None
+            else None
+        ),
+        "fixed": fixed,
+        "broken": broken,
+        "net_fixed_minus_broken": fixed - broken,
+        "changed_predictions": changed,
+        "both_correct": both_correct,
+        "both_wrong": both_wrong,
+    }
+
+
 def summarize(
     baseline_rows: List[Dict[str, Any]],
-    coordinate_rows: List[Dict[str, Any]],
+    control_rows: List[Dict[str, Any]],
+    guided_rows: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    base_by_sid = {
+    baseline_by_sid = {
         int(row["sid"]): row
         for row in baseline_rows
         if "sid" in row and "error" not in row
     }
-    coord_by_sid = {
+    control_by_sid = {
         int(row["sid"]): row
-        for row in coordinate_rows
+        for row in control_rows
+        if "sid" in row and "error" not in row
+    }
+    guided_by_sid = {
+        int(row["sid"]): row
+        for row in guided_rows
         if "sid" in row and "error" not in row
     }
 
-    baseline_valid = [row for row in base_by_sid.values() if row.get("prediction")]
+    baseline_valid = [
+        row for row in baseline_by_sid.values() if row.get("prediction")
+    ]
     grounding_valid = [
-        row for row in base_by_sid.values() if row.get("grounding_prediction")
+        row for row in baseline_by_sid.values()
+        if row.get("grounding_prediction")
     ]
-    coordinate_valid = [row for row in coord_by_sid.values() if row.get("prediction")]
-
-    common = sorted(set(base_by_sid) & set(coord_by_sid))
-    paired = [
-        sid for sid in common
-        if base_by_sid[sid].get("prediction")
-        and coord_by_sid[sid].get("prediction")
+    control_valid = [
+        row for row in control_by_sid.values() if row.get("prediction")
     ]
-
-    def accuracy(
-        rows: Iterable[Dict[str, Any]],
-        key: str = "correct",
-    ) -> Optional[float]:
-        rows = list(rows)
-        if not rows:
-            return None
-        return float(np.mean([bool(row.get(key, False)) for row in rows]))
-
-    fixed = 0
-    broken = 0
-    changed = 0
-    both_correct = 0
-    both_wrong = 0
-    per_relation_sids: Dict[str, List[int]] = defaultdict(list)
-
-    for sid in paired:
-        baseline = base_by_sid[sid]
-        coordinate = coord_by_sid[sid]
-        changed += int(
-            baseline.get("prediction") != coordinate.get("prediction")
-        )
-        if (not baseline.get("correct")) and coordinate.get("correct"):
-            fixed += 1
-        elif baseline.get("correct") and (not coordinate.get("correct")):
-            broken += 1
-        elif baseline.get("correct") and coordinate.get("correct"):
-            both_correct += 1
-        else:
-            both_wrong += 1
-        per_relation_sids[str(baseline.get("gt"))].append(sid)
+    guided_valid = [
+        row for row in guided_by_sid.values() if row.get("prediction")
+    ]
 
     grounding_on_baseline_wrong = [
         row for row in grounding_valid
@@ -1169,6 +1370,9 @@ def summarize(
         row for row in grounding_valid
         if row.get("prediction") and bool(row.get("correct"))
     ]
+    agreement_rows = [
+        row for row in grounding_valid if row.get("prediction")
+    ]
 
     oracle = (
         float(np.mean([
@@ -1177,8 +1381,6 @@ def summarize(
         ]))
         if grounding_valid else None
     )
-
-    agreement_rows = [row for row in grounding_valid if row.get("prediction")]
     agreement = (
         float(np.mean([
             row.get("prediction") == row.get("grounding_prediction")
@@ -1187,104 +1389,170 @@ def summarize(
         if agreement_rows else None
     )
 
+    baseline_control = paired_comparison(
+        baseline_by_sid,
+        control_by_sid,
+    )
+    baseline_guided = paired_comparison(
+        baseline_by_sid,
+        guided_by_sid,
+    )
+    control_guided = paired_comparison(
+        control_by_sid,
+        guided_by_sid,
+    )
+
+    common = sorted(
+        set(baseline_by_sid)
+        & set(control_by_sid)
+        & set(guided_by_sid)
+    )
     per_relation: Dict[str, Dict[str, Any]] = {}
-    for relation, sids in sorted(per_relation_sids.items()):
+    relation_groups: Dict[str, List[int]] = defaultdict(list)
+    for sid in common:
+        if (
+            baseline_by_sid[sid].get("prediction")
+            and control_by_sid[sid].get("prediction")
+            and guided_by_sid[sid].get("prediction")
+        ):
+            relation_groups[str(baseline_by_sid[sid].get("gt"))].append(sid)
+
+    for relation, sids in sorted(relation_groups.items()):
         ground_rows = [
-            base_by_sid[sid] for sid in sids
-            if base_by_sid[sid].get("grounding_prediction")
+            baseline_by_sid[sid]
+            for sid in sids
+            if baseline_by_sid[sid].get("grounding_prediction")
         ]
         per_relation[relation] = {
             "n": len(sids),
-            "baseline_accuracy": accuracy(base_by_sid[sid] for sid in sids),
+            "baseline_accuracy": accuracy(
+                baseline_by_sid[sid] for sid in sids
+            ),
             "grounding_accuracy": accuracy(
-                ground_rows, key="grounding_correct"
+                ground_rows,
+                key="grounding_correct",
             ),
             "grounding_n": len(ground_rows),
-            "coordinate_accuracy": accuracy(
-                coord_by_sid[sid] for sid in sids
+            "control_accuracy": accuracy(
+                control_by_sid[sid] for sid in sids
+            ),
+            "guided_accuracy": accuracy(
+                guided_by_sid[sid] for sid in sids
             ),
         }
 
-    paired_base_accuracy = accuracy(base_by_sid[sid] for sid in paired)
-    paired_coordinate_accuracy = accuracy(coord_by_sid[sid] for sid in paired)
-
-    coordinate_evidence_rows = [
-        row for row in coordinate_valid if row.get("coordinates_appended")
-    ]
-
     return {
-        "n_baseline_rows": len(base_by_sid),
-        "n_coordinate_rows": len(coord_by_sid),
         "n_baseline_valid": len(baseline_valid),
         "n_grounding_valid": len(grounding_valid),
-        "n_coordinate_valid": len(coordinate_valid),
-        "n_paired_valid": len(paired),
-
+        "n_control_valid": len(control_valid),
+        "n_guided_valid": len(guided_valid),
         "baseline_accuracy": accuracy(baseline_valid),
         "grounding_accuracy": accuracy(
-            grounding_valid, key="grounding_correct"
+            grounding_valid,
+            key="grounding_correct",
         ),
-        "coordinate_accuracy": accuracy(coordinate_valid),
-
+        "control_accuracy": accuracy(control_valid),
+        "guided_accuracy": accuracy(guided_valid),
         "grounding_accuracy_on_baseline_wrong": accuracy(
-            grounding_on_baseline_wrong, key="grounding_correct"
+            grounding_on_baseline_wrong,
+            key="grounding_correct",
         ),
-        "n_grounding_on_baseline_wrong": len(grounding_on_baseline_wrong),
+        "n_grounding_on_baseline_wrong": len(
+            grounding_on_baseline_wrong
+        ),
         "grounding_accuracy_on_baseline_correct": accuracy(
-            grounding_on_baseline_correct, key="grounding_correct"
+            grounding_on_baseline_correct,
+            key="grounding_correct",
         ),
-        "n_grounding_on_baseline_correct": len(grounding_on_baseline_correct),
+        "n_grounding_on_baseline_correct": len(
+            grounding_on_baseline_correct
+        ),
         "baseline_or_grounding_oracle_accuracy": oracle,
         "baseline_grounding_agreement": agreement,
-
-        "paired_baseline_accuracy": paired_base_accuracy,
-        "paired_coordinate_accuracy": paired_coordinate_accuracy,
-        "paired_absolute_change": (
-            paired_coordinate_accuracy - paired_base_accuracy
-            if paired_base_accuracy is not None
-            and paired_coordinate_accuracy is not None
-            else None
+        "baseline_vs_control": baseline_control,
+        "baseline_vs_guided": baseline_guided,
+        "control_vs_guided": control_guided,
+        "baseline_parse_failures": (
+            len(baseline_by_sid) - len(baseline_valid)
         ),
-        "fixed": fixed,
-        "broken": broken,
-        "net_fixed_minus_broken": fixed - broken,
-        "changed_predictions": changed,
-        "both_correct": both_correct,
-        "both_wrong": both_wrong,
-        "baseline_parse_failures": len(base_by_sid) - len(baseline_valid),
-        "coordinate_parse_failures": len(coord_by_sid) - len(coordinate_valid),
-        "coordinates_appended": len(coordinate_evidence_rows),
-        "coordinates_not_appended": (
-            len(coordinate_valid) - len(coordinate_evidence_rows)
-        ),
-        "mean_coordinate_confidence": (
+        "control_parse_failures": len(control_by_sid) - len(control_valid),
+        "guided_parse_failures": len(guided_by_sid) - len(guided_valid),
+        "mean_carrier_confidence": (
             float(np.mean([
-                float(row.get("coordinate_confidence", 0.0))
-                for row in coordinate_valid
+                float(row.get("carrier_confidence", 0.0))
+                for row in guided_valid
             ]))
-            if coordinate_valid else None
+            if guided_valid else None
+        ),
+        "mean_effective_carrier_strength": (
+            float(np.mean([
+                float(row.get("effective_carrier_strength", 0.0))
+                for row in guided_valid
+            ]))
+            if guided_valid else None
+        ),
+        "mean_basis_r2": (
+            float(np.mean([
+                float(row.get("basis_r2", 0.0))
+                for row in baseline_valid
+            ]))
+            if baseline_valid else None
         ),
         "per_relation": per_relation,
     }
 
 
+def print_pair(
+    title: str,
+    stats: Dict[str, Any],
+) -> None:
+    print(f"\n{title}:")
+    print(f"paired valid:             {stats.get('n')}")
+    ref = stats.get("reference_accuracy")
+    cand = stats.get("candidate_accuracy")
+    delta = stats.get("absolute_change")
+    print(
+        f"reference accuracy:       {ref:.4f}"
+        if ref is not None else "reference accuracy:       n/a"
+    )
+    print(
+        f"candidate accuracy:       {cand:.4f}"
+        if cand is not None else "candidate accuracy:       n/a"
+    )
+    print(
+        f"absolute change:          {delta:+.4f}"
+        if delta is not None else "absolute change:          n/a"
+    )
+    print(f"fixed:                    {stats.get('fixed')}")
+    print(f"broken:                   {stats.get('broken')}")
+    print(
+        f"net fixed-broken:         "
+        f"{stats.get('net_fixed_minus_broken'):+d}"
+    )
+    print(
+        f"prediction changed:       "
+        f"{stats.get('changed_predictions')}"
+    )
+
+
 def print_summary(summary: Dict[str, Any]) -> None:
-    print("\n" + "=" * 92)
-    print("BASELINE VS CENTROID GROUNDING VS COORDINATE-AUGMENTED GENERATION")
-    print("=" * 92)
+    print("\n" + "=" * 96)
+    print("BASELINE VS CENTROID VS LATENT SPATIAL-CARRIER GENERATION")
+    print("=" * 96)
 
     metrics = [
         ("baseline generation", "baseline_accuracy", "n_baseline_valid"),
         ("centroid grounding", "grounding_accuracy", "n_grounding_valid"),
-        ("coordinate generation", "coordinate_accuracy", "n_coordinate_valid"),
+        ("carrier control", "control_accuracy", "n_control_valid"),
+        ("carrier guided", "guided_accuracy", "n_guided_valid"),
     ]
     for index, (name, key, n_key) in enumerate(metrics, 1):
         value = summary.get(key)
         if value is None:
-            print(f"{index}) {name:24s}: n/a")
+            print(f"{index}) {name:22s}: n/a")
         else:
             print(
-                f"{index}) {name:24s}: {value:.4f} "
+                f"{index}) {name:22s}: {value:.4f} "
                 f"(n={summary.get(n_key)})"
             )
 
@@ -1294,52 +1562,64 @@ def print_summary(summary: Dict[str, Any]) -> None:
     oracle = summary.get("baseline_or_grounding_oracle_accuracy")
     agreement = summary.get("baseline_grounding_agreement")
     print(
-        f"grounding on baseline-wrong:    {gw:.4f} "
+        f"grounding on baseline-wrong:   {gw:.4f} "
         f"(n={summary.get('n_grounding_on_baseline_wrong')})"
-        if gw is not None else "grounding on baseline-wrong:    n/a"
+        if gw is not None else
+        "grounding on baseline-wrong:   n/a"
     )
     print(
-        f"grounding on baseline-correct:  {gc:.4f} "
+        f"grounding on baseline-correct: {gc:.4f} "
         f"(n={summary.get('n_grounding_on_baseline_correct')})"
-        if gc is not None else "grounding on baseline-correct:  n/a"
+        if gc is not None else
+        "grounding on baseline-correct: n/a"
     )
     print(
         f"baseline union grounding oracle:{oracle:.4f}"
-        if oracle is not None else "baseline union grounding oracle:n/a"
+        if oracle is not None else
+        "baseline union grounding oracle:n/a"
     )
     print(
-        f"baseline/grounding agreement:   {agreement:.4f}"
-        if agreement is not None else "baseline/grounding agreement:   n/a"
+        f"baseline/grounding agreement:  {agreement:.4f}"
+        if agreement is not None else
+        "baseline/grounding agreement:  n/a"
     )
 
-    pb = summary.get("paired_baseline_accuracy")
-    pc = summary.get("paired_coordinate_accuracy")
-    delta = summary.get("paired_absolute_change")
-    print("\nPaired baseline/coordinate comparison:")
-    print(f"paired valid:                  {summary.get('n_paired_valid')}")
-    print(
-        f"paired baseline:               {pb:.4f}"
-        if pb is not None else "paired baseline:               n/a"
+    print_pair(
+        "Baseline -> carrier control (prompt-only effect)",
+        summary["baseline_vs_control"],
     )
-    print(
-        f"paired coordinate:             {pc:.4f}"
-        if pc is not None else "paired coordinate:             n/a"
+    print_pair(
+        "Baseline -> carrier guided (total effect)",
+        summary["baseline_vs_guided"],
     )
-    print(
-        f"paired absolute change:        {delta:+.4f}"
-        if delta is not None else "paired absolute change:        n/a"
+    print_pair(
+        "Carrier control -> carrier guided (latent-vector effect)",
+        summary["control_vs_guided"],
     )
-    print(f"fixed:                         {summary.get('fixed')}")
-    print(f"broken:                        {summary.get('broken')}")
-    print(f"net fixed-broken:              {summary.get('net_fixed_minus_broken'):+d}")
-    print(f"prediction changed:            {summary.get('changed_predictions')}")
-    print(f"baseline parse fail:           {summary.get('baseline_parse_failures')}")
-    print(f"coordinate parse fail:         {summary.get('coordinate_parse_failures')}")
-    print(f"coordinates appended:          {summary.get('coordinates_appended')}")
-    print(f"coordinates not appended:      {summary.get('coordinates_not_appended')}")
-    print(f"mean coordinate confidence:    {summary.get('mean_coordinate_confidence')}")
 
-    print("\nPer relation on paired samples:")
+    print(
+        f"\nbaseline parse fail:            "
+        f"{summary.get('baseline_parse_failures')}"
+    )
+    print(
+        f"carrier-control parse fail:     "
+        f"{summary.get('control_parse_failures')}"
+    )
+    print(
+        f"carrier-guided parse fail:      "
+        f"{summary.get('guided_parse_failures')}"
+    )
+    print(
+        f"mean carrier confidence:        "
+        f"{summary.get('mean_carrier_confidence')}"
+    )
+    print(
+        f"mean effective carrier strength:"
+        f"{summary.get('mean_effective_carrier_strength')}"
+    )
+    print(f"mean latent basis R2:           {summary.get('mean_basis_r2')}")
+
+    print("\nPer relation on common valid samples:")
     for relation, stats in summary.get("per_relation", {}).items():
         grounding = (
             f"{stats['grounding_accuracy']:.4f}"
@@ -1350,7 +1630,8 @@ def print_summary(summary: Dict[str, Any]) -> None:
             f"  {relation:6s} n={stats['n']:4d} | "
             f"base={stats['baseline_accuracy']:.4f} | "
             f"ground={grounding} (n={stats['grounding_n']}) | "
-            f"coordinate={stats['coordinate_accuracy']:.4f}"
+            f"control={stats['control_accuracy']:.4f} | "
+            f"guided={stats['guided_accuracy']:.4f}"
         )
 
 
@@ -1359,10 +1640,12 @@ def main() -> None:
 
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
-    if not (0.0 <= args.min_coordinate_confidence <= 1.0):
-        raise ValueError("--min-coordinate-confidence must be in [0, 1]")
-    if args.coordinate_decimals < 0 or args.coordinate_decimals > 8:
-        raise ValueError("--coordinate-decimals must be in [0, 8]")
+    if args.basis_ridge < 0:
+        raise ValueError("--basis-ridge must be non-negative")
+    if args.carrier_strength < 0:
+        raise ValueError("--carrier-strength must be non-negative")
+    if not (0.0 <= args.min_carrier_confidence <= 1.0):
+        raise ValueError("--min-carrier-confidence must be in [0, 1]")
     if args.print_every < 0:
         raise ValueError("--print-every must be >= 0")
 
@@ -1389,7 +1672,7 @@ def main() -> None:
     if missing_prompt_ids:
         raise RuntimeError(
             f"Standard prompt file {prompt_path} is missing "
-            f"{len(missing_prompt_ids)} record IDs; first={missing_prompt_ids[:10]}"
+            f"{len(missing_prompt_ids)} IDs; first={missing_prompt_ids[:10]}"
         )
 
     if args.model not in module.SPECS:
@@ -1413,10 +1696,11 @@ def main() -> None:
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    centroid_dir = output_dir / "centroids"
-    centroid_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = output_dir / "carrier_data"
+    data_dir.mkdir(parents=True, exist_ok=True)
     baseline_path = output_dir / "baseline.jsonl"
-    coordinate_path = output_dir / "coordinate.jsonl"
+    control_path = output_dir / "carrier_control.jsonl"
+    guided_path = output_dir / "carrier_guided.jsonl"
     errors_path = output_dir / "errors.jsonl"
     summary_path = output_dir / "summary.json"
 
@@ -1428,22 +1712,20 @@ def main() -> None:
         "repo_id": spec.repo_id,
         "transformers_version": transformers.__version__,
         "prompt_jsonl": str(prompt_path),
-        "relation_labels": list(RELATIONS),
         "layer": layer,
-        "grounding_temperature": args.temperature,
-        "grounding_confidence_mode": args.confidence_mode,
-        "coordinate_confidence_mode": args.coordinate_confidence_mode,
-        "min_coordinate_confidence": args.min_coordinate_confidence,
-        "coordinate_decimals": args.coordinate_decimals,
-        "coordinate_wording": args.coordinate_wording,
+        "temperature": args.temperature,
+        "basis_ridge": args.basis_ridge,
+        "carrier_marker": args.carrier_marker,
+        "carrier_strength": args.carrier_strength,
+        "carrier_confidence_mode": args.carrier_confidence_mode,
+        "min_carrier_confidence": args.min_carrier_confidence,
+        "renorm_carrier": args.renorm_carrier,
         "max_new_tokens": args.max_new_tokens,
         "n_records": len(records),
         "audit": audit,
-        "uses_gt_for_coordinate_prompt": False,
-        "includes_centroid_direction_label": False,
-        "edits_logits": False,
-        "edits_hidden_states": False,
+        "uses_gt_for_intervention": False,
         "updates_model_weights": False,
+        "edits_output_logits": False,
     }
     (output_dir / "config.json").write_text(
         json.dumps(run_config, ensure_ascii=False, indent=2),
@@ -1453,7 +1735,8 @@ def main() -> None:
     model_cls = getattr(transformers, spec.model_class, None)
     if model_cls is None:
         raise RuntimeError(
-            f"transformers=={transformers.__version__} has no {spec.model_class}"
+            f"transformers=={transformers.__version__} has no "
+            f"{spec.model_class}"
         )
 
     load_kwargs: Dict[str, Any] = {
@@ -1486,49 +1769,60 @@ def main() -> None:
     print(f"Standard prompt file: {prompt_path} (rows={len(prompt_rows)})")
     print(
         f"Resolved decoder layers: {decoder_path}, n={len(decoder_layers)}, "
-        f"centroid layer={layer}"
+        f"carrier layer={layer}"
     )
+    print(f"Carrier marker: {args.carrier_marker!r}")
     print(
-        "Coordinate prompt: "
-        f"wording={args.coordinate_wording}, "
-        f"decimals={args.coordinate_decimals}, "
-        f"confidence={args.coordinate_confidence_mode}, "
-        f"threshold={args.min_coordinate_confidence}"
+        f"Carrier injection: strength={args.carrier_strength}, "
+        f"confidence={args.carrier_confidence_mode}, "
+        f"threshold={args.min_carrier_confidence}, "
+        f"renorm={args.renorm_carrier}"
     )
 
     baseline_existing = [
         row for row in read_jsonl(baseline_path)
         if "sid" in row and "error" not in row
     ]
-    coordinate_existing = [
-        row for row in read_jsonl(coordinate_path)
+    control_existing = [
+        row for row in read_jsonl(control_path)
+        if "sid" in row and "error" not in row
+    ]
+    guided_existing = [
+        row for row in read_jsonl(guided_path)
         if "sid" in row and "error" not in row
     ]
 
     baseline_done = {int(row["sid"]) for row in baseline_existing}
-    coordinate_done = {int(row["sid"]) for row in coordinate_existing}
+    control_done = {int(row["sid"]) for row in control_existing}
+    guided_done = {int(row["sid"]) for row in guided_existing}
 
     baseline_seen = len(baseline_existing)
     baseline_correct_count = sum(
         bool(row.get("correct")) for row in baseline_existing
     )
-    coordinate_seen = len(coordinate_existing)
-    coordinate_correct_count = sum(
-        bool(row.get("correct")) for row in coordinate_existing
+    control_seen = len(control_existing)
+    control_correct_count = sum(
+        bool(row.get("correct")) for row in control_existing
+    )
+    guided_seen = len(guided_existing)
+    guided_correct_count = sum(
+        bool(row.get("correct")) for row in guided_existing
     )
 
     started = time.time()
 
     try:
         if args.only in ("both", "baseline"):
-            print("\nPASS 1/2: baseline generation + centroid capture")
+            print(
+                "\nPASS 1/2: baseline generation + centroid + latent basis capture"
+            )
             for record in tqdm(
                 records,
                 desc=f"baseline:{args.dataset}:{args.model}",
             ):
                 sid = int(record.sid)
-                centroid_path = centroid_dir / f"{sid}.npz"
-                if sid in baseline_done and centroid_path.exists():
+                data_path = data_dir / f"{sid}.npz"
+                if sid in baseline_done and data_path.exists():
                     continue
 
                 batch = None
@@ -1543,7 +1837,12 @@ def main() -> None:
                         raw_question,
                         answer_raw,
                         image,
-                    ) = make_batch(processor, record, prompt_row, device)
+                    ) = make_batch(
+                        processor,
+                        record,
+                        prompt_row,
+                        device,
+                    )
 
                     baseline_text = generate_text(
                         model,
@@ -1551,10 +1850,12 @@ def main() -> None:
                         batch,
                         max_new_tokens=args.max_new_tokens,
                     )
-                    baseline_prediction = normalize_relation(baseline_text)
+                    baseline_prediction = normalize_relation(
+                        baseline_text
+                    )
                     gt = normalize_relation(answer_raw)
 
-                    patch = build_patch_data(
+                    data = build_carrier_data(
                         model=model,
                         processor=processor,
                         batch=batch,
@@ -1563,9 +1864,9 @@ def main() -> None:
                         reference=reference,
                         layer=layer,
                         temperature=args.temperature,
-                        confidence_mode=args.confidence_mode,
+                        basis_ridge=args.basis_ridge,
                     )
-                    save_patch(centroid_path, patch)
+                    save_carrier_data(data_path, data)
 
                     row = {
                         "sid": sid,
@@ -1584,27 +1885,32 @@ def main() -> None:
                         "standard_answer_raw": answer_raw,
                         "layer": layer,
                         "grounding_prediction": (
-                            patch.grounding_prediction or None
+                            data.grounding_prediction or None
                         ),
                         "grounding_correct": bool(
                             gt is not None
-                            and patch.grounding_prediction
-                            and gt == patch.grounding_prediction
+                            and data.grounding_prediction
+                            and gt == data.grounding_prediction
                         ),
                         "subject_centroid": [
-                            patch.subject_x,
-                            patch.subject_y,
+                            data.subject_x,
+                            data.subject_y,
                         ],
                         "reference_centroid": [
-                            patch.reference_x,
-                            patch.reference_y,
+                            data.reference_x,
+                            data.reference_y,
                         ],
                         "delta_xy": [
-                            patch.delta_x,
-                            patch.delta_y,
+                            data.delta_x,
+                            data.delta_y,
                         ],
-                        "map_separation": patch.map_separation,
-                        "axis_confidence": patch.axis_confidence,
+                        "map_separation": data.map_separation,
+                        "axis_confidence": data.axis_confidence,
+                        "basis_r2": data.basis_r2,
+                        "basis_axis_cosine": data.basis_axis_cosine,
+                        "basis_x_norm": data.basis_x_norm,
+                        "basis_y_norm": data.basis_y_norm,
+                        "spatial_vector_norm": data.spatial_vector_norm,
                     }
                     append_jsonl(baseline_path, row)
                     baseline_done.add(sid)
@@ -1626,11 +1932,11 @@ def main() -> None:
                             f"  acc        : "
                             f"{baseline_correct_count}/{baseline_seen}="
                             f"{baseline_correct_count / baseline_seen:.4f}\n"
-                            f"  grounding={patch.grounding_prediction or None} | "
-                            f"subject=({patch.subject_x:.3f},{patch.subject_y:.3f}) | "
-                            f"reference=({patch.reference_x:.3f},{patch.reference_y:.3f}) | "
-                            f"sep={patch.map_separation:.3f} | "
-                            f"axis={patch.axis_confidence:.3f}"
+                            f"  grounding={data.grounding_prediction} | "
+                            f"dx={data.delta_x:+.4f} dy={data.delta_y:+.4f} | "
+                            f"sep={data.map_separation:.3f} | "
+                            f"axis={data.axis_confidence:.3f} | "
+                            f"basis_R2={data.basis_r2:.4f}"
                         )
 
                 except Exception as exc:
@@ -1658,47 +1964,35 @@ def main() -> None:
                     if image is not None:
                         del image
 
-        if args.only in ("both", "coordinate"):
+        if args.only in ("both", "carrier"):
             print(
-                "\nPASS 2/2: normal generation with raw centroid "
-                "coordinates in the prompt"
+                "\nPASS 2/2: carrier-prompt control + latent spatial-carrier generation"
             )
-
             baseline_by_sid = {
                 int(row["sid"]): row
                 for row in read_jsonl(baseline_path)
                 if "sid" in row and "error" not in row
             }
 
-            fixed_running = 0
-            broken_running = 0
-            for row in coordinate_existing:
-                sid = int(row["sid"])
-                baseline = baseline_by_sid.get(sid)
-                if baseline is None:
-                    continue
-                if (not baseline.get("correct")) and row.get("correct"):
-                    fixed_running += 1
-                elif baseline.get("correct") and (not row.get("correct")):
-                    broken_running += 1
-
             for record in tqdm(
                 records,
-                desc=f"coordinate:{args.dataset}:{args.model}",
+                desc=f"carrier:{args.dataset}:{args.model}",
             ):
                 sid = int(record.sid)
-                if sid in coordinate_done:
+                need_control = sid not in control_done
+                need_guided = sid not in guided_done
+                if not need_control and not need_guided:
                     continue
 
-                centroid_path = centroid_dir / f"{sid}.npz"
-                if not centroid_path.exists():
+                data_path = data_dir / f"{sid}.npz"
+                if not data_path.exists():
                     append_jsonl(
                         errors_path,
                         {
-                            "pass": "coordinate",
+                            "pass": "carrier",
                             "sid": sid,
                             "error_type": "FileNotFoundError",
-                            "error": f"Missing centroid file: {centroid_path}",
+                            "error": f"Missing carrier data: {data_path}",
                         },
                     )
                     continue
@@ -1706,7 +2000,7 @@ def main() -> None:
                 batch = None
                 image = None
                 try:
-                    patch = load_patch(centroid_path)
+                    data = load_carrier_data(data_path)
                     prompt_row = prompt_rows[sid]
                     subject = str(prompt_row["subject"])
                     reference = str(prompt_row["reference"])
@@ -1715,145 +2009,178 @@ def main() -> None:
                     answer_raw = prompt_row["answer_raw"]
                     gt = normalize_relation(answer_raw)
 
-                    confidence = coordinate_confidence(
-                        patch,
-                        args.coordinate_confidence_mode,
+                    question_with_carrier = carrier_question(
+                        standard_question,
+                        args.carrier_marker,
                     )
-                    coordinates_appended = bool(
-                        confidence >= args.min_coordinate_confidence
-                    )
-
-                    if coordinates_appended:
-                        coordinate_question = build_coordinate_question(
-                            standard_question=standard_question,
-                            subject=subject,
-                            reference=reference,
-                            patch=patch,
-                            decimals=args.coordinate_decimals,
-                            wording=args.coordinate_wording,
-                        )
-                    else:
-                        coordinate_question = standard_question
-
                     image = record_image(record)
-                    batch = make_text_image_batch(
+                    batch = make_question_batch(
                         processor=processor,
                         image=image,
-                        question_text=coordinate_question,
+                        question_text=question_with_carrier,
                         device=device,
                     )
-
-                    coordinate_text = generate_text(
-                        model,
-                        processor,
-                        batch,
-                        max_new_tokens=args.max_new_tokens,
-                    )
-                    coordinate_prediction = normalize_relation(
-                        coordinate_text
+                    token_ids = batch["input_ids"][0].detach().cpu().tolist()
+                    carrier_index, carrier_span = locate_carrier_index(
+                        processor.tokenizer,
+                        token_ids,
+                        args.carrier_marker,
                     )
 
-                    row = {
-                        "sid": sid,
-                        "subject": subject,
-                        "reference": reference,
-                        "gt": gt,
-                        "prediction": coordinate_prediction,
-                        "correct": bool(
-                            gt is not None
-                            and coordinate_prediction is not None
-                            and gt == coordinate_prediction
-                        ),
-                        "generated_text": coordinate_text,
-                        "standard_question": standard_question,
-                        "coordinate_question": coordinate_question,
-                        "raw_question": raw_question,
-                        "standard_answer_raw": answer_raw,
-                        "coordinates_appended": coordinates_appended,
-                        "coordinate_confidence": confidence,
-                        "coordinate_confidence_mode": (
-                            args.coordinate_confidence_mode
-                        ),
-                        "subject_centroid": [
-                            patch.subject_x,
-                            patch.subject_y,
-                        ],
-                        "reference_centroid": [
-                            patch.reference_x,
-                            patch.reference_y,
-                        ],
-                        "map_separation": patch.map_separation,
-                        "axis_confidence": patch.axis_confidence,
-                        # Diagnostic only; never included in the prompt.
-                        "grounding_prediction": (
-                            patch.grounding_prediction or None
-                        ),
-                    }
-                    append_jsonl(coordinate_path, row)
-                    coordinate_done.add(sid)
-                    coordinate_seen += 1
-                    coordinate_correct_count += int(row["correct"])
-
-                    baseline = baseline_by_sid.get(sid)
-                    baseline_prediction = (
-                        baseline.get("prediction")
-                        if baseline is not None
-                        else None
-                    )
-                    status = "NO_BASELINE"
-                    if baseline is not None:
-                        if (
-                            not baseline.get("correct")
-                            and row.get("correct")
-                        ):
-                            status = "FIXED"
-                            fixed_running += 1
-                        elif (
-                            baseline.get("correct")
-                            and not row.get("correct")
-                        ):
-                            status = "BROKEN"
-                            broken_running += 1
-                        elif (
-                            baseline.get("correct")
-                            and row.get("correct")
-                        ):
-                            status = "UNCHANGED_CORRECT"
-                        else:
-                            status = "UNCHANGED_WRONG"
-
-                    if should_print_sample(
-                        coordinate_seen,
-                        args.print_every,
-                    ):
-                        tqdm.write(
-                            f"\n[COORD {coordinate_seen}/{len(records)}] "
-                            f"sid={sid} | {subject} -> {reference}\n"
-                            f"  standard   : {one_line(standard_question)}\n"
-                            f"  augmented  : {one_line(coordinate_question)}\n"
-                            f"  gt         : {gt}\n"
-                            f"  generation : {coordinate_text!r}\n"
-                            f"  pred       : {coordinate_prediction}\n"
-                            f"  correct    : {int(row['correct'])}\n"
-                            f"  acc        : "
-                            f"{coordinate_correct_count}/{coordinate_seen}="
-                            f"{coordinate_correct_count / coordinate_seen:.4f}\n"
-                            f"  base={baseline_prediction} -> "
-                            f"coordinate={coordinate_prediction} | "
-                            f"{status} | fixed={fixed_running} | "
-                            f"broken={broken_running} | "
-                            f"net={fixed_running - broken_running}\n"
-                            f"  appended={int(coordinates_appended)} | "
-                            f"coord_conf={confidence:.3f} | "
-                            f"subject=({patch.subject_x:.3f},{patch.subject_y:.3f}) | "
-                            f"reference=({patch.reference_x:.3f},{patch.reference_y:.3f})"
+                    if need_control:
+                        control_text = generate_text(
+                            model,
+                            processor,
+                            batch,
+                            max_new_tokens=args.max_new_tokens,
                         )
+                        control_prediction = normalize_relation(control_text)
+                        control_row = {
+                            "sid": sid,
+                            "subject": subject,
+                            "reference": reference,
+                            "gt": gt,
+                            "prediction": control_prediction,
+                            "correct": bool(
+                                gt is not None
+                                and control_prediction is not None
+                                and gt == control_prediction
+                            ),
+                            "generated_text": control_text,
+                            "standard_question": standard_question,
+                            "carrier_question": question_with_carrier,
+                            "raw_question": raw_question,
+                            "carrier_marker": args.carrier_marker,
+                            "carrier_index": carrier_index,
+                            "carrier_span": list(carrier_span),
+                        }
+                        append_jsonl(control_path, control_row)
+                        control_done.add(sid)
+                        control_seen += 1
+                        control_correct_count += int(control_row["correct"])
+
+                        if should_print_sample(
+                            control_seen,
+                            args.print_every,
+                        ):
+                            tqdm.write(
+                                f"\n[CONTROL {control_seen}/{len(records)}] "
+                                f"sid={sid} | {subject} -> {reference}\n"
+                                f"  question   : {one_line(question_with_carrier)}\n"
+                                f"  gt         : {gt}\n"
+                                f"  generation : {control_text!r}\n"
+                                f"  pred       : {control_prediction}\n"
+                                f"  correct    : {int(control_row['correct'])}\n"
+                                f"  acc        : "
+                                f"{control_correct_count}/{control_seen}="
+                                f"{control_correct_count / control_seen:.4f}"
+                            )
+
+                    if need_guided:
+                        guided_text, metadata = carrier_guided_generate(
+                            model=model,
+                            processor=processor,
+                            batch=batch,
+                            decoder_layer=decoder_layers[layer],
+                            data=data,
+                            carrier_index=carrier_index,
+                            carrier_strength=args.carrier_strength,
+                            confidence_mode=args.carrier_confidence_mode,
+                            min_confidence=args.min_carrier_confidence,
+                            renorm_carrier=args.renorm_carrier,
+                            max_new_tokens=args.max_new_tokens,
+                        )
+                        guided_prediction = normalize_relation(guided_text)
+                        guided_row = {
+                            "sid": sid,
+                            "subject": subject,
+                            "reference": reference,
+                            "gt": gt,
+                            "prediction": guided_prediction,
+                            "correct": bool(
+                                gt is not None
+                                and guided_prediction is not None
+                                and gt == guided_prediction
+                            ),
+                            "generated_text": guided_text,
+                            "standard_question": standard_question,
+                            "carrier_question": question_with_carrier,
+                            "raw_question": raw_question,
+                            "carrier_marker": args.carrier_marker,
+                            "carrier_index": carrier_index,
+                            "carrier_span": list(carrier_span),
+                            "grounding_prediction": (
+                                data.grounding_prediction or None
+                            ),
+                            "delta_xy": [
+                                data.delta_x,
+                                data.delta_y,
+                            ],
+                            "map_separation": data.map_separation,
+                            "axis_confidence": data.axis_confidence,
+                            "basis_r2": data.basis_r2,
+                            "basis_axis_cosine": data.basis_axis_cosine,
+                            "spatial_vector_norm": data.spatial_vector_norm,
+                            **metadata,
+                        }
+                        append_jsonl(guided_path, guided_row)
+                        guided_done.add(sid)
+                        guided_seen += 1
+                        guided_correct_count += int(guided_row["correct"])
+
+                        baseline = baseline_by_sid.get(sid)
+                        base_prediction = (
+                            baseline.get("prediction")
+                            if baseline is not None else None
+                        )
+                        status = "NO_BASELINE"
+                        if baseline is not None:
+                            if (
+                                not baseline.get("correct")
+                                and guided_row.get("correct")
+                            ):
+                                status = "FIXED"
+                            elif (
+                                baseline.get("correct")
+                                and not guided_row.get("correct")
+                            ):
+                                status = "BROKEN"
+                            elif (
+                                baseline.get("correct")
+                                and guided_row.get("correct")
+                            ):
+                                status = "UNCHANGED_CORRECT"
+                            else:
+                                status = "UNCHANGED_WRONG"
+
+                        if should_print_sample(
+                            guided_seen,
+                            args.print_every,
+                        ):
+                            tqdm.write(
+                                f"\n[GUIDED {guided_seen}/{len(records)}] "
+                                f"sid={sid} | {subject} -> {reference}\n"
+                                f"  gt         : {gt}\n"
+                                f"  generation : {guided_text!r}\n"
+                                f"  pred       : {guided_prediction}\n"
+                                f"  correct    : {int(guided_row['correct'])}\n"
+                                f"  acc        : "
+                                f"{guided_correct_count}/{guided_seen}="
+                                f"{guided_correct_count / guided_seen:.4f}\n"
+                                f"  base={base_prediction} -> "
+                                f"guided={guided_prediction} | {status}\n"
+                                f"  grounding={data.grounding_prediction} | "
+                                f"carrier_conf={metadata['carrier_confidence']:.3f} | "
+                                f"effective_strength="
+                                f"{metadata['effective_carrier_strength']:.3f} | "
+                                f"delta_norm={metadata['delta_norm']}"
+                            )
 
                 except Exception as exc:
                     append_jsonl(
                         errors_path,
                         {
-                            "pass": "coordinate",
+                            "pass": "carrier",
                             "sid": sid,
                             "error_type": type(exc).__name__,
                             "error": str(exc),
@@ -1863,7 +2190,7 @@ def main() -> None:
                         },
                     )
                     tqdm.write(
-                        f"\n[COORD ERROR] sid={sid} | "
+                        f"\n[CARRIER ERROR] sid={sid} | "
                         f"{type(exc).__name__}: {exc}"
                     )
                     if torch.cuda.is_available():
@@ -1875,29 +2202,30 @@ def main() -> None:
                         del image
 
         baseline_rows = read_jsonl(baseline_path)
-        coordinate_rows = read_jsonl(coordinate_path)
-
-        if baseline_rows and coordinate_rows:
-            summary = summarize(baseline_rows, coordinate_rows)
+        control_rows = read_jsonl(control_path)
+        guided_rows = read_jsonl(guided_path)
+        if baseline_rows and control_rows and guided_rows:
+            summary = summarize(
+                baseline_rows,
+                control_rows,
+                guided_rows,
+            )
             summary["config"] = run_config
             summary["elapsed_minutes"] = (
                 time.time() - started
             ) / 60.0
             summary_path.write_text(
-                json.dumps(
-                    summary,
-                    ensure_ascii=False,
-                    indent=2,
-                ),
+                json.dumps(summary, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
             print_summary(summary)
             print(f"\nSaved summary: {summary_path}")
         else:
             print(
-                "Completed requested pass. "
+                "Completed requested stage. "
                 f"baseline_rows={len(baseline_rows)}, "
-                f"coordinate_rows={len(coordinate_rows)}"
+                f"control_rows={len(control_rows)}, "
+                f"guided_rows={len(guided_rows)}"
             )
 
     finally:
