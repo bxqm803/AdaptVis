@@ -64,12 +64,12 @@ except Exception as exc:  # pragma: no cover
     raise SystemExit(f"Unable to import transformers: {exc}")
 
 
-PROMPT_TEMPLATE = (
-    "Where is the {subject} relative to the {reference}? "
-    "Answer with one spatial relation."
-)
+DEFAULT_PROMPT_FILES = {
+    "coco_two": Path("prompts/COCO_QA_two_obj_with_answer_four_options.jsonl"),
+    "vg_two": Path("prompts/VG_QA_two_obj_with_answer_four_options.jsonl"),
+}
 
-RELATIONS = ("left", "right", "on", "under")
+RELATIONS = ("left", "right", "above", "below")
 
 AUTO_LAYERS = {
     "llava-7b": 12,
@@ -109,6 +109,14 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dataset", default="coco_two", choices=["coco_two", "vg_two"])
     p.add_argument("--data-root", default="data")
+    p.add_argument(
+        "--prompt-jsonl",
+        default=None,
+        help=(
+            "Standard dataset question file. For coco_two, the default is "
+            "prompts/COCO_QA_two_obj_with_answer_four_options.jsonl."
+        ),
+    )
     p.add_argument("--model", required=True)
     p.add_argument("--device", default="cuda:0")
     p.add_argument(
@@ -148,6 +156,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--save-every", type=int, default=10)
+    p.add_argument(
+        "--print-every",
+        type=int,
+        default=1,
+        help="Print one detailed sample log every N completed samples; 0 disables it.",
+    )
     p.add_argument("--output-dir", required=True)
     p.add_argument("--overwrite", action="store_true")
     p.add_argument(
@@ -174,24 +188,92 @@ def import_two_object_module():
     return importlib.import_module("extract_two_object_relation_states")
 
 
-def build_prompt(processor: Any, subject: str, reference: str) -> Tuple[str, str]:
-    prompt_text = PROMPT_TEMPLATE.format(subject=subject, reference=reference)
+def resolve_prompt_path(args: argparse.Namespace) -> Path:
+    if args.prompt_jsonl:
+        path = Path(args.prompt_jsonl)
+    else:
+        path = DEFAULT_PROMPT_FILES[args.dataset]
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing standard prompt file: {path}. "
+            "Pass it explicitly with --prompt-jsonl."
+        )
+    return path
+
+
+def extract_standard_user_text(raw_question: str) -> str:
+    """Extract the exact USER text from a stored <image>/USER/ASSISTANT prompt."""
+    text = str(raw_question).strip()
+    text = re.sub(r"^\s*<image>\s*", "", text, flags=re.IGNORECASE)
+    match = re.search(
+        r"\bUSER\s*:\s*(.*?)(?:\s*\bASSISTANT\s*:|\Z)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match:
+        text = match.group(1)
+    return text.strip()
+
+
+def standard_answer_value(value: Any) -> Any:
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value
+
+
+def load_standard_prompts(path: Path) -> Dict[int, Dict[str, Any]]:
+    rows: Dict[int, Dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, 1):
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            required = {"id", "question", "answer"}
+            if not required.issubset(row):
+                raise ValueError(
+                    f"{path}:{line_no} must contain id/question/answer; "
+                    f"keys={sorted(row.keys())}"
+                )
+            sid = int(row["id"])
+            if sid in rows:
+                raise ValueError(f"Duplicate prompt id={sid} in {path}")
+            raw_question = str(row["question"])
+            rows[sid] = {
+                "id": sid,
+                "raw_question": raw_question,
+                "question_text": extract_standard_user_text(raw_question),
+                "answer_raw": standard_answer_value(row["answer"]),
+            }
+    if not rows:
+        raise RuntimeError(f"No standard questions loaded from {path}")
+    return rows
+
+
+def build_prompt(processor: Any, question_text: str) -> str:
+    """Render the dataset standard question with the current model chat template."""
     messages = [{
         "role": "user",
         "content": [
             {"type": "image"},
-            {"type": "text", "text": prompt_text},
+            {"type": "text", "text": question_text},
         ],
     }]
     if hasattr(processor, "apply_chat_template"):
-        rendered = processor.apply_chat_template(
+        return processor.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
         )
-    else:
-        rendered = prompt_text
-    return rendered, prompt_text
+    return question_text
+
+
+def one_line(value: Any) -> str:
+    return " ".join(str(value).split())
+
+
+def should_print_sample(done_count: int, print_every: int) -> bool:
+    return print_every > 0 and done_count % print_every == 0
 
 
 def configure_processor(model: Any, processor: Any) -> None:
@@ -509,37 +591,42 @@ def relation_from_centroids(delta_x: float, delta_y: float) -> Tuple[str, float]
     axis_conf = abs(ax - ay) / (ax + ay + 1e-8)
     if ax >= ay:
         return ("left" if delta_x < 0 else "right"), float(axis_conf)
-    return ("on" if delta_y < 0 else "under"), float(axis_conf)
+    return ("above" if delta_y < 0 else "below"), float(axis_conf)
 
 
 def normalize_relation(value: Any) -> Optional[str]:
+    if value is None:
+        return None
     text = str(value).strip().lower().replace("_", " ").replace("-", " ")
+    text = re.sub(r"\s+", " ", text)
     exact = {
         "left": "left",
         "left of": "left",
         "to the left": "left",
+        "to the left of": "left",
         "right": "right",
         "right of": "right",
         "to the right": "right",
-        "on": "on",
-        "above": "on",
-        "over": "on",
-        "on top of": "on",
-        "top": "on",
-        "under": "under",
-        "below": "under",
-        "beneath": "under",
+        "to the right of": "right",
+        "above": "above",
+        "over": "above",
+        "on": "above",
+        "on top of": "above",
+        "top": "above",
+        "below": "below",
+        "under": "below",
+        "beneath": "below",
+        "bottom": "below",
     }
     if text in exact:
         return exact[text]
 
-    # Prefer explicit spatial phrases. Word boundaries avoid matching "on" inside words.
     patterns = [
         (r"\b(left|leftward)\b", "left"),
         (r"\b(right|rightward)\b", "right"),
-        (r"\b(under|below|beneath|bottom)\b", "under"),
-        (r"\b(above|over|on top|top)\b", "on"),
-        (r"\bon\b", "on"),
+        (r"\b(below|under|beneath|bottom)\b", "below"),
+        (r"\b(above|over|on top|top)\b", "above"),
+        (r"\bon\b", "above"),
     ]
     hits: List[Tuple[int, str]] = []
     for pattern, label in patterns:
@@ -816,11 +903,16 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
 def make_batch(
     processor: Any,
     record: Any,
+    prompt_row: Dict[str, Any],
     device: torch.device,
-) -> Tuple[Dict[str, Any], str, str, str, Image.Image]:
+) -> Tuple[Dict[str, Any], str, str, str, str, Any, Image.Image]:
     subject = str(record.subject)
     reference = str(record.reference)
-    rendered, prompt_text = build_prompt(processor, subject, reference)
+    question_text = str(prompt_row["question_text"])
+    raw_question = str(prompt_row["raw_question"])
+    answer_raw = prompt_row["answer_raw"]
+
+    rendered = build_prompt(processor, question_text)
     image = record_image(record)
     batch = processor(
         text=[rendered],
@@ -828,7 +920,15 @@ def make_batch(
         return_tensors="pt",
     )
     batch = move_batch(batch, device)
-    return batch, subject, reference, prompt_text, image
+    return (
+        batch,
+        subject,
+        reference,
+        question_text,
+        raw_question,
+        answer_raw,
+        image,
+    )
 
 
 def modified_generate(
@@ -1030,6 +1130,8 @@ def main() -> None:
         raise ValueError("Use --gamma in [0, 2] for the initial experiment")
     if not (0.0 <= args.min_confidence <= 1.0):
         raise ValueError("--min-confidence must be in [0, 1]")
+    if args.print_every < 0:
+        raise ValueError("--print-every must be >= 0")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -1043,6 +1145,20 @@ def main() -> None:
     )
     if not records:
         raise RuntimeError("No usable records")
+
+    prompt_path = resolve_prompt_path(args)
+    prompt_rows = load_standard_prompts(prompt_path)
+    missing_prompt_ids = [
+        int(record.sid)
+        for record in records
+        if int(record.sid) not in prompt_rows
+    ]
+    if missing_prompt_ids:
+        raise RuntimeError(
+            f"Standard prompt file {prompt_path} is missing "
+            f"{len(missing_prompt_ids)} record ids; first={missing_prompt_ids[:10]}"
+        )
+
     if args.model not in module.SPECS:
         raise ValueError(
             f"Model {args.model!r} not found in extract_two_object_relation_states.SPECS"
@@ -1075,7 +1191,9 @@ def main() -> None:
         "model": args.model,
         "repo_id": spec.repo_id,
         "transformers_version": transformers.__version__,
-        "prompt_template": PROMPT_TEMPLATE,
+        "prompt_jsonl": str(prompt_path),
+        "prompt_source": "dataset_standard_question",
+        "relation_labels": list(RELATIONS),
         "layer": layer,
         "temperature": args.temperature,
         "gamma": args.gamma,
@@ -1116,6 +1234,10 @@ def main() -> None:
     device = torch.device(args.device)
 
     decoder_layers, decoder_path = resolve_decoder_layers(model)
+    print(f"Standard prompt file: {prompt_path} (rows={len(prompt_rows)})")
+    first_sid = int(records[0].sid)
+    print(f"First standard question: {one_line(prompt_rows[first_sid]['question_text'])}")
+    print(f"First standard answer: {prompt_rows[first_sid]['answer_raw']!r}")
     print(
         f"Resolved decoder layers: {decoder_path}, n={len(decoder_layers)}, "
         f"target layer={layer}"
@@ -1125,16 +1247,21 @@ def main() -> None:
             f"Requested layer={layer}, decoder has {len(decoder_layers)} layers"
         )
 
-    baseline_done = {
-        int(row["sid"])
-        for row in read_jsonl(baseline_path)
+    baseline_existing_rows = [
+        row for row in read_jsonl(baseline_path)
         if "sid" in row and "error" not in row
-    }
-    modified_done = {
-        int(row["sid"])
-        for row in read_jsonl(modified_path)
+    ]
+    modified_existing_rows = [
+        row for row in read_jsonl(modified_path)
         if "sid" in row and "error" not in row
-    }
+    ]
+    baseline_done = {int(row["sid"]) for row in baseline_existing_rows}
+    modified_done = {int(row["sid"]) for row in modified_existing_rows}
+
+    baseline_seen = len(baseline_existing_rows)
+    baseline_correct_count = sum(bool(row.get("correct")) for row in baseline_existing_rows)
+    modified_seen = len(modified_existing_rows)
+    modified_correct_count = sum(bool(row.get("correct")) for row in modified_existing_rows)
 
     started = time.time()
 
@@ -1150,9 +1277,19 @@ def main() -> None:
                 batch = None
                 image = None
                 try:
-                    batch, subject, reference, prompt_text, image = make_batch(
+                    prompt_row = prompt_rows[sid]
+                    (
+                        batch,
+                        subject,
+                        reference,
+                        question_text,
+                        raw_question,
+                        answer_raw,
+                        image,
+                    ) = make_batch(
                         processor,
                         record,
+                        prompt_row,
                         device,
                     )
                     baseline_text = generate_text(
@@ -1162,7 +1299,7 @@ def main() -> None:
                         max_new_tokens=args.max_new_tokens,
                     )
                     baseline_prediction = normalize_relation(baseline_text)
-                    gt = normalize_relation(record.relation)
+                    gt = normalize_relation(answer_raw)
 
                     patch = build_patch_data(
                         model=model,
@@ -1189,7 +1326,9 @@ def main() -> None:
                             and gt == baseline_prediction
                         ),
                         "generated_text": baseline_text,
-                        "prompt": prompt_text,
+                        "question": question_text,
+                        "raw_question": raw_question,
+                        "standard_answer_raw": answer_raw,
                         "layer": layer,
                         "confidence": patch.confidence,
                         "map_separation": patch.map_separation,
@@ -1211,6 +1350,21 @@ def main() -> None:
                     }
                     append_jsonl(baseline_path, row)
                     baseline_done.add(sid)
+                    baseline_seen += 1
+                    baseline_correct_count += int(row["correct"])
+
+                    if should_print_sample(baseline_seen, args.print_every):
+                        tqdm.write(
+                            f"\n[BASE {baseline_seen}/{len(records)}] sid={sid} | "
+                            f"{subject} -> {reference}\n"
+                            f"  question: {one_line(question_text)}\n"
+                            f"  gt={gt} | generation={baseline_text!r} | "
+                            f"pred={baseline_prediction} | correct={int(row['correct'])} | "
+                            f"running_acc={baseline_correct_count}/{baseline_seen}="
+                            f"{baseline_correct_count / baseline_seen:.4f}\n"
+                            f"  grounding={patch.grounding_prediction or None} | "
+                            f"confidence={patch.confidence:.3f}"
+                        )
 
                 except Exception as exc:
                     append_jsonl(
@@ -1225,6 +1379,10 @@ def main() -> None:
                             "traceback_tail": traceback.format_exc().splitlines()[-12:],
                         },
                     )
+                    tqdm.write(
+                        f"\n[BASE ERROR] sid={sid} | "
+                        f"{type(exc).__name__}: {exc}"
+                    )
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                 finally:
@@ -1235,6 +1393,23 @@ def main() -> None:
 
         if args.only in ("both", "modified"):
             print("\nPASS 2/2: modified generation with object-token re-grounding")
+            baseline_by_sid = {
+                int(row["sid"]): row
+                for row in read_jsonl(baseline_path)
+                if "sid" in row and "error" not in row
+            }
+            fixed_running = 0
+            broken_running = 0
+            for old_row in modified_existing_rows:
+                old_sid = int(old_row["sid"])
+                old_base = baseline_by_sid.get(old_sid)
+                if old_base is None:
+                    continue
+                if (not bool(old_base.get("correct"))) and bool(old_row.get("correct")):
+                    fixed_running += 1
+                elif bool(old_base.get("correct")) and (not bool(old_row.get("correct"))):
+                    broken_running += 1
+
             for record in tqdm(records, desc=f"modified:{args.dataset}:{args.model}"):
                 sid = int(record.sid)
                 if sid in modified_done:
@@ -1256,9 +1431,19 @@ def main() -> None:
                 image = None
                 try:
                     patch = load_patch(patch_path)
-                    batch, subject, reference, prompt_text, image = make_batch(
+                    prompt_row = prompt_rows[sid]
+                    (
+                        batch,
+                        subject,
+                        reference,
+                        question_text,
+                        raw_question,
+                        answer_raw,
+                        image,
+                    ) = make_batch(
                         processor,
                         record,
+                        prompt_row,
                         device,
                     )
                     modified_text, gamma_effective, actually_patched = modified_generate(
@@ -1272,7 +1457,7 @@ def main() -> None:
                         max_new_tokens=args.max_new_tokens,
                     )
                     modified_prediction = normalize_relation(modified_text)
-                    gt = normalize_relation(record.relation)
+                    gt = normalize_relation(answer_raw)
                     row = {
                         "sid": sid,
                         "subject": subject,
@@ -1285,7 +1470,9 @@ def main() -> None:
                             and gt == modified_prediction
                         ),
                         "generated_text": modified_text,
-                        "prompt": prompt_text,
+                        "question": question_text,
+                        "raw_question": raw_question,
+                        "standard_answer_raw": answer_raw,
                         "layer": layer,
                         "gamma": args.gamma,
                         "confidence": patch.confidence,
@@ -1300,6 +1487,44 @@ def main() -> None:
                     }
                     append_jsonl(modified_path, row)
                     modified_done.add(sid)
+                    modified_seen += 1
+                    modified_correct_count += int(row["correct"])
+
+                    baseline_row = baseline_by_sid.get(sid)
+                    baseline_prediction = (
+                        baseline_row.get("prediction") if baseline_row is not None else None
+                    )
+                    status = "NO_BASELINE"
+                    if baseline_row is not None:
+                        base_correct = bool(baseline_row.get("correct"))
+                        mod_correct = bool(row["correct"])
+                        if (not base_correct) and mod_correct:
+                            status = "FIXED"
+                            fixed_running += 1
+                        elif base_correct and (not mod_correct):
+                            status = "BROKEN"
+                            broken_running += 1
+                        elif base_correct and mod_correct:
+                            status = "UNCHANGED_CORRECT"
+                        else:
+                            status = "UNCHANGED_WRONG"
+
+                    if should_print_sample(modified_seen, args.print_every):
+                        tqdm.write(
+                            f"\n[MOD  {modified_seen}/{len(records)}] sid={sid} | "
+                            f"{subject} -> {reference}\n"
+                            f"  question: {one_line(question_text)}\n"
+                            f"  gt={gt} | generation={modified_text!r} | "
+                            f"pred={modified_prediction} | correct={int(row['correct'])} | "
+                            f"running_acc={modified_correct_count}/{modified_seen}="
+                            f"{modified_correct_count / modified_seen:.4f}\n"
+                            f"  base={baseline_prediction} -> modified={modified_prediction} | "
+                            f"{status} | fixed={fixed_running} | broken={broken_running} | "
+                            f"net={fixed_running - broken_running}\n"
+                            f"  patched={int(actually_patched)} | "
+                            f"gamma_eff={gamma_effective:.4f} | "
+                            f"grounding={patch.grounding_prediction or None}"
+                        )
 
                 except Exception as exc:
                     append_jsonl(
@@ -1313,6 +1538,10 @@ def main() -> None:
                             "error": str(exc),
                             "traceback_tail": traceback.format_exc().splitlines()[-12:],
                         },
+                    )
+                    tqdm.write(
+                        f"\n[MOD ERROR] sid={sid} | "
+                        f"{type(exc).__name__}: {exc}"
                     )
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
