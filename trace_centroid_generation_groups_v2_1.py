@@ -70,7 +70,7 @@ except Exception as exc:  # pragma: no cover
     raise SystemExit(f"Unable to import transformers: {exc}")
 
 
-SCRIPT_VERSION = "trace-centroid-generation-groups-v2"
+SCRIPT_VERSION = "trace-centroid-generation-groups-v2.1"
 
 DEFAULT_PROMPT_FILES = {
     "coco_two": Path("prompts/COCO_QA_two_obj_with_answer_four_options.jsonl"),
@@ -1369,17 +1369,39 @@ class LayerTraceCollector:
             if hidden is None or v_proj is None:
                 return
             object_indices = self.subject_indices + self.reference_indices
+            # Qwen may pass float32 normalized hidden states into an
+            # attention module whose projection weights are bfloat16. The
+            # model's own attention forward handles that conversion internally,
+            # but this diagnostic hook calls v_proj directly, so it must cast
+            # the captured states to the projection module's device and dtype.
+            projection_device, projection_dtype = module_device_dtype(
+                v_proj,
+                hidden,
+            )
+            object_input = hidden[:, object_indices, :].to(
+                device=projection_device,
+                dtype=projection_dtype,
+            )
             with torch.inference_mode():
-                object_values = v_proj(hidden[:, object_indices, :])
+                object_values = v_proj(object_input)
+                object_tensor = first_tensor(object_values)
+                if object_tensor.ndim == 2:
+                    object_tensor = object_tensor.unsqueeze(0)
                 self.object_values[layer_index] = (
-                    first_tensor(object_values)[0].detach().cpu()
+                    object_tensor[0].detach().cpu()
                 )
+
                 if layer_index in self.selected_spatial_layers:
-                    visual_values = v_proj(
-                        hidden[:, self.visual_indices, :]
+                    visual_input = hidden[:, self.visual_indices, :].to(
+                        device=projection_device,
+                        dtype=projection_dtype,
                     )
+                    visual_values = v_proj(visual_input)
+                    visual_tensor = first_tensor(visual_values)
+                    if visual_tensor.ndim == 2:
+                        visual_tensor = visual_tensor.unsqueeze(0)
                     self.visual_values[layer_index] = (
-                        first_tensor(visual_values)[0].detach().cpu()
+                        visual_tensor[0].detach().cpu()
                     )
         return hook
 
@@ -2604,6 +2626,7 @@ def main() -> None:
             batch = None
             image = None
             try:
+                failure_stage = "sample_setup"
                 prior = prior_rows[sid]
                 record = record_by_sid[sid]
                 prompt_row = prompt_rows[sid]
@@ -2622,6 +2645,7 @@ def main() -> None:
                     question_text=question,
                     device=device,
                 )
+                failure_stage = "trace_one_prompt"
                 trace_meta, trace_arrays = trace_one_prompt(
                     model=model,
                     processor=processor,
@@ -2636,6 +2660,7 @@ def main() -> None:
                     token_bias=token_bias,
                     relation_positions=relation_positions,
                 )
+                failure_stage = "post_trace_metadata"
                 metadata = {
                     **prior,
                     **trace_meta,
@@ -2669,7 +2694,7 @@ def main() -> None:
                     )
             except Exception as exc:
                 append_jsonl(errors_path, {
-                    "stage": "group_trace",
+                    "stage": locals().get("failure_stage", "group_trace_setup"),
                     "sid": sid,
                     "group": prior_rows.get(sid, {}).get("group"),
                     "error_type": type(exc).__name__,
