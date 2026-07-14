@@ -70,7 +70,7 @@ except Exception as exc:  # pragma: no cover
     raise SystemExit(f"Unable to import transformers: {exc}")
 
 
-SCRIPT_VERSION = "trace-centroid-generation-groups-v2.1"
+SCRIPT_VERSION = "trace-centroid-generation-groups-v2.2"
 
 DEFAULT_PROMPT_FILES = {
     "coco_two": Path("prompts/COCO_QA_two_obj_with_answer_four_options.jsonl"),
@@ -1704,7 +1704,7 @@ def attention_and_av_metrics(
                 object_values_flat,
                 n_attention_heads=n_heads,
                 attention_module=collector.attention_modules[layer_index],
-            )
+            ).float()
             n_subject = len(subject_indices)
             values_subject = values[:n_subject].permute(1, 0, 2)
             values_reference = values[n_subject:].permute(1, 0, 2)
@@ -1737,7 +1737,7 @@ def attention_and_av_metrics(
             visual_values_flat,
             n_attention_heads=n_heads,
             attention_module=collector.attention_modules[layer_index],
-        ).permute(1, 0, 2)
+        ).float().permute(1, 0, 2)
 
         for head in range(n_heads):
             selected_index = selected_lookup.get((layer_index, head))
@@ -2060,6 +2060,7 @@ def trace_one_prompt(
         visual_indices=visual_indices,
         last_index=last_index,
     )
+    trace_stage = "model_forward"
     try:
         with torch.inference_mode():
             outputs = model(
@@ -2072,6 +2073,7 @@ def trace_one_prompt(
     finally:
         collector.active = False
 
+    trace_stage = "extract_attentions"
     attentions = attention_tuple(outputs)
     n_layers = len(collector.layers)
     if len(attentions) != n_layers:
@@ -2103,6 +2105,7 @@ def trace_one_prompt(
     )
 
     arrays: Dict[str, np.ndarray] = {}
+    trace_stage = "logit_lens"
     stage_states = {
         "input": input_last,
         "after_attention": after_attention_last,
@@ -2172,6 +2175,7 @@ def trace_one_prompt(
         layer_output_last, output_reference
     )
 
+    trace_stage = "attention_av_metrics"
     attention_metrics = attention_and_av_metrics(
         attentions=attentions,
         collector=collector,
