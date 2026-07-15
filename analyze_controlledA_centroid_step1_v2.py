@@ -10,8 +10,9 @@ and the swapped question
 
     Q_BA: Where is object B in relation to object A?
 
-The model is not modified.  It generates normally with eager attention while
-the script records, for every selected decoder layer and attention head:
+The model is not modified. The script uses eager-attention generation tracing
+to expose prompt and answer-token attention while it records, for every
+selected decoder layer and attention head:
 
 - subject/reference object-token -> visual-token attention mass and centroid;
 - question-last-token -> visual-token attention and object-token routing;
@@ -53,6 +54,7 @@ import traceback
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -68,7 +70,7 @@ except Exception as exc:  # pragma: no cover
     raise SystemExit(f"Unable to import transformers: {exc}")
 
 
-SCRIPT_VERSION = "controlledA-similarity-head-generation-step1-v1"
+SCRIPT_VERSION = "controlledA-centroid-step1-v2"
 
 DEFAULT_PROMPT_FILE = Path(
     "prompts/Controlled_Images_A_with_answer_four_options.jsonl"
@@ -83,6 +85,20 @@ AUTO_LAYERS = {
     "llava-13b": 16,
     "qwen-3b": 24,
     "qwen-7b": 19,
+    # Only affects the readable auxiliary report layer. All layers are still
+    # evaluated when --layers all is used.
+    "qwen2-vl-7b": 16,
+}
+
+# Qwen2-VL-7B is injected locally so this script does not require editing the
+# Controlled-A extractor's SPECS table.
+EXTRA_MODEL_SPECS = {
+    "qwen2-vl-7b": SimpleNamespace(
+        repo_id="Qwen/Qwen2-VL-7B-Instruct",
+        model_class="Qwen2VLForConditionalGeneration",
+        dtype_name="bfloat16",
+        trust_remote_code=False,
+    ),
 }
 
 
@@ -229,6 +245,12 @@ def import_controlled_module(explicit: str = ""):
         "Could not import a Controlled-A extractor module. Tried:\n  "
         + "\n  ".join(errors)
     )
+
+
+def merged_model_specs(module: Any) -> Dict[str, Any]:
+    specs = dict(getattr(module, "SPECS", {}) or {})
+    specs.update(EXTRA_MODEL_SPECS)
+    return specs
 
 
 def resolve_prompt_path(args: argparse.Namespace) -> Path:
@@ -1677,6 +1699,18 @@ def save_sample_arrays(
         "similarity_relation_consistency": cross[
             "similarity_relation_consistency"
         ].astype(np.int8),
+
+        # One prediction per layer after averaging normalized attention maps
+        # over all heads. These are the overall-attention centroid results.
+        "headmean_original_prediction": cross[
+            "headmean_original_prediction"
+        ].astype(np.int8),
+        "headmean_swapped_aligned_prediction": cross[
+            "headmean_swapped_aligned_prediction"
+        ].astype(np.int8),
+        "headmean_average_prediction": cross[
+            "headmean_average_prediction"
+        ].astype(np.int8),
     }
 
     if save_object_maps:
@@ -2538,12 +2572,13 @@ def main() -> None:
             f"{len(missing_ids)} record IDs; first={missing_ids[:10]}"
         )
 
-    if args.model not in module.SPECS:
+    specs = merged_model_specs(module)
+    if args.model not in specs:
         raise ValueError(
-            f"Model {args.model!r} not found in "
-            f"{module.__name__}.SPECS"
+            f"Model {args.model!r} not found in the merged model specs. "
+            f"Available={sorted(specs)}"
         )
-    spec = module.SPECS[args.model]
+    spec = specs[args.model]
 
     output_dir = Path(args.output_dir)
     if args.overwrite and output_dir.exists():
@@ -2631,6 +2666,12 @@ def main() -> None:
         "audit": audit,
         "uses_gt_for_generation": False,
         "modifies_model": False,
+        "generation_is_trace_only": True,
+        "generation_note": (
+            "This Step-1 trace may force two decoding steps for answer-token "
+            "routing. Do not use its generation accuracy as normal free "
+            "generation; use the separate corrected generation run."
+        ),
     }
     (output_dir / "config.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2),
@@ -2854,6 +2895,11 @@ def main() -> None:
                     ),
                     original["visual_coordinates"],
                 )
+                cross.update({
+                    "headmean_original_prediction": headmean_original,
+                    "headmean_swapped_aligned_prediction": headmean_swapped,
+                    "headmean_average_prediction": headmean_average,
+                })
 
                 if aggregate is None:
                     aggregate = init_aggregate(
