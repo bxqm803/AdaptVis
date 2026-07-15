@@ -10,14 +10,15 @@ and the swapped question
 
     Q_BA: Where is object B in relation to object A?
 
-The model is not modified. The script uses eager-attention generation tracing
+The model is not modified. The script uses natural greedy generation with eager attention
 to expose prompt and answer-token attention while it records, for every
 selected decoder layer and attention head:
 
 - subject/reference object-token -> visual-token attention mass and centroid;
 - question-last-token -> visual-token attention and object-token routing;
 - prompt-last-token -> visual-token attention and object-token routing;
-- first-generated-answer-token -> visual-token attention and object-token routing;
+- first-generated-answer-token -> visual-token attention and object-token routing
+  when generation naturally reaches a second decoding step;
 - subject/reference attention-map separation;
 - original/swap same-object map cosine and centroid distance;
 - original/swap attention-centroid relation consistency;
@@ -70,7 +71,7 @@ except Exception as exc:  # pragma: no cover
     raise SystemExit(f"Unable to import transformers: {exc}")
 
 
-SCRIPT_VERSION = "coco-centroid-step1-v3"
+SCRIPT_VERSION = "coco-centroid-generation-step1-v4"
 
 DEFAULT_PROMPT_FILES = {
     "coco_two": Path("prompts/COCO_QA_two_obj_with_answer_four_options.jsonl"),
@@ -165,8 +166,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help=(
-            "Generation length. Internally at least two tokens are generated so "
-            "the first answer token can itself act as an attention query."
+            "Maximum number of newly generated tokens. No minimum generation "
+            "length is forced; generation may stop naturally at EOS."
         ),
     )
     p.add_argument(
@@ -1207,12 +1208,13 @@ def analyze_prompt(
             f"Could not construct coordinates for {len(visual_indices)} visual tokens"
         )
 
-    generation_length = max(2, int(max_new_tokens))
+    generation_length = int(max_new_tokens)
+    if generation_length < 1:
+        raise ValueError("max_new_tokens must be positive")
     with torch.inference_mode():
         generated = model.generate(
             **batch,
             max_new_tokens=generation_length,
-            min_new_tokens=2,
             do_sample=False,
             use_cache=True,
             return_dict_in_generate=True,
@@ -1245,15 +1247,21 @@ def analyze_prompt(
 
     attention_steps = generation_steps(generated, "attentions")
     hidden_steps = generation_steps(generated, "hidden_states")
-    if len(attention_steps) < 2:
-        raise RuntimeError(
-            "Need at least two generation attention steps to analyze the first "
-            "generated answer token as a query."
-        )
 
     prompt_attentions = step_layers(attention_steps[0])
-    answer_attentions = step_layers(attention_steps[1])
     prompt_hidden_layers = step_layers(hidden_steps[0])
+
+    # A generated token can act as an attention query only at the following
+    # autoregressive step. Do not force that following step. If generation
+    # naturally stops after one token, answer-query routing is unavailable and
+    # the corresponding arrays are saved as NaN without affecting prompt-based
+    # similarity or attention-centroid metrics.
+    answer_query_available = len(attention_steps) >= 2
+    answer_attentions = (
+        step_layers(attention_steps[1])
+        if answer_query_available
+        else None
+    )
 
     n_heads = int(
         normalize_attention_tensor(
@@ -1280,20 +1288,22 @@ def analyze_prompt(
     prompt_routing_sum = np.zeros_like(prompt_visual_mass)
     prompt_routing_balance = np.zeros_like(prompt_visual_mass)
 
-    answer_visual_mass = np.zeros(
+    answer_visual_mass = np.full(
         (n_selected, n_heads),
+        np.nan,
         dtype=np.float32,
     )
-    answer_centroids = np.zeros(
+    answer_centroids = np.full(
         (n_selected, n_heads, 2),
+        np.nan,
         dtype=np.float32,
     )
-    answer_entropy = np.zeros_like(answer_visual_mass)
-    answer_peak = np.zeros_like(answer_visual_mass)
-    answer_to_subject = np.zeros_like(answer_visual_mass)
-    answer_to_reference = np.zeros_like(answer_visual_mass)
-    answer_routing_sum = np.zeros_like(answer_visual_mass)
-    answer_routing_balance = np.zeros_like(answer_visual_mass)
+    answer_entropy = np.full_like(answer_visual_mass, np.nan)
+    answer_peak = np.full_like(answer_visual_mass, np.nan)
+    answer_to_subject = np.full_like(answer_visual_mass, np.nan)
+    answer_to_reference = np.full_like(answer_visual_mass, np.nan)
+    answer_routing_sum = np.full_like(answer_visual_mass, np.nan)
+    answer_routing_balance = np.full_like(answer_visual_mass, np.nan)
 
     object_maps = np.zeros(
         (n_selected, n_heads, 2, n_visual),
@@ -1368,48 +1378,50 @@ def analyze_prompt(
             * torch.sum(torch.abs(maps[:, 0, :] - maps[:, 1, :]), dim=-1)
         ).detach().cpu().numpy()
 
-        answer_tensor = normalize_attention_tensor(
-            answer_attentions[layer],
-            expected_query_length=1,
-        )
-        answer_rows = answer_tensor[:, -1:, :]
-        answer_metrics = query_attention_metrics(
-            answer_rows,
-            visual_indices,
-            coords,
-            subject_index,
-            reference_index,
-        )
-        answer_visual_mass[out_index] = (
-            answer_metrics["visual_mass"][:, 0].detach().cpu().numpy()
-        )
-        answer_centroids[out_index] = (
-            answer_metrics["centroids"][:, 0, :].detach().cpu().numpy()
-        )
-        answer_entropy[out_index] = (
-            answer_metrics["entropy_confidence"][:, 0]
-            .detach()
-            .cpu()
-            .numpy()
-        )
-        answer_peak[out_index] = (
-            answer_metrics["peak"][:, 0].detach().cpu().numpy()
-        )
-        answer_to_subject[out_index] = (
-            answer_metrics["to_subject"][:, 0].detach().cpu().numpy()
-        )
-        answer_to_reference[out_index] = (
-            answer_metrics["to_reference"][:, 0].detach().cpu().numpy()
-        )
-        answer_routing_sum[out_index] = (
-            answer_metrics["routing_sum"][:, 0].detach().cpu().numpy()
-        )
-        answer_routing_balance[out_index] = (
-            answer_metrics["routing_balance"][:, 0]
-            .detach()
-            .cpu()
-            .numpy()
-        )
+        if answer_query_available:
+            assert answer_attentions is not None
+            answer_tensor = normalize_attention_tensor(
+                answer_attentions[layer],
+                expected_query_length=1,
+            )
+            answer_rows = answer_tensor[:, -1:, :]
+            answer_metrics = query_attention_metrics(
+                answer_rows,
+                visual_indices,
+                coords,
+                subject_index,
+                reference_index,
+            )
+            answer_visual_mass[out_index] = (
+                answer_metrics["visual_mass"][:, 0].detach().cpu().numpy()
+            )
+            answer_centroids[out_index] = (
+                answer_metrics["centroids"][:, 0, :].detach().cpu().numpy()
+            )
+            answer_entropy[out_index] = (
+                answer_metrics["entropy_confidence"][:, 0]
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            answer_peak[out_index] = (
+                answer_metrics["peak"][:, 0].detach().cpu().numpy()
+            )
+            answer_to_subject[out_index] = (
+                answer_metrics["to_subject"][:, 0].detach().cpu().numpy()
+            )
+            answer_to_reference[out_index] = (
+                answer_metrics["to_reference"][:, 0].detach().cpu().numpy()
+            )
+            answer_routing_sum[out_index] = (
+                answer_metrics["routing_sum"][:, 0].detach().cpu().numpy()
+            )
+            answer_routing_balance[out_index] = (
+                answer_metrics["routing_balance"][:, 0]
+                .detach()
+                .cpu()
+                .numpy()
+            )
 
     object_prediction, object_axis_confidence = (
         relation_codes_from_centroids(object_centroids)
@@ -1438,6 +1450,8 @@ def analyze_prompt(
         "prediction": prediction,
         "first_token_id": first_token_id,
         "first_token_text": first_token_text,
+        "answer_query_available": bool(answer_query_available),
+        "generation_steps_returned": int(len(attention_steps)),
         "relation_logits": relation_score_data["logits"],
         "relation_probs": relation_score_data["probs"],
         "relation_score_prediction": relation_score_data["prediction"],
@@ -1548,6 +1562,12 @@ def save_sample_arrays(
         "layer_indices": np.asarray(selected_layers, dtype=np.int32),
         "query_names": np.asarray(QUERY_NAMES, dtype="<U24"),
         "relation_names": INDEX_TO_RELATION,
+        "original_answer_query_available": np.asarray(
+            original["answer_query_available"], dtype=np.bool_
+        ),
+        "swapped_answer_query_available": np.asarray(
+            swapped["answer_query_available"], dtype=np.bool_
+        ),
 
         "original_prompt_visual_mass": original["prompt_visual_mass"].astype(float_dtype),
         "original_prompt_centroids": original["prompt_centroids"].astype(float_dtype),
@@ -1765,9 +1785,13 @@ def init_aggregate(
         "swapped_answer_to_reference_sum": zeros_lh(),
         "original_answer_routing_balance_sum": zeros_lh(),
         "swapped_answer_routing_balance_sum": zeros_lh(),
+        "original_answer_query_count": 0,
+        "swapped_answer_query_count": 0,
 
         "correct_group_count": 0,
         "wrong_group_count": 0,
+        "correct_answer_query_count": 0,
+        "wrong_answer_query_count": 0,
         "answer_to_subject_correct_sum": zeros_lh(),
         "answer_to_reference_correct_sum": zeros_lh(),
         "answer_routing_balance_correct_sum": zeros_lh(),
@@ -1909,59 +1933,68 @@ def update_aggregate(
         swapped["prompt_to_reference"]
     )
 
-    aggregate["original_answer_visual_mass_sum"] += (
-        original["answer_visual_mass"]
-    )
-    aggregate["swapped_answer_visual_mass_sum"] += (
-        swapped["answer_visual_mass"]
-    )
-    aggregate["original_answer_to_subject_sum"] += (
-        original["answer_to_subject"]
-    )
-    aggregate["original_answer_to_reference_sum"] += (
-        original["answer_to_reference"]
-    )
-    aggregate["swapped_answer_to_subject_sum"] += (
-        swapped["answer_to_subject"]
-    )
-    aggregate["swapped_answer_to_reference_sum"] += (
-        swapped["answer_to_reference"]
-    )
-    aggregate["original_answer_routing_balance_sum"] += (
-        original["answer_routing_balance"]
-    )
-    aggregate["swapped_answer_routing_balance_sum"] += (
-        swapped["answer_routing_balance"]
-    )
+    if original["answer_query_available"]:
+        aggregate["original_answer_query_count"] += 1
+        aggregate["original_answer_visual_mass_sum"] += (
+            original["answer_visual_mass"]
+        )
+        aggregate["original_answer_to_subject_sum"] += (
+            original["answer_to_subject"]
+        )
+        aggregate["original_answer_to_reference_sum"] += (
+            original["answer_to_reference"]
+        )
+        aggregate["original_answer_routing_balance_sum"] += (
+            original["answer_routing_balance"]
+        )
+
+    if swapped["answer_query_available"]:
+        aggregate["swapped_answer_query_count"] += 1
+        aggregate["swapped_answer_visual_mass_sum"] += (
+            swapped["answer_visual_mass"]
+        )
+        aggregate["swapped_answer_to_subject_sum"] += (
+            swapped["answer_to_subject"]
+        )
+        aggregate["swapped_answer_to_reference_sum"] += (
+            swapped["answer_to_reference"]
+        )
+        aggregate["swapped_answer_routing_balance_sum"] += (
+            swapped["answer_routing_balance"]
+        )
 
     if original_correct:
         aggregate["correct_group_count"] += 1
-        aggregate["answer_to_subject_correct_sum"] += (
-            original["answer_to_subject"]
-        )
-        aggregate["answer_to_reference_correct_sum"] += (
-            original["answer_to_reference"]
-        )
-        aggregate["answer_routing_balance_correct_sum"] += (
-            original["answer_routing_balance"]
-        )
-        aggregate["answer_visual_mass_correct_sum"] += (
-            original["answer_visual_mass"]
-        )
+        if original["answer_query_available"]:
+            aggregate["correct_answer_query_count"] += 1
+            aggregate["answer_to_subject_correct_sum"] += (
+                original["answer_to_subject"]
+            )
+            aggregate["answer_to_reference_correct_sum"] += (
+                original["answer_to_reference"]
+            )
+            aggregate["answer_routing_balance_correct_sum"] += (
+                original["answer_routing_balance"]
+            )
+            aggregate["answer_visual_mass_correct_sum"] += (
+                original["answer_visual_mass"]
+            )
     else:
         aggregate["wrong_group_count"] += 1
-        aggregate["answer_to_subject_wrong_sum"] += (
-            original["answer_to_subject"]
-        )
-        aggregate["answer_to_reference_wrong_sum"] += (
-            original["answer_to_reference"]
-        )
-        aggregate["answer_routing_balance_wrong_sum"] += (
-            original["answer_routing_balance"]
-        )
-        aggregate["answer_visual_mass_wrong_sum"] += (
-            original["answer_visual_mass"]
-        )
+        if original["answer_query_available"]:
+            aggregate["wrong_answer_query_count"] += 1
+            aggregate["answer_to_subject_wrong_sum"] += (
+                original["answer_to_subject"]
+            )
+            aggregate["answer_to_reference_wrong_sum"] += (
+                original["answer_to_reference"]
+            )
+            aggregate["answer_routing_balance_wrong_sum"] += (
+                original["answer_routing_balance"]
+            )
+            aggregate["answer_visual_mass_wrong_sum"] += (
+                original["answer_visual_mass"]
+            )
 
     aggregate["headmean_original_correct"] += (
         headmean_original == gt_code
@@ -2009,6 +2042,14 @@ def finalize_aggregate(
     n = max(1, int(aggregate["n"]))
     count_lh = np.maximum(aggregate["attention_count"], 1.0)
     count_l = np.maximum(aggregate["similarity_count"], 1.0)
+
+    def available_mean(total: np.ndarray, count: int) -> np.ndarray:
+        if int(count) <= 0:
+            return np.full_like(total, np.nan, dtype=np.float32)
+        return (total / int(count)).astype(np.float32)
+
+    original_answer_n = int(aggregate["original_answer_query_count"])
+    swapped_answer_n = int(aggregate["swapped_answer_query_count"])
 
     metrics: Dict[str, np.ndarray] = {
         "layer_indices": np.asarray(selected_layers, dtype=np.int32),
@@ -2075,30 +2116,38 @@ def finalize_aggregate(
             aggregate["swapped_prompt_to_reference_sum"] / n
         ).astype(np.float32),
 
-        "original_answer_visual_mass": (
-            aggregate["original_answer_visual_mass_sum"] / n
-        ).astype(np.float32),
-        "swapped_answer_visual_mass": (
-            aggregate["swapped_answer_visual_mass_sum"] / n
-        ).astype(np.float32),
-        "original_answer_to_subject": (
-            aggregate["original_answer_to_subject_sum"] / n
-        ).astype(np.float32),
-        "original_answer_to_reference": (
-            aggregate["original_answer_to_reference_sum"] / n
-        ).astype(np.float32),
-        "swapped_answer_to_subject": (
-            aggregate["swapped_answer_to_subject_sum"] / n
-        ).astype(np.float32),
-        "swapped_answer_to_reference": (
-            aggregate["swapped_answer_to_reference_sum"] / n
-        ).astype(np.float32),
-        "original_answer_routing_balance": (
-            aggregate["original_answer_routing_balance_sum"] / n
-        ).astype(np.float32),
-        "swapped_answer_routing_balance": (
-            aggregate["swapped_answer_routing_balance_sum"] / n
-        ).astype(np.float32),
+        "original_answer_visual_mass": available_mean(
+            aggregate["original_answer_visual_mass_sum"],
+            original_answer_n,
+        ),
+        "swapped_answer_visual_mass": available_mean(
+            aggregate["swapped_answer_visual_mass_sum"],
+            swapped_answer_n,
+        ),
+        "original_answer_to_subject": available_mean(
+            aggregate["original_answer_to_subject_sum"],
+            original_answer_n,
+        ),
+        "original_answer_to_reference": available_mean(
+            aggregate["original_answer_to_reference_sum"],
+            original_answer_n,
+        ),
+        "swapped_answer_to_subject": available_mean(
+            aggregate["swapped_answer_to_subject_sum"],
+            swapped_answer_n,
+        ),
+        "swapped_answer_to_reference": available_mean(
+            aggregate["swapped_answer_to_reference_sum"],
+            swapped_answer_n,
+        ),
+        "original_answer_routing_balance": available_mean(
+            aggregate["original_answer_routing_balance_sum"],
+            original_answer_n,
+        ),
+        "swapped_answer_routing_balance": available_mean(
+            aggregate["swapped_answer_routing_balance_sum"],
+            swapped_answer_n,
+        ),
 
         "headmean_original_accuracy": (
             aggregate["headmean_original_correct"] / n
@@ -2111,33 +2160,33 @@ def finalize_aggregate(
         ).astype(np.float32),
     }
 
-    correct_n = max(1, int(aggregate["correct_group_count"]))
-    wrong_n = max(1, int(aggregate["wrong_group_count"]))
+    correct_answer_n = int(aggregate["correct_answer_query_count"])
+    wrong_answer_n = int(aggregate["wrong_answer_query_count"])
     metrics.update({
-        "answer_to_subject_correct": (
-            aggregate["answer_to_subject_correct_sum"] / correct_n
-        ).astype(np.float32),
-        "answer_to_reference_correct": (
-            aggregate["answer_to_reference_correct_sum"] / correct_n
-        ).astype(np.float32),
-        "answer_routing_balance_correct": (
-            aggregate["answer_routing_balance_correct_sum"] / correct_n
-        ).astype(np.float32),
-        "answer_visual_mass_correct": (
-            aggregate["answer_visual_mass_correct_sum"] / correct_n
-        ).astype(np.float32),
-        "answer_to_subject_wrong": (
-            aggregate["answer_to_subject_wrong_sum"] / wrong_n
-        ).astype(np.float32),
-        "answer_to_reference_wrong": (
-            aggregate["answer_to_reference_wrong_sum"] / wrong_n
-        ).astype(np.float32),
-        "answer_routing_balance_wrong": (
-            aggregate["answer_routing_balance_wrong_sum"] / wrong_n
-        ).astype(np.float32),
-        "answer_visual_mass_wrong": (
-            aggregate["answer_visual_mass_wrong_sum"] / wrong_n
-        ).astype(np.float32),
+        "answer_to_subject_correct": available_mean(
+            aggregate["answer_to_subject_correct_sum"], correct_answer_n
+        ),
+        "answer_to_reference_correct": available_mean(
+            aggregate["answer_to_reference_correct_sum"], correct_answer_n
+        ),
+        "answer_routing_balance_correct": available_mean(
+            aggregate["answer_routing_balance_correct_sum"], correct_answer_n
+        ),
+        "answer_visual_mass_correct": available_mean(
+            aggregate["answer_visual_mass_correct_sum"], correct_answer_n
+        ),
+        "answer_to_subject_wrong": available_mean(
+            aggregate["answer_to_subject_wrong_sum"], wrong_answer_n
+        ),
+        "answer_to_reference_wrong": available_mean(
+            aggregate["answer_to_reference_wrong_sum"], wrong_answer_n
+        ),
+        "answer_routing_balance_wrong": available_mean(
+            aggregate["answer_routing_balance_wrong_sum"], wrong_answer_n
+        ),
+        "answer_visual_mass_wrong": available_mean(
+            aggregate["answer_visual_mass_wrong_sum"], wrong_answer_n
+        ),
     })
 
     attention_accuracy = metrics["attention_average_accuracy"]
@@ -2203,6 +2252,10 @@ def finalize_aggregate(
 
     summary: Dict[str, Any] = {
         "n_samples": int(aggregate["n"]),
+        "answer_query_availability": {
+            "original": int(aggregate["original_answer_query_count"]),
+            "swapped": int(aggregate["swapped_answer_query_count"]),
+        },
         "generation_original_accuracy": (
             aggregate["generation_original_correct"]
             / max(1, aggregate["generation_original_valid"])
@@ -2632,11 +2685,12 @@ def main() -> None:
         "audit": audit,
         "uses_gt_for_generation": False,
         "modifies_model": False,
-        "generation_is_trace_only": True,
+        "generation_is_trace_only": False,
+        "generation_forces_minimum_tokens": False,
         "generation_note": (
-            "The Step-1 trace forces at least two decoding steps so the first "
-            "answer token can act as a query. Do not treat its generation "
-            "accuracy as the normal free-generation baseline."
+            "Generation uses the requested max_new_tokens as an upper bound "
+            "and may stop naturally at EOS. First-answer-token routing is "
+            "reported only when a second decoding step naturally exists."
         ),
     }
     (output_dir / "config.json").write_text(
@@ -2944,6 +2998,12 @@ def main() -> None:
                     ],
                     "original_prediction": original["prediction"],
                     "original_correct": original_correct,
+                    "original_answer_query_available": bool(
+                        original["answer_query_available"]
+                    ),
+                    "swapped_answer_query_available": bool(
+                        swapped["answer_query_available"]
+                    ),
                     "swapped_generated_text": swapped[
                         "generated_text"
                     ],
