@@ -3,7 +3,7 @@
 """Run COCO-two centroid comparison across models.
 
 Companion Step-1 script:
-    analyze_coco_centroid_step1_v3.py
+    analyze_coco_centroid_generation_step1_v4.py
 
 Default models:
     qwen2-2b
@@ -26,9 +26,9 @@ All metrics use the same original/swap-aligned average protocol. Models are
 frozen. The best layer/head is selected using full-set GT, so these are
 diagnostic oracle statistics.
 
-Generation from Step 1 is intentionally not reported. Step 1 forces at least
-two decoding steps to expose answer-token routing and is therefore not the
-normal free-generation baseline.
+Generation uses the requested --max-new-tokens only as an upper bound. No
+minimum token count is forced, and EOS may stop generation naturally. The
+runner reports normal greedy-generation accuracy from the same run.
 """
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 
-SCRIPT_VERSION = "coco-centroid-multimodel-v3"
+SCRIPT_VERSION = "coco-centroid-generation-multimodel-v4"
 
 DEFAULT_MODELS = [
     "qwen2-2b",
@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--step1-script",
-        default="analyze_coco_centroid_step1_v3.py",
+        default="analyze_coco_centroid_generation_step1_v4.py",
     )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--device", default="cuda:0")
@@ -102,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument(
         "--output-root",
-        default="output/coco_centroid_multimodel_v3",
+        default="output/coco_centroid_generation_multimodel_v4",
     )
     parser.add_argument("--skip-step1", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -413,10 +413,13 @@ def evaluate_model(
 
     method_names = ("similarity", "headmean", "best_head")
     counts = {name: 0 for name in method_names}
+    counts["generation"] = 0
+    counts["generation_valid"] = 0
     relation_counts: Dict[str, Dict[str, int]] = {
         relation: {
             "n": 0,
             **{name: 0 for name in method_names},
+            "generation": 0,
         }
         for relation in RELATIONS
     }
@@ -435,12 +438,21 @@ def evaluate_model(
             name: pred[name] == gt
             for name in method_names
         }
+        generation_prediction = normalize_relation(
+            row.get("original_prediction")
+        )
+        generation_ok = generation_prediction == gt
         for name in method_names:
             counts[name] += int(correct[name])
+        counts["generation"] += int(generation_ok)
+        counts["generation_valid"] += int(
+            generation_prediction in RELATIONS
+        )
 
         relation_counts[gt]["n"] += 1
         for name in method_names:
             relation_counts[gt][name] += int(correct[name])
+        relation_counts[gt]["generation"] += int(generation_ok)
 
         sample_output.append({
             "model": model,
@@ -448,6 +460,9 @@ def evaluate_model(
             "sid": sid,
             "question": row.get("question"),
             "gt": gt,
+            "generation_text": row.get("original_generated_text"),
+            "generation_prediction": generation_prediction,
+            "generation_correct": generation_ok,
             "similarity_layer": positions["similarity_layer"],
             "similarity_prediction": pred["similarity"],
             "similarity_correct": correct["similarity"],
@@ -483,6 +498,17 @@ def evaluate_model(
             "best_head_layer"
         ],
         "best_attention_head": positions["best_head"],
+        "normal_generation_accuracy": counts["generation"] / n,
+        "generation_valid_rate": counts["generation_valid"] / n,
+        "generation_max_new_tokens_note": (
+            "natural greedy generation; no min_new_tokens"
+        ),
+        "generation_minus_similarity": (
+            counts["generation"] - counts["similarity"]
+        ) / n,
+        "generation_minus_headmean": (
+            counts["generation"] - counts["headmean"]
+        ) / n,
         "headmean_minus_similarity": (
             counts["headmean"] - counts["similarity"]
         ) / n,
@@ -514,6 +540,9 @@ def evaluate_model(
             "best_attention_head_centroid_accuracy": (
                 stats["best_head"] / relation_n
             ),
+            "normal_generation_accuracy": (
+                stats["generation"] / relation_n
+            ),
         })
 
     return headline, per_relation, sample_output
@@ -538,6 +567,11 @@ def print_model_summary(row: Mapping[str, Any]) -> None:
         f"{row['best_attention_head_centroid_accuracy']:.4f} "
         f"at L{row['best_attention_head_layer']}"
         f"H{row['best_attention_head']}"
+    )
+    print(
+        "4. Normal greedy generation:         "
+        f"{row['normal_generation_accuracy']:.4f} "
+        f"(valid={row['generation_valid_rate']:.4f})"
     )
 
 
