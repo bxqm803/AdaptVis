@@ -53,7 +53,7 @@ except Exception as exc:
     raise SystemExit(f"Unable to import transformers: {exc}")
 
 
-SCRIPT_VERSION = "compare-centroid-generation-transfer-groups-v1"
+SCRIPT_VERSION = "compare-centroid-generation-transfer-groups-v1.1"
 
 RELATIONS = ("left", "right", "above", "below")
 RELATION_TO_INDEX = {name: i for i, name in enumerate(RELATIONS)}
@@ -114,7 +114,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--selected-heads",
         default=None,
-        help="Optional override, e.g. '12:3,15:7,20:1'. Otherwise read from prior-dir.",
+        help=(
+            "Optional override, e.g. '12:3,15:7,20:1'. "
+            "If omitted, read prior-dir/config.json when available; otherwise "
+            "automatically trace all heads at the model's reference layer."
+        ),
     )
 
     p.add_argument("--max-per-group", type=int, default=None)
@@ -248,6 +252,45 @@ def parse_selected_heads(text: Optional[str]) -> Optional[List[Dict[str, int]]]:
     if not rows:
         raise ValueError("--selected-heads produced an empty list.")
     return rows
+
+
+def resolve_num_attention_heads(model: Any) -> int:
+    """Resolve the language decoder attention-head count across LLaVA/Qwen configs."""
+    config = getattr(model, "config", None)
+    candidates = [
+        config,
+        getattr(config, "text_config", None),
+        getattr(config, "language_config", None),
+        getattr(config, "llm_config", None),
+    ]
+    for cfg in candidates:
+        if cfg is None:
+            continue
+        for name in ("num_attention_heads", "num_heads", "n_head"):
+            value = getattr(cfg, name, None)
+            if value is not None:
+                value = int(value)
+                if value > 0:
+                    return value
+    raise RuntimeError(
+        "Could not resolve num_attention_heads from the model configuration. "
+        "Pass --selected-heads explicitly, for example --selected-heads '12:0,12:1'."
+    )
+
+
+def auto_selected_heads(
+    *,
+    core: Any,
+    model: Any,
+    model_name: str,
+    n_layers: int,
+) -> List[Dict[str, int]]:
+    """Use every head at the repository's model-specific reference layer."""
+    auto_layers = getattr(core, "AUTO_LAYERS", {})
+    layer = int(auto_layers.get(model_name, n_layers // 2))
+    layer = max(0, min(layer, n_layers - 1))
+    n_heads = resolve_num_attention_heads(model)
+    return [{"layer": layer, "head": head} for head in range(n_heads)]
 
 
 def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -910,9 +953,7 @@ def main() -> None:
         raise RuntimeError("No samples remained after building groups.")
 
     selected_heads = parse_selected_heads(args.selected_heads)
-    if selected_heads is None:
-        selected_heads = core.load_selected_heads(prior_dir)
-    selected_layers = sorted({int(row["layer"]) for row in selected_heads})
+    selected_layers: List[int] = []
 
     group_counts = Counter(row["group"] for row in prior_rows.values())
     print("=" * 110)
@@ -921,13 +962,8 @@ def main() -> None:
     for group in ALL_GROUPS:
         if group in group_counts or group in PRIMARY_GROUPS:
             print(f"{group:46s}: {group_counts[group]}")
-    print(
-        "Selected heads:",
-        ", ".join(
-            f"L{int(row['layer']):02d}H{int(row['head']):02d}"
-            for row in selected_heads
-        ),
-    )
+    # Selected heads are resolved after the model is loaded. This makes
+    # prior-dir/config.json optional.
 
     # Dataset and prompt loading.
     backend_module = core.import_two_object_module()
@@ -981,10 +1017,49 @@ def main() -> None:
 
     layers, layers_path = core.resolve_decoder_layers(model)
     n_layers = len(layers)
+
+    if selected_heads is None:
+        config_path = prior_dir / "config.json"
+        if config_path.exists():
+            try:
+                selected_heads = core.load_selected_heads(prior_dir)
+                print(f"Selected heads loaded from: {config_path}")
+            except Exception as exc:
+                print(
+                    "[WARN] Failed to load selected heads from config.json; "
+                    f"using automatic reference-layer heads instead: {exc}"
+                )
+                selected_heads = auto_selected_heads(
+                    core=core,
+                    model=model,
+                    model_name=args.model,
+                    n_layers=n_layers,
+                )
+        else:
+            print(
+                f"[WARN] Missing {config_path}; using all heads at the "
+                "model-specific reference layer."
+            )
+            selected_heads = auto_selected_heads(
+                core=core,
+                model=model,
+                model_name=args.model,
+                n_layers=n_layers,
+            )
+
+    selected_layers = sorted({int(row["layer"]) for row in selected_heads})
     if selected_layers and max(selected_layers) >= n_layers:
         raise RuntimeError(
             f"Selected layer {max(selected_layers)} outside model with {n_layers} layers"
         )
+
+    print(
+        "Selected heads:",
+        ", ".join(
+            f"L{int(row['layer']):02d}H{int(row['head']):02d}"
+            for row in selected_heads
+        ),
+    )
 
     final_norm, final_norm_path = core.resolve_final_norm(model)
     label_token_ids = core.label_token_id_variants(processor.tokenizer)
