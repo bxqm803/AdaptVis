@@ -53,7 +53,7 @@ except Exception as exc:
     raise SystemExit(f"Unable to import transformers: {exc}")
 
 
-SCRIPT_VERSION = "compare-centroid-generation-transfer-groups-v1.1"
+SCRIPT_VERSION = "compare-centroid-generation-transfer-groups-v1.2"
 
 RELATIONS = ("left", "right", "above", "below")
 RELATION_TO_INDEX = {name: i for i, name in enumerate(RELATIONS)}
@@ -790,28 +790,44 @@ def append_pairwise_head_rows(
     if tensor.ndim != 3:
         raise ValueError(f"{metric} must have shape [N,L,H], got {tensor.shape}")
     n_layers, n_heads = int(tensor.shape[1]), int(tensor.shape[2])
-    for comparison_index, (name, left, right) in enumerate(PAIR_SPECS):
-        for layer in range(n_layers):
-            for head in range(n_heads):
-                row = pairwise_comparison_row(
-                    comparison=name,
-                    group_left=left,
-                    group_right=right,
-                    metric=metric,
-                    values=tensor[:, layer, head],
-                    group_labels=group_labels,
-                    relation_codes=relation_codes,
-                    relation="all",
-                    bootstrap_samples=bootstrap_samples,
-                    seed=(
-                        seed_offset
-                        + comparison_index * 1000000
-                        + layer * 1000
-                        + head
-                    ),
-                )
-                row.update({"layer": layer, "head": head})
-                output.append(row)
+    total = len(PAIR_SPECS) * n_layers * n_heads
+    progress = tqdm(
+        total=total,
+        desc=f"head-bootstrap:{metric}",
+        unit="head-test",
+        dynamic_ncols=True,
+        leave=True,
+    )
+    try:
+        for comparison_index, (name, left, right) in enumerate(PAIR_SPECS):
+            for layer in range(n_layers):
+                for head in range(n_heads):
+                    progress.set_postfix_str(
+                        f"{name} L{layer}H{head} B={bootstrap_samples}",
+                        refresh=False,
+                    )
+                    row = pairwise_comparison_row(
+                        comparison=name,
+                        group_left=left,
+                        group_right=right,
+                        metric=metric,
+                        values=tensor[:, layer, head],
+                        group_labels=group_labels,
+                        relation_codes=relation_codes,
+                        relation="all",
+                        bootstrap_samples=bootstrap_samples,
+                        seed=(
+                            seed_offset
+                            + comparison_index * 1000000
+                            + layer * 1000
+                            + head
+                        ),
+                    )
+                    row.update({"layer": layer, "head": head})
+                    output.append(row)
+                    progress.update(1)
+    finally:
+        progress.close()
 
 
 def earliest_persistent_divergence(
@@ -1254,6 +1270,7 @@ def main() -> None:
             ),
         }
 
+        print("\n[Statistics 1/9] Scalar comparisons", flush=True)
         # 1) Scalar pairwise comparison.
         scalar_names = [
             "centroid_confidence",
@@ -1306,6 +1323,7 @@ def main() -> None:
                     )
         write_csv(output_dir / "scalar_pairwise.csv", scalar_rows)
 
+        print("\n[Statistics 2/9] Layerwise logit lens", flush=True)
         # 2) Layerwise logit lens.
         logit_rows: List[Dict[str, Any]] = []
         for stage in ("input", "after_attention", "after_layer"):
@@ -1331,6 +1349,7 @@ def main() -> None:
             )
         write_csv(output_dir / "layerwise_logit_lens_pairwise.csv", logit_rows)
 
+        print("\n[Statistics 3/9] Attention / MLP / block gains", flush=True)
         # 3) Attention/MLP/block contribution gains.
         module_rows: List[Dict[str, Any]] = []
         for component, key in (
@@ -1350,6 +1369,7 @@ def main() -> None:
             )
         write_csv(output_dir / "layerwise_module_gains_pairwise.csv", module_rows)
 
+        print("\n[Statistics 4/9] Layerwise routing", flush=True)
         # 4) Layerwise transfer/routing metrics.
         routing_rows: List[Dict[str, Any]] = []
         for metric, matrix in layer_metrics.items():
@@ -1364,6 +1384,7 @@ def main() -> None:
             )
         write_csv(output_dir / "layerwise_routing_pairwise.csv", routing_rows)
 
+        print(f"\n[Statistics 5/9] Per-head bootstrap: {args.bootstrap_samples} resamples/test", flush=True)
         # 5) Per-head transfer/routing metrics.
         head_rows: List[Dict[str, Any]] = []
         head_tensors = {
@@ -1400,6 +1421,7 @@ def main() -> None:
         )[:300]
         write_csv(output_dir / "top_head_candidates.csv", top_head_rows)
 
+        print("\n[Statistics 6/9] Selected spatial heads", flush=True)
         # 6) Selected spatial-head visual/object tracing.
         selected_rows: List[Dict[str, Any]] = []
         selected_metrics = {
@@ -1448,6 +1470,7 @@ def main() -> None:
             selected_rows,
         )
 
+        print("\n[Statistics 7/9] Matched comparisons", flush=True)
         # 7) Nuisance-matched comparisons.
         match_features_ab = parse_feature_list(args.match_features_ab)
         match_features_other = parse_feature_list(args.match_features_other)
@@ -1521,6 +1544,7 @@ def main() -> None:
                     matched_rows.append(row)
         write_csv(output_dir / "matched_layerwise_pairwise.csv", matched_rows)
 
+        print("\n[Statistics 8/9] Candidate breakpoints", flush=True)
         # 8) Candidate breakpoint summary.
         breakpoint_rows: List[Dict[str, Any]] = []
         breakpoint_specs = [
@@ -1574,6 +1598,7 @@ def main() -> None:
                 )
         write_csv(output_dir / "candidate_breakpoints.csv", breakpoint_rows)
 
+        print("\n[Statistics 9/9] Summary and plots", flush=True)
         # 9) Compact mechanism-oriented summary.
         late_start = max(0, n_layers - max(4, n_layers // 4))
 
