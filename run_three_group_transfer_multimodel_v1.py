@@ -51,7 +51,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 import numpy as np
 
 
-SCRIPT_VERSION = "run-three-group-transfer-multimodel-v1"
+SCRIPT_VERSION = "run-three-group-transfer-multimodel-v1.1"
 RELATIONS = ("left", "right", "above", "below")
 CODE_TO_RELATION = {i: relation for i, relation in enumerate(RELATIONS)}
 
@@ -244,24 +244,26 @@ def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 def run_command(
     command: Sequence[str],
     *,
-    log_path: Path,
     env: Optional[Mapping[str, str]] = None,
 ) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    """Run a child process directly in the current terminal.
+
+    stdout and stderr are intentionally inherited, so model-loading messages,
+    warnings, print statements, and tqdm progress bars appear immediately.
+    """
     printable = " ".join(str(x) for x in command)
     print("\n$ " + printable, flush=True)
-    with log_path.open("a", encoding="utf-8") as log:
-        log.write("$ " + printable + "\n")
-        log.flush()
-        completed = subprocess.run(
-            list(command),
-            env=dict(env) if env is not None else None,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
+
+    completed = subprocess.run(
+        list(command),
+        env=dict(env) if env is not None else None,
+        check=False,
+    )
     if completed.returncode != 0:
-        raise subprocess.CalledProcessError(completed.returncode, list(command))
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            list(command),
+        )
 
 
 def resolve_array_path(step1_dir: Path, row: Mapping[str, Any]) -> Path:
@@ -713,8 +715,6 @@ def main() -> None:
         step1_dir = model_root / "pass1_centroid_generation"
         prior_dir = model_root / "fresh_group_cache"
         trace_dir = model_root / "pass2_transfer_trace"
-        step1_log = model_root / "pass1.log"
-        trace_log = model_root / "pass2.log"
 
         try:
             print("\n" + "=" * 112)
@@ -761,7 +761,7 @@ def main() -> None:
 
                 with commands_path.open("a", encoding="utf-8") as handle:
                     handle.write("$ " + " ".join(command) + "\n")
-                run_command(command, log_path=step1_log, env=env)
+                run_command(command, env=env)
 
             config = build_compatibility_prior(
                 step1_dir=step1_dir,
@@ -827,7 +827,7 @@ def main() -> None:
 
                 with commands_path.open("a", encoding="utf-8") as handle:
                     handle.write("$ " + " ".join(command) + "\n")
-                run_command(command, log_path=trace_log, env=env)
+                run_command(command, env=env)
 
             model_summary_rows.append(
                 {
