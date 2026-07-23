@@ -1010,5 +1010,663 @@ def main() -> None:
         raise SystemExit(1)
 
 
+
+# ===========================================================================
+# Compatibility API for run_centroid_only_spatial_enhancement_v2.py
+# ===========================================================================
+#
+# The original standalone analyzer above uses:
+#     Capture
+#     sample_to_arrays
+#
+# The centroid-only enhancement script imports:
+#     LayerGroundingCapture
+#     sample_result_to_arrays
+#
+# The following implementation exposes the latter API and, unlike the compact
+# original Capture class, optionally retains all per-layer visual maps.
+# ===========================================================================
+
+@dataclass
+class _LayerGroundingResult:
+    similarity_prediction: int
+    attention_prediction: int
+
+    similarity_subject_centroid: np.ndarray
+    similarity_reference_centroid: np.ndarray
+    attention_subject_centroid: np.ndarray
+    attention_reference_centroid: np.ndarray
+
+    similarity_subject_map: np.ndarray
+    similarity_reference_map: np.ndarray
+    attention_subject_map: np.ndarray
+    attention_reference_map: np.ndarray
+
+    similarity_subject_entropy: float
+    similarity_reference_entropy: float
+    similarity_subject_topk: float
+    similarity_reference_topk: float
+    similarity_subject_compactness: float
+    similarity_reference_compactness: float
+    similarity_overlap: float
+    similarity_separation: float
+    similarity_gt_axis_margin: float
+
+    attention_subject_entropy: float
+    attention_reference_entropy: float
+    attention_subject_topk: float
+    attention_reference_topk: float
+    attention_subject_compactness: float
+    attention_reference_compactness: float
+    attention_overlap: float
+    attention_separation: float
+    attention_gt_axis_margin: float
+    attention_subject_visual_mass: float
+    attention_reference_visual_mass: float
+    attention_subject_head_agreement: float
+    attention_reference_head_agreement: float
+
+
+class LayerGroundingCapture:
+    """
+    Compatibility capture class used by centroid-only enhancement experiments.
+    """
+
+    def __init__(
+        self,
+        *,
+        layers: Sequence[torch.nn.Module],
+        model: Any,
+        processor: Any,
+        similarity_mode: str,
+        similarity_temperature: float,
+        top_fraction: float,
+        save_maps: bool = False,
+    ) -> None:
+        self.layers = list(layers)
+        self.model = model
+        self.processor = processor
+        self.similarity_mode = str(similarity_mode)
+        self.similarity_temperature = float(similarity_temperature)
+        self.top_fraction = float(top_fraction)
+        self.save_maps = bool(save_maps)
+
+        self.handles: List[Any] = []
+        self.reset()
+
+        for layer_id, layer in enumerate(self.layers):
+            attention_module = getattr(layer, "self_attn", None)
+            if attention_module is None:
+                raise RuntimeError(
+                    f"Decoder layer {layer_id} has no self_attn module."
+                )
+
+            self.handles.append(
+                attention_module.register_forward_hook(
+                    self._make_attention_hook(layer_id),
+                    with_kwargs=True,
+                )
+            )
+            self.handles.append(
+                layer.register_forward_hook(
+                    self._make_layer_hook(layer_id),
+                    with_kwargs=True,
+                )
+            )
+
+    def reset(self) -> None:
+        self.prompt_spec: Optional[base.PromptPositionSpec] = None
+        self.batch: Optional[Mapping[str, Any]] = None
+        self.image_size: Optional[Tuple[int, int]] = None
+        self.gt_code: Optional[int] = None
+
+        self.positions: Optional[base.ExpandedPositionSpec] = None
+        self.xy: Optional[torch.Tensor] = None
+        self.grid_shape: Optional[Tuple[int, int]] = None
+        self.grid_source: Optional[str] = None
+
+        self.pending_attention: Dict[int, Dict[str, Any]] = {}
+        self.results: Dict[int, _LayerGroundingResult] = {}
+
+    def configure(
+        self,
+        *,
+        prompt_spec: base.PromptPositionSpec,
+        batch: Mapping[str, Any],
+        image_size: Tuple[int, int],
+        gt_code: int,
+    ) -> None:
+        self.reset()
+        self.prompt_spec = prompt_spec
+        self.batch = batch
+        self.image_size = image_size
+        self.gt_code = int(gt_code)
+
+    def close(self) -> None:
+        for handle in self.handles:
+            with contextlib.suppress(Exception):
+                handle.remove()
+        self.handles.clear()
+        self.reset()
+
+    def _ensure_geometry(
+        self,
+        sequence_length: int,
+        device: torch.device,
+    ) -> None:
+        if self.positions is not None:
+            return
+
+        if (
+            self.prompt_spec is None
+            or self.batch is None
+            or self.image_size is None
+        ):
+            raise RuntimeError(
+                "LayerGroundingCapture.configure() must be called first."
+            )
+
+        self.positions = base.expand_positions(
+            self.prompt_spec,
+            hidden_length=int(sequence_length),
+        )
+        visual_count = len(self.positions.visual_positions)
+
+        grid_height, grid_width, grid_source = infer_grid(
+            visual_count,
+            self.batch,
+            self.image_size,
+            self.model,
+            self.processor,
+        )
+        if grid_height * grid_width != visual_count:
+            raise RuntimeError(
+                f"Resolved grid {grid_height}x{grid_width} does not match "
+                f"visual token count {visual_count}."
+            )
+
+        self.xy = make_xy(
+            grid_height,
+            grid_width,
+            device,
+        )
+        self.grid_shape = (int(grid_height), int(grid_width))
+        self.grid_source = str(grid_source)
+
+    @staticmethod
+    def _find_attention_tensor(output: Any) -> Optional[torch.Tensor]:
+        if not isinstance(output, (tuple, list)):
+            return None
+
+        candidates = [
+            value
+            for value in output[1:]
+            if torch.is_tensor(value) and value.ndim == 4
+        ]
+        if not candidates:
+            return None
+
+        return max(
+            candidates,
+            key=lambda tensor: (
+                int(tensor.shape[-2]) * int(tensor.shape[-1])
+            ),
+        )
+
+    def _make_attention_hook(self, layer_id: int):
+        def hook(
+            module: torch.nn.Module,
+            args: Tuple[Any, ...],
+            kwargs: Dict[str, Any],
+            output: Any,
+        ):
+            weights = self._find_attention_tensor(output)
+            if weights is None:
+                raise RuntimeError(
+                    f"L{layer_id} did not expose eager attention weights. "
+                    "Use attn_implementation='eager' and output_attentions=True."
+                )
+
+            self._ensure_geometry(
+                sequence_length=int(weights.shape[-1]),
+                device=weights.device,
+            )
+            assert self.positions is not None
+
+            subject_map, subject_mass, subject_agreement = attention_map(
+                weights,
+                self.positions.subject_positions,
+                self.positions.visual_positions,
+            )
+            reference_map, reference_mass, reference_agreement = attention_map(
+                weights,
+                self.positions.reference_positions,
+                self.positions.visual_positions,
+            )
+
+            self.pending_attention[layer_id] = {
+                "subject_map": subject_map.detach(),
+                "reference_map": reference_map.detach(),
+                "subject_mass": float(subject_mass),
+                "reference_mass": float(reference_mass),
+                "subject_agreement": float(subject_agreement),
+                "reference_agreement": float(reference_agreement),
+            }
+            return output
+
+        return hook
+
+    def _make_layer_hook(self, layer_id: int):
+        def hook(
+            module: torch.nn.Module,
+            args: Tuple[Any, ...],
+            kwargs: Dict[str, Any],
+            output: Any,
+        ):
+            hidden_states = base.output_first_tensor(output)
+
+            self._ensure_geometry(
+                sequence_length=int(hidden_states.shape[1]),
+                device=hidden_states.device,
+            )
+
+            if layer_id not in self.pending_attention:
+                raise RuntimeError(
+                    f"Missing object-to-visual attention map at L{layer_id}."
+                )
+            if self.gt_code is None:
+                raise RuntimeError("Missing GT relation code for evaluation.")
+
+            assert self.positions is not None
+            assert self.xy is not None
+
+            similarity_subject = hidden_map(
+                hidden_states,
+                self.positions.subject_positions,
+                self.positions.visual_positions,
+                self.similarity_mode,
+                self.similarity_temperature,
+            )
+            similarity_reference = hidden_map(
+                hidden_states,
+                self.positions.reference_positions,
+                self.positions.visual_positions,
+                self.similarity_mode,
+                self.similarity_temperature,
+            )
+
+            attention_data = self.pending_attention.pop(layer_id)
+            attention_subject = attention_data["subject_map"].to(
+                device=hidden_states.device
+            )
+            attention_reference = attention_data["reference_map"].to(
+                device=hidden_states.device
+            )
+            coordinates = self.xy.to(device=hidden_states.device)
+
+            similarity_subject_centroid = centroid(
+                similarity_subject,
+                coordinates,
+            )
+            similarity_reference_centroid = centroid(
+                similarity_reference,
+                coordinates,
+            )
+            attention_subject_centroid = centroid(
+                attention_subject,
+                coordinates,
+            )
+            attention_reference_centroid = centroid(
+                attention_reference,
+                coordinates,
+            )
+
+            empty_map = np.empty(0, dtype=np.float32)
+
+            self.results[layer_id] = _LayerGroundingResult(
+                similarity_prediction=relation_from_centroids(
+                    similarity_subject_centroid,
+                    similarity_reference_centroid,
+                ),
+                attention_prediction=relation_from_centroids(
+                    attention_subject_centroid,
+                    attention_reference_centroid,
+                ),
+
+                similarity_subject_centroid=(
+                    similarity_subject_centroid.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                ),
+                similarity_reference_centroid=(
+                    similarity_reference_centroid.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                ),
+                attention_subject_centroid=(
+                    attention_subject_centroid.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                ),
+                attention_reference_centroid=(
+                    attention_reference_centroid.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                ),
+
+                similarity_subject_map=(
+                    similarity_subject.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                    if self.save_maps
+                    else empty_map
+                ),
+                similarity_reference_map=(
+                    similarity_reference.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                    if self.save_maps
+                    else empty_map
+                ),
+                attention_subject_map=(
+                    attention_subject.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                    if self.save_maps
+                    else empty_map
+                ),
+                attention_reference_map=(
+                    attention_reference.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                    if self.save_maps
+                    else empty_map
+                ),
+
+                similarity_subject_entropy=entropy(
+                    similarity_subject
+                ),
+                similarity_reference_entropy=entropy(
+                    similarity_reference
+                ),
+                similarity_subject_topk=topk_mass(
+                    similarity_subject,
+                    self.top_fraction,
+                ),
+                similarity_reference_topk=topk_mass(
+                    similarity_reference,
+                    self.top_fraction,
+                ),
+                similarity_subject_compactness=compactness(
+                    similarity_subject,
+                    coordinates,
+                    similarity_subject_centroid,
+                ),
+                similarity_reference_compactness=compactness(
+                    similarity_reference,
+                    coordinates,
+                    similarity_reference_centroid,
+                ),
+                similarity_overlap=overlap(
+                    similarity_subject,
+                    similarity_reference,
+                ),
+                similarity_separation=float(
+                    torch.linalg.vector_norm(
+                        similarity_subject_centroid
+                        - similarity_reference_centroid
+                    )
+                    .detach()
+                    .cpu()
+                ),
+                similarity_gt_axis_margin=gt_axis_margin(
+                    similarity_subject_centroid,
+                    similarity_reference_centroid,
+                    int(self.gt_code),
+                ),
+
+                attention_subject_entropy=entropy(
+                    attention_subject
+                ),
+                attention_reference_entropy=entropy(
+                    attention_reference
+                ),
+                attention_subject_topk=topk_mass(
+                    attention_subject,
+                    self.top_fraction,
+                ),
+                attention_reference_topk=topk_mass(
+                    attention_reference,
+                    self.top_fraction,
+                ),
+                attention_subject_compactness=compactness(
+                    attention_subject,
+                    coordinates,
+                    attention_subject_centroid,
+                ),
+                attention_reference_compactness=compactness(
+                    attention_reference,
+                    coordinates,
+                    attention_reference_centroid,
+                ),
+                attention_overlap=overlap(
+                    attention_subject,
+                    attention_reference,
+                ),
+                attention_separation=float(
+                    torch.linalg.vector_norm(
+                        attention_subject_centroid
+                        - attention_reference_centroid
+                    )
+                    .detach()
+                    .cpu()
+                ),
+                attention_gt_axis_margin=gt_axis_margin(
+                    attention_subject_centroid,
+                    attention_reference_centroid,
+                    int(self.gt_code),
+                ),
+                attention_subject_visual_mass=float(
+                    attention_data["subject_mass"]
+                ),
+                attention_reference_visual_mass=float(
+                    attention_data["reference_mass"]
+                ),
+                attention_subject_head_agreement=float(
+                    attention_data["subject_agreement"]
+                ),
+                attention_reference_head_agreement=float(
+                    attention_data["reference_agreement"]
+                ),
+            )
+
+            return output
+
+        return hook
+
+
+_COMPATIBILITY_SCALAR_FIELDS = (
+    "similarity_subject_entropy",
+    "similarity_reference_entropy",
+    "similarity_subject_topk",
+    "similarity_reference_topk",
+    "similarity_subject_compactness",
+    "similarity_reference_compactness",
+    "similarity_overlap",
+    "similarity_separation",
+    "similarity_gt_axis_margin",
+    "attention_subject_entropy",
+    "attention_reference_entropy",
+    "attention_subject_topk",
+    "attention_reference_topk",
+    "attention_subject_compactness",
+    "attention_reference_compactness",
+    "attention_overlap",
+    "attention_separation",
+    "attention_gt_axis_margin",
+    "attention_subject_visual_mass",
+    "attention_reference_visual_mass",
+    "attention_subject_head_agreement",
+    "attention_reference_head_agreement",
+)
+
+
+def _compatibility_pair_drift(
+    subject_centroids: np.ndarray,
+    reference_centroids: np.ndarray,
+) -> np.ndarray:
+    output = np.full(
+        int(subject_centroids.shape[0]),
+        np.nan,
+        dtype=np.float32,
+    )
+
+    if subject_centroids.shape[0] > 1:
+        output[1:] = 0.5 * (
+            np.linalg.norm(
+                subject_centroids[1:] - subject_centroids[:-1],
+                axis=-1,
+            )
+            + np.linalg.norm(
+                reference_centroids[1:] - reference_centroids[:-1],
+                axis=-1,
+            )
+        )
+
+    return output
+
+
+def sample_result_to_arrays(
+    results: Mapping[int, _LayerGroundingResult],
+    n_layers: int,
+) -> Dict[str, np.ndarray]:
+    missing = [
+        layer_id
+        for layer_id in range(int(n_layers))
+        if layer_id not in results
+    ]
+    if missing:
+        raise RuntimeError(
+            f"Missing layer grounding results: {missing[:10]}"
+        )
+
+    similarity_subject_centroid = np.stack(
+        [
+            results[layer_id].similarity_subject_centroid
+            for layer_id in range(n_layers)
+        ],
+        axis=0,
+    )
+    similarity_reference_centroid = np.stack(
+        [
+            results[layer_id].similarity_reference_centroid
+            for layer_id in range(n_layers)
+        ],
+        axis=0,
+    )
+    attention_subject_centroid = np.stack(
+        [
+            results[layer_id].attention_subject_centroid
+            for layer_id in range(n_layers)
+        ],
+        axis=0,
+    )
+    attention_reference_centroid = np.stack(
+        [
+            results[layer_id].attention_reference_centroid
+            for layer_id in range(n_layers)
+        ],
+        axis=0,
+    )
+
+    output: Dict[str, np.ndarray] = {
+        "similarity_prediction": np.asarray(
+            [
+                results[layer_id].similarity_prediction
+                for layer_id in range(n_layers)
+            ],
+            dtype=np.int16,
+        ),
+        "attention_prediction": np.asarray(
+            [
+                results[layer_id].attention_prediction
+                for layer_id in range(n_layers)
+            ],
+            dtype=np.int16,
+        ),
+        "similarity_subject_centroid": (
+            similarity_subject_centroid.astype(np.float32)
+        ),
+        "similarity_reference_centroid": (
+            similarity_reference_centroid.astype(np.float32)
+        ),
+        "attention_subject_centroid": (
+            attention_subject_centroid.astype(np.float32)
+        ),
+        "attention_reference_centroid": (
+            attention_reference_centroid.astype(np.float32)
+        ),
+        "similarity_centroid_drift": _compatibility_pair_drift(
+            similarity_subject_centroid,
+            similarity_reference_centroid,
+        ),
+        "attention_centroid_drift": _compatibility_pair_drift(
+            attention_subject_centroid,
+            attention_reference_centroid,
+        ),
+    }
+
+    for field_name in _COMPATIBILITY_SCALAR_FIELDS:
+        output[field_name] = np.asarray(
+            [
+                float(getattr(results[layer_id], field_name))
+                for layer_id in range(n_layers)
+            ],
+            dtype=np.float32,
+        )
+
+    first_result = results[0]
+    if first_result.similarity_subject_map.size:
+        output["similarity_subject_map"] = np.stack(
+            [
+                results[layer_id].similarity_subject_map
+                for layer_id in range(n_layers)
+            ],
+            axis=0,
+        ).astype(np.float32)
+        output["similarity_reference_map"] = np.stack(
+            [
+                results[layer_id].similarity_reference_map
+                for layer_id in range(n_layers)
+            ],
+            axis=0,
+        ).astype(np.float32)
+        output["attention_subject_map"] = np.stack(
+            [
+                results[layer_id].attention_subject_map
+                for layer_id in range(n_layers)
+            ],
+            axis=0,
+        ).astype(np.float32)
+        output["attention_reference_map"] = np.stack(
+            [
+                results[layer_id].attention_reference_map
+                for layer_id in range(n_layers)
+            ],
+            axis=0,
+        ).astype(np.float32)
+
+    return output
+
+
+
 if __name__ == "__main__":
     main()
