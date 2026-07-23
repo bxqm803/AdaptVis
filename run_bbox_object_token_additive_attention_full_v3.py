@@ -25,7 +25,7 @@ import analyze_object_visual_attention_layers_v1 as grounding
 
 
 # ============================================================================
-# First experiment configuration
+# Full-dataset experiment configuration
 # ============================================================================
 MODEL_NAME = "qwen-3b"
 DEVICE = "cuda:0"
@@ -36,18 +36,17 @@ DEVICE = "cuda:0"
 ADD_SCALES = [0.0, 0.0625, 0.125, 0.25, 0.5]
 
 # Set 20 for a quick smoke run; None means all eligible samples.
-MAX_PER_GROUP = None
+MAX_SAMPLES = None
 
-EXCLUDE_AMBIGUOUS = True
+EXCLUDE_AMBIGUOUS = False
 BBOX_THRESHOLD = 0.25
 MAX_NEW_TOKENS = 8
 FAIL_FAST = True
 
 DATA_ROOT = Path("data")
 PROMPT_JSONL = Path("prompts/COCO_QA_two_obj_with_answer_four_options.jsonl")
-INPUT_ROOT = Path("output/three_group_transfer_fresh/coco")
 BBOX_JSONL = Path("output/groundingdino_coco_two_bboxes/bboxes_by_sid.jsonl")
-OUTPUT_DIR = Path("output/bbox_object_token_additive_attention_v2/coco") / MODEL_NAME
+OUTPUT_DIR = Path("output/bbox_object_token_additive_attention_full_v3/coco") / MODEL_NAME
 
 
 def load_jsonl(path):
@@ -677,101 +676,155 @@ class BBoxObjectTokenAddManager:
         return hook
 
 
+def clean_generation_text(value, limit=120):
+    text = " ".join(str(value).replace("\n", " ").split())
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return text
+
+
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     sample_output = OUTPUT_DIR / "sample_results.jsonl"
+    sample_csv_output = OUTPUT_DIR / "sample_results.csv"
     error_output = OUTPUT_DIR / "errors.jsonl"
     summary_output = OUTPUT_DIR / "summary.csv"
     stats_output = OUTPUT_DIR / "added_attention_stats.csv"
+    eligible_output = OUTPUT_DIR / "eligible_sids.json"
 
-    for path in [
+    for path in (
         sample_output,
+        sample_csv_output,
         error_output,
         summary_output,
         stats_output,
-    ]:
+        eligible_output,
+    ):
         if path.exists():
             path.unlink()
+
+    alphas = [float(x) for x in ADD_SCALES]
+    if not alphas or 0.0 not in alphas:
+        raise ValueError("ADD_SCALES must contain 0.0 as the live baseline.")
+    # Baseline first, then interventions from weak to strong.
+    alphas = [0.0] + sorted(x for x in set(alphas) if x != 0.0)
 
     bbox_by_sid = {
         int(row["sid"]): row
         for row in load_jsonl(BBOX_JSONL)
     }
 
-    metadata_path = (
-        INPUT_ROOT
-        / MODEL_NAME
-        / "pass2_transfer_trace"
-        / "sample_metadata.jsonl"
-    )
-    prior_rows = repair.read_jsonl(metadata_path)
-    selected_groups = [
-        repair.GROUP_A,
-        repair.GROUP_B,
-        repair.GROUP_C,
-        repair.GROUP_D,
-    ]
-    prior_rows = repair.cap_rows(
-        prior_rows,
-        selected_groups=selected_groups,
-        max_per_group=MAX_PER_GROUP,
-        seed=0,
-        sid=None,
-    )
-
-    prior_rows = [
-        row
-        for row in prior_rows
-        if int(row["sid"]) in bbox_by_sid
-        and selected_box(
-            bbox_by_sid[int(row["sid"])], "subject"
-        ) is not None
-        and selected_box(
-            bbox_by_sid[int(row["sid"])], "reference"
-        ) is not None
-        and (
-            not EXCLUDE_AMBIGUOUS
-            or not bool(
-                bbox_by_sid[int(row["sid"])].get(
-                    "either_ambiguous", False
-                )
-            )
-        )
-    ]
-
     backend = core.import_two_object_module()
-    records, _ = backend.load_records(
-        "coco_two", DATA_ROOT, None
+    records, dataset_audit = backend.load_records(
+        "coco_two",
+        DATA_ROOT,
+        None,
     )
     record_by_sid = {
-        int(record.sid): record for record in records
+        int(record.sid): record
+        for record in records
     }
-    prompt_rows = core.load_standard_prompts(
-        PROMPT_JSONL
+    prompt_rows = core.load_standard_prompts(PROMPT_JSONL)
+
+    common_sids = sorted(
+        set(record_by_sid)
+        & set(prompt_rows)
+        & set(bbox_by_sid)
     )
+
+    missing_subject_box = 0
+    missing_reference_box = 0
+    excluded_ambiguous = 0
+    eligible_sids = []
+
+    for sid in common_sids:
+        bbox_row = bbox_by_sid[sid]
+        subject_box = selected_box(bbox_row, "subject")
+        reference_box = selected_box(bbox_row, "reference")
+
+        if subject_box is None:
+            missing_subject_box += 1
+            continue
+        if reference_box is None:
+            missing_reference_box += 1
+            continue
+        if (
+            EXCLUDE_AMBIGUOUS
+            and bool(bbox_row.get("either_ambiguous", False))
+        ):
+            excluded_ambiguous += 1
+            continue
+
+        eligible_sids.append(sid)
+
+    if MAX_SAMPLES is not None:
+        eligible_sids = eligible_sids[: int(MAX_SAMPLES)]
+
+    if not eligible_sids:
+        raise RuntimeError("No eligible full-dataset samples.")
+
+    eligible_output.write_text(
+        json.dumps(
+            {
+                "model": MODEL_NAME,
+                "eligible_sids": eligible_sids,
+                "n": len(eligible_sids),
+                "exclude_ambiguous": EXCLUDE_AMBIGUOUS,
+                "max_samples": MAX_SAMPLES,
+                "audit": {
+                    "records": len(record_by_sid),
+                    "prompts": len(prompt_rows),
+                    "bbox_rows": len(bbox_by_sid),
+                    "common_sids": len(common_sids),
+                    "missing_subject_box": missing_subject_box,
+                    "missing_reference_box": missing_reference_box,
+                    "excluded_ambiguous": excluded_ambiguous,
+                    "dataset_audit": dataset_audit,
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        ),
+        encoding="utf-8",
+    )
+
+    if MODEL_NAME not in backend.SPECS:
+        raise ValueError(
+            f"Unknown model {MODEL_NAME!r}; "
+            f"available={sorted(backend.SPECS)}"
+        )
 
     spec = backend.SPECS[MODEL_NAME]
-    model_cls = getattr(
-        transformers, spec.model_class
-    )
+    model_cls = getattr(transformers, spec.model_class, None)
+    if model_cls is None:
+        raise RuntimeError(
+            f"transformers=={transformers.__version__} "
+            f"has no {spec.model_class}"
+        )
 
-    print("=" * 130)
-    print(
-        "BBOX-TARGETED ADDITIVE OBJECT-TOKEN ATTENTION V2"
-    )
-    print("=" * 130)
-    print(f"model={MODEL_NAME}")
-    print(f"samples={len(prior_rows)}")
-    print(f"alphas={ADD_SCALES}")
-    print("all decoder layers; all attention heads")
+    print("=" * 160)
+    print("FULL-DATASET BBOX-TARGETED ADDITIVE OBJECT-TOKEN ATTENTION V3")
+    print("=" * 160)
+    print(f"model={MODEL_NAME} -> {spec.repo_id}")
+    print(f"records={len(record_by_sid)}")
+    print(f"prompts={len(prompt_rows)}")
+    print(f"bbox_rows={len(bbox_by_sid)}")
+    print(f"common_sids={len(common_sids)}")
+    print(f"eligible_samples={len(eligible_sids)}")
+    print(f"exclude_ambiguous={EXCLUDE_AMBIGUOUS}")
+    print(f"alphas={alphas}")
+    print("No A/B/C/D filtering or grouped evaluation.")
+    print("Every eligible full-dataset sample is generated live.")
+    print("Every run prints: gt, generation text, pred, acc, baseline pred, change, running acc.")
+    print("All decoder layers and all attention heads are intervened.")
     print(
         "A'[object_query,bbox_key] = "
-        "A + alpha * "
-        "mean(A[object_query,all_visual_keys])"
+        "A + alpha * mean(A[object_query,all_visual_keys])"
     )
     print("No multiplication. No renormalization.")
-    print("Self-contained processor-aware bbox mapping; FAIL_FAST=True.")
-    print("=" * 130)
+    print("=" * 160)
 
     model = model_cls.from_pretrained(
         spec.repo_id,
@@ -788,25 +841,40 @@ def main():
         trust_remote_code=spec.trust_remote_code,
     )
     core.configure_processor(model, processor)
+
     device = torch.device(DEVICE)
-    layers, layers_path = (
-        core.resolve_decoder_layers(model)
-    )
+    layers, layers_path = core.resolve_decoder_layers(model)
     manager = BBoxObjectTokenAddManager(layers)
 
+    print(f"decoder_path={layers_path}")
+    print(f"decoder_layers={len(layers)}")
+    print("=" * 160)
+
     rows = []
+    running = {
+        alpha: {
+            "n": 0,
+            "correct": 0,
+            "changed": 0,
+            "wrong_to_correct": 0,
+            "correct_to_wrong": 0,
+        }
+        for alpha in alphas
+    }
+
     progress = tqdm(
-        prior_rows,
-        desc=f"bbox-add:{MODEL_NAME}",
+        enumerate(eligible_sids, 1),
+        total=len(eligible_sids),
+        desc=f"bbox-add-full:{MODEL_NAME}",
         unit="sample",
         dynamic_ncols=True,
     )
 
     try:
-        for prior in progress:
-            sid = int(prior["sid"])
+        for sample_index, sid in progress:
             image = None
             batch = None
+
             try:
                 record = record_by_sid[sid]
                 prompt = prompt_rows[sid]
@@ -816,21 +884,26 @@ def main():
                 subject = str(prompt["subject"])
                 reference = str(prompt["reference"])
                 question = str(prompt["question_text"])
-                gt = repair.normalize_relation(
-                    prompt["answer_raw"]
-                )
+                gt = repair.normalize_relation(prompt["answer_raw"])
+
                 if gt not in repair.RELATIONS:
                     raise RuntimeError(
-                        f"Invalid GT: "
+                        f"Invalid GT for sid={sid}: "
                         f"{prompt['answer_raw']!r}"
                     )
 
                 subject_box = selected_box(
-                    bbox_row, "subject"
+                    bbox_row,
+                    "subject",
                 )
                 reference_box = selected_box(
-                    bbox_row, "reference"
+                    bbox_row,
+                    "reference",
                 )
+                if subject_box is None or reference_box is None:
+                    raise RuntimeError(
+                        f"Missing selected bbox for sid={sid}"
+                    )
 
                 batch = core.make_question_batch(
                     processor=processor,
@@ -839,37 +912,31 @@ def main():
                     device=device,
                 )
                 batch = repair.move_batch_to_device(
-                    batch, device
+                    batch,
+                    device,
                 )
 
-                prompt_spec = (
-                    repair.build_prompt_position_spec(
-                        model=model,
-                        tokenizer=processor.tokenizer,
-                        input_ids=batch["input_ids"],
-                        subject=subject,
-                        reference=reference,
-                    )
+                prompt_spec = repair.build_prompt_position_spec(
+                    model=model,
+                    tokenizer=processor.tokenizer,
+                    input_ids=batch["input_ids"],
+                    subject=subject,
+                    reference=reference,
                 )
 
-                input_length = int(
-                    batch["input_ids"].shape[1]
-                )
+                input_length = int(batch["input_ids"].shape[1])
                 expanded = repair.expand_positions(
                     prompt_spec,
                     hidden_length=input_length,
                 )
-                visual_count = len(
-                    expanded.visual_positions
-                )
-                grid_h, grid_w, grid_source = (
-                    grounding.infer_grid(
-                        visual_count,
-                        batch,
-                        tuple(image.size),
-                        model,
-                        processor,
-                    )
+                visual_count = len(expanded.visual_positions)
+
+                grid_h, grid_w, grid_source = grounding.infer_grid(
+                    visual_count,
+                    batch,
+                    tuple(image.size),
+                    model,
+                    processor,
                 )
 
                 subject_soft, reference_soft, mask_meta = (
@@ -890,60 +957,89 @@ def main():
                     grid_h,
                     grid_w,
                 )
+
                 subject_mask = hard_mask(
-                    subject_soft, BBOX_THRESHOLD
+                    subject_soft,
+                    BBOX_THRESHOLD,
                 )
                 reference_mask = hard_mask(
-                    reference_soft, BBOX_THRESHOLD
+                    reference_soft,
+                    BBOX_THRESHOLD,
                 )
 
-                results = {}
-                for alpha in ADD_SCALES:
+                baseline_text = None
+                baseline_prediction = None
+                baseline_correct = None
+
+                for alpha in alphas:
                     manager.configure(
                         alpha=alpha,
                         prompt_spec=prompt_spec,
                         subject_visual_mask=subject_mask,
                         reference_visual_mask=reference_mask,
                     )
-                    text, prediction = (
-                        repair.generate_relation(
-                            model=model,
-                            processor=processor,
-                            batch=batch,
-                            max_new_tokens=MAX_NEW_TOKENS,
-                            need_attentions=(
-                                float(alpha) != 0.0
-                            ),
-                        )
-                    )
-                    results[float(alpha)] = (
-                        text, prediction
+
+                    generated_text, prediction = repair.generate_relation(
+                        model=model,
+                        processor=processor,
+                        batch=batch,
+                        max_new_tokens=MAX_NEW_TOKENS,
+                        need_attentions=(alpha != 0.0),
                     )
                     manager.reset()
 
-                baseline_text, baseline_prediction = (
-                    results[0.0]
-                )
-                baseline_correct = (
-                    baseline_prediction == gt
-                )
+                    if alpha == 0.0:
+                        baseline_text = generated_text
+                        baseline_prediction = prediction
+                        baseline_correct = prediction == gt
 
-                for alpha in ADD_SCALES:
-                    alpha = float(alpha)
-                    text, prediction = results[alpha]
+                    if baseline_prediction is None or baseline_correct is None:
+                        raise RuntimeError(
+                            "Baseline alpha=0.0 was not executed first."
+                        )
+
+                    parsed = prediction in repair.RELATIONS
+                    correct = prediction == gt
+                    changed = prediction != baseline_prediction
+                    wrong_to_correct = (
+                        not baseline_correct and correct
+                    )
+                    correct_to_wrong = (
+                        baseline_correct and not correct
+                    )
+
+                    state = running[alpha]
+                    state["n"] += 1
+                    state["correct"] += int(correct)
+                    state["changed"] += int(changed)
+                    state["wrong_to_correct"] += int(
+                        wrong_to_correct
+                    )
+                    state["correct_to_wrong"] += int(
+                        correct_to_wrong
+                    )
+                    running_accuracy = (
+                        state["correct"] / state["n"]
+                    )
+
                     row = {
                         "model": MODEL_NAME,
+                        "sample_index": sample_index,
                         "sid": sid,
-                        "group": str(prior["group"]),
-                        "group_short": repair.group_short(
-                            str(prior["group"])
-                        ),
                         "gt": gt,
                         "subject": subject,
                         "reference": reference,
-                        "grid_height": grid_h,
-                        "grid_width": grid_w,
+                        "either_ambiguous": bool(
+                            bbox_row.get(
+                                "either_ambiguous",
+                                False,
+                            )
+                        ),
+                        "grid_height": int(grid_h),
+                        "grid_width": int(grid_w),
                         "grid_source": grid_source,
+                        "pixel_key": mask_meta.get("pixel_key"),
+                        "pixel_shape": mask_meta.get("pixel_shape"),
                         "subject_bbox_tokens": int(
                             subject_mask.sum()
                         ),
@@ -953,60 +1049,72 @@ def main():
                         "visual_tokens": int(
                             subject_mask.size
                         ),
-                        "alpha": alpha,
-                        "baseline_prediction": (
-                            baseline_prediction
-                        ),
-                        "baseline_text": baseline_text,
+                        "alpha": float(alpha),
+                        "baseline_generation": baseline_text,
+                        "baseline_prediction": baseline_prediction,
                         "baseline_correct": bool(
                             baseline_correct
                         ),
+                        "generation": generated_text,
                         "prediction": prediction,
-                        "text": text,
-                        "parsed": (
-                            prediction in repair.RELATIONS
+                        "parsed": bool(parsed),
+                        "correct": bool(correct),
+                        "changed_prediction": bool(changed),
+                        "wrong_to_correct": bool(
+                            wrong_to_correct
                         ),
-                        "correct": prediction == gt,
-                        "wrong_to_correct": (
-                            not baseline_correct
-                            and prediction == gt
+                        "correct_to_wrong": bool(
+                            correct_to_wrong
                         ),
-                        "correct_to_wrong": (
-                            baseline_correct
-                            and prediction != gt
-                        ),
-                        "changed_prediction": (
-                            prediction
-                            != baseline_prediction
+                        "running_accuracy": float(
+                            running_accuracy
                         ),
                     }
-                    append_jsonl(
-                        sample_output, row
-                    )
+                    append_jsonl(sample_output, row)
                     rows.append(row)
+
+                    generation_display = clean_generation_text(
+                        generated_text
+                    )
+                    print(
+                        f"[{sample_index:03d}/{len(eligible_sids):03d}] "
+                        f"sid={sid:04d} "
+                        f"alpha={alpha:>6g} | "
+                        f"gt={gt:<5s} | "
+                        f'generation="{generation_display}" | '
+                        f"pred={str(prediction):<5s} | "
+                        f"acc={int(correct)} | "
+                        f"baseline_pred={str(baseline_prediction):<5s} | "
+                        f"baseline_acc={int(baseline_correct)} | "
+                        f"changed={int(changed)} | "
+                        f"W→C={int(wrong_to_correct)} | "
+                        f"C→W={int(correct_to_wrong)} | "
+                        f"running_acc={running_accuracy:.4f}",
+                        flush=True,
+                    )
 
             except Exception as exc:
                 append_jsonl(
                     error_output,
                     {
                         "sid": sid,
-                        "group": prior.get("group"),
-                        "error_type": (
-                            type(exc).__name__
-                        ),
+                        "sample_index": sample_index,
+                        "error_type": type(exc).__name__,
                         "error": str(exc),
                         "traceback_tail": (
                             traceback.format_exc()
-                            .splitlines()[-30:]
+                            .splitlines()[-40:]
                         ),
                     },
                 )
-                tqdm.write(
+                print(
                     f"[ERROR] sid={sid}: "
-                    f"{type(exc).__name__}: {exc}"
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
                 )
                 if FAIL_FAST:
                     raise
+
             finally:
                 manager.reset()
                 if image is not None:
@@ -1016,19 +1124,29 @@ def main():
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
     finally:
         progress.close()
         manager.close()
 
+    if not rows:
+        raise RuntimeError("No successful generation rows.")
+
     df = pd.DataFrame(rows)
+    df.to_csv(sample_csv_output, index=False)
+
     summary_rows = []
 
-    for alpha in sorted(df["alpha"].unique()):
+    for alpha in alphas:
         part = df[df["alpha"] == alpha].copy()
-        base_acc = float(
+        if part.empty:
+            continue
+
+        baseline_accuracy = float(
             part["baseline_correct"].mean()
         )
         accuracy = float(part["correct"].mean())
+
         baseline_wrong = part[
             ~part["baseline_correct"]
         ]
@@ -1037,15 +1155,13 @@ def main():
         ]
 
         summary = {
-            "alpha": alpha,
-            "n": len(part),
-            "parse_rate": float(
-                part["parsed"].mean()
-            ),
-            "baseline_accuracy": base_acc,
+            "alpha": float(alpha),
+            "n": int(len(part)),
+            "parse_rate": float(part["parsed"].mean()),
+            "baseline_accuracy": baseline_accuracy,
             "accuracy": accuracy,
             "accuracy_change": (
-                accuracy - base_acc
+                accuracy - baseline_accuracy
             ),
             "prediction_change_rate": float(
                 part["changed_prediction"].mean()
@@ -1055,12 +1171,6 @@ def main():
             ),
             "correct_to_wrong_count": int(
                 part["correct_to_wrong"].sum()
-            ),
-            "wrong_to_correct_rate_all": float(
-                part["wrong_to_correct"].mean()
-            ),
-            "correct_to_wrong_rate_all": float(
-                part["correct_to_wrong"].mean()
             ),
             "repair_rate_among_baseline_wrong": (
                 float(
@@ -1082,26 +1192,25 @@ def main():
             ),
         }
 
-        for group in selected_groups:
-            group_rows = part[
-                part["group"] == group
+        for relation in repair.RELATIONS:
+            relation_rows = part[
+                part["gt"] == relation
             ]
-            short = repair.group_short(group)
-            summary[f"{short}_n"] = len(
-                group_rows
+            summary[f"{relation}_n"] = int(
+                len(relation_rows)
             )
-            summary[f"{short}_accuracy"] = (
-                float(group_rows["correct"].mean())
-                if len(group_rows)
+            summary[f"{relation}_accuracy"] = (
+                float(
+                    relation_rows["correct"].mean()
+                )
+                if len(relation_rows)
                 else float("nan")
             )
 
         summary_rows.append(summary)
 
     summary_df = pd.DataFrame(summary_rows)
-    summary_df.to_csv(
-        summary_output, index=False
-    )
+    summary_df.to_csv(summary_output, index=False)
 
     stat_rows = []
     for alpha_layer in sorted(manager.stats):
@@ -1111,16 +1220,20 @@ def main():
             "alpha": float(alpha),
             "layer": int(layer_id),
         }
+
         for label in ("subject", "reference"):
             n = max(
-                1.0, stat.get(f"{label}_n", 0.0)
+                1.0,
+                stat.get(f"{label}_n", 0.0),
             )
             mean_mu = (
                 stat.get(
-                    f"{label}_mu_sum", 0.0
+                    f"{label}_mu_sum",
+                    0.0,
                 )
                 / n
             )
+
             row[
                 f"{label}_mean_visual_attention_per_patch"
             ] = mean_mu
@@ -1131,7 +1244,8 @@ def main():
                 f"{label}_mean_added_total_attention_mass"
             ] = (
                 stat.get(
-                    f"{label}_added_mass_sum", 0.0
+                    f"{label}_added_mass_sum",
+                    0.0,
                 )
                 / n
             )
@@ -1139,7 +1253,8 @@ def main():
                 f"{label}_mean_original_visual_attention_mass"
             ] = (
                 stat.get(
-                    f"{label}_visual_mass_sum", 0.0
+                    f"{label}_visual_mass_sum",
+                    0.0,
                 )
                 / n
             )
@@ -1161,46 +1276,26 @@ def main():
                 )
                 / n
             )
+
         stat_rows.append(row)
 
     stats_df = pd.DataFrame(stat_rows)
     stats_df.to_csv(stats_output, index=False)
 
-    print("\n" + "=" * 150)
-    print("RESULT")
-    print("=" * 150)
+    print("\n" + "=" * 180)
+    print("FULL-DATASET RESULT — NO GROUPS")
+    print("=" * 180)
     print(
         summary_df.to_string(
             index=False,
-            float_format=lambda x: f"{x:.4f}",
-        )
-    )
-
-    print("\n" + "=" * 150)
-    print("MEAN ACTUAL ADDITION BY LAYER")
-    print("=" * 150)
-    show_layers = sorted(
-        set(
-            list(range(min(5, len(layers))))
-            + list(
-                range(
-                    max(0, len(layers) - 5),
-                    len(layers),
-                )
-            )
-        )
-    )
-    print(
-        stats_df[
-            stats_df["layer"].isin(show_layers)
-        ].to_string(
-            index=False,
-            float_format=lambda x: f"{x:.6f}",
+            float_format=lambda value: f"{value:.4f}",
         )
     )
 
     print("\nSaved:")
+    print(" ", eligible_output)
     print(" ", sample_output)
+    print(" ", sample_csv_output)
     print(" ", summary_output)
     print(" ", stats_output)
     if (
