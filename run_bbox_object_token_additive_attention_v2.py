@@ -17,11 +17,11 @@ import torch.nn.functional as F
 import transformers
 from tqdm import tqdm
 from transformers import AutoProcessor
+from PIL import Image, ImageDraw
 
 import trace_centroid_generation_groups_v2_1 as core
 import run_spatial_repair_three_experiments_v1 as repair
 import analyze_object_visual_attention_layers_v1 as grounding
-import evaluate_attention_grounding_with_gdino_bboxes_v1 as bbox_eval
 
 
 # ============================================================================
@@ -31,9 +31,9 @@ MODEL_NAME = "qwen-3b"
 DEVICE = "cuda:0"
 
 # 0.0 is an exact same-path baseline.
-# 1.0 means: for every bbox visual token, add one per-head/per-query
-# full-image mean visual attention probability.
-ADD_SCALES = [0.0, 1.0]
+# alpha means: for every bbox visual token, add alpha times the
+# per-head/per-object-token mean attention over all visual keys.
+ADD_SCALES = [0.0, 0.0625, 0.125, 0.25, 0.5]
 
 # Set 20 for a quick smoke run; None means all eligible samples.
 MAX_PER_GROUP = None
@@ -41,12 +41,13 @@ MAX_PER_GROUP = None
 EXCLUDE_AMBIGUOUS = True
 BBOX_THRESHOLD = 0.25
 MAX_NEW_TOKENS = 8
+FAIL_FAST = True
 
 DATA_ROOT = Path("data")
 PROMPT_JSONL = Path("prompts/COCO_QA_two_obj_with_answer_four_options.jsonl")
 INPUT_ROOT = Path("output/three_group_transfer_fresh/coco")
 BBOX_JSONL = Path("output/groundingdino_coco_two_bboxes/bboxes_by_sid.jsonl")
-OUTPUT_DIR = Path("output/bbox_object_token_additive_attention/coco") / MODEL_NAME
+OUTPUT_DIR = Path("output/bbox_object_token_additive_attention_v2/coco") / MODEL_NAME
 
 
 def load_jsonl(path):
@@ -81,6 +82,291 @@ def hard_mask(soft, threshold):
     if not m.any():
         m[int(np.argmax(x))] = True
     return m
+
+
+def box_mask(size, box_xyxy):
+    """Create an original-image-space binary RGB mask for one xyxy box."""
+    width, height = [int(v) for v in size]
+    image = Image.new("RGB", (width, height), (0, 0, 0))
+    draw = ImageDraw.Draw(image)
+
+    x1, y1, x2, y2 = [float(v) for v in box_xyxy]
+    x1 = max(0.0, min(float(width), x1))
+    x2 = max(0.0, min(float(width), x2))
+    y1 = max(0.0, min(float(height), y1))
+    y2 = max(0.0, min(float(height), y2))
+
+    if x2 > x1 and y2 > y1:
+        draw.rectangle([x1, y1, x2, y2], fill=(255, 255, 255))
+    return image
+
+
+def processor_mask_batch(processor, image, question_text):
+    """
+    Run the exact VLM processor used for the real image.
+    Keep this on CPU: it is only used to recover processor geometry.
+    """
+    return core.make_question_batch(
+        processor=processor,
+        image=image,
+        question_text=question_text,
+        device=torch.device("cpu"),
+    )
+
+
+def find_pixel_tensor(batch):
+    preferred = (
+        "pixel_values",
+        "pixel_values_images",
+        "image_pixel_values",
+    )
+    for key in preferred:
+        value = batch.get(key)
+        if torch.is_tensor(value):
+            return key, value.detach().float().cpu()
+
+    for key, value in batch.items():
+        if "pixel" in str(key).lower() and torch.is_tensor(value):
+            return str(key), value.detach().float().cpu()
+
+    raise RuntimeError(
+        f"No processed pixel tensor. Batch keys={list(batch.keys())}"
+    )
+
+
+def occupancy_ratio(mask_tensor, black_tensor, white_tensor):
+    if (
+        mask_tensor.shape != black_tensor.shape
+        or mask_tensor.shape != white_tensor.shape
+    ):
+        raise RuntimeError(
+            "Processed mask/black/white shapes differ: "
+            f"{tuple(mask_tensor.shape)}, "
+            f"{tuple(black_tensor.shape)}, "
+            f"{tuple(white_tensor.shape)}"
+        )
+
+    denominator = white_tensor - black_tensor
+    valid = denominator.abs() > 1e-6
+    ratio = torch.zeros_like(mask_tensor, dtype=torch.float32)
+    ratio[valid] = (
+        mask_tensor[valid] - black_tensor[valid]
+    ) / denominator[valid]
+    return ratio.clamp(0.0, 1.0)
+
+
+def processed_mask_to_grid(
+    mask_batch,
+    black_batch,
+    white_batch,
+    grid_h,
+    grid_w,
+):
+    mask_key, mask_tensor = find_pixel_tensor(mask_batch)
+    black_key, black_tensor = find_pixel_tensor(black_batch)
+    white_key, white_tensor = find_pixel_tensor(white_batch)
+
+    if not (
+        mask_key == black_key == white_key
+    ):
+        raise RuntimeError(
+            "Processed pixel tensor keys differ: "
+            f"{mask_key}, {black_key}, {white_key}"
+        )
+
+    ratio = occupancy_ratio(
+        mask_tensor,
+        black_tensor,
+        white_tensor,
+    )
+
+    # LLaVA / CLIP-style [B,C,H,W].
+    if ratio.ndim == 4:
+        image = ratio[0].mean(dim=0)[None, None]
+        pooled = F.adaptive_avg_pool2d(
+            image, (grid_h, grid_w)
+        )[0, 0]
+        return pooled.numpy().astype(np.float32)
+
+    # Possible video/tiled [B,T,C,H,W] or [B,C,T,H,W].
+    if ratio.ndim == 5:
+        x = ratio[0]
+        if x.shape[0] in (1, 3, 4):
+            image = x.mean(dim=(0, 1))[None, None]
+        elif x.shape[1] in (1, 3, 4):
+            image = x.mean(dim=(0, 1))[None, None]
+        else:
+            raise RuntimeError(
+                f"Unsupported 5D pixel tensor: {tuple(ratio.shape)}"
+            )
+        pooled = F.adaptive_avg_pool2d(
+            image, (grid_h, grid_w)
+        )[0, 0]
+        return pooled.numpy().astype(np.float32)
+
+    # Qwen2.5-VL flattened patch rows [N,D] or [1,N,D].
+    if ratio.ndim == 3 and ratio.shape[0] == 1:
+        ratio = ratio[0]
+
+    if ratio.ndim == 2:
+        patch_occupancy = ratio.mean(dim=-1)
+        grid = mask_batch.get("image_grid_thw")
+        if not torch.is_tensor(grid) or grid.numel() < 3:
+            raise RuntimeError(
+                "Flattened pixel tensor requires image_grid_thw"
+            )
+
+        temporal, raw_h, raw_w = [
+            int(v)
+            for v in grid.detach().cpu().reshape(-1, 3)[0].tolist()
+        ]
+        expected = temporal * raw_h * raw_w
+        if patch_occupancy.numel() != expected:
+            raise RuntimeError(
+                "Qwen processed patch count mismatch: "
+                f"rows={patch_occupancy.numel()}, "
+                f"grid={temporal}x{raw_h}x{raw_w}={expected}"
+            )
+
+        raw = patch_occupancy.reshape(
+            temporal, raw_h, raw_w
+        ).mean(dim=0)
+        pooled = F.adaptive_avg_pool2d(
+            raw[None, None],
+            (grid_h, grid_w),
+        )[0, 0]
+        return pooled.numpy().astype(np.float32)
+
+    raise RuntimeError(
+        f"Unsupported processed pixel tensor shape: {tuple(ratio.shape)}"
+    )
+
+
+def processor_box_masks(
+    processor,
+    question_text,
+    image_size,
+    subject_box,
+    reference_box,
+    grid_h,
+    grid_w,
+):
+    """
+    Map original-image xyxy boxes to the exact VLM visual-token grid.
+
+    This function is deliberately self-contained. It does not import the
+    grounding-evaluation script, so helper names/signatures cannot drift.
+    """
+    width, height = [int(v) for v in image_size]
+
+    subject_image = box_mask(
+        (width, height), subject_box
+    )
+    reference_image = box_mask(
+        (width, height), reference_box
+    )
+    black_image = Image.new(
+        "RGB", (width, height), (0, 0, 0)
+    )
+    white_image = Image.new(
+        "RGB", (width, height), (255, 255, 255)
+    )
+
+    batches = []
+    try:
+        subject_batch = processor_mask_batch(
+            processor, subject_image, question_text
+        )
+        reference_batch = processor_mask_batch(
+            processor, reference_image, question_text
+        )
+        black_batch = processor_mask_batch(
+            processor, black_image, question_text
+        )
+        white_batch = processor_mask_batch(
+            processor, white_image, question_text
+        )
+        batches = [
+            subject_batch,
+            reference_batch,
+            black_batch,
+            white_batch,
+        ]
+
+        subject_mask = processed_mask_to_grid(
+            subject_batch,
+            black_batch,
+            white_batch,
+            grid_h,
+            grid_w,
+        )
+        reference_mask = processed_mask_to_grid(
+            reference_batch,
+            black_batch,
+            white_batch,
+            grid_h,
+            grid_w,
+        )
+
+        pixel_key, pixel_value = find_pixel_tensor(
+            subject_batch
+        )
+        metadata = {
+            "pixel_key": pixel_key,
+            "pixel_shape": list(pixel_value.shape),
+            "image_grid_thw": (
+                subject_batch["image_grid_thw"]
+                .detach()
+                .cpu()
+                .tolist()
+                if torch.is_tensor(
+                    subject_batch.get("image_grid_thw")
+                )
+                else None
+            ),
+        }
+        return subject_mask, reference_mask, metadata
+    finally:
+        for image in (
+            subject_image,
+            reference_image,
+            black_image,
+            white_image,
+        ):
+            image.close()
+        del batches
+
+
+def validate_mask_geometry(
+    subject_soft,
+    reference_soft,
+    visual_count,
+    grid_h,
+    grid_w,
+):
+    expected_shape = (int(grid_h), int(grid_w))
+    if subject_soft.shape != expected_shape:
+        raise RuntimeError(
+            f"Subject bbox mask shape={subject_soft.shape}, "
+            f"expected={expected_shape}"
+        )
+    if reference_soft.shape != expected_shape:
+        raise RuntimeError(
+            f"Reference bbox mask shape={reference_soft.shape}, "
+            f"expected={expected_shape}"
+        )
+    if int(grid_h) * int(grid_w) != int(visual_count):
+        raise RuntimeError(
+            f"Grid {grid_h}x{grid_w} != visual_count={visual_count}"
+        )
+    if not np.isfinite(subject_soft).all():
+        raise RuntimeError("Subject bbox mask contains NaN/Inf")
+    if not np.isfinite(reference_soft).all():
+        raise RuntimeError("Reference bbox mask contains NaN/Inf")
+    if float(subject_soft.max()) <= 0:
+        raise RuntimeError("Subject bbox mask is empty after processing")
+    if float(reference_soft.max()) <= 0:
+        raise RuntimeError("Reference bbox mask is empty after processing")
 
 
 class BBoxObjectTokenAddManager:
@@ -270,7 +556,7 @@ class BBoxObjectTokenAddManager:
 
         visual_mass = visual_rows.sum(dim=-1)
         added_mass = float(self.alpha) * mu * len(bbox_keys)
-        stat = self.stats[layer_id]
+        stat = self.stats[(float(self.alpha), int(layer_id))]
         n = int(mu.numel())
         stat[f"{label}_mu_sum"] += float(
             mu.detach().float().sum().cpu()
@@ -471,7 +757,7 @@ def main():
 
     print("=" * 130)
     print(
-        "BBOX-TARGETED ADDITIVE OBJECT-TOKEN ATTENTION"
+        "BBOX-TARGETED ADDITIVE OBJECT-TOKEN ATTENTION V2"
     )
     print("=" * 130)
     print(f"model={MODEL_NAME}")
@@ -484,6 +770,7 @@ def main():
         "mean(A[object_query,all_visual_keys])"
     )
     print("No multiplication. No renormalization.")
+    print("Self-contained processor-aware bbox mapping; FAIL_FAST=True.")
     print("=" * 130)
 
     model = model_cls.from_pretrained(
@@ -585,17 +872,23 @@ def main():
                     )
                 )
 
-                subject_soft, reference_soft, _ = (
-                    bbox_eval.processor_aware_box_masks(
-                        core=core,
-                        processor=processor,
-                        question_text=question,
-                        image_size=tuple(image.size),
-                        subject_box=subject_box,
-                        reference_box=reference_box,
-                        grid_h=grid_h,
-                        grid_w=grid_w,
+                subject_soft, reference_soft, mask_meta = (
+                    processor_box_masks(
+                        processor,
+                        question,
+                        tuple(image.size),
+                        subject_box,
+                        reference_box,
+                        grid_h,
+                        grid_w,
                     )
+                )
+                validate_mask_geometry(
+                    subject_soft,
+                    reference_soft,
+                    visual_count,
+                    grid_h,
+                    grid_w,
                 )
                 subject_mask = hard_mask(
                     subject_soft, BBOX_THRESHOLD
@@ -712,6 +1005,8 @@ def main():
                     f"[ERROR] sid={sid}: "
                     f"{type(exc).__name__}: {exc}"
                 )
+                if FAIL_FAST:
+                    raise
             finally:
                 manager.reset()
                 if image is not None:
@@ -809,21 +1104,29 @@ def main():
     )
 
     stat_rows = []
-    for layer_id in sorted(manager.stats):
-        stat = manager.stats[layer_id]
-        row = {"layer": layer_id}
+    for alpha_layer in sorted(manager.stats):
+        alpha, layer_id = alpha_layer
+        stat = manager.stats[alpha_layer]
+        row = {
+            "alpha": float(alpha),
+            "layer": int(layer_id),
+        }
         for label in ("subject", "reference"):
             n = max(
                 1.0, stat.get(f"{label}_n", 0.0)
             )
-            row[
-                f"{label}_mean_visual_attention_per_patch"
-            ] = (
+            mean_mu = (
                 stat.get(
                     f"{label}_mu_sum", 0.0
                 )
                 / n
             )
+            row[
+                f"{label}_mean_visual_attention_per_patch"
+            ] = mean_mu
+            row[
+                f"{label}_mean_added_attention_per_bbox_patch"
+            ] = float(alpha) * mean_mu
             row[
                 f"{label}_mean_added_total_attention_mass"
             ] = (
