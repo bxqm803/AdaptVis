@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import inspect
 import os
 import sys
 import traceback
@@ -49,7 +50,7 @@ except Exception as exc:  # pragma: no cover
     raise SystemExit(f"Unable to import transformers GroundingDINO classes: {exc}")
 
 
-SCRIPT_VERSION = "coco-groundingdino-subject-reference-bboxes-v1"
+SCRIPT_VERSION = "coco-groundingdino-subject-reference-bboxes-v2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -286,25 +287,43 @@ def detect_candidates(
     encoded = move_inputs(encoded, device, model_dtype)
     outputs = model(**encoded)
 
-    post_kwargs = dict(
-        box_threshold=float(box_threshold),
-        text_threshold=float(text_threshold),
-        target_sizes=[(height, width)],
-    )
+    # transformers API compatibility:
+    # older releases use `box_threshold`; newer releases use `threshold`.
+    post_fn = processor.post_process_grounded_object_detection
+    try:
+        post_parameters = inspect.signature(post_fn).parameters
+    except (TypeError, ValueError):
+        post_parameters = {}
+
+    post_kwargs = {
+        "text_threshold": float(text_threshold),
+        "target_sizes": [(height, width)],
+    }
+    if "threshold" in post_parameters:
+        post_kwargs["threshold"] = float(box_threshold)
+    elif "box_threshold" in post_parameters:
+        post_kwargs["box_threshold"] = float(box_threshold)
+    else:
+        # Recent HF releases use `threshold`; use it as the fallback.
+        post_kwargs["threshold"] = float(box_threshold)
+
     input_ids = encoded.get("input_ids")
     try:
-        processed = processor.post_process_grounded_object_detection(
+        processed = post_fn(
             outputs,
             input_ids=input_ids,
             **post_kwargs,
         )[0]
-    except TypeError:
-        # Compatibility with transformers versions where input_ids is positional.
-        processed = processor.post_process_grounded_object_detection(
-            outputs,
-            input_ids,
-            **post_kwargs,
-        )[0]
+    except TypeError as keyword_error:
+        # Compatibility with releases where input_ids is positional.
+        try:
+            processed = post_fn(
+                outputs,
+                input_ids,
+                **post_kwargs,
+            )[0]
+        except TypeError:
+            raise keyword_error
 
     boxes = processed.get("boxes", torch.empty((0, 4))).detach().cpu().float()
     scores = processed.get("scores", torch.empty((0,))).detach().cpu().float()
@@ -530,6 +549,7 @@ def main() -> None:
 
     counts: Counter[str] = Counter()
     processed_now = 0
+    attempted_now = 0
     vis_saved = 0
 
     for sid, row in enumerate(tqdm(raw_rows, desc="GroundingDINO bboxes")):
@@ -540,8 +560,10 @@ def main() -> None:
         if sid in existing and not args.overwrite:
             counts["resumed_existing"] += 1
             continue
-        if args.limit > 0 and processed_now >= args.limit:
+        if args.limit > 0 and attempted_now >= args.limit:
             break
+        attempted_now += 1
+        counts["attempted"] += 1
 
         try:
             if not isinstance(row, (list, tuple)) or len(row) < 3:
