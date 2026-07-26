@@ -92,7 +92,7 @@ Main outputs
 
 Example
 -------
-CUDA_VISIBLE_DEVICES=0 python analyze_spatial_storage_transport_utilization_v1.py \
+CUDA_VISIBLE_DEVICES=0 python analyze_spatial_storage_transport_utilization_v2.py \
   --dataset coco_two \
   --data-root data \
   --prompt-jsonl prompts/COCO_QA_two_obj_with_answer_four_options.jsonl \
@@ -119,6 +119,7 @@ import json
 import math
 import random
 import shutil
+import sys
 import time
 import traceback
 from collections import Counter, defaultdict
@@ -138,7 +139,7 @@ except Exception as exc:  # pragma: no cover
     raise SystemExit(f"Unable to import transformers: {exc}")
 
 
-SCRIPT_VERSION = "spatial-storage-transport-utilization-v1"
+SCRIPT_VERSION = "spatial-storage-transport-utilization-v2"
 RELATIONS = ("left", "right", "above", "below")
 REL_TO_ID = {name: index for index, name in enumerate(RELATIONS)}
 ID_TO_REL = {index: name for name, index in REL_TO_ID.items()}
@@ -168,7 +169,14 @@ def parse_args() -> argparse.Namespace:
         "--prompt-jsonl",
         default="prompts/COCO_QA_two_obj_with_answer_four_options.jsonl",
     )
-    p.add_argument("--model", required=True)
+    p.add_argument(
+        "--model",
+        required=True,
+        help=(
+            "Model key from the merged repository model registry, for example "
+            "'llava-7b' or 'qwen-3b'. Run one model per process/output directory."
+        ),
+    )
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--attn-impl", default="eager", choices=["eager"])
     p.add_argument("--layers", default="all")
@@ -247,14 +255,34 @@ def parse_args() -> argparse.Namespace:
 
 
 def import_file(path: Path, module_name: str) -> Any:
+    """Import a Python file under a stable module name.
+
+    The module must be inserted into ``sys.modules`` before ``exec_module``.
+    Python 3.11's ``dataclasses`` implementation looks up
+    ``sys.modules[cls.__module__]`` while processing ``@dataclass``.  Without
+    this registration, dynamically imported helper files containing
+    dataclasses fail with ``AttributeError: 'NoneType' object has no attribute
+    '__dict__'``.
+    """
     path = path.resolve()
     if not path.exists():
         raise FileNotFoundError(path)
+
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
-        raise ImportError(path)
+        raise ImportError(f"Unable to create import spec for {path}")
+
+    # Remove a stale module with the same synthetic name, then register the new
+    # object before executing it.  This also makes postponed annotations and
+    # dataclass type inspection work correctly.
+    sys.modules.pop(module_name, None)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
     return module
 
 
