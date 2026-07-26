@@ -92,7 +92,7 @@ Main outputs
 
 Example
 -------
-CUDA_VISIBLE_DEVICES=0 python analyze_spatial_storage_transport_utilization_v2.py \
+CUDA_VISIBLE_DEVICES=0 python analyze_spatial_storage_transport_utilization_v3.py \
   --dataset coco_two \
   --data-root data \
   --prompt-jsonl prompts/COCO_QA_two_obj_with_answer_four_options.jsonl \
@@ -139,7 +139,7 @@ except Exception as exc:  # pragma: no cover
     raise SystemExit(f"Unable to import transformers: {exc}")
 
 
-SCRIPT_VERSION = "spatial-storage-transport-utilization-v2"
+SCRIPT_VERSION = "spatial-storage-transport-utilization-v3"
 RELATIONS = ("left", "right", "above", "below")
 REL_TO_ID = {name: index for index, name in enumerate(RELATIONS)}
 ID_TO_REL = {index: name for name, index in REL_TO_ID.items()}
@@ -248,6 +248,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-extraction", action="store_true")
     p.add_argument("--skip-head-ablation", action="store_true")
     p.add_argument("--skip-factorial", action="store_true")
+    p.add_argument(
+        "--fail-fast",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Stop immediately after the first per-sample causal error. "
+            "Useful for foreground debugging; otherwise errors are logged and the run continues."
+        ),
+    )
     p.add_argument("--print-every", type=int, default=5)
     p.add_argument("--empty-cache-every", type=int, default=10)
     p.add_argument("--replay-tolerance", type=float, default=5e-3)
@@ -998,6 +1007,45 @@ class AttentionTargetSubtraction:
         self.close()
 
 
+class ModuleTargetCapture:
+    """Capture one token from a module's first tensor output.
+
+    This is used on the final decoder block so the causal run is compared with
+    the cached ``trace.block_output`` representation.  Reading
+    ``outputs.hidden_states[-1]`` is not equivalent for LLaMA/Qwen-style
+    decoders because the final entry is commonly after the model's final norm.
+    """
+
+    def __init__(self, module: torch.nn.Module, target_position: int):
+        self.target_position = int(target_position)
+        self.value: Optional[torch.Tensor] = None
+        self.handle = module.register_forward_hook(self._hook)
+
+    def _hook(self, module: torch.nn.Module, inputs: Tuple[Any, ...], output: Any) -> Any:
+        hidden = first_tensor(output)
+        if hidden.ndim < 3:
+            raise RuntimeError(
+                f"Expected decoder-block output [B,T,D], got shape={tuple(hidden.shape)}"
+            )
+        if int(hidden.shape[1]) <= self.target_position:
+            raise RuntimeError(
+                f"Target position {self.target_position} outside decoder output length "
+                f"{int(hidden.shape[1])}"
+            )
+        self.value = hidden[0, self.target_position].detach().float().cpu()
+        return output
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self.handle.remove()
+
+    def __enter__(self) -> "ModuleTargetCapture":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+
 @torch.inference_mode()
 def run_attention_subtraction(
     *,
@@ -1016,17 +1064,22 @@ def run_attention_subtraction(
     max_new_tokens: int,
 ) -> Dict[str, Any]:
     attention_module = attention_helper.resolve_self_attention(decoder_layers[int(layer)])
-    with AttentionTargetSubtraction(attention_module, target_position, vector) as intervention:
-        outputs = model(
-            **batch,
-            output_hidden_states=True,
-            use_cache=False,
-            return_dict=True,
-        )
-        if not intervention.applied:
-            raise RuntimeError(f"Attention subtraction did not fire at L{layer}")
-        hidden_layers = base.output_hidden_layers(outputs, len(decoder_layers))
-        final_last = hidden_layers[int(final_layer)][0, int(target_position)].detach().float().cpu().numpy()
+    final_block = decoder_layers[int(final_layer)]
+    with ModuleTargetCapture(final_block, target_position) as final_capture:
+        with AttentionTargetSubtraction(attention_module, target_position, vector) as intervention:
+            outputs = model(
+                **batch,
+                output_hidden_states=False,
+                use_cache=False,
+                return_dict=True,
+            )
+            if not intervention.applied:
+                raise RuntimeError(f"Attention subtraction did not fire at L{layer}")
+        if final_capture.value is None:
+            raise RuntimeError(
+                f"Final decoder-block capture did not fire at L{final_layer}"
+            )
+        final_last = final_capture.value.numpy().astype(np.float32)
         relation_data = base.relation_scores(
             outputs.logits[0, -1], relation_token_map, gt=None
         )
@@ -1682,7 +1735,12 @@ def main() -> None:
                     "error": str(exc),
                     "traceback": traceback.format_exc(),
                 })
-                print(f"[ERROR head_ablation sid={sid}] {type(exc).__name__}: {exc}")
+                print(
+                    f"[ERROR head_ablation sid={sid}] {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                if args.fail_fast:
+                    raise
             finally:
                 if image is not None:
                     image.close()
@@ -1874,7 +1932,12 @@ def main() -> None:
                     "error": str(exc),
                     "traceback": traceback.format_exc(),
                 })
-                print(f"[ERROR factorial sid={sid}] {type(exc).__name__}: {exc}")
+                print(
+                    f"[ERROR factorial sid={sid}] {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                if args.fail_fast:
+                    raise
             finally:
                 if image is not None:
                     image.close()
