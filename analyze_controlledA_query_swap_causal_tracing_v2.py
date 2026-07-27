@@ -9,20 +9,22 @@ Given the same image, how does the LLM-side computation use the order of the
 subject/reference object mentions to form an opposite spatial relation and
 transmit it to the final decision?
 
-For every Controlled-A sample:
+For every Controlled-A sample, this version rebuilds the question with one
+fixed template:
 
-    clean question:  relation of A relative to B?  -> r
-    swap question:   relation of B relative to A?  -> opposite(r)
+    What is the spatial relation of A relative to B?
+    Answer with exactly one word: left, right, on, or under. Do not explain.
 
-The image is identical.  Only the two object mentions in the question are
-exchanged.
+The swapped question exchanges A and B while keeping the image and all other
+words fixed.  Therefore the correct answer must change to the opposite
+relation.  Because the requested answer is the first generated relation label,
+the prompt-last position is now the actual relation decision position.
 
 This first-stage script performs:
 
 1. Query-swap baseline
    * unrestricted autoregressive generation for clean and swapped questions;
-   * length-normalized teacher-forced scores for the clean relation r and its
-     opposite;
+   * teacher-forced one-label scores for the clean relation r and its opposite;
    * pair status: both_correct / original_only / swapped_only / both_wrong.
 
 2. Clean-state extraction
@@ -37,7 +39,7 @@ This first-stage script performs:
    * run the swapped question;
    * at one decoder layer, replace one selected swapped block-output state with
      the corresponding clean state;
-   * recompute the teacher-forced GT-vs-opposite sequence margin.
+   * recompute the first-answer-label GT-vs-opposite margin.
 
 For the clean relation r, define the fixed-axis margin:
 
@@ -94,29 +96,29 @@ Main outputs
 Recommended pilot
 -----------------
 CUDA_VISIBLE_DEVICES=0 python -u \
-  analyze_controlledA_query_swap_causal_tracing_v1.py \
+  analyze_controlledA_query_swap_causal_tracing_v2.py \
   --model qwen-3b \
   --phase all \
   --cache-layers all \
   --patch-layers stride:4 \
   --patch-conditions object_a,object_b,object_pair,query_context,options,last \
   --patch-max-samples 80 \
-  --generation-max-new-tokens 128 \
-  --candidate-style sentence \
+  --generation-max-new-tokens 16 \
+  --candidate-style label \
   --device cuda:0 \
   --output-dir output/controlledA_query_swap_causal/qwen-3b
 
 Smoke test
 ----------
 CUDA_VISIBLE_DEVICES=0 python -u \
-  analyze_controlledA_query_swap_causal_tracing_v1.py \
+  analyze_controlledA_query_swap_causal_tracing_v2.py \
   --model qwen-3b \
   --phase all \
   --cache-layers all \
   --patch-layers stride:8 \
   --max-samples 10 \
   --patch-max-samples 4 \
-  --generation-max-new-tokens 128 \
+  --generation-max-new-tokens 16 \
   --device cuda:0 \
   --output-dir output/controlledA_query_swap_causal_smoke/qwen-3b \
   --overwrite
@@ -159,7 +161,7 @@ except Exception as exc:
     raise SystemExit(f"Unable to import transformers: {exc}")
 
 
-SCRIPT_VERSION = "controlledA-query-swap-causal-tracing-v1"
+SCRIPT_VERSION = "controlledA-query-swap-causal-tracing-v2"
 
 RELATIONS = ("left", "right", "on", "under")
 OPPOSITE = {
@@ -224,6 +226,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--controlled-prompt-jsonl",
         default="prompts/Controlled_Images_A_with_answer_four_options.jsonl",
+        help=(
+            "Used for object names, relation labels, and image alignment. "
+            "The actual model question is rebuilt from --question-template."
+        ),
+    )
+    parser.add_argument(
+        "--question-template",
+        default=(
+            "What is the spatial relation of the {subject} relative to the "
+            "{reference}? Answer with exactly one word: left, right, on, or "
+            "under. Do not explain."
+        ),
+        help=(
+            "Fixed clean/swap question template. It must contain both "
+            "{subject} and {reference}."
+        ),
     )
     parser.add_argument(
         "--base-script",
@@ -283,11 +301,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--candidate-style",
         choices=("sentence", "label"),
-        default="sentence",
+        default="label",
         help=(
-            "Teacher-forced continuation used for the continuous causal metric. "
-            "'sentence' is closer to long-form model generations; 'label' is "
-            "more direct."
+            "Use label for the main experiment. With the fixed one-word "
+            "instruction this scores the relation at the prompt-last decision "
+            "position. sentence is retained only as a diagnostic fallback."
         ),
     )
     parser.add_argument(
@@ -298,7 +316,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--generation-max-new-tokens",
         type=int,
-        default=128,
+        default=16,
     )
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -555,6 +573,7 @@ def load_samples(
     controlled: Any,
     base: Any,
     prompt_path: Path,
+    question_template: str,
     max_samples: Optional[int],
     num_workers: int,
     download: bool,
@@ -583,12 +602,27 @@ def load_samples(
 
         subject = str(prompt["subject"])
         reference = str(prompt["reference"])
-        clean_question = str(prompt["question_text"])
-        swapped_question = swap_object_mentions(
-            clean_question,
-            subject,
-            reference,
-        )
+
+        try:
+            clean_question = str(question_template).format(
+                subject=subject,
+                reference=reference,
+            )
+            swapped_question = str(question_template).format(
+                subject=reference,
+                reference=subject,
+            )
+        except KeyError as exc:
+            raise ValueError(
+                "--question-template must contain only the named placeholders "
+                "{subject} and {reference}"
+            ) from exc
+
+        if clean_question == swapped_question:
+            raise RuntimeError(
+                f"Query swap produced no change for sid={sid}: "
+                f"subject={subject!r}, reference={reference!r}"
+            )
 
         samples.append(
             ControlledSample(
@@ -1609,6 +1643,22 @@ def write_baseline_report(
     swap_axis_acc = safe_mean(
         int(float(row["swapped_margin_fixed_axis"]) < 0) for row in rows
     )
+    clean_axis_generation_agreement = safe_mean(
+        int(
+            str(row["clean_axis_prediction"])
+            == str(row["clean_generation_pred"])
+        )
+        for row in rows
+        if str(row["clean_generation_pred"])
+    )
+    swap_axis_generation_agreement = safe_mean(
+        int(
+            str(row["swapped_axis_prediction"])
+            == str(row["swapped_generation_pred"])
+        )
+        for row in rows
+        if str(row["swapped_generation_pred"])
+    )
 
     status_counts: Dict[str, int] = {
         status: 0 for status in PAIR_STATUSES
@@ -1624,6 +1674,14 @@ def write_baseline_report(
         f"both-correct pair rate: {both_acc:.4f}",
         f"clean candidate-axis accuracy: {clean_axis_acc:.4f}",
         f"swapped candidate-axis accuracy: {swap_axis_acc:.4f}",
+        (
+            "clean candidate/generation agreement: "
+            f"{clean_axis_generation_agreement:.4f}"
+        ),
+        (
+            "swapped candidate/generation agreement: "
+            f"{swap_axis_generation_agreement:.4f}"
+        ),
         f"clean/swap margin sign-valid rate: {sign_rate:.4f}",
         f"pair status counts: {status_counts}",
         "",
@@ -1986,7 +2044,9 @@ def write_causal_report(
             "  swapped A-reference.",
             "  query_context/options/last are patched by token-group order; unequal",
             "  lengths use mean broadcasting and are marked in alignment_modes.",
-            "  This is node-level causal tracing, not an exact sender->receiver path.",
+            "  The fixed one-word instruction makes prompt-last the relation-label",
+            "  decision position, so last-state patching is now directly interpretable.",
+            "  This remains node-level causal tracing, not an exact sender->receiver path.",
         ]
     )
     (output_dir / "causal_report.txt").write_text(
@@ -2088,6 +2148,7 @@ def main() -> None:
         controlled=controlled,
         base=base,
         prompt_path=Path(args.controlled_prompt_jsonl),
+        question_template=args.question_template,
         max_samples=args.max_samples,
         num_workers=args.num_workers,
         download=args.download,
@@ -2119,8 +2180,10 @@ def main() -> None:
             "repo_id": spec.repo_id,
             "dataset": "controlled_a",
             "counterfactual": (
-                "same image; swap subject/reference object mentions in question"
+                "same image; fixed one-word question; swap subject/reference "
+                "object roles"
             ),
+            "question_template": args.question_template,
             "controlled_prompt_jsonl": args.controlled_prompt_jsonl,
             "controlled_script": args.controlled_script,
             "n_samples": len(samples),
