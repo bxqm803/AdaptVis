@@ -50,9 +50,17 @@ Datasets
    and the standard prompt JSONL.
 
 2. controlled_a
-   First tries repository-native load_records aliases. If unavailable, it loads
-   a generic JSON/JSONL manifest. Use --controlled-json and
-   --controlled-image-root when auto-detection cannot identify the local paths.
+   Uses the original repository path exactly:
+     extract_controlledA_relation_states_standalone.py::load_records(...)
+       -> dataset_zoo.get_dataset("Controlled_Images_A", ...)
+       -> data/controlled_images_dataset.json
+       -> images referenced by that annotation file
+   Questions and labels are aligned by sid with:
+     prompts/Controlled_Images_A_with_answer_four_options.jsonl
+
+   Controlled-A native labels are left/right/on/under. Internally, on and under
+   are mapped to above and below only for the shared four-centroid computation.
+   Per-sample output preserves both native and canonical labels.
 
 Per-sample generation output
 ----------------------------
@@ -80,13 +88,13 @@ Main outputs
 
 Example: run all requested models and datasets
 ----------------------------------------------
-CUDA_VISIBLE_DEVICES=0 python -u benchmark_two_object_centroid_generation_v1.py \
+CUDA_VISIBLE_DEVICES=0 python -u benchmark_two_object_centroid_generation_v2.py \
   --models all \
   --datasets controlled_a,coco_two \
   --data-root data \
   --coco-prompt-jsonl prompts/COCO_QA_two_obj_with_answer_four_options.jsonl \
-  --controlled-json /path/to/controlled_A_manifest.jsonl \
-  --controlled-image-root /path/to/Controlled_Images_A \
+  --controlled-prompt-jsonl prompts/Controlled_Images_A_with_answer_four_options.jsonl \
+  --controlled-script extract_controlledA_relation_states_standalone.py \
   --device cuda:0 \
   --folds 5 \
   --object-states last,mean \
@@ -94,7 +102,7 @@ CUDA_VISIBLE_DEVICES=0 python -u benchmark_two_object_centroid_generation_v1.py 
 
 Run one model only
 ------------------
-CUDA_VISIBLE_DEVICES=0 python -u benchmark_two_object_centroid_generation_v1.py \
+CUDA_VISIBLE_DEVICES=0 python -u benchmark_two_object_centroid_generation_v2.py \
   --models qwen-3b \
   --datasets coco_two \
   --data-root data \
@@ -133,7 +141,7 @@ except Exception as exc:
     raise SystemExit(f"Unable to import transformers: {exc}")
 
 
-SCRIPT_VERSION = "two-object-centroid-generation-benchmark-v1"
+SCRIPT_VERSION = "two-object-centroid-generation-benchmark-v2"
 RELATIONS = ("left", "right", "above", "below")
 REL_TO_ID = {name: index for index, name in enumerate(RELATIONS)}
 ID_TO_REL = {index: name for name, index in REL_TO_ID.items()}
@@ -226,6 +234,7 @@ class BenchmarkSample:
     reference: str
     question: str
     gt: str
+    gt_native: Optional[str] = None
     image_path: Optional[str] = None
     native_record: Any = None
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -284,26 +293,31 @@ def parse_args() -> argparse.Namespace:
         default="prompts/COCO_QA_two_obj_with_answer_four_options.jsonl",
     )
     parser.add_argument(
-        "--controlled-json",
-        default=None,
-        help="Controlled-A manifest JSON/JSONL. Auto-detected when omitted.",
-    )
-    parser.add_argument(
         "--controlled-prompt-jsonl",
-        default=None,
-        help="Optional Controlled-A prompt JSONL keyed by sid.",
-    )
-    parser.add_argument(
-        "--controlled-image-root",
-        default=None,
-        help="Root directory for Controlled-A images.",
-    )
-    parser.add_argument(
-        "--controlled-question-template",
-        default=(
-            "What is the spatial relation of the {subject} relative to the "
-            "{reference}? Answer with one relation: left, right, above, or below."
+        default="prompts/Controlled_Images_A_with_answer_four_options.jsonl",
+        help=(
+            "Original Controlled-A standard prompt file. Records are aligned "
+            "to dataset_zoo Controlled_Images_A images by sid."
         ),
+    )
+    parser.add_argument(
+        "--controlled-script",
+        default="extract_controlledA_relation_states_standalone.py",
+        help=(
+            "Original repository Controlled-A extractor. Its load_records() "
+            "uses dataset_zoo.get_dataset('Controlled_Images_A')."
+        ),
+    )
+    parser.add_argument(
+        "--download",
+        action="store_true",
+        help="Allow the original dataset_zoo loader to download Controlled-A.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="DataLoader workers used by the original Controlled-A loader.",
     )
 
     parser.add_argument("--device", default="cuda:0")
@@ -457,6 +471,23 @@ def stable_pair_fold(subject: str, reference: str, folds: int, seed: int) -> int
     return int(digest[:16], 16) % int(folds)
 
 
+def native_relation_name(canonical: str, dataset: str) -> str:
+    """Map the shared canonical label to the dataset's original vocabulary."""
+    canonical = str(canonical).strip().lower()
+    if dataset == "controlled_a":
+        if canonical == "above":
+            return "on"
+        if canonical == "below":
+            return "under"
+    return canonical
+
+
+def dataset_relation_labels(dataset: str) -> Tuple[str, str, str, str]:
+    if dataset == "controlled_a":
+        return ("left", "right", "on", "under")
+    return ("left", "right", "above", "below")
+
+
 def normalize_relation(value: Any, base: Any = None) -> str:
     if base is not None:
         with contextlib.suppress(Exception):
@@ -494,6 +525,68 @@ def first_tensor(output: Any) -> torch.Tensor:
 def relation_logits_to_list(relation_data: Mapping[str, Any]) -> List[float]:
     logits = relation_data.get("logits", [])
     return [float(value) for value in logits]
+
+
+def tokenizer_ids(tokenizer: Any, text: str) -> List[int]:
+    output = tokenizer(text, add_special_tokens=False)
+    ids = output.input_ids
+    if isinstance(ids, np.ndarray):
+        ids = ids.tolist()
+    if ids and isinstance(ids[0], (list, tuple)):
+        ids = ids[0]
+    return [int(value) for value in ids]
+
+
+def relation_token_variants_for_labels(
+    tokenizer: Any,
+    labels: Sequence[str],
+) -> Dict[str, List[int]]:
+    result: Dict[str, List[int]] = {}
+    unk = getattr(tokenizer, "unk_token_id", None)
+    for label in labels:
+        token_ids: List[int] = []
+        for surface in (
+            label,
+            " " + label,
+            "\n" + label,
+            label.capitalize(),
+            " " + label.capitalize(),
+        ):
+            ids = tokenizer_ids(tokenizer, surface)
+            if len(ids) != 1:
+                continue
+            token_id = int(ids[0])
+            if unk is not None and token_id == int(unk):
+                continue
+            token_ids.append(token_id)
+        token_ids = list(dict.fromkeys(token_ids))
+        if not token_ids:
+            raise RuntimeError(
+                f"No one-token generation variant found for relation {label!r}"
+            )
+        result[str(label)] = token_ids
+    return result
+
+
+def relation_scores_for_labels(
+    score_vector: torch.Tensor,
+    token_map: Mapping[str, Sequence[int]],
+    labels: Sequence[str],
+) -> Dict[str, Any]:
+    logits: List[torch.Tensor] = []
+    for label in labels:
+        ids = torch.as_tensor(
+            list(token_map[str(label)]),
+            device=score_vector.device,
+            dtype=torch.long,
+        )
+        logits.append(score_vector[ids].float().max())
+    logits_tensor = torch.stack(logits)
+    prediction_index = int(torch.argmax(logits_tensor).item())
+    return {
+        "logits": logits_tensor.detach().cpu().numpy().astype(np.float32),
+        "prediction": str(labels[prediction_index]),
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -659,207 +752,70 @@ def load_model_and_processor(
 # -----------------------------------------------------------------------------
 
 
-def get_first(row: Mapping[str, Any], keys: Sequence[str]) -> Any:
-    for key in keys:
-        if key in row and row[key] not in (None, ""):
-            return row[key]
-    return None
-
-
-def load_json_or_jsonl(path: Path) -> List[Dict[str, Any]]:
-    if path.suffix.lower() == ".jsonl":
-        return read_jsonl(path)
-    with path.open("r", encoding="utf-8") as handle:
-        value = json.load(handle)
-    if isinstance(value, list):
-        return [dict(item) for item in value]
-    if isinstance(value, dict):
-        for key in ("records", "samples", "data", "items", "annotations"):
-            if isinstance(value.get(key), list):
-                return [dict(item) for item in value[key]]
-        # Mapping from id -> row.
-        if all(isinstance(item, Mapping) for item in value.values()):
-            rows: List[Dict[str, Any]] = []
-            for key, item in value.items():
-                row = dict(item)
-                row.setdefault("sid", key)
-                rows.append(row)
-            return rows
-    raise ValueError(f"Unsupported manifest structure: {path}")
-
-
-def controlled_manifest_candidates(data_root: Path) -> List[Path]:
-    candidates = [
-        data_root / "controlled_a.jsonl",
-        data_root / "controlled_A.jsonl",
-        data_root / "Controlled_A.jsonl",
-        data_root / "Controlled_Images_A.jsonl",
-        data_root / "controlled_a.json",
-        data_root / "controlled_A.json",
-        data_root / "Controlled_A.json",
-        data_root / "Controlled_Images_A.json",
-        data_root / "controlled_a" / "manifest.jsonl",
-        data_root / "controlled_A" / "manifest.jsonl",
-        data_root / "Controlled_Images_A" / "manifest.jsonl",
-        Path("prompts/Controlled_Images_A_with_answer_four_options.jsonl"),
-        Path("prompts/controlled_A_with_answer_four_options.jsonl"),
-        Path("prompts/controlled_a_with_answer_four_options.jsonl"),
-    ]
-    return [path for path in candidates if path.exists()]
-
-
-def controlled_image_root_candidates(data_root: Path) -> List[Path]:
-    candidates = [
-        data_root / "controlled_a",
-        data_root / "controlled_A",
-        data_root / "Controlled_A",
-        data_root / "Controlled_Images_A",
-        data_root / "controlled_images_A",
-        Path("data/controlled_a"),
-        Path("data/Controlled_Images_A"),
-    ]
-    return [path for path in candidates if path.exists()]
-
-
-def resolve_image_path(
-    raw_value: Any,
+def load_controlled_a_samples(
     *,
-    manifest_dir: Path,
-    image_root: Optional[Path],
-) -> Optional[Path]:
-    if raw_value in (None, ""):
-        return None
-    raw = Path(str(raw_value))
-    candidates = []
-    if raw.is_absolute():
-        candidates.append(raw)
-    else:
-        candidates.append(manifest_dir / raw)
-        if image_root is not None:
-            candidates.append(image_root / raw)
-        candidates.append(raw)
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate.resolve()
-    return candidates[0].resolve() if candidates else None
-
-
-def parse_generic_controlled_manifest(
-    *,
-    manifest_path: Path,
-    image_root: Optional[Path],
-    question_template: str,
+    args: argparse.Namespace,
     base: Any,
-    max_samples: Optional[int],
+    controlled: Any,
 ) -> List[BenchmarkSample]:
-    rows = load_json_or_jsonl(manifest_path)
-    samples: List[BenchmarkSample] = []
+    """Load Controlled-A exactly as the original llava16 repository does.
 
-    subject_keys = (
-        "subject", "subj", "subject_name", "object1", "obj1", "object_a",
-        "first_object", "query_object", "target_object",
-    )
-    reference_keys = (
-        "reference", "ref", "reference_name", "object2", "obj2", "object_b",
-        "second_object", "anchor_object",
-    )
-    relation_keys = (
-        "gt", "answer", "answer_raw", "relation", "label", "direction",
-        "spatial_relation",
-    )
-    question_keys = (
-        "question", "question_text", "prompt", "text", "query",
-    )
-    image_keys = (
-        "image_path", "image", "file_name", "filename", "img", "path",
-        "image_file",
-    )
-    sid_keys = ("sid", "id", "sample_id", "uid", "index")
+    The original extractor calls:
 
-    for index, row in enumerate(rows):
-        subject = get_first(row, subject_keys)
-        reference = get_first(row, reference_keys)
-        gt = normalize_relation(get_first(row, relation_keys), base)
-        if subject is None or reference is None or gt not in REL_TO_ID:
-            continue
-
-        sid = get_first(row, sid_keys)
-        if sid is None:
-            sid = index
-        question = get_first(row, question_keys)
-        if not question:
-            question = question_template.format(
-                subject=str(subject),
-                reference=str(reference),
-            )
-        image_value = get_first(row, image_keys)
-        image_path = resolve_image_path(
-            image_value,
-            manifest_dir=manifest_path.parent,
-            image_root=image_root,
+        controlled.load_records(
+            prompt_path,
+            download=...,
+            max_samples=...,
+            num_workers=...,
         )
-        if image_path is None:
-            continue
 
-        samples.append(
-            BenchmarkSample(
-                uid=sanitize_uid(sid),
-                sid=sid,
-                dataset="controlled_a",
-                subject=str(subject),
-                reference=str(reference),
-                question=str(question),
-                gt=gt,
-                image_path=str(image_path),
-                metadata={"manifest": str(manifest_path)},
-            )
+    Its load_records() uses dataset_zoo.get_dataset("Controlled_Images_A"),
+    whose subset-A dataset reads data/controlled_images_dataset.json and opens
+    the image paths stored in that annotation file.  Images and prompt rows are
+    aligned by the original sequential sid.
+    """
+    prompt_path = Path(args.controlled_prompt_jsonl)
+    if not prompt_path.exists():
+        raise FileNotFoundError(
+            f"Missing original Controlled-A prompt file: {prompt_path}"
         )
-        if max_samples is not None and len(samples) >= max_samples:
-            break
 
-    if not samples:
-        raise RuntimeError(
-            f"No usable Controlled-A samples parsed from {manifest_path}. "
-            "Expected subject/reference/relation/image fields."
+    required = ("load_records",)
+    missing = [name for name in required if not hasattr(controlled, name)]
+    if missing:
+        raise AttributeError(
+            f"Controlled-A module {args.controlled_script} lacks {missing}"
         )
-    return samples
 
-
-def try_native_controlled_loader(
-    *,
-    two_object: Any,
-    base: Any,
-    data_root: Path,
-    prompt_path: Optional[Path],
-    max_samples: Optional[int],
-) -> Optional[List[BenchmarkSample]]:
-    aliases = ("controlled_a", "controlled_A", "controlled", "controlled_images_a")
-    loaded_records = None
-    used_alias = None
-    for alias in aliases:
-        try:
-            records, _audit = two_object.load_records(alias, data_root, max_samples)
-            if records:
-                loaded_records = records
-                used_alias = alias
-                break
-        except Exception:
-            continue
-    if not loaded_records:
-        return None
-
-    if prompt_path is None or not prompt_path.exists():
-        return None
+    records, audit = controlled.load_records(
+        prompt_path,
+        download=bool(args.download),
+        max_samples=args.max_samples,
+        num_workers=int(args.num_workers),
+    )
     prompts = base.load_standard_prompts(prompt_path)
+
     samples: List[BenchmarkSample] = []
-    for record in loaded_records:
+    skipped_missing_prompt = 0
+    skipped_relation = 0
+
+    for record in records:
         sid = int(record.sid)
-        if sid not in prompts:
+        prompt = prompts.get(sid)
+        if prompt is None:
+            skipped_missing_prompt += 1
             continue
-        prompt = prompts[sid]
-        gt = normalize_relation(prompt.get("answer_raw"), base)
-        if gt not in REL_TO_ID:
+
+        # record.relation is already normalized by the original loader to
+        # left/right/on/under.  Convert only for the shared centroid label IDs.
+        gt_native = str(getattr(record, "relation", "")).strip().lower()
+        gt_canonical = normalize_relation(gt_native, base=None)
+        if gt_canonical not in REL_TO_ID:
+            skipped_relation += 1
             continue
+
+        # Use the exact standard user question and exact object surface strings
+        # from the prompt file, matching analyze_controlledA_centroid_step1_v2.
         samples.append(
             BenchmarkSample(
                 uid=sanitize_uid(sid),
@@ -868,76 +824,38 @@ def try_native_controlled_loader(
                 subject=str(prompt["subject"]),
                 reference=str(prompt["reference"]),
                 question=str(prompt["question_text"]),
-                gt=gt,
+                gt=gt_canonical,
+                gt_native=gt_native,
                 native_record=record,
-                metadata={"native_loader_alias": used_alias},
+                metadata={
+                    "loader": (
+                        "extract_controlledA_relation_states_standalone."
+                        "load_records"
+                    ),
+                    "dataset_key": "Controlled_Images_A",
+                },
             )
         )
-    return samples or None
 
-
-def load_controlled_a_samples(
-    *,
-    args: argparse.Namespace,
-    base: Any,
-    two_object: Any,
-) -> List[BenchmarkSample]:
-    data_root = Path(args.data_root)
-    prompt_path = (
-        Path(args.controlled_prompt_jsonl)
-        if args.controlled_prompt_jsonl
-        else None
-    )
-    if prompt_path is None:
-        prompt_candidates = controlled_manifest_candidates(data_root)
-        prompt_path = prompt_candidates[0] if prompt_candidates else None
-
-    native = try_native_controlled_loader(
-        two_object=two_object,
-        base=base,
-        data_root=data_root,
-        prompt_path=prompt_path,
-        max_samples=args.max_samples,
-    )
-    if native is not None:
-        print(
-            f"Controlled-A: native loader, samples={len(native)}, "
-            f"prompt={prompt_path}",
-            flush=True,
+    if not samples:
+        raise RuntimeError(
+            "Original Controlled-A loader returned no usable samples. "
+            "Run from the AdaptVis repository root and verify "
+            "data/controlled_images_dataset.json, data/controlled_images, and "
+            f"{prompt_path}."
         )
-        return native
 
-    if args.controlled_json:
-        manifest_path = Path(args.controlled_json)
-    else:
-        candidates = controlled_manifest_candidates(data_root)
-        if not candidates:
-            raise FileNotFoundError(
-                "Controlled-A manifest was not auto-detected. Pass "
-                "--controlled-json and --controlled-image-root explicitly."
-            )
-        manifest_path = candidates[0]
+    relation_counts: Dict[str, int] = {}
+    for sample in samples:
+        key = str(sample.gt_native)
+        relation_counts[key] = relation_counts.get(key, 0) + 1
 
-    if not manifest_path.exists():
-        raise FileNotFoundError(manifest_path)
-
-    image_root: Optional[Path]
-    if args.controlled_image_root:
-        image_root = Path(args.controlled_image_root)
-    else:
-        roots = controlled_image_root_candidates(data_root)
-        image_root = roots[0] if roots else None
-
-    samples = parse_generic_controlled_manifest(
-        manifest_path=manifest_path,
-        image_root=image_root,
-        question_template=args.controlled_question_template,
-        base=base,
-        max_samples=args.max_samples,
-    )
     print(
-        f"Controlled-A: manifest={manifest_path}, image_root={image_root}, "
-        f"samples={len(samples)}",
+        "Controlled-A original repository loader: "
+        f"samples={len(samples)}, prompt={prompt_path}, "
+        f"relations={relation_counts}, audit={len(audit)}, "
+        f"missing_prompt={skipped_missing_prompt}, "
+        f"unsupported_relation={skipped_relation}",
         flush=True,
     )
     return samples
@@ -974,6 +892,7 @@ def load_coco_two_samples(
                 reference=str(prompt["reference"]),
                 question=str(prompt["question_text"]),
                 gt=gt,
+                gt_native=gt,
                 native_record=record,
                 metadata={"audit": audit},
             )
@@ -1127,7 +1046,11 @@ def extract_model_dataset(
         raise ValueError("--object-states selected no modes")
 
     decoder_layers, decoder_path = base.resolve_decoder_layers(model)
-    relation_token_map = base.relation_token_variants(processor.tokenizer)
+    native_relation_labels = dataset_relation_labels(dataset_name)
+    relation_token_map = relation_token_variants_for_labels(
+        processor.tokenizer,
+        native_relation_labels,
+    )
     device = torch.device(args.device)
 
     config = {
@@ -1142,6 +1065,12 @@ def extract_model_dataset(
         "seed": args.seed,
         "object_states": object_modes,
         "centroid_metric": args.centroid_metric,
+        "native_relation_labels": list(dataset_relation_labels(dataset_name)),
+        "controlled_a_source": (
+            "dataset_zoo.get_dataset('Controlled_Images_A')"
+            if dataset_name == "controlled_a"
+            else None
+        ),
         "centroid_definition": (
             "four independent class means of subject-minus-reference block-output "
             "vectors; held-out nearest cosine/euclidean centroid"
@@ -1203,14 +1132,17 @@ def extract_model_dataset(
                 )
             np.savez_compressed(cache_path, **arrays)
 
-            relation_data = base.relation_scores(
+            relation_data = relation_scores_for_labels(
                 outputs.logits[0, -1],
                 relation_token_map,
-                gt=None,
+                native_relation_labels,
             )
-            lm_pred = normalize_relation(
-                relation_data.get("prediction", ""),
-                base,
+            lm_pred_native = str(
+                relation_data.get("prediction", "")
+            ).strip().lower()
+            lm_pred_canonical = normalize_relation(
+                lm_pred_native,
+                base=None,
             )
             generation = base.generate_text(
                 model,
@@ -1218,8 +1150,16 @@ def extract_model_dataset(
                 dict(batch),
                 max_new_tokens=args.max_new_tokens,
             )
-            generation_pred = normalize_relation(generation, base)
-            correct = bool(generation_pred == sample.gt)
+            generation_pred_canonical = normalize_relation(generation, base)
+            generation_pred_native = native_relation_name(
+                generation_pred_canonical,
+                dataset_name,
+            )
+            gt_native = sample.gt_native or native_relation_name(
+                sample.gt,
+                dataset_name,
+            )
+            correct = bool(generation_pred_canonical == sample.gt)
             fold = stable_pair_fold(
                 sample.subject,
                 sample.reference,
@@ -1235,13 +1175,17 @@ def extract_model_dataset(
                 "sid": sample.sid,
                 "subject": sample.subject,
                 "reference": sample.reference,
-                "pred": generation_pred,
+                "pred": generation_pred_native,
+                "pred_canonical": generation_pred_canonical,
                 "question": sample.question,
-                "gt": sample.gt,
+                "gt": gt_native,
+                "gt_canonical": sample.gt,
                 "generation": generation,
                 "acc": int(correct),
                 "generation_correct": correct,
-                "lm_pred": lm_pred,
+                "lm_pred": lm_pred_native,
+                "lm_pred_canonical": lm_pred_canonical,
+                "lm_relation_labels": list(native_relation_labels),
                 "lm_relation_logits": relation_logits_to_list(relation_data),
                 "fold": int(fold),
                 "subject_span": list(map(int, subject_span)),
@@ -1257,8 +1201,9 @@ def extract_model_dataset(
                 compact_generation = " ".join(str(generation).split())
                 print(
                     f"\n[{requested_alias}][{dataset_name}] "
-                    f"sid={sample.sid} pred={generation_pred or '<unparsed>'} "
-                    f"gt={sample.gt} acc={int(correct)} "
+                    f"sid={sample.sid} "
+                    f"pred={generation_pred_native or '<unparsed>'} "
+                    f"gt={gt_native} acc={int(correct)} "
                     f"question={compact_question!r} "
                     f"generation={compact_generation!r}",
                     flush=True,
@@ -1316,7 +1261,7 @@ def extract_model_dataset(
         append_jsonl(samples_jsonl, row)
     write_csv(run_dir / "generation_samples.csv", rows)
 
-    labels = np.asarray([REL_TO_ID[row["gt"]] for row in rows], dtype=np.int64)
+    labels = np.asarray([REL_TO_ID[row["gt_canonical"]] for row in rows], dtype=np.int64)
     folds = np.asarray([int(row["fold"]) for row in rows], dtype=np.int64)
     generation_correct = np.asarray(
         [bool(row["generation_correct"]) for row in rows],
@@ -1326,7 +1271,7 @@ def extract_model_dataset(
     generation_macro = macro_accuracy(
         np.asarray(
             [
-                REL_TO_ID.get(str(row["pred"]), -1)
+                REL_TO_ID.get(str(row["pred_canonical"]), -1)
                 for row in rows
             ],
             dtype=np.int64,
@@ -1403,7 +1348,12 @@ def extract_model_dataset(
                         "uid": row["uid"],
                         "layer": int(layer),
                         "gt": row["gt"],
-                        "centroid_pred": ID_TO_REL[int(cv_pred[index])],
+                        "gt_canonical": row["gt_canonical"],
+                        "centroid_pred": native_relation_name(
+                            ID_TO_REL[int(cv_pred[index])],
+                            dataset_name,
+                        ),
+                        "centroid_pred_canonical": ID_TO_REL[int(cv_pred[index])],
                         "centroid_correct": int(cv_pred[index] == labels[index]),
                         "gt_opposite_margin": float(cv_margin[index]),
                         "score_left": float(scores[REL_TO_ID["left"]]),
@@ -1411,6 +1361,7 @@ def extract_model_dataset(
                         "score_above": float(scores[REL_TO_ID["above"]]),
                         "score_below": float(scores[REL_TO_ID["below"]]),
                         "generation_pred": row["pred"],
+                        "generation_pred_canonical": row["pred_canonical"],
                         "generation_correct": int(row["generation_correct"]),
                         "question": row["question"],
                         "generation": row["generation"],
@@ -1498,6 +1449,12 @@ def main() -> None:
         Path(args.two_object_script),
         "centroid_benchmark_two_object",
     )
+    controlled = None
+    if "controlled_a" in datasets:
+        controlled = import_file(
+            Path(args.controlled_script),
+            "centroid_benchmark_controlled_a",
+        )
 
     # Some base scripts expose their own import helper and merged model registry.
     if hasattr(base, "merged_model_specs"):
@@ -1522,10 +1479,12 @@ def main() -> None:
                 two_object=two_object,
             )
         else:
+            if controlled is None:
+                raise RuntimeError("Controlled-A module was not imported")
             dataset_samples[dataset] = load_controlled_a_samples(
                 args=args,
                 base=base,
-                two_object=two_object,
+                controlled=controlled,
             )
 
     all_summaries: List[Dict[str, Any]] = []
