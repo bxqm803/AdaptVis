@@ -2095,15 +2095,35 @@ def run_upstream_phase(
     }
     all_rows = list(existing)
 
+    # Resume at the actual computation level, not merely at JSONL writing.
+    # The previous implementation iterated from the first sample and recomputed
+    # pair captures plus every sender C-pass, only skipping completed D-passes.
+    # Build the pending sample set before model execution so fully completed
+    # samples are skipped entirely.
+    pending_rows: List[Mapping[str, Any]] = []
+    for source_row in rows_to_run:
+        sid = int(source_row["sid"])
+        has_pending = any(
+            (sid, sender.node, unit.unit, scope) not in completed
+            for scope in sender_scopes
+            for sender in senders
+            for unit in receiver_units
+            if sender.layer < unit.layer
+        )
+        if has_pending:
+            pending_rows.append(source_row)
+
     all_capture_layers = list(range(len(decoder_layers)))
     print(
-        f"Upstream path scan: N={len(rows_to_run)}, senders={len(senders)}, "
-        f"receiver_units={len(receiver_units)}, scopes={sender_scopes}",
+        f"Upstream path scan: requested_N={len(rows_to_run)}, "
+        f"pending_N={len(pending_rows)}, existing_rows={len(existing)}, "
+        f"senders={len(senders)}, receiver_units={len(receiver_units)}, "
+        f"scopes={sender_scopes}",
         flush=True,
     )
 
     for sample_index, source_row in enumerate(
-        tqdm(rows_to_run, desc=f"upstream-path:{args.model}"),
+        tqdm(pending_rows, desc=f"upstream-path:{args.model}"),
         start=1,
     ):
         pair = None
@@ -2158,15 +2178,26 @@ def run_upstream_phase(
             for scope in sender_scopes:
                 mapping = sender_position_mapping(pair, scope)
                 for sender in senders:
-                    active_units = [
-                        unit for unit in receiver_units if sender.layer < unit.layer
+                    # Skip the expensive sender C-pass when every downstream
+                    # receiver unit for this (sid, sender, scope) is complete.
+                    pending_units = [
+                        unit
+                        for unit in receiver_units
+                        if sender.layer < unit.layer
+                        and (
+                            int(pair.sid),
+                            sender.node,
+                            unit.unit,
+                            scope,
+                        )
+                        not in completed
                     ]
-                    if not active_units:
+                    if not pending_units:
                         continue
                     c_states = run_c_pass_capture_receivers(
                         sender=sender,
                         sender_mapping=mapping,
-                        receiver_units=active_units,
+                        receiver_units=pending_units,
                         pair=pair,
                         original_capture=original_capture,
                         swapped_capture=swapped_capture,
@@ -2178,7 +2209,7 @@ def run_upstream_phase(
                         attention_helper=attention_helper,
                         kv_scope=args.receiver_kv_scope,
                     )
-                    for unit in active_units:
+                    for unit in pending_units:
                         key = (
                             int(pair.sid),
                             sender.node,
@@ -2278,7 +2309,7 @@ def run_upstream_phase(
                 torch.cuda.empty_cache()
         if args.print_every > 0 and sample_index % args.print_every == 0:
             print(
-                f"[upstream {sample_index}/{len(rows_to_run)}] rows={len(all_rows)}",
+                f"[upstream {sample_index}/{len(pending_rows)}] rows={len(all_rows)}",
                 flush=True,
             )
 
