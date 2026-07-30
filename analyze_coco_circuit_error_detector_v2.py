@@ -108,7 +108,7 @@ except Exception as exc:  # pragma: no cover
     )
 
 
-SCRIPT_VERSION = "coco-circuit-error-detector-v1"
+SCRIPT_VERSION = "coco-circuit-error-detector-v2"
 RELATIONS = ("left", "right", "above", "below")
 OPPOSITE = {
     "left": "right",
@@ -258,20 +258,63 @@ def normalize_relation(value: Any) -> Optional[str]:
 
 
 def relation_scores(value: Any) -> Optional[Dict[str, float]]:
-    if not isinstance(value, Mapping):
+    """Normalize a four-relation score container.
+
+    Supported input schemas:
+      * mapping: {"left": ..., "right": ..., "above": ..., "below": ...}
+      * mapping wrapper: {"scores": ...} or {"logits": ...}
+      * sequence in canonical source order [left, right, above, below]
+
+    analyze_spatial_storage_transport_utilization_v3.py writes
+    swapped_relation_logits as a JSON list, while the head-misrouting script
+    writes closed_scores/head_logit_contribution as mappings.  The original
+    detector accepted only mappings and therefore skipped every sample.
+    """
+    if value is None:
         return None
-    result: Dict[str, float] = {}
-    for key, item in value.items():
-        relation = normalize_relation(key)
-        if relation is None:
-            continue
+
+    if isinstance(value, Mapping):
+        # Common nested schemas returned by relation-scoring helpers.
+        for wrapper_key in ("scores", "logits", "relation_scores", "relation_logits"):
+            wrapped = value.get(wrapper_key)
+            if wrapped is not None and wrapped is not value:
+                parsed = relation_scores(wrapped)
+                if parsed is not None:
+                    return parsed
+
+        result: Dict[str, float] = {}
+        for key, item in value.items():
+            relation = normalize_relation(key)
+            if relation is None:
+                continue
+            try:
+                result[relation] = float(item)
+            except (TypeError, ValueError):
+                continue
+        if all(relation in result for relation in RELATIONS):
+            return {relation: float(result[relation]) for relation in RELATIONS}
+        return None
+
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        if len(value) != len(RELATIONS):
+            return None
         try:
-            result[relation] = float(item)
-        except (TypeError, ValueError):
-            continue
-    if not all(relation in result for relation in RELATIONS):
-        return None
-    return {relation: float(result[relation]) for relation in RELATIONS}
+            return {
+                relation: float(value[index])
+                for index, relation in enumerate(RELATIONS)
+            }
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    return None
+
+
+def first_present(mapping: Mapping[str, Any], keys: Sequence[str]) -> Any:
+    """Return the first present, non-None field without truth-testing arrays."""
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return None
 
 
 def score_vector(scores: Mapping[str, float]) -> np.ndarray:
@@ -375,6 +418,7 @@ def source_original_correct(row: Mapping[str, Any]) -> Optional[bool]:
     if status in {"swapped_only", "both_wrong"}:
         return False
     for key in (
+        "baseline_generation_correct",
         "original_generation_correct",
         "generation_original_correct",
         "original_correct",
@@ -461,15 +505,36 @@ def build_sample_features(
 ) -> Dict[str, Any]:
     sid = int(baseline_row["sid"])
     generation_prediction = normalize_relation(baseline_row.get("prediction"))
-    original_scores = relation_scores(
-        baseline_row.get("closed_scores")
-        or baseline_row.get("baseline_closed_scores")
+    original_score_value = first_present(
+        baseline_row,
+        ("closed_scores", "baseline_closed_scores", "relation_scores"),
     )
-    swapped_scores = relation_scores(source_row.get("swapped_relation_logits"))
+    if original_score_value is None:
+        original_score_value = first_present(
+            source_row,
+            ("baseline_relation_logits", "original_relation_logits"),
+        )
+    swapped_score_value = first_present(
+        source_row,
+        (
+            "swapped_relation_logits",
+            "swapped_closed_scores",
+            "swapped_scores",
+        ),
+    )
+    original_scores = relation_scores(original_score_value)
+    swapped_scores = relation_scores(swapped_score_value)
     if original_scores is None:
-        raise RuntimeError(f"SID {sid}: missing original closed scores")
+        raise RuntimeError(
+            f"SID {sid}: cannot parse original relation scores; "
+            f"baseline keys={sorted(baseline_row.keys())}"
+        )
     if swapped_scores is None:
-        raise RuntimeError(f"SID {sid}: missing swapped_relation_logits")
+        raise RuntimeError(
+            f"SID {sid}: cannot parse swapped relation scores; "
+            f"value_type={type(swapped_score_value).__name__}; "
+            f"source keys={sorted(source_row.keys())}"
+        )
 
     original_vector = score_vector(original_scores)
     swapped_vector = score_vector(swapped_scores)
@@ -1043,8 +1108,27 @@ def main() -> None:
             )
     if skipped:
         write_json(output_dir / "skipped_samples.json", skipped)
+
+    print(
+        "Feature extraction: "
+        f"source={len(source_rows)} baseline={len(baseline_rows)} "
+        f"head_sids={len(head_rows_by_sid)} common={len(common_sids)} "
+        f"complete={len(complete_sids)} built={len(feature_rows)} "
+        f"skipped={len(skipped)}"
+    )
+    if skipped:
+        error_counts = Counter(
+            f"{row['error_type']}: {row['error']}" for row in skipped
+        )
+        print("Top feature-extraction skip reasons:")
+        for reason, count in error_counts.most_common(10):
+            print(f"  {count:4d}  {reason}")
+
     if not feature_rows:
-        raise RuntimeError("Feature extraction produced no samples")
+        raise RuntimeError(
+            "Feature extraction produced no samples. See "
+            f"{output_dir / 'skipped_samples.json'} for per-SID errors."
+        )
 
     frame = pd.DataFrame(feature_rows).sort_values("sid").reset_index(drop=True)
     frame.to_csv(output_dir / "error_detector_features.csv", index=False)
