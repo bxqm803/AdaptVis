@@ -94,7 +94,7 @@ except Exception as exc:  # pragma: no cover
     raise SystemExit(f"Unable to import transformers: {exc}")
 
 
-SCRIPT_VERSION = "coco-downstream-relation-utilization-v2"
+SCRIPT_VERSION = "coco-downstream-relation-utilization-v3"
 RELATIONS = ("left", "right", "above", "below")
 REL_TO_ID = {relation: index for index, relation in enumerate(RELATIONS)}
 ID_TO_REL = {index: relation for relation, index in REL_TO_ID.items()}
@@ -426,15 +426,57 @@ def extract_sids(path: Path) -> set[int]:
 
 
 def relation_score_map(value: Any) -> Dict[str, float]:
+    """Normalize common relation-score containers to a four-key mapping.
+
+    Accepted inputs include:
+      * {left: ..., right: ..., above: ..., below: ...}
+      * wrapper mappings such as {scores: ...} or {logits: ...}
+      * Python sequences of length four
+      * NumPy arrays / Torch tensors containing exactly four values, including
+        shapes such as (4,), (1, 4), or (4, 1)
+    """
     if isinstance(value, Mapping):
         if all(relation in value for relation in RELATIONS):
             return {relation: float(value[relation]) for relation in RELATIONS}
         for key in ("scores", "logits", "relation_scores", "relation_logits"):
             if key in value:
                 return relation_score_map(value[key])
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)) and len(value) == 4:
-        return {relation: float(value[index]) for index, relation in enumerate(RELATIONS)}
-    raise ValueError(f"Cannot parse relation scores from {type(value)}")
+
+    # torch.Tensor does not satisfy collections.abc.Sequence, and NumPy arrays
+    # may have shape (1, 4), so normalize both explicitly before the generic
+    # sequence branch.
+    if torch.is_tensor(value):
+        array = value.detach().float().cpu().numpy()
+        flat = np.asarray(array).reshape(-1)
+        if flat.size == len(RELATIONS):
+            return {
+                relation: float(flat[index])
+                for index, relation in enumerate(RELATIONS)
+            }
+
+    if isinstance(value, np.ndarray):
+        flat = np.asarray(value).reshape(-1)
+        if flat.size == len(RELATIONS):
+            return {
+                relation: float(flat[index])
+                for index, relation in enumerate(RELATIONS)
+            }
+
+    if (
+        isinstance(value, Sequence)
+        and not isinstance(value, (str, bytes))
+        and len(value) == len(RELATIONS)
+    ):
+        return {
+            relation: float(value[index])
+            for index, relation in enumerate(RELATIONS)
+        }
+
+    shape = getattr(value, "shape", None)
+    raise ValueError(
+        "Cannot parse relation scores from "
+        f"type={type(value).__name__}, shape={shape!r}"
+    )
 
 
 def score_prediction(scores: Mapping[str, float]) -> Tuple[str, float]:
@@ -2049,7 +2091,19 @@ def main() -> None:
                         torch.cuda.empty_cache()
 
         if args.phase == "extract":
-            print(f"Saved clean late-stage states to {output_dir}")
+            extracted_rows = deduplicate_rows(read_jsonl(clean_path), ("sid",))
+            extracted_sids = {int(row["sid"]) for row in extracted_rows}
+            missing_extract = [sid for sid in selected_sids if sid not in extracted_sids]
+            print(
+                f"Clean extraction completed: built={len(extracted_sids)}/{len(selected_sids)} "
+                f"failed={len(missing_extract)} output={output_dir}",
+                flush=True,
+            )
+            if missing_extract:
+                raise RuntimeError(
+                    "Clean extraction incomplete. Missing SIDs "
+                    f"{missing_extract[:20]}; inspect {errors_path}"
+                )
             return
 
         # ------------------------------------------------------------------
