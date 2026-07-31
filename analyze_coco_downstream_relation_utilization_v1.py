@@ -94,7 +94,7 @@ except Exception as exc:  # pragma: no cover
     raise SystemExit(f"Unable to import transformers: {exc}")
 
 
-SCRIPT_VERSION = "coco-downstream-relation-utilization-v1"
+SCRIPT_VERSION = "coco-downstream-relation-utilization-v2"
 RELATIONS = ("left", "right", "above", "below")
 REL_TO_ID = {relation: index for index, relation in enumerate(RELATIONS)}
 ID_TO_REL = {index: relation for relation, index in REL_TO_ID.items()}
@@ -766,7 +766,10 @@ def relation_scores_from_hidden(
     if logits.ndim != 3:
         raise RuntimeError(f"LM output embedding returned shape {tuple(logits.shape)}")
     relation_data = base.relation_scores(logits[0, 0], relation_token_map, gt=None)
-    scores = {relation: float(relation_data["scores"][relation]) for relation in RELATIONS}
+    # Repository helpers are not schema-uniform: some return
+    # {"scores": {relation: value, ...}}, while others return the flat
+    # {relation: value, ...} mapping directly. Normalize both forms.
+    scores = relation_score_map(relation_data)
     prediction, margin = score_prediction(scores)
     return {"scores": scores, "prediction": prediction, "top_margin": margin}
 
@@ -985,7 +988,7 @@ def score_model(
     with torch.inference_mode():
         outputs = model(**dict(batch), use_cache=False, return_dict=True)
     relation_data = base.relation_scores(outputs.logits[0, -1], relation_token_map, gt=None)
-    scores = {relation: float(relation_data["scores"][relation]) for relation in RELATIONS}
+    scores = relation_score_map(relation_data)
     prediction, margin = score_prediction(scores)
     return {"scores": scores, "prediction": prediction, "top_margin": margin}
 
@@ -1986,14 +1989,11 @@ def main() -> None:
                             base=base,
                             fallback_device=torch.device(args.device),
                         )
-                    final_scores = {
-                        relation: float(
-                            base.relation_scores(
-                                outputs.logits[0, -1], relation_token_map, gt=None
-                            )["scores"][relation]
+                    final_scores = relation_score_map(
+                        base.relation_scores(
+                            outputs.logits[0, -1], relation_token_map, gt=None
                         )
-                        for relation in RELATIONS
-                    }
+                    )
                     final_prediction, final_top_margin = score_prediction(final_scores)
                     row = {
                         "script_version": SCRIPT_VERSION,
