@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Multi-GPU pipeline for the prototype_head baseline-error detector.
+# Single-GPU foreground pipeline for the prototype_head baseline-error detector.
 #
 # Default model registry:
 #   qwen2-2b, qwen-7b, llava-7b, llava-13b,
@@ -32,10 +32,9 @@ FORCE_SOURCE="${FORCE_SOURCE:-0}"
 FORCE_SWAP="${FORCE_SWAP:-0}"
 FORCE_DETECTOR="${FORCE_DETECTOR:-0}"
 
-GPU0_MODELS_DEFAULT="qwen2-2b,qwen-7b,internvl-1b,internvl-8b"
-GPU1_MODELS_DEFAULT="llava-7b,llava-13b,internvl-2b"
-GPU0_MODELS="${GPU0_MODELS:-$GPU0_MODELS_DEFAULT}"
-GPU1_MODELS="${GPU1_MODELS:-$GPU1_MODELS_DEFAULT}"
+GPU_ID="${GPU_ID:-0}"
+MODELS_DEFAULT="qwen2-2b,qwen-7b,llava-7b,llava-13b,internvl-1b,internvl-2b,internvl-8b"
+MODELS="${MODELS:-$MODELS_DEFAULT}"
 
 mkdir -p "$SOURCE_ROOT" "$SWAP_ROOT" "$DETECTOR_ROOT" "$SUMMARY_DIR" "$LOG_ROOT"
 
@@ -57,8 +56,16 @@ run_logged() {
   local log_file="$1"
   shift
   mkdir -p "$(dirname "$log_file")"
-  echo "[RUN] $*" > "$log_file"
-  if ! "$@" >> "$log_file" 2>&1; then
+
+  echo
+  echo "======================================================================"
+  echo "[RUN] $*"
+  echo "[LOG] $log_file"
+  echo "======================================================================"
+
+  # tqdm writes to stderr. Merge stdout/stderr and tee both to the terminal
+  # and the stage log. With set -o pipefail, command failures still propagate.
+  if ! "$@" 2>&1 | tee "$log_file"; then
     echo "[FAILED] See $log_file" >&2
     tail -n 120 "$log_file" >&2 || true
     return 1
@@ -227,29 +234,16 @@ run_queue() {
   done
 }
 
-echo "GPU0 queue: $GPU0_MODELS"
-echo "GPU1 queue: $GPU1_MODELS"
+echo "Physical GPU: $GPU_ID"
+echo "Sequential model queue: $MODELS"
+echo "Progress is shown live and also saved under: $LOG_ROOT"
+echo
 
-run_queue 0 "$GPU0_MODELS" > "${LOG_ROOT}/gpu0_queue.log" 2>&1 &
-pid0=$!
-run_queue 1 "$GPU1_MODELS" > "${LOG_ROOT}/gpu1_queue.log" 2>&1 &
-pid1=$!
-
-status=0
-wait "$pid0" || status=1
-wait "$pid1" || status=1
-
-if [[ "$status" != "0" ]]; then
-  echo "[FAILED] At least one GPU queue failed." >&2
-  echo "GPU0 tail:" >&2
-  tail -n 100 "${LOG_ROOT}/gpu0_queue.log" >&2 || true
-  echo "GPU1 tail:" >&2
-  tail -n 100 "${LOG_ROOT}/gpu1_queue.log" >&2 || true
-  exit 1
-fi
+# Foreground execution: one model at a time on one physical GPU.
+run_queue "$GPU_ID" "$MODELS"
 
 python -u summarize_coco_multimodel_prototype_detector.py \
-  --models "qwen2-2b,qwen-7b,llava-7b,llava-13b,internvl-1b,internvl-2b,internvl-8b" \
+  --models "$MODELS" \
   --detector-root "$DETECTOR_ROOT" \
   --threshold 0.5 \
   --output-dir "$SUMMARY_DIR"
