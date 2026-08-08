@@ -65,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dataset", default="coco_two", choices=["coco_two"])
     p.add_argument("--data-root", default="data")
+    p.add_argument("--prompt-jsonl", default="prompts/COCO_QA_two_obj_with_answer_four_options.jsonl")
     p.add_argument("--model", required=True, choices=sorted(base.SPECS))
     p.add_argument("--device", default="cuda:0")
     p.add_argument(
@@ -88,26 +89,32 @@ def norm_relation(x: Any) -> str:
     return REL_ALIASES.get(key, key)
 
 
-def prompt_text(subject: str, reference: str) -> str:
-    # Keep the answer space fully fixed.  The final hidden state is the final
-    # prompt token, so all instructions are already in its causal context.
-    return (
-        "Determine the spatial relation of the target object to the reference "
-        "object in the image. "
-        "Choose exactly one label from: left, right, on, under. "
-        "Use 'on' for vertically above and 'under' for vertically below. "
-        "Output exactly one label and nothing else. "
-        f"Objects: {subject} and {reference}. "
-        f"Target object: {subject}. "
-        f"Reference object: {reference}."
-    )
+def load_original_prompts(path: Path) -> Dict[int, str]:
+    """Load the exact original COCO four-option question text by sample id."""
+    rows: Dict[int, str] = {}
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            sid = int(row["id"])
+            q = str(row["question"])
+            # Original file stores LLaVA-style wrappers. Keep the user question
+            # itself exact, but let each model receive its own native chat template.
+            q = q.replace("<image>", "")
+            q = q.replace("USER:", "")
+            if "ASSISTANT:" in q:
+                q = q.split("ASSISTANT:", 1)[0]
+            rows[sid] = q.strip()
+    return rows
 
 
-def build_chat_prompt(processor: Any, subject: str, reference: str, *, with_image: bool) -> str:
+def build_chat_prompt(processor: Any, question_text: str, *, with_image: bool) -> str:
     content: List[Dict[str, Any]] = []
     if with_image:
         content.append({"type": "image"})
-    content.append({"type": "text", "text": prompt_text(subject, reference)})
+    content.append({"type": "text", "text": question_text})
     messages = [{"role": "user", "content": content}]
     return processor.apply_chat_template(
         messages,
@@ -147,6 +154,7 @@ def extract_states(
     model: Any,
     processor: Any,
     records: Sequence[base.Record],
+    prompt_rows: Mapping[int, str],
     device: torch.device,
     out_path: Path,
 ) -> Dict[str, Any]:
@@ -177,7 +185,8 @@ def extract_states(
                 "repo_id": base.SPECS[args.model].repo_id,
                 "representation": "last_prompt_token",
                 "definition": "h_last(correct_image) - h_last(no_image)",
-                "prompt_template": prompt_text("{subject}", "{reference}"),
+                "prompt_source": str(args.prompt_jsonl),
+                "prompt_template": "original per-sample COCO four-option prompt",
                 "decoder_blocks": decoder_blocks,
                 "hidden_size": hidden_size,
                 "n_saved": len(sids),
@@ -200,10 +209,10 @@ def extract_states(
 
             for mode in ("correct", "no_image"):
                 with_image = mode == "correct"
+                question_text = prompt_rows[int(record.sid)]
                 rendered = build_chat_prompt(
                     processor,
-                    record.subject,
-                    record.reference,
+                    question_text,
                     with_image=with_image,
                 )
                 batch = process_inputs(
@@ -396,7 +405,11 @@ def main() -> None:
     states_path = out_dir / "states" / "last_token_correct_noimage.npz"
 
     records, audit = base.load_records(args.dataset, Path(args.data_root), args.max_samples)
-    records = [r for r in records if norm_relation(r.relation) in RELATIONS]
+    prompt_rows = load_original_prompts(Path(args.prompt_jsonl))
+    records = [
+        r for r in records
+        if norm_relation(r.relation) in RELATIONS and int(r.sid) in prompt_rows
+    ]
     if not records:
         raise RuntimeError("No usable records")
 
@@ -436,6 +449,7 @@ def main() -> None:
             model=model,
             processor=processor,
             records=records,
+            prompt_rows=prompt_rows,
             device=device,
             out_path=states_path,
         )
@@ -474,6 +488,7 @@ def main() -> None:
                 "train_ratio": args.train_ratio,
                 "repeats": args.repeats,
                 "seed": args.seed,
+                "prompt_jsonl": args.prompt_jsonl,
                 "n": len(y),
                 "representation": "last_prompt_token",
                 "residual": "correct_image - no_image",
