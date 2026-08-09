@@ -859,7 +859,7 @@ def main() -> None:
         print(f"original baseline correct-image | acc={100*base_m['acc_mean']:.2f}%±{100*base_m['acc_std']:.2f}%")
         for _, r in cond_df.iterrows():
             print(
-                f"I={int(r.I):+d} T={int(r.T):+d} O={int(r.O):+d} | "
+                f"I={int(r['I']):+d} T={int(r['T']):+d} O={int(r['O']):+d} | "
                 f"acc={100*r.acc_mean:.2f}%±{100*r.acc_std:.2f}% | norm={r.mean_norm:.3f}"
             )
 
@@ -873,7 +873,7 @@ def main() -> None:
         print("="*108)
         for _, r in resid_df.iterrows():
             print(
-                f"T={int(r.T):+d} O={int(r.O):+d} | "
+                f"T={int(r['T']):+d} O={int(r['O']):+d} | "
                 f"acc={100*r.acc_mean:.2f}%±{100*r.acc_std:.2f}% | norm={r.mean_norm:.3f}"
             )
 
