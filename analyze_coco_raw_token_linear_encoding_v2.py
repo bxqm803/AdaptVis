@@ -500,20 +500,48 @@ def load_pair_metadata(path: Optional[str]) -> Tuple[Dict[int, Mapping[str, Any]
 
 
 def auto_find_coco_instances(data_root: Path, explicit: Optional[str]) -> Optional[Path]:
-    if explicit:
-        p = Path(explicit)
-        return p if p.exists() else None
-    direct = [
-        data_root / "annotations" / "instances_val2017.json",
-        data_root / "coco" / "annotations" / "instances_val2017.json",
-        data_root / "coco_two" / "annotations" / "instances_val2017.json",
-        data_root / "instances_val2017.json",
-    ]
-    for p in direct:
-        if p.exists(): return p
-    hits = list(data_root.glob("**/instances_val2017.json"))
-    return hits[0] if hits else None
+    """Find COCO instances_val2017.json without assuming it lives inside data_root.
 
+    COCO-two itself only stores image id + relation captions, so this external
+    annotation file is required for bbox geometry unless --pair-metadata is supplied.
+    """
+    if explicit:
+        p = Path(explicit).expanduser().resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"--coco-instances does not exist: {p}")
+        return p
+
+    roots = []
+    for r in [data_root, data_root.parent, Path.cwd(), Path.cwd().parent]:
+        try:
+            r = r.expanduser().resolve()
+        except Exception:
+            continue
+        if r not in roots:
+            roots.append(r)
+
+    rels = [
+        Path('annotations/instances_val2017.json'),
+        Path('coco/annotations/instances_val2017.json'),
+        Path('COCO/annotations/instances_val2017.json'),
+        Path('coco2017/annotations/instances_val2017.json'),
+        Path('instances_val2017.json'),
+    ]
+    for root in roots:
+        for rel in rels:
+            q = root / rel
+            if q.exists():
+                return q
+
+    # Bounded recursive fallback under likely small roots only.
+    for root in roots[:2]:
+        try:
+            hits = list(root.glob('**/instances_val2017.json'))
+        except Exception:
+            hits = []
+        if hits:
+            return hits[0]
+    return None
 
 def load_coco_instances(path: Optional[Path]) -> Optional[Dict[str, Any]]:
     if path is None: return None
@@ -523,21 +551,65 @@ def load_coco_instances(path: Optional[Path]) -> Optional[Dict[str, Any]]:
     cat_to_ids: Dict[str, List[int]] = defaultdict(list)
     for cid, name in cats.items(): cat_to_ids[name].append(cid)
     images = {int(x["id"]): x for x in obj.get("images", [])}
+    file_to_id = {Path(str(x.get("file_name", ""))).name: int(x["id"]) for x in obj.get("images", []) if x.get("file_name")}
     anns_by_img: Dict[int, List[Mapping[str, Any]]] = defaultdict(list)
     for a in obj.get("annotations", []): anns_by_img[int(a["image_id"])].append(a)
-    return {"cats": cats, "cat_to_ids": cat_to_ids, "images": images, "anns_by_img": anns_by_img}
+    return {"cats": cats, "cat_to_ids": cat_to_ids, "images": images, "file_to_id": file_to_id, "anns_by_img": anns_by_img}
+
+
+COCO_NAME_ALIASES: Dict[str, str] = {
+    # people / vehicles
+    'man':'person','woman':'person','boy':'person','girl':'person','child':'person','kid':'person','people':'person','human':'person',
+    'bike':'bicycle','cycle':'bicycle','motorbike':'motorcycle','motor bike':'motorcycle',
+    'plane':'airplane','aircraft':'airplane','jet':'airplane',
+    # furniture / electronics
+    'sofa':'couch','armchair':'chair','seat':'chair','table':'dining table','dinner table':'dining table',
+    'tv':'tv','television':'tv','monitor':'tv','phone':'cell phone','cellphone':'cell phone','mobile phone':'cell phone',
+    'fridge':'refrigerator',
+    # sports / kitchen / common lexical variants
+    'ball':'sports ball','baseball glove':'baseball glove','racket':'tennis racket','racquet':'tennis racket',
+    'wineglass':'wine glass','wine-glass':'wine glass','hotdog':'hot dog',
+    'pottedplant':'potted plant','plant':'potted plant','hairdryer':'hair drier','hair dryer':'hair drier',
+}
+
+
+def _normalize_obj_phrase(s: str) -> str:
+    s = str(s).lower().strip()
+    s = re.sub(r'^(?:a|an|the)\s+', '', s)
+    s = re.sub(r'[^a-z0-9]+', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
 
 
 def _name_variants(s: str) -> List[str]:
-    s = s.lower().strip()
+    s = _normalize_obj_phrase(s)
     vals = [s]
-    for art in ("the ", "a ", "an "):
-        if s.startswith(art): vals.append(s[len(art):].strip())
-    # light singular/plural fallback only
-    if s.endswith("s") and len(s) > 3: vals.append(s[:-1])
-    else: vals.append(s + "s")
-    return list(dict.fromkeys(vals))
-
+    if s in COCO_NAME_ALIASES:
+        vals.append(COCO_NAME_ALIASES[s])
+    # If a caption contains an adjective, allow an exact COCO category suffix,
+    # e.g. "wooden dining table" -> "dining table".  We still do not map
+    # semantically ambiguous words such as generic "vehicle".
+    coco_multi = [
+        'traffic light','fire hydrant','stop sign','parking meter','sports ball',
+        'baseball bat','baseball glove','tennis racket','wine glass','hot dog',
+        'potted plant','dining table','cell phone','teddy bear','hair drier'
+    ]
+    for c in coco_multi:
+        if s == c or s.endswith(' '+c):
+            vals.append(c)
+    # light singular/plural fallback
+    if s.endswith('s') and len(s) > 3:
+        vals.append(s[:-1])
+    else:
+        vals.append(s + 's')
+    # common head-noun aliases after stripping modifiers
+    toks=s.split()
+    if toks:
+        head=toks[-1]
+        if head in COCO_NAME_ALIASES:
+            vals.append(COCO_NAME_ALIASES[head])
+        vals.append(head)
+    return list(dict.fromkeys(v for v in vals if v))
 
 def _relation_from_centers(a: Sequence[float], b: Sequence[float], relation: str) -> bool:
     ax, ay = a[0] + a[2]/2.0, a[1] + a[3]/2.0
@@ -550,36 +622,70 @@ def _relation_from_centers(a: Sequence[float], b: Sequence[float], relation: str
 
 
 def resolve_from_coco(rec: Any, coco: Optional[Dict[str, Any]]) -> Optional[Tuple[List[float], List[float], float, float, str]]:
-    if coco is None: return None
-    try: iid = int(str(rec.image_id).split(".")[0])
+    if coco is None:
+        return None
+
+    # Record.image_id in this COCO-two loader is normally the numeric COCO id,
+    # but support filenames/paths as well.
+    iid = None
+    raw_id = str(getattr(rec, 'image_id', ''))
+    try:
+        iid = int(raw_id)
     except Exception:
-        m = re.search(r"(\d+)", str(rec.image_id))
-        if not m: return None
-        iid = int(m.group(1))
-    if iid not in coco["images"]: return None
-    img = coco["images"][iid]; W = float(img["width"]); H = float(img["height"])
-    anns = coco["anns_by_img"].get(iid, [])
+        pass
+    if iid not in coco['images']:
+        try:
+            fname = Path(str(getattr(rec, 'image_path', raw_id))).name
+            iid = coco.get('file_to_id', {}).get(fname)
+        except Exception:
+            iid = None
+    if iid not in coco['images']:
+        nums = re.findall(r'(\d+)', Path(raw_id).stem)
+        if nums:
+            cand = int(nums[-1])
+            if cand in coco['images']:
+                iid = cand
+    if iid not in coco['images']:
+        return None
+
+    img = coco['images'][iid]
+    W = float(img['width']); H = float(img['height'])
+    anns = coco['anns_by_img'].get(iid, [])
+
     def catids_for(name: str) -> set:
         ids = set()
-        for v in _name_variants(name): ids.update(coco["cat_to_ids"].get(v, []))
+        for v in _name_variants(name):
+            ids.update(coco['cat_to_ids'].get(v, []))
+        # Last conservative fallback: match a COCO category as a full token suffix.
+        if not ids:
+            phrase = _normalize_obj_phrase(name)
+            for cname, cids in coco['cat_to_ids'].items():
+                if phrase == cname or phrase.endswith(' '+cname):
+                    ids.update(cids)
         return ids
+
     sa = catids_for(str(rec.subject)); rb = catids_for(str(rec.reference))
-    if not sa or not rb: return None
-    As = [a for a in anns if int(a.get("category_id", -1)) in sa and a.get("bbox")]
-    Bs = [b for b in anns if int(b.get("category_id", -1)) in rb and b.get("bbox")]
-    if len(As) == 1 and len(Bs) == 1 and int(As[0].get("id", -1)) != int(Bs[0].get("id", -2)):
-        return list(map(float, As[0]["bbox"])), list(map(float, Bs[0]["bbox"])), W, H, "coco_unique_category"
+    if not sa or not rb:
+        return None
+    As = [a for a in anns if int(a.get('category_id', -1)) in sa and a.get('bbox')]
+    Bs = [b for b in anns if int(b.get('category_id', -1)) in rb and b.get('bbox')]
+    if len(As) == 1 and len(Bs) == 1 and int(As[0].get('id', -1)) != int(Bs[0].get('id', -2)):
+        return list(map(float, As[0]['bbox'])), list(map(float, Bs[0]['bbox'])), W, H, 'coco_unique_category'
+
+    # Strict default: use the relation label only when it leaves exactly one
+    # ordered A/B instance pair.  Do NOT guess among multiple compatible pairs.
     pairs = []
     rel = norm_relation(rec.relation)
     for a in As:
         for b in Bs:
-            if int(a.get("id", -1)) == int(b.get("id", -1)): continue
-            ba, bb = list(map(float, a["bbox"])), list(map(float, b["bbox"]))
-            if _relation_from_centers(ba, bb, rel): pairs.append((ba, bb))
+            if int(a.get('id', -1)) == int(b.get('id', -1)):
+                continue
+            ba, bb = list(map(float, a['bbox'])), list(map(float, b['bbox']))
+            if _relation_from_centers(ba, bb, rel):
+                pairs.append((ba, bb))
     if len(pairs) == 1:
-        return pairs[0][0], pairs[0][1], W, H, "coco_unique_relation_pair"
+        return pairs[0][0], pairs[0][1], W, H, 'coco_unique_relation_pair'
     return None
-
 
 def resolve_bbox_record(
     rec: Any, pair_by_sid: Mapping[int, Mapping[str, Any]],
@@ -840,6 +946,16 @@ def main() -> None:
     rec_by_sid={int(r.sid):r for r in records}
     pair_sid,pair_key=load_pair_metadata(args.pair_metadata)
     coco_path=auto_find_coco_instances(Path(args.data_root),args.coco_instances)
+    if coco_path is None and not pair_sid and not pair_key:
+        raise RuntimeError(
+            "No bbox source was found. COCO-two's coco_qa_two_obj.json stores only "
+            "[image_id, caption, opposite_caption], not A/B boxes.\n"
+            "Provide standard COCO 2017 instance annotations with:\n"
+            "  --coco-instances /path/to/annotations/instances_val2017.json\n"
+            "or provide exact pair boxes with --pair-metadata.\n"
+            "Quick locate command:\n"
+            "  find /ddnB/work/mwang32 -name instances_val2017.json 2>/dev/null | head"
+        )
     coco=load_coco_instances(coco_path)
     bbox_rows=[]; unresolved=[]; source_counts=Counter()
     for sid in common.tolist():
@@ -859,7 +975,14 @@ def main() -> None:
     print(f"resolved={len(bbox_rows)}/{len(common)} | sources={dict(source_counts)}")
     if unresolved: print(f"unresolved={len(unresolved)} (see {out/'bbox_audit.json'})")
     if len(bbox_rows) < 40:
-        raise RuntimeError("Too few samples with resolved A/B bboxes. Supply --pair-metadata with exact subject/reference bboxes.")
+        raise RuntimeError(
+            f"Too few unambiguous A/B bbox pairs: {len(bbox_rows)}/{len(common)}. "
+            f"COCO annotations={coco_path}. See {out/'bbox_audit.json'}. "
+            "The COCO-two JSON does not retain instance IDs, so images with multiple "
+            "compatible instances cannot be resolved exactly from the caption alone. "
+            "For those samples, supply --pair-metadata with exact subject/reference bboxes; "
+            "do not silently guess an instance pair for the final analysis."
+        )
 
     # Align states to geometry rows.
     sid_to_raw={int(s):i for i,s in enumerate(common.tolist())}
