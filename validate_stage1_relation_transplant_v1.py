@@ -1,0 +1,2121 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Stage-I counterfactual relation-state transplantation.
+
+Question
+========
+Do the proposed Stage-I Direction heads merely contain decodable spatial
+information, or does changing the relation state inside one of these heads
+causally change downstream spatial computation?
+
+This script does NOT ablate the head.
+
+For each COCO sample we construct two branches with the SAME image:
+
+    target : Where is A in relation to B?   GT = r
+    source : Where is B in relation to A?   GT = opposite(r)
+
+Thus all four classes are supported:
+
+    left  <-> right
+    above <-> below
+
+At a tested attention head, we capture the REAL pre-W_O object-head states
+from the source branch.  During the target branch we preserve the target
+head's mean object content but replace its antisymmetric subject-reference
+component with the source branch's component.
+
+For a target head state:
+    t_sub, t_ref
+
+target mean:
+    m_t = (t_sub + t_ref) / 2
+
+source role relation half-difference:
+    d_role = (s_subject - s_reference) / 2
+           = (s_B - s_A) / 2        # source prompt asks B relative to A
+
+role-relation transplant:
+    t'_sub = m_t + d_role
+    t'_ref = m_t - d_role
+
+The target sequence, image, all other heads, all model weights and downstream
+computation remain the target run.
+
+Identity-aligned control uses:
+    d_identity = (s_A - s_B) / 2
+which preserves object identity alignment rather than source subject/reference
+role.  A same-layer random head receives the same role-transplant operation.
+
+Why this is different from ablation
+===================================
+The main question is not "can the model survive without this head?".
+It is:
+
+    If this head is forced to carry the opposite relation state,
+    do downstream object hidden states follow that opposite relation?
+
+The main metric is SOURCE-FOLLOW ACC of frozen clean-trained probes.
+
+Example:
+    target GT = left
+    source GT = right
+
+If the downstream frozen probe predicts RIGHT after transplant,
+this counts as source-follow.
+
+Outputs
+=======
+1) object_hidden_probe.csv
+   For each downstream layer and intervention:
+       target_accuracy
+       source_follow_accuracy
+       other_accuracy
+
+2) last_hidden_probe.csv
+   Same measurement at prompt-last hidden state.
+
+3) next_token_summary.csv
+   Direct model next-token target/source-follow rates.
+
+4) generation_summary.csv
+   Optional autoregressive generation source-follow rates.
+
+5) individual_head_summary.csv
+   Compact per-head source-follow deltas at selected report layers.
+
+6) sample_predictions.jsonl
+   Per-sample next-token and optional generation predictions.
+
+Recommended smoke test
+======================
+
+CUDA_VISIBLE_DEVICES=0 python -u validate_stage1_relation_transplant_v1.py \
+  --model qwen-3b \
+  --source-output-dir output/spatial_storage_transport_utilization/coco/qwen-3b \
+  --heads 23:1,19:13,23:5 \
+  --max-samples 100 \
+  --pair-status both_correct \
+  --object-probe-layers 18,20,23,24,26,27 \
+  --last-probe-layers 23,26,27,35 \
+  --probe-train-ratio 0.15 \
+  --probe-repeats 5 \
+  --device cuda:0 \
+  --no-run-generation \
+  --output-dir output/qwen3b_stage1_relation_transplant_smoke \
+  --overwrite
+
+Full probe run
+==============
+
+CUDA_VISIBLE_DEVICES=0 python -u validate_stage1_relation_transplant_v1.py \
+  --model qwen-3b \
+  --source-output-dir output/spatial_storage_transport_utilization/coco/qwen-3b \
+  --heads 23:1,19:13,23:5,19:8,23:0 \
+  --max-samples 0 \
+  --pair-status both_correct \
+  --object-probe-layers 18,19,20,21,23,24,25,26,27 \
+  --last-probe-layers 23,24,25,26,27,35 \
+  --probe-train-ratio 0.15 \
+  --probe-repeats 5 \
+  --device cuda:0 \
+  --no-run-generation \
+  --output-dir output/qwen3b_stage1_relation_transplant_full \
+  --overwrite
+
+Generation confirmation for the strongest head(s)
+==================================================
+
+CUDA_VISIBLE_DEVICES=0 python -u validate_stage1_relation_transplant_v1.py \
+  --model qwen-3b \
+  --source-output-dir output/spatial_storage_transport_utilization/coco/qwen-3b \
+  --heads 23:1,23:5 \
+  --max-samples 0 \
+  --pair-status both_correct \
+  --run-generation \
+  --generation-max-samples 200 \
+  --generation-individual \
+  --device cuda:0 \
+  --output-dir output/qwen3b_stage1_relation_transplant_generation \
+  --overwrite
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import gc
+import importlib.util
+import json
+import math
+import random
+import re
+import shutil
+import sys
+import traceback
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+from tqdm import tqdm
+
+
+VERSION = "stage1-relation-transplant-v1"
+
+RELATIONS = ("left", "right", "above", "below")
+REL_TO_ID = {r: i for i, r in enumerate(RELATIONS)}
+ID_TO_REL = {i: r for i, r in enumerate(RELATIONS)}
+OPPOSITE = {
+    "left": "right",
+    "right": "left",
+    "above": "below",
+    "below": "above",
+}
+
+DEFAULT_HEADS = "23:1,19:13,23:5,19:8,23:0"
+DEFAULT_OBJECT_LAYERS = "18,19,20,21,23,24,25,26,27"
+DEFAULT_LAST_LAYERS = "23,24,25,26,27,35"
+
+REL_PATTERNS: Dict[str, Sequence[str]] = {
+    "left": (r"\bleft\s+of\b", r"\bto\s+the\s+left\b", r"\bleft\b"),
+    "right": (r"\bright\s+of\b", r"\bto\s+the\s+right\b", r"\bright\b"),
+    "above": (r"\bon\s+top\s+of\b", r"\batop\b", r"\babove\b", r"\bover\b"),
+    "below": (r"\bunderneath\b", r"\bbeneath\b", r"\bbelow\b", r"\bunder\b"),
+}
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    p.add_argument("--model", default="qwen-3b")
+    p.add_argument("--dataset", default="coco_two", choices=("coco_two",))
+    p.add_argument("--data-root", default="data")
+    p.add_argument(
+        "--prompt-jsonl",
+        default="prompts/COCO_QA_two_obj_with_answer_four_options.jsonl",
+    )
+    p.add_argument("--device", default="cuda:0")
+    p.add_argument("--attn-impl", default="eager", choices=("eager",))
+    p.add_argument("--object-state", default="mean", choices=("mean", "last"))
+
+    p.add_argument(
+        "--source-output-dir",
+        default="output/spatial_storage_transport_utilization/coco/qwen-3b",
+    )
+
+    p.add_argument("--heads", default=DEFAULT_HEADS)
+    p.add_argument("--object-probe-layers", default=DEFAULT_OBJECT_LAYERS)
+    p.add_argument("--last-probe-layers", default=DEFAULT_LAST_LAYERS)
+    p.add_argument(
+        "--report-layers",
+        default="23,24,26,27,35",
+        help="Layers printed in compact per-head summary when available.",
+    )
+
+    p.add_argument(
+        "--pair-status",
+        default="both_correct",
+        choices=("all", "both_correct", "original_only", "swapped_only", "both_wrong"),
+        help="Use both_correct first so the source branch is a valid opposite-relation source.",
+    )
+    p.add_argument(
+        "--max-samples",
+        type=int,
+        default=100,
+        help="0 = all eligible source-cache samples.",
+    )
+    p.add_argument("--sample-seed", type=int, default=17)
+
+    p.add_argument("--probe-train-ratio", type=float, default=0.15)
+    p.add_argument("--probe-repeats", type=int, default=5)
+    p.add_argument("--probe-seed", type=int, default=1)
+
+    p.add_argument(
+        "--delta-scale",
+        default="raw",
+        choices=("raw", "target_norm"),
+        help=(
+            "raw uses the real source half-difference magnitude; target_norm keeps "
+            "only source direction and rescales to the target head's current delta norm."
+        ),
+    )
+
+    p.add_argument(
+        "--include-bundle",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also transplant all selected Stage-I heads simultaneously.",
+    )
+
+    p.add_argument(
+        "--run-generation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    p.add_argument(
+        "--generation-individual",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If generation is enabled, also generate individual-head role/random conditions.",
+    )
+    p.add_argument(
+        "--generation-max-samples",
+        type=int,
+        default=100,
+        help="0 = all analyzed samples.",
+    )
+    p.add_argument("--max-new-tokens", type=int, default=8)
+    p.add_argument("--min-new-tokens", type=int, default=1)
+
+    p.add_argument(
+        "--feature-dtype",
+        default="float16",
+        choices=("float16", "float32"),
+        help="CPU storage dtype for captured hidden states.",
+    )
+
+    p.add_argument("--seed", type=int, default=29)
+    p.add_argument("--print-every", type=int, default=5)
+    p.add_argument("--empty-cache-every", type=int, default=5)
+
+    # Same repository helper scripts used by previous experiments.
+    p.add_argument(
+        "--three-stage-script",
+        default="validate_three_stage_spatial_circuit_v1.py",
+    )
+    p.add_argument(
+        "--ioi-script",
+        default="analyze_coco_ioi_backward_circuit_v1.py",
+    )
+    p.add_argument(
+        "--producer-script",
+        default="analyze_coco_producer_qk_ov_v1.py",
+    )
+    p.add_argument(
+        "--receiver-script",
+        default="analyze_coco_receiver_qkv_v1.py",
+    )
+    p.add_argument(
+        "--v3-script",
+        default="analyze_spatial_storage_transport_utilization_v3.py",
+    )
+    p.add_argument(
+        "--base-script",
+        default="analyze_coco_centroid_generation_step1_v4.py",
+    )
+    p.add_argument(
+        "--attention-helper",
+        default="analyze_coco_flip_attention_spatial_vectors_v1.py",
+    )
+
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--overwrite", action="store_true")
+    p.add_argument(
+        "--fail-fast",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    return p.parse_args()
+
+
+# =============================================================================
+# Generic utilities
+# =============================================================================
+
+def import_file(path: Path, name: str) -> Any:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    spec = importlib.util.spec_from_file_location(name, str(path))
+    if spec is None or spec.loader is None:
+        raise ImportError(path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def append_jsonl(path: Path, row: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(dict(row), ensure_ascii=False) + "\n")
+
+
+def write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+
+    fields: List[str] = []
+    seen = set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                fields.append(key)
+
+    with path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in rows:
+            w.writerow(dict(row))
+
+
+def parse_head(text: str) -> Tuple[int, int]:
+    s = str(text).strip().upper()
+    s = s.replace("L", "").replace("H", ":")
+    while "::" in s:
+        s = s.replace("::", ":")
+    if ":" not in s:
+        raise ValueError(f"Bad head {text!r}; use 23:1 or L23H1")
+    a, b = s.split(":", 1)
+    return int(a), int(b)
+
+
+def parse_heads(text: str) -> List[Tuple[int, int]]:
+    out: List[Tuple[int, int]] = []
+    seen = set()
+    for item in str(text).split(","):
+        if not item.strip():
+            continue
+        head = parse_head(item)
+        if head not in seen:
+            seen.add(head)
+            out.append(head)
+    if not out:
+        raise ValueError("No --heads selected")
+    return out
+
+
+def hname(head: Tuple[int, int]) -> str:
+    return f"L{int(head[0])}H{int(head[1]):02d}"
+
+
+def parse_layers(text: str, n_layers: int) -> List[int]:
+    result: List[int] = []
+    seen = set()
+    for piece in str(text).split(","):
+        piece = piece.strip().upper().replace("L", "")
+        if not piece:
+            continue
+        if "-" in piece:
+            a, b = piece.split("-", 1)
+            start, stop = int(a), int(b)
+            values = range(min(start, stop), max(start, stop) + 1)
+        else:
+            values = [int(piece)]
+        for layer in values:
+            if not 0 <= layer < n_layers:
+                raise ValueError(f"Layer {layer} outside 0..{n_layers-1}")
+            if layer not in seen:
+                seen.add(layer)
+                result.append(layer)
+    return sorted(result)
+
+
+def stratified_subset(
+    rows: Sequence[Mapping[str, Any]],
+    limit: int,
+    seed: int,
+) -> List[Dict[str, Any]]:
+    rows = [dict(r) for r in rows]
+    if limit <= 0 or len(rows) <= limit:
+        return sorted(rows, key=lambda x: int(x["sid"]))
+
+    groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        groups[str(row["gt"])].append(row)
+
+    rng = random.Random(seed)
+    for group in groups.values():
+        rng.shuffle(group)
+
+    selected: List[Dict[str, Any]] = []
+    cursors = {r: 0 for r in RELATIONS}
+    while len(selected) < limit:
+        moved = False
+        for relation in RELATIONS:
+            group = groups.get(relation, [])
+            i = cursors[relation]
+            if i < len(group) and len(selected) < limit:
+                selected.append(group[i])
+                cursors[relation] += 1
+                moved = True
+        if not moved:
+            break
+
+    return sorted(selected, key=lambda x: int(x["sid"]))
+
+
+def one_line(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text)).strip()
+
+
+def parse_generation(text: str) -> Optional[str]:
+    normalized = one_line(text).lower()
+    found: List[Tuple[int, int, str]] = []
+    for relation, patterns in REL_PATTERNS.items():
+        for priority, pattern in enumerate(patterns):
+            m = re.search(pattern, normalized)
+            if m:
+                found.append((m.start(), priority, relation))
+                break
+    if not found:
+        return None
+    found.sort()
+    return found[0][2]
+
+
+def safe_mean(xs: Iterable[float]) -> float:
+    x = np.asarray(list(xs), dtype=np.float64)
+    x = x[np.isfinite(x)]
+    return float(x.mean()) if x.size else float("nan")
+
+
+def safe_std(xs: Iterable[float]) -> float:
+    x = np.asarray(list(xs), dtype=np.float64)
+    x = x[np.isfinite(x)]
+    return float(x.std()) if x.size else float("nan")
+
+
+# =============================================================================
+# Head geometry / matched random controls
+# =============================================================================
+
+def validate_heads(
+    heads: Sequence[Tuple[int, int]],
+    decoder_layers: Sequence[Any],
+    attention_helper: Any,
+    receiver_module: Any,
+) -> None:
+    for layer, head in heads:
+        if not 0 <= layer < len(decoder_layers):
+            raise ValueError(f"{hname((layer, head))}: bad layer")
+        attn = attention_helper.resolve_self_attention(decoder_layers[layer])
+        shape = receiver_module.resolve_attention_shape(attn)
+        if not 0 <= head < int(shape.n_query_heads):
+            raise ValueError(
+                f"{hname((layer, head))}: head outside 0..{int(shape.n_query_heads)-1}"
+            )
+
+
+def matched_random_heads(
+    target_heads: Sequence[Tuple[int, int]],
+    decoder_layers: Sequence[Any],
+    attention_helper: Any,
+    receiver_module: Any,
+    excluded: set[Tuple[int, int]],
+    seed: int,
+) -> List[Tuple[int, int]]:
+    rng = random.Random(seed)
+    out: List[Tuple[int, int]] = []
+    used = set(excluded)
+    for layer, _ in target_heads:
+        attn = attention_helper.resolve_self_attention(decoder_layers[layer])
+        nh = int(receiver_module.resolve_attention_shape(attn).n_query_heads)
+        choices = [(layer, h) for h in range(nh) if (layer, h) not in used]
+        if not choices:
+            raise RuntimeError(f"No matched random head left at L{layer}")
+        pick = rng.choice(choices)
+        out.append(pick)
+        used.add(pick)
+    return out
+
+
+# =============================================================================
+# Tensor output helpers
+# =============================================================================
+
+def first_3d_tensor(output: Any) -> torch.Tensor:
+    if torch.is_tensor(output) and output.ndim == 3:
+        return output
+    if isinstance(output, (tuple, list)):
+        for item in output:
+            if torch.is_tensor(item) and item.ndim == 3:
+                return item
+    raise RuntimeError("Could not find 3D hidden tensor")
+
+
+# =============================================================================
+# Source head-state capture
+# =============================================================================
+
+class SourceHeadCapture:
+    """
+    Captures source swapped-branch pre-W_O states for all requested heads.
+
+    Source prompt:
+        subject = original B
+        reference = original A
+
+    We retain identity-pooled vectors:
+        A = source reference
+        B = source subject
+    """
+
+    def __init__(
+        self,
+        *,
+        decoder_layers: Sequence[Any],
+        attention_helper: Any,
+        receiver_module: Any,
+        heads: Sequence[Tuple[int, int]],
+        source_a_positions: Sequence[int],
+        source_b_positions: Sequence[int],
+    ) -> None:
+        self.decoder_layers = decoder_layers
+        self.attention_helper = attention_helper
+        self.receiver_module = receiver_module
+        self.by_layer: Dict[int, List[int]] = defaultdict(list)
+        for layer, head in heads:
+            self.by_layer[int(layer)].append(int(head))
+        self.a_positions = sorted(set(map(int, source_a_positions)))
+        self.b_positions = sorted(set(map(int, source_b_positions)))
+        self.handles: List[Any] = []
+        self.states: Dict[Tuple[int, int], Dict[str, np.ndarray]] = {}
+
+    def __enter__(self) -> "SourceHeadCapture":
+        for layer, heads in self.by_layer.items():
+            attn = self.attention_helper.resolve_self_attention(
+                self.decoder_layers[layer]
+            )
+            o_proj = getattr(attn, "o_proj", None)
+            if o_proj is None:
+                raise RuntimeError(f"L{layer} attention lacks o_proj")
+            shape = self.receiver_module.resolve_attention_shape(attn)
+            nh = int(shape.n_query_heads)
+            width = int(o_proj.weight.shape[1])
+            if width % nh != 0:
+                raise RuntimeError(f"L{layer}: o_proj width/head mismatch")
+            hd = width // nh
+
+            def make_hook(layer_index: int, head_ids: Sequence[int], head_dim: int):
+                def hook(_module: Any, inputs: Tuple[Any, ...]) -> None:
+                    if not inputs or not torch.is_tensor(inputs[0]):
+                        return None
+                    x = inputs[0]
+                    if x.ndim != 3 or int(x.shape[0]) != 1:
+                        return None
+
+                    ap = torch.as_tensor(
+                        self.a_positions, device=x.device, dtype=torch.long
+                    )
+                    bp = torch.as_tensor(
+                        self.b_positions, device=x.device, dtype=torch.long
+                    )
+                    for head in head_ids:
+                        lo = int(head) * head_dim
+                        hi = lo + head_dim
+                        a = x[0].index_select(0, ap)[:, lo:hi].mean(dim=0)
+                        b = x[0].index_select(0, bp)[:, lo:hi].mean(dim=0)
+                        self.states[(layer_index, int(head))] = {
+                            "A": a.detach().float().cpu().numpy().astype(np.float32),
+                            "B": b.detach().float().cpu().numpy().astype(np.float32),
+                        }
+                    return None
+                return hook
+
+            self.handles.append(
+                o_proj.register_forward_pre_hook(
+                    make_hook(layer, heads, hd)
+                )
+            )
+        return self
+
+    def validate(self, heads: Sequence[Tuple[int, int]]) -> None:
+        missing = [hname(h) for h in heads if h not in self.states]
+        if missing:
+            raise RuntimeError(f"Missing source head states: {missing}")
+
+    def close(self) -> None:
+        for h in reversed(self.handles):
+            with contextlib.suppress(Exception):
+                h.remove()
+        self.handles.clear()
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+
+# =============================================================================
+# Target relation-state transplant + hidden-state capture
+# =============================================================================
+
+class TargetTransplantAndCapture:
+    """
+    Applies relation-delta transplant to selected target heads and captures:
+      * object residual hidden A-B after selected decoder blocks
+      * prompt-last residual hidden after selected decoder blocks
+
+    source_half_deltas maps head -> source half-difference.
+
+    During target A-relative-B run:
+        target subject = A
+        target reference = B
+
+    We preserve the target head's pooled mean m_t and only replace the
+    antisymmetric half-difference.
+    """
+
+    def __init__(
+        self,
+        *,
+        decoder_layers: Sequence[Any],
+        attention_helper: Any,
+        receiver_module: Any,
+        source_half_deltas: Mapping[Tuple[int, int], np.ndarray],
+        target_a_positions: Sequence[int],
+        target_b_positions: Sequence[int],
+        prompt_last: int,
+        object_layers: Sequence[int],
+        last_layers: Sequence[int],
+        delta_scale: str,
+        storage_dtype: np.dtype,
+    ) -> None:
+        self.decoder_layers = decoder_layers
+        self.attention_helper = attention_helper
+        self.receiver_module = receiver_module
+        self.by_layer: Dict[int, Dict[int, np.ndarray]] = defaultdict(dict)
+        for (layer, head), delta in source_half_deltas.items():
+            self.by_layer[int(layer)][int(head)] = np.asarray(delta, dtype=np.float32)
+
+        self.a_positions = sorted(set(map(int, target_a_positions)))
+        self.b_positions = sorted(set(map(int, target_b_positions)))
+        self.prompt_last = int(prompt_last)
+        self.object_layers = set(map(int, object_layers))
+        self.last_layers = set(map(int, last_layers))
+        self.delta_scale = str(delta_scale)
+        self.storage_dtype = storage_dtype
+
+        self.handles: List[Any] = []
+        self.object_features: Dict[int, np.ndarray] = {}
+        self.last_features: Dict[int, np.ndarray] = {}
+        self.patch_events: Dict[Tuple[int, int], int] = defaultdict(int)
+        self.patch_stats: Dict[Tuple[int, int], Dict[str, float]] = {}
+
+    def __enter__(self) -> "TargetTransplantAndCapture":
+        # Intervention pre-hooks on o_proj input.
+        for layer, head_map in self.by_layer.items():
+            attn = self.attention_helper.resolve_self_attention(
+                self.decoder_layers[layer]
+            )
+            o_proj = getattr(attn, "o_proj", None)
+            if o_proj is None:
+                raise RuntimeError(f"L{layer} attention lacks o_proj")
+            shape = self.receiver_module.resolve_attention_shape(attn)
+            nh = int(shape.n_query_heads)
+            width = int(o_proj.weight.shape[1])
+            if width % nh != 0:
+                raise RuntimeError(f"L{layer}: o_proj width/head mismatch")
+            hd = width // nh
+
+            def make_patch_hook(
+                layer_index: int,
+                deltas: Mapping[int, np.ndarray],
+                head_dim: int,
+            ):
+                def hook(_module: Any, inputs: Tuple[Any, ...]) -> Any:
+                    if not inputs or not torch.is_tensor(inputs[0]):
+                        return None
+                    x = inputs[0]
+                    if x.ndim != 3 or int(x.shape[0]) != 1:
+                        return None
+
+                    modified = x.clone()
+                    ap = torch.as_tensor(
+                        self.a_positions, device=x.device, dtype=torch.long
+                    )
+                    bp = torch.as_tensor(
+                        self.b_positions, device=x.device, dtype=torch.long
+                    )
+
+                    for head, source_delta_np in deltas.items():
+                        lo = int(head) * head_dim
+                        hi = lo + head_dim
+
+                        t_a_tokens = modified[0].index_select(0, ap)[:, lo:hi]
+                        t_b_tokens = modified[0].index_select(0, bp)[:, lo:hi]
+                        t_a = t_a_tokens.mean(dim=0)
+                        t_b = t_b_tokens.mean(dim=0)
+
+                        target_mean = 0.5 * (t_a + t_b)
+                        target_half = 0.5 * (t_a - t_b)
+
+                        source_half = torch.as_tensor(
+                            source_delta_np,
+                            device=x.device,
+                            dtype=x.dtype,
+                        )
+
+                        if self.delta_scale == "target_norm":
+                            src_norm = source_half.float().norm()
+                            tgt_norm = target_half.float().norm()
+                            if float(src_norm) > 1e-12:
+                                source_half = source_half * (
+                                    tgt_norm.to(source_half.dtype)
+                                    / src_norm.to(source_half.dtype)
+                                )
+
+                        desired_a = target_mean + source_half
+                        desired_b = target_mean - source_half
+
+                        # Constant shift preserves within-object token variation.
+                        shift_a = desired_a - t_a
+                        shift_b = desired_b - t_b
+
+                        modified[0, ap, lo:hi] = (
+                            modified[0, ap, lo:hi] + shift_a[None, :]
+                        )
+                        modified[0, bp, lo:hi] = (
+                            modified[0, bp, lo:hi] + shift_b[None, :]
+                        )
+
+                        self.patch_events[(layer_index, int(head))] += 1
+                        self.patch_stats[(layer_index, int(head))] = {
+                            "target_half_norm": float(target_half.float().norm().item()),
+                            "source_half_norm": float(source_half.float().norm().item()),
+                            "shift_a_norm": float(shift_a.float().norm().item()),
+                            "shift_b_norm": float(shift_b.float().norm().item()),
+                        }
+
+                    return (modified, *inputs[1:])
+                return hook
+
+            self.handles.append(
+                o_proj.register_forward_pre_hook(
+                    make_patch_hook(layer, head_map, hd)
+                )
+            )
+
+        # Decoder-block output captures: actual residual hidden states.
+        for layer in sorted(self.object_layers | self.last_layers):
+            block = self.decoder_layers[layer]
+
+            def make_block_hook(layer_index: int):
+                def hook(_module: Any, _inputs: Any, output: Any) -> None:
+                    hidden = first_3d_tensor(output)
+                    if int(hidden.shape[0]) != 1:
+                        return
+
+                    if layer_index in self.object_layers:
+                        ap = torch.as_tensor(
+                            self.a_positions, device=hidden.device, dtype=torch.long
+                        )
+                        bp = torch.as_tensor(
+                            self.b_positions, device=hidden.device, dtype=torch.long
+                        )
+                        a = hidden[0].index_select(0, ap).mean(dim=0)
+                        b = hidden[0].index_select(0, bp).mean(dim=0)
+                        self.object_features[layer_index] = (
+                            (a - b)
+                            .detach().float().cpu().numpy()
+                            .astype(self.storage_dtype)
+                        )
+
+                    if layer_index in self.last_layers:
+                        if 0 <= self.prompt_last < int(hidden.shape[1]):
+                            self.last_features[layer_index] = (
+                                hidden[0, self.prompt_last]
+                                .detach().float().cpu().numpy()
+                                .astype(self.storage_dtype)
+                            )
+                return hook
+
+            self.handles.append(
+                block.register_forward_hook(make_block_hook(layer))
+            )
+
+        return self
+
+    def validate(self) -> None:
+        missing_patches = [
+            hname(h)
+            for h in self.by_layer_as_heads()
+            if self.patch_events[h] < 1
+        ]
+        if missing_patches:
+            raise RuntimeError(f"Transplant hook did not fire: {missing_patches}")
+
+        missing_object = [
+            layer for layer in self.object_layers
+            if layer not in self.object_features
+        ]
+        missing_last = [
+            layer for layer in self.last_layers
+            if layer not in self.last_features
+        ]
+        if missing_object or missing_last:
+            raise RuntimeError(
+                f"Missing captures object={missing_object} last={missing_last}"
+            )
+
+    def by_layer_as_heads(self) -> List[Tuple[int, int]]:
+        return [
+            (layer, head)
+            for layer, head_map in self.by_layer.items()
+            for head in head_map
+        ]
+
+    def close(self) -> None:
+        for h in reversed(self.handles):
+            with contextlib.suppress(Exception):
+                h.remove()
+        self.handles.clear()
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+
+# =============================================================================
+# Generation-safe prefill transplant
+# =============================================================================
+
+class PrefillRelationTransplant:
+    def __init__(
+        self,
+        *,
+        decoder_layers: Sequence[Any],
+        attention_helper: Any,
+        receiver_module: Any,
+        source_half_deltas: Mapping[Tuple[int, int], np.ndarray],
+        target_a_positions: Sequence[int],
+        target_b_positions: Sequence[int],
+        prompt_length: int,
+        delta_scale: str,
+    ) -> None:
+        self.decoder_layers = decoder_layers
+        self.attention_helper = attention_helper
+        self.receiver_module = receiver_module
+        self.by_layer: Dict[int, Dict[int, np.ndarray]] = defaultdict(dict)
+        for (layer, head), delta in source_half_deltas.items():
+            self.by_layer[int(layer)][int(head)] = np.asarray(delta, dtype=np.float32)
+        self.a_positions = sorted(set(map(int, target_a_positions)))
+        self.b_positions = sorted(set(map(int, target_b_positions)))
+        self.prompt_length = int(prompt_length)
+        self.delta_scale = str(delta_scale)
+        self.handles: List[Any] = []
+        self.applications = 0
+
+    def __enter__(self) -> "PrefillRelationTransplant":
+        for layer, head_map in self.by_layer.items():
+            attn = self.attention_helper.resolve_self_attention(
+                self.decoder_layers[layer]
+            )
+            o_proj = attn.o_proj
+            shape = self.receiver_module.resolve_attention_shape(attn)
+            nh = int(shape.n_query_heads)
+            width = int(o_proj.weight.shape[1])
+            hd = width // nh
+
+            def make_hook(
+                deltas: Mapping[int, np.ndarray],
+                head_dim: int,
+            ):
+                def hook(_module: Any, inputs: Tuple[Any, ...]) -> Any:
+                    if not inputs or not torch.is_tensor(inputs[0]):
+                        return None
+                    x = inputs[0]
+                    if x.ndim != 3 or int(x.shape[0]) != 1:
+                        return None
+                    # Only prefill; decode usually S=1.
+                    if int(x.shape[1]) < self.prompt_length:
+                        return None
+
+                    modified = x.clone()
+                    ap = torch.as_tensor(
+                        self.a_positions, device=x.device, dtype=torch.long
+                    )
+                    bp = torch.as_tensor(
+                        self.b_positions, device=x.device, dtype=torch.long
+                    )
+
+                    for head, source_delta_np in deltas.items():
+                        lo = int(head) * head_dim
+                        hi = lo + head_dim
+                        t_a = modified[0].index_select(0, ap)[:, lo:hi].mean(dim=0)
+                        t_b = modified[0].index_select(0, bp)[:, lo:hi].mean(dim=0)
+                        mean = 0.5 * (t_a + t_b)
+                        target_half = 0.5 * (t_a - t_b)
+                        source_half = torch.as_tensor(
+                            source_delta_np, device=x.device, dtype=x.dtype
+                        )
+                        if self.delta_scale == "target_norm":
+                            sn = source_half.float().norm()
+                            tn = target_half.float().norm()
+                            if float(sn) > 1e-12:
+                                source_half = source_half * (
+                                    tn.to(source_half.dtype)
+                                    / sn.to(source_half.dtype)
+                                )
+                        desired_a = mean + source_half
+                        desired_b = mean - source_half
+                        modified[0, ap, lo:hi] += (desired_a - t_a)[None, :]
+                        modified[0, bp, lo:hi] += (desired_b - t_b)[None, :]
+
+                    self.applications += 1
+                    return (modified, *inputs[1:])
+                return hook
+
+            self.handles.append(
+                o_proj.register_forward_pre_hook(make_hook(head_map, hd))
+            )
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        for h in reversed(self.handles):
+            with contextlib.suppress(Exception):
+                h.remove()
+
+
+# =============================================================================
+# Forward / generation
+# =============================================================================
+
+@torch.inference_mode()
+def capture_source_states(
+    *,
+    model: Any,
+    batch: Mapping[str, Any],
+    decoder_layers: Sequence[Any],
+    attention_helper: Any,
+    receiver_module: Any,
+    heads: Sequence[Tuple[int, int]],
+    source_a_positions: Sequence[int],
+    source_b_positions: Sequence[int],
+) -> Dict[Tuple[int, int], Dict[str, np.ndarray]]:
+    capture = SourceHeadCapture(
+        decoder_layers=decoder_layers,
+        attention_helper=attention_helper,
+        receiver_module=receiver_module,
+        heads=heads,
+        source_a_positions=source_a_positions,
+        source_b_positions=source_b_positions,
+    )
+    with capture:
+        out = model(**batch, use_cache=False, return_dict=True)
+    capture.validate(heads)
+    del out
+    return capture.states
+
+
+@torch.inference_mode()
+def run_target_forward(
+    *,
+    model: Any,
+    batch: Mapping[str, Any],
+    decoder_layers: Sequence[Any],
+    relation_token_map: Mapping[str, Sequence[int]],
+    base: Any,
+    attention_helper: Any,
+    receiver_module: Any,
+    target_a_positions: Sequence[int],
+    target_b_positions: Sequence[int],
+    prompt_last: int,
+    object_layers: Sequence[int],
+    last_layers: Sequence[int],
+    source_half_deltas: Mapping[Tuple[int, int], np.ndarray],
+    delta_scale: str,
+    storage_dtype: np.dtype,
+) -> Dict[str, Any]:
+    capture = TargetTransplantAndCapture(
+        decoder_layers=decoder_layers,
+        attention_helper=attention_helper,
+        receiver_module=receiver_module,
+        source_half_deltas=source_half_deltas,
+        target_a_positions=target_a_positions,
+        target_b_positions=target_b_positions,
+        prompt_last=prompt_last,
+        object_layers=object_layers,
+        last_layers=last_layers,
+        delta_scale=delta_scale,
+        storage_dtype=storage_dtype,
+    )
+    with capture:
+        outputs = model(**batch, use_cache=False, return_dict=True)
+
+    capture.validate()
+    relation = base.relation_scores(
+        outputs.logits[0, -1],
+        dict(relation_token_map),
+        gt=None,
+    )
+    pred = str(relation["prediction"])
+    logits = np.asarray(relation["logits"], dtype=np.float32)
+    del outputs
+
+    return {
+        "prediction": pred,
+        "relation_logits": logits,
+        "object": capture.object_features,
+        "last": capture.last_features,
+        "patch_stats": {
+            hname(k): v for k, v in capture.patch_stats.items()
+        },
+    }
+
+
+def generation_kwargs(processor: Any, args: argparse.Namespace) -> Dict[str, Any]:
+    tok = processor.tokenizer
+    pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    kw: Dict[str, Any] = {
+        "max_new_tokens": int(args.max_new_tokens),
+        "min_new_tokens": int(args.min_new_tokens),
+        "do_sample": False,
+        "num_beams": 1,
+        "use_cache": True,
+        "return_dict_in_generate": True,
+        "output_scores": False,
+        "pad_token_id": pad,
+    }
+    if tok.eos_token_id is not None:
+        kw["eos_token_id"] = tok.eos_token_id
+    return kw
+
+
+@torch.inference_mode()
+def run_generation(
+    *,
+    model: Any,
+    processor: Any,
+    batch: Mapping[str, Any],
+    decoder_layers: Sequence[Any],
+    attention_helper: Any,
+    receiver_module: Any,
+    source_half_deltas: Mapping[Tuple[int, int], np.ndarray],
+    target_a_positions: Sequence[int],
+    target_b_positions: Sequence[int],
+    delta_scale: str,
+    gen_kw: Mapping[str, Any],
+) -> Dict[str, Any]:
+    prompt_length = int(batch["input_ids"].shape[1])
+    patcher = PrefillRelationTransplant(
+        decoder_layers=decoder_layers,
+        attention_helper=attention_helper,
+        receiver_module=receiver_module,
+        source_half_deltas=source_half_deltas,
+        target_a_positions=target_a_positions,
+        target_b_positions=target_b_positions,
+        prompt_length=prompt_length,
+        delta_scale=delta_scale,
+    )
+    with patcher:
+        out = model.generate(**batch, **dict(gen_kw))
+
+    seq = out.sequences[0]
+    new = seq[prompt_length:]
+    ids = [int(x) for x in new.detach().cpu().tolist()]
+    text = processor.tokenizer.decode(
+        ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    pred = parse_generation(text)
+    del out
+    return {
+        "prediction": pred,
+        "text": one_line(text),
+        "token_ids": ids,
+    }
+
+
+# =============================================================================
+# Frozen probes
+# =============================================================================
+
+def fit_direction_probe(
+    x: np.ndarray,
+    y: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.int64)
+    center = x.mean(axis=0)
+    centered = x - center[None, :]
+
+    dirs = []
+    for label in range(len(RELATIONS)):
+        rows = centered[y == label]
+        if len(rows) == 0:
+            raise RuntimeError(f"No train samples for label={label}")
+        d = rows.mean(axis=0)
+        norm = np.linalg.norm(d)
+        if norm <= 1e-12:
+            raise RuntimeError(f"Zero prototype norm for label={label}")
+        dirs.append(d / norm)
+    return center, np.stack(dirs, axis=0)
+
+
+def predict_direction_probe(
+    x: np.ndarray,
+    center: np.ndarray,
+    dirs: np.ndarray,
+) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    z = x - center[None, :]
+    norms = np.linalg.norm(z, axis=1, keepdims=True)
+    z = z / np.clip(norms, 1e-12, None)
+    scores = z @ np.asarray(dirs, dtype=np.float64).T
+    return np.argmax(scores, axis=1).astype(np.int64)
+
+
+def split_indices(
+    labels: np.ndarray,
+    train_ratio: float,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    n = len(labels)
+    indices = np.arange(n)
+    rng.shuffle(indices)
+
+    n_train = max(4, int(round(n * train_ratio)))
+    n_train = min(n_train, n - 4)
+
+    # Retry a few random permutations until every class appears in train/test.
+    for _ in range(100):
+        train = indices[:n_train]
+        test = indices[n_train:]
+        if (
+            len(np.unique(labels[train])) == len(RELATIONS)
+            and len(np.unique(labels[test])) == len(RELATIONS)
+        ):
+            return train, test
+        rng.shuffle(indices)
+
+    raise RuntimeError("Could not build 4-class train/test split")
+
+
+def probe_rows_for_layer(
+    *,
+    layer: int,
+    clean_x: np.ndarray,
+    condition_x: Mapping[str, np.ndarray],
+    labels: np.ndarray,
+    train_ratio: float,
+    repeats: int,
+    seed: int,
+    feature_type: str,
+) -> List[Dict[str, Any]]:
+    stats: Dict[str, List[Dict[str, float]]] = defaultdict(list)
+
+    for repeat in range(repeats):
+        train, test = split_indices(
+            labels,
+            train_ratio=train_ratio,
+            seed=seed + 1009 * repeat + 17 * layer,
+        )
+        center, dirs = fit_direction_probe(clean_x[train], labels[train])
+        source_labels = np.asarray(
+            [REL_TO_ID[OPPOSITE[ID_TO_REL[int(v)]]] for v in labels[test]],
+            dtype=np.int64,
+        )
+
+        for condition, x in condition_x.items():
+            pred = predict_direction_probe(x[test], center, dirs)
+            target_acc = float(np.mean(pred == labels[test]))
+            source_follow = float(np.mean(pred == source_labels))
+            other = float(np.mean(
+                (pred != labels[test]) & (pred != source_labels)
+            ))
+            stats[condition].append({
+                "target_accuracy": target_acc,
+                "source_follow_accuracy": source_follow,
+                "other_accuracy": other,
+            })
+
+    rows: List[Dict[str, Any]] = []
+    for condition, values in stats.items():
+        row: Dict[str, Any] = {
+            "feature_type": feature_type,
+            "layer": int(layer),
+            "condition": condition,
+            "N": int(len(labels)),
+            "repeats": int(repeats),
+        }
+        for metric in (
+            "target_accuracy",
+            "source_follow_accuracy",
+            "other_accuracy",
+        ):
+            vals = [v[metric] for v in values]
+            row[f"{metric}_mean"] = safe_mean(vals)
+            row[f"{metric}_std"] = safe_std(vals)
+        rows.append(row)
+    return rows
+
+
+# =============================================================================
+# Direct prediction summaries
+# =============================================================================
+
+def prediction_summary_rows(
+    *,
+    predictions: Mapping[str, Sequence[Optional[str]]],
+    labels: Sequence[str],
+    title: str,
+) -> List[Dict[str, Any]]:
+    labels = list(labels)
+    clean = list(predictions["clean"])
+    rows: List[Dict[str, Any]] = []
+
+    for condition, pred_seq in predictions.items():
+        preds = list(pred_seq)
+        target = np.asarray(
+            [p == g for p, g in zip(preds, labels)],
+            dtype=np.float64,
+        )
+        source = np.asarray(
+            [p == OPPOSITE[g] for p, g in zip(preds, labels)],
+            dtype=np.float64,
+        )
+        parsed = np.asarray(
+            [p in RELATIONS for p in preds],
+            dtype=np.float64,
+        )
+
+        clean_target_to_source = sum(
+            (c == g) and (p == OPPOSITE[g])
+            for c, p, g in zip(clean, preds, labels)
+        )
+        clean_target_correct = sum(c == g for c, g in zip(clean, labels))
+
+        rows.append({
+            "metric": title,
+            "condition": condition,
+            "N": len(labels),
+            "target_accuracy": float(target.mean()),
+            "source_follow_accuracy": float(source.mean()),
+            "parse_rate": float(parsed.mean()),
+            "clean_target_correct_to_source": int(clean_target_to_source),
+            "clean_target_correct_N": int(clean_target_correct),
+            "clean_target_correct_to_source_rate": (
+                float(clean_target_to_source / clean_target_correct)
+                if clean_target_correct else float("nan")
+            ),
+            "prediction_change_rate_vs_clean": float(
+                np.mean([p != c for p, c in zip(preds, clean)])
+            ),
+        })
+    return rows
+
+
+def print_prediction_table(
+    title: str,
+    rows: Sequence[Mapping[str, Any]],
+) -> None:
+    print("\n" + "=" * 114)
+    print(title)
+    print("=" * 114)
+    print(
+        f"{'condition':<28s} {'N':>5s} {'target':>9s} {'SOURCE':>9s} "
+        f"{'cleanGT->src':>13s} {'change':>9s} {'parse':>8s}"
+    )
+    print("-" * 114)
+    for row in rows:
+        print(
+            f"{str(row['condition']):<28s} "
+            f"{int(row['N']):>5d} "
+            f"{100*float(row['target_accuracy']):>8.2f}% "
+            f"{100*float(row['source_follow_accuracy']):>8.2f}% "
+            f"{100*float(row['clean_target_correct_to_source_rate']):>12.2f}% "
+            f"{100*float(row['prediction_change_rate_vs_clean']):>8.2f}% "
+            f"{100*float(row['parse_rate']):>7.2f}%"
+        )
+
+
+# =============================================================================
+# Condition construction
+# =============================================================================
+
+def half_delta_from_source(
+    source_state: Mapping[str, np.ndarray],
+    alignment: str,
+) -> np.ndarray:
+    a = np.asarray(source_state["A"], dtype=np.float32)
+    b = np.asarray(source_state["B"], dtype=np.float32)
+    if alignment == "role":
+        # Source prompt asks B relative to A.
+        return 0.5 * (b - a)
+    if alignment == "identity":
+        # Identity A->A, B->B; same orientation as target A relative B.
+        return 0.5 * (a - b)
+    raise ValueError(alignment)
+
+
+def build_condition_deltas(
+    *,
+    condition: str,
+    tested_heads: Sequence[Tuple[int, int]],
+    random_heads: Sequence[Tuple[int, int]],
+    source_states: Mapping[Tuple[int, int], Mapping[str, np.ndarray]],
+) -> Dict[Tuple[int, int], np.ndarray]:
+    if condition == "clean":
+        return {}
+
+    if condition == "bundle_role":
+        return {
+            h: half_delta_from_source(source_states[h], "role")
+            for h in tested_heads
+        }
+    if condition == "bundle_identity":
+        return {
+            h: half_delta_from_source(source_states[h], "identity")
+            for h in tested_heads
+        }
+    if condition == "bundle_random_role":
+        return {
+            h: half_delta_from_source(source_states[h], "role")
+            for h in random_heads
+        }
+
+    # individual: L23H01__role / __identity / __random_role
+    if "__" not in condition:
+        raise ValueError(condition)
+    prefix, kind = condition.split("__", 1)
+
+    tested_by_name = {hname(h): h for h in tested_heads}
+    if prefix not in tested_by_name:
+        raise ValueError(f"Unknown individual condition {condition}")
+    target_head = tested_by_name[prefix]
+    index = list(tested_heads).index(target_head)
+
+    if kind == "role":
+        return {
+            target_head: half_delta_from_source(
+                source_states[target_head], "role"
+            )
+        }
+    if kind == "identity":
+        return {
+            target_head: half_delta_from_source(
+                source_states[target_head], "identity"
+            )
+        }
+    if kind == "random_role":
+        random_head = random_heads[index]
+        return {
+            random_head: half_delta_from_source(
+                source_states[random_head], "role"
+            )
+        }
+
+    raise ValueError(condition)
+
+
+# =============================================================================
+# Compact per-head report
+# =============================================================================
+
+def build_individual_summary(
+    *,
+    object_rows: Sequence[Mapping[str, Any]],
+    last_rows: Sequence[Mapping[str, Any]],
+    tested_heads: Sequence[Tuple[int, int]],
+    random_heads: Sequence[Tuple[int, int]],
+    report_layers: Sequence[int],
+) -> List[Dict[str, Any]]:
+    obj = {
+        (int(r["layer"]), str(r["condition"])): r
+        for r in object_rows
+    }
+    last = {
+        (int(r["layer"]), str(r["condition"])): r
+        for r in last_rows
+    }
+
+    rows: List[Dict[str, Any]] = []
+    for i, head in enumerate(tested_heads):
+        name = hname(head)
+        role = f"{name}__role"
+        identity = f"{name}__identity"
+        random_c = f"{name}__random_role"
+
+        for layer in report_layers:
+            if (layer, role) not in obj and (layer, role) not in last:
+                continue
+            row: Dict[str, Any] = {
+                "head": name,
+                "matched_random_head": hname(random_heads[i]),
+                "intervention_layer": int(head[0]),
+                "report_layer": int(layer),
+            }
+
+            if (layer, role) in obj:
+                clean = obj[(layer, "clean")]
+                rr = obj[(layer, role)]
+                ii = obj[(layer, identity)]
+                rc = obj[(layer, random_c)]
+                row.update({
+                    "object_clean_source_follow": clean["source_follow_accuracy_mean"],
+                    "object_role_source_follow": rr["source_follow_accuracy_mean"],
+                    "object_identity_source_follow": ii["source_follow_accuracy_mean"],
+                    "object_random_source_follow": rc["source_follow_accuracy_mean"],
+                    "object_role_excess_vs_random": (
+                        float(rr["source_follow_accuracy_mean"])
+                        - float(rc["source_follow_accuracy_mean"])
+                    ),
+                    "object_role_excess_vs_identity": (
+                        float(rr["source_follow_accuracy_mean"])
+                        - float(ii["source_follow_accuracy_mean"])
+                    ),
+                    "object_role_target_accuracy": rr["target_accuracy_mean"],
+                })
+
+            if (layer, role) in last:
+                clean = last[(layer, "clean")]
+                rr = last[(layer, role)]
+                ii = last[(layer, identity)]
+                rc = last[(layer, random_c)]
+                row.update({
+                    "last_clean_source_follow": clean["source_follow_accuracy_mean"],
+                    "last_role_source_follow": rr["source_follow_accuracy_mean"],
+                    "last_identity_source_follow": ii["source_follow_accuracy_mean"],
+                    "last_random_source_follow": rc["source_follow_accuracy_mean"],
+                    "last_role_excess_vs_random": (
+                        float(rr["source_follow_accuracy_mean"])
+                        - float(rc["source_follow_accuracy_mean"])
+                    ),
+                    "last_role_excess_vs_identity": (
+                        float(rr["source_follow_accuracy_mean"])
+                        - float(ii["source_follow_accuracy_mean"])
+                    ),
+                    "last_role_target_accuracy": rr["target_accuracy_mean"],
+                })
+
+            rows.append(row)
+    return rows
+
+
+def print_compact_head_summary(
+    rows: Sequence[Mapping[str, Any]],
+) -> None:
+    interesting = [
+        r for r in rows
+        if "object_role_source_follow" in r
+        and int(r["report_layer"]) >= int(r["intervention_layer"])
+    ]
+    if not interesting:
+        return
+
+    print("\n" + "=" * 128)
+    print("INDIVIDUAL HEAD: DOWNSTREAM OBJECT SOURCE-FOLLOW")
+    print("=" * 128)
+    print(
+        f"{'head':<9s} {'random':<9s} {'layer':>6s} "
+        f"{'clean':>9s} {'ROLE':>9s} {'identity':>10s} {'random':>9s} "
+        f"{'role-rnd':>10s} {'role-id':>9s}"
+    )
+    print("-" * 128)
+    for r in interesting:
+        print(
+            f"{str(r['head']):<9s} {str(r['matched_random_head']):<9s} "
+            f"L{int(r['report_layer']):<5d} "
+            f"{100*float(r['object_clean_source_follow']):>8.2f}% "
+            f"{100*float(r['object_role_source_follow']):>8.2f}% "
+            f"{100*float(r['object_identity_source_follow']):>9.2f}% "
+            f"{100*float(r['object_random_source_follow']):>8.2f}% "
+            f"{100*float(r['object_role_excess_vs_random']):>+9.2f} "
+            f"{100*float(r['object_role_excess_vs_identity']):>+8.2f}"
+        )
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main() -> None:
+    args = parse_args()
+
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but unavailable")
+    if not 0 < args.probe_train_ratio < 1:
+        raise ValueError("--probe-train-ratio must be in (0,1)")
+    if args.probe_repeats < 1:
+        raise ValueError("--probe-repeats must be >= 1")
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    out_dir = Path(args.output_dir)
+    if args.overwrite and out_dir.exists():
+        shutil.rmtree(out_dir)
+    if out_dir.exists() and any(out_dir.iterdir()):
+        raise RuntimeError(f"Output directory not empty: {out_dir}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    three = import_file(Path(args.three_stage_script), "_s1tx_three")
+    ioi = import_file(Path(args.ioi_script), "_s1tx_ioi")
+    producer = import_file(Path(args.producer_script), "_s1tx_producer")
+    receiver = import_file(Path(args.receiver_script), "_s1tx_receiver")
+    v3 = import_file(Path(args.v3_script), "_s1tx_v3")
+    base = import_file(Path(args.base_script), "_s1tx_base")
+    attention_helper = import_file(
+        Path(args.attention_helper),
+        "_s1tx_attention",
+    )
+
+    source_dir = Path(args.source_output_dir)
+    extraction = source_dir / "extraction.jsonl"
+    config_path = source_dir / "config.json"
+    if not extraction.exists() or not config_path.exists():
+        raise FileNotFoundError(
+            f"Need config.json + extraction.jsonl in {source_dir}"
+        )
+
+    source_config = json.loads(config_path.read_text(encoding="utf-8"))
+    if str(source_config.get("model")) != args.model:
+        raise RuntimeError(
+            f"Source cache model={source_config.get('model')} != --model={args.model}"
+        )
+
+    rows = read_jsonl(extraction)
+    rows = [r for r in rows if str(r.get("gt")) in RELATIONS]
+    if args.pair_status != "all":
+        rows = [
+            r for r in rows
+            if str(r.get("generation_pair_status", "")) == args.pair_status
+        ]
+    rows = stratified_subset(rows, args.max_samples, args.sample_seed)
+    if not rows:
+        raise RuntimeError("No eligible samples")
+
+    model = processor = None
+    try:
+        model, processor, spec, decoder_layers, decoder_path, relation_token_map = (
+            producer.load_model_bundle(args=args, base=base)
+        )
+
+        # prepare_data_helpers interprets args.max_samples as dataset truncation.
+        saved_max = args.max_samples
+        args.max_samples = None
+        try:
+            records_by_sid, prompt_rows, audit = ioi.prepare_data_helpers(
+                args, base
+            )
+        finally:
+            args.max_samples = saved_max
+
+        tested_heads = parse_heads(args.heads)
+        validate_heads(
+            tested_heads, decoder_layers, attention_helper, receiver
+        )
+
+        random_heads = matched_random_heads(
+            tested_heads,
+            decoder_layers,
+            attention_helper,
+            receiver,
+            excluded=set(tested_heads),
+            seed=args.seed + 991,
+        )
+        validate_heads(
+            random_heads, decoder_layers, attention_helper, receiver
+        )
+
+        object_layers = parse_layers(
+            args.object_probe_layers, len(decoder_layers)
+        )
+        last_layers = parse_layers(
+            args.last_probe_layers, len(decoder_layers)
+        )
+        report_layers = parse_layers(
+            args.report_layers, len(decoder_layers)
+        )
+
+        all_source_heads = list(
+            dict.fromkeys(tested_heads + random_heads)
+        )
+
+        conditions: List[str] = ["clean"]
+        for head in tested_heads:
+            name = hname(head)
+            conditions.extend([
+                f"{name}__role",
+                f"{name}__identity",
+                f"{name}__random_role",
+            ])
+        if args.include_bundle:
+            conditions.extend([
+                "bundle_role",
+                "bundle_identity",
+                "bundle_random_role",
+            ])
+
+        storage_dtype = (
+            np.float16 if args.feature_dtype == "float16" else np.float32
+        )
+
+        config = {
+            "version": VERSION,
+            "model": args.model,
+            "repo_id": getattr(spec, "repo_id", ""),
+            "decoder_path": decoder_path,
+            "n_decoder_layers": len(decoder_layers),
+            "N": len(rows),
+            "pair_status": args.pair_status,
+            "tested_heads": [hname(h) for h in tested_heads],
+            "matched_random_heads": [hname(h) for h in random_heads],
+            "tested_to_random": {
+                hname(h): hname(random_heads[i])
+                for i, h in enumerate(tested_heads)
+            },
+            "object_probe_layers": object_layers,
+            "last_probe_layers": last_layers,
+            "report_layers": report_layers,
+            "conditions": conditions,
+            "delta_scale": args.delta_scale,
+            "probe_train_ratio": args.probe_train_ratio,
+            "probe_repeats": args.probe_repeats,
+            "probe_seed": args.probe_seed,
+            "run_generation": args.run_generation,
+            "generation_individual": args.generation_individual,
+            "feature_dtype": args.feature_dtype,
+            "intervention": (
+                "preserve target head mean; replace target A-B antisymmetric "
+                "half-difference with real swapped-prompt source relation half-difference"
+            ),
+            "source_relation": (
+                "same image, swapped query roles: B relative A = opposite(target GT)"
+            ),
+            "audit": audit,
+        }
+        write_json(out_dir / "config.json", config)
+
+        print("\n" + "=" * 120)
+        print("STAGE-I RELATION-STATE TRANSPLANT")
+        print("=" * 120)
+        print("N               :", len(rows))
+        print("pair status     :", args.pair_status)
+        print("delta scale     :", args.delta_scale)
+        print("tested heads    :", ", ".join(hname(h) for h in tested_heads))
+        print("matched random  :", ", ".join(hname(h) for h in random_heads))
+        print("object layers   :", object_layers)
+        print("last layers     :", last_layers)
+        print("conditions      :", len(conditions))
+        print("=" * 120, flush=True)
+
+        # condition -> layer -> list(feature)
+        object_features: Dict[str, Dict[int, List[np.ndarray]]] = {
+            c: {l: [] for l in object_layers} for c in conditions
+        }
+        last_features: Dict[str, Dict[int, List[np.ndarray]]] = {
+            c: {l: [] for l in last_layers} for c in conditions
+        }
+        next_predictions: Dict[str, List[Optional[str]]] = {
+            c: [] for c in conditions
+        }
+
+        labels_text: List[str] = []
+        successful_sids: List[int] = []
+        sample_path = out_dir / "sample_predictions.jsonl"
+        error_path = out_dir / "errors.jsonl"
+
+        # Generation subset is selected by sid up front.
+        generation_rows = stratified_subset(
+            rows,
+            args.generation_max_samples if args.run_generation else 0,
+            args.sample_seed + 404,
+        )
+        generation_sids = (
+            {int(r["sid"]) for r in generation_rows}
+            if args.run_generation else set()
+        )
+        generation_predictions: Dict[str, List[Optional[str]]] = defaultdict(list)
+        generation_labels: List[str] = []
+        generation_sid_order: List[int] = []
+        gen_kw = generation_kwargs(processor, args)
+
+        for sample_index, source_row in enumerate(
+            tqdm(rows, desc=f"stage1-transplant:{args.model}"),
+            start=1,
+        ):
+            pair = None
+            try:
+                pair = receiver.prepare_pair(
+                    args=args,
+                    row=source_row,
+                    records_by_sid=records_by_sid,
+                    prompt_rows=prompt_rows,
+                    base=base,
+                    v3=v3,
+                    processor=processor,
+                    device=torch.device(args.device),
+                )
+
+                gt = str(pair.gt)
+                source_gt = OPPOSITE[gt]
+
+                source_states = capture_source_states(
+                    model=model,
+                    batch=pair.swapped_batch,
+                    decoder_layers=decoder_layers,
+                    attention_helper=attention_helper,
+                    receiver_module=receiver,
+                    heads=all_source_heads,
+                    source_a_positions=pair.swapped_a_positions,
+                    source_b_positions=pair.swapped_b_positions,
+                )
+
+                sample_record: Dict[str, Any] = {
+                    "sid": int(pair.sid),
+                    "gt_target": gt,
+                    "gt_source": source_gt,
+                    "subject": pair.subject,
+                    "reference": pair.reference,
+                }
+
+                condition_deltas_cache: Dict[
+                    str, Dict[Tuple[int, int], np.ndarray]
+                ] = {}
+
+                for condition in conditions:
+                    deltas = build_condition_deltas(
+                        condition=condition,
+                        tested_heads=tested_heads,
+                        random_heads=random_heads,
+                        source_states=source_states,
+                    )
+                    condition_deltas_cache[condition] = deltas
+
+                    result = run_target_forward(
+                        model=model,
+                        batch=pair.original_batch,
+                        decoder_layers=decoder_layers,
+                        relation_token_map=relation_token_map,
+                        base=base,
+                        attention_helper=attention_helper,
+                        receiver_module=receiver,
+                        target_a_positions=pair.original_a_positions,
+                        target_b_positions=pair.original_b_positions,
+                        prompt_last=pair.original_prompt_last,
+                        object_layers=object_layers,
+                        last_layers=last_layers,
+                        source_half_deltas=deltas,
+                        delta_scale=args.delta_scale,
+                        storage_dtype=storage_dtype,
+                    )
+
+                    next_predictions[condition].append(result["prediction"])
+                    sample_record[f"{condition}__next"] = result["prediction"]
+
+                    for layer in object_layers:
+                        object_features[condition][layer].append(
+                            result["object"][layer]
+                        )
+                    for layer in last_layers:
+                        last_features[condition][layer].append(
+                            result["last"][layer]
+                        )
+
+                    if condition != "clean":
+                        sample_record[
+                            f"{condition}__patch_stats"
+                        ] = result["patch_stats"]
+
+                # Optional full generation.
+                if args.run_generation and int(pair.sid) in generation_sids:
+                    generation_sid_order.append(int(pair.sid))
+                    generation_labels.append(gt)
+
+                    gen_conditions = ["clean"]
+                    if args.include_bundle:
+                        gen_conditions.extend([
+                            "bundle_role",
+                            "bundle_identity",
+                            "bundle_random_role",
+                        ])
+                    if args.generation_individual:
+                        for head in tested_heads:
+                            name = hname(head)
+                            gen_conditions.extend([
+                                f"{name}__role",
+                                f"{name}__random_role",
+                            ])
+
+                    for condition in gen_conditions:
+                        g = run_generation(
+                            model=model,
+                            processor=processor,
+                            batch=pair.original_batch,
+                            decoder_layers=decoder_layers,
+                            attention_helper=attention_helper,
+                            receiver_module=receiver,
+                            source_half_deltas=condition_deltas_cache[condition],
+                            target_a_positions=pair.original_a_positions,
+                            target_b_positions=pair.original_b_positions,
+                            delta_scale=args.delta_scale,
+                            gen_kw=gen_kw,
+                        )
+                        generation_predictions[condition].append(g["prediction"])
+                        sample_record[f"{condition}__generation"] = g["prediction"]
+                        sample_record[f"{condition}__generation_text"] = g["text"]
+
+                labels_text.append(gt)
+                successful_sids.append(int(pair.sid))
+                append_jsonl(sample_path, sample_record)
+
+                if (
+                    args.print_every > 0
+                    and sample_index % args.print_every == 0
+                ):
+                    compact = []
+                    for head in tested_heads:
+                        name = hname(head)
+                        p = next_predictions[f"{name}__role"][-1]
+                        compact.append(
+                            f"{name}:{gt}->{p}"
+                        )
+                    tqdm.write(
+                        f"sid={pair.sid} target={gt} source={source_gt} | "
+                        + " ".join(compact)
+                    )
+
+            except Exception as exc:
+                append_jsonl(error_path, {
+                    "sid": int(source_row["sid"]),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                })
+                print(
+                    f"\n[ERROR sid={source_row['sid']}] "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                if args.fail_fast:
+                    raise
+            finally:
+                if pair is not None:
+                    receiver.release_pair(pair)
+                gc.collect()
+                if (
+                    torch.cuda.is_available()
+                    and args.empty_cache_every > 0
+                    and sample_index % args.empty_cache_every == 0
+                ):
+                    torch.cuda.empty_cache()
+
+        if not successful_sids:
+            raise RuntimeError("No successful samples")
+
+        labels = np.asarray(
+            [REL_TO_ID[g] for g in labels_text],
+            dtype=np.int64,
+        )
+
+        # Stack CPU feature arrays once.
+        object_arrays: Dict[str, Dict[int, np.ndarray]] = {
+            c: {
+                l: np.stack(object_features[c][l], axis=0)
+                for l in object_layers
+            }
+            for c in conditions
+        }
+        last_arrays: Dict[str, Dict[int, np.ndarray]] = {
+            c: {
+                l: np.stack(last_features[c][l], axis=0)
+                for l in last_layers
+            }
+            for c in conditions
+        }
+
+        object_probe_rows: List[Dict[str, Any]] = []
+        for layer in object_layers:
+            condition_x = {
+                c: object_arrays[c][layer] for c in conditions
+            }
+            object_probe_rows.extend(
+                probe_rows_for_layer(
+                    layer=layer,
+                    clean_x=object_arrays["clean"][layer],
+                    condition_x=condition_x,
+                    labels=labels,
+                    train_ratio=args.probe_train_ratio,
+                    repeats=args.probe_repeats,
+                    seed=args.probe_seed,
+                    feature_type="object_hidden_A_minus_B",
+                )
+            )
+
+        last_probe_rows: List[Dict[str, Any]] = []
+        for layer in last_layers:
+            condition_x = {
+                c: last_arrays[c][layer] for c in conditions
+            }
+            last_probe_rows.extend(
+                probe_rows_for_layer(
+                    layer=layer,
+                    clean_x=last_arrays["clean"][layer],
+                    condition_x=condition_x,
+                    labels=labels,
+                    train_ratio=args.probe_train_ratio,
+                    repeats=args.probe_repeats,
+                    seed=args.probe_seed + 7001,
+                    feature_type="prompt_last_hidden",
+                )
+            )
+
+        write_csv(out_dir / "object_hidden_probe.csv", object_probe_rows)
+        write_csv(out_dir / "last_hidden_probe.csv", last_probe_rows)
+
+        next_rows = prediction_summary_rows(
+            predictions=next_predictions,
+            labels=labels_text,
+            title="next_token",
+        )
+        write_csv(out_dir / "next_token_summary.csv", next_rows)
+        print_prediction_table("NEXT-TOKEN TARGET vs SOURCE-FOLLOW", next_rows)
+
+        if args.run_generation and generation_labels:
+            gen_rows = prediction_summary_rows(
+                predictions=generation_predictions,
+                labels=generation_labels,
+                title="generation",
+            )
+            write_csv(out_dir / "generation_summary.csv", gen_rows)
+            print_prediction_table(
+                "FULL GENERATION TARGET vs SOURCE-FOLLOW",
+                gen_rows,
+            )
+
+        individual_rows = build_individual_summary(
+            object_rows=object_probe_rows,
+            last_rows=last_probe_rows,
+            tested_heads=tested_heads,
+            random_heads=random_heads,
+            report_layers=report_layers,
+        )
+        write_csv(
+            out_dir / "individual_head_summary.csv",
+            individual_rows,
+        )
+        print_compact_head_summary(individual_rows)
+
+        # Bundle compact table.
+        if args.include_bundle:
+            obj_map = {
+                (int(r["layer"]), str(r["condition"])): r
+                for r in object_probe_rows
+            }
+            print("\n" + "=" * 112)
+            print("BUNDLE ROLE TRANSPLANT: OBJECT SOURCE-FOLLOW")
+            print("=" * 112)
+            print(
+                f"{'layer':>6s} {'clean':>10s} {'ROLE':>10s} "
+                f"{'identity':>10s} {'random':>10s} {'role-rnd':>10s}"
+            )
+            print("-" * 112)
+            for layer in report_layers:
+                key = (layer, "bundle_role")
+                if key not in obj_map:
+                    continue
+                clean = obj_map[(layer, "clean")]
+                role = obj_map[(layer, "bundle_role")]
+                ident = obj_map[(layer, "bundle_identity")]
+                rnd = obj_map[(layer, "bundle_random_role")]
+                print(
+                    f"L{layer:<5d} "
+                    f"{100*float(clean['source_follow_accuracy_mean']):>9.2f}% "
+                    f"{100*float(role['source_follow_accuracy_mean']):>9.2f}% "
+                    f"{100*float(ident['source_follow_accuracy_mean']):>9.2f}% "
+                    f"{100*float(rnd['source_follow_accuracy_mean']):>9.2f}% "
+                    f"{100*(float(role['source_follow_accuracy_mean'])-float(rnd['source_follow_accuracy_mean'])):>+9.2f}"
+                )
+
+        report = [
+            f"version: {VERSION}",
+            f"model: {args.model}",
+            f"N successful: {len(successful_sids)}",
+            f"pair_status: {args.pair_status}",
+            f"delta_scale: {args.delta_scale}",
+            "",
+            "MAIN TEST",
+            "A Stage-I head supports a causal relation-state claim if:",
+            "  1) role-relation transplant raises downstream OBJECT source-follow",
+            "     substantially above both same-layer random and identity-aligned controls;",
+            "  2) the effect starts at/after the intervention layer, not before it;",
+            "  3) source-follow propagates into later object hidden states;",
+            "  4) last-token / next-token / generation source-follow may also rise,",
+            "     but final answer flips are NOT required for the head to control an",
+            "     intermediate relation variable.",
+            "",
+            "IMPORTANT CONTROL INTERPRETATION",
+            "role transplant     : source subject(B)-reference(A), opposite target relation",
+            "identity transplant : source identity A-B, same target object ordering",
+            "random role         : same manipulation on a same-layer random head",
+            "",
+            "A convincing result looks like:",
+            "  downstream object source-follow:",
+            "      role >> random",
+            "      role >> identity",
+            "  with little/no effect in layers before the intervention.",
+            "",
+            "FILES",
+            "object_hidden_probe.csv",
+            "last_hidden_probe.csv",
+            "next_token_summary.csv",
+            "generation_summary.csv (if enabled)",
+            "individual_head_summary.csv",
+            "sample_predictions.jsonl",
+        ]
+        (out_dir / "report.txt").write_text(
+            "\n".join(report) + "\n",
+            encoding="utf-8",
+        )
+
+        print("\nSaved:")
+        for name in (
+            "config.json",
+            "object_hidden_probe.csv",
+            "last_hidden_probe.csv",
+            "next_token_summary.csv",
+            "individual_head_summary.csv",
+            "sample_predictions.jsonl",
+            "report.txt",
+        ):
+            print(" ", out_dir / name)
+        if args.run_generation:
+            print(" ", out_dir / "generation_summary.csv")
+
+    finally:
+        if model is not None:
+            del model
+        if processor is not None:
+            del processor
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+if __name__ == "__main__":
+    main()
