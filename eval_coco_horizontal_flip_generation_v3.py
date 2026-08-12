@@ -65,7 +65,7 @@ This script reuses the same repo helpers and model bundle as your earlier runs.
 
 Recommended
 ===========
-CUDA_VISIBLE_DEVICES=0 python -u eval_coco_horizontal_flip_generation_v1_fix.py \
+CUDA_VISIBLE_DEVICES=0 python -u eval_coco_horizontal_flip_generation_v3.py \
   --model qwen-3b \
   --source-output-dir output/spatial_storage_transport_utilization/coco/qwen-3b \
   --sample-scope das_eval \
@@ -238,96 +238,200 @@ def try_get_from_mapping(mp: Mapping[str, Any], names: Sequence[str]) -> Any:
     return None
 
 
-def infer_image_path(row: Mapping[str, Any], records_by_sid: Mapping[int, Mapping[str, Any]], pair: Any) -> str:
-    sid = int(row["sid"])
-    rec = records_by_sid.get(sid, {})
-    # Search common names on pair, row, record.
-    cand = try_get_attr(pair, [
-        "image_path", "original_image_path", "img_path", "image_file", "image",
-    ])
-    if cand is None:
-        cand = try_get_from_mapping(row, [
-            "image_path", "img_path", "image", "file_name", "filename",
-        ])
-    if cand is None:
-        cand = try_get_from_mapping(rec, [
-            "image_path", "img_path", "image", "file_name", "filename",
-        ])
-    if cand is None:
-        raise KeyError(
-            f"Could not infer image path for sid={sid}. "
-            f"pair attrs={list(getattr(pair, '__dict__', {}).keys())} "
-            f"row keys={list(row.keys())} rec keys={list(rec.keys())}"
-        )
-    return str(cand)
-
-
-def infer_prompt_text(row: Mapping[str, Any], prompt_rows: Mapping[int, Mapping[str, Any]], pair: Any) -> str:
+def infer_prompt_text(
+    row: Mapping[str, Any],
+    prompt_rows: Mapping[int, Mapping[str, Any]],
+    pair: Any,
+) -> str:
+    """
+    Metadata only.  The flipped forward pass does NOT rebuild text from this
+    string; it reuses pair.original_batch verbatim.
+    """
     sid = int(row["sid"])
     prow = prompt_rows.get(sid, {})
+
     cand = try_get_attr(pair, [
         "original_prompt", "prompt_text", "question", "original_question",
         "clean_prompt", "original_text", "text",
     ])
+
     if cand is None:
         cand = try_get_from_mapping(row, [
+            "question_text", "raw_question",
             "prompt", "question", "text", "input_text",
         ])
+
     if cand is None:
         cand = try_get_from_mapping(prow, [
+            "question_text", "raw_question",
             "prompt", "question", "text", "input_text",
         ])
+
     if cand is None:
-        raise KeyError(
-            f"Could not infer prompt text for sid={sid}. "
-            f"pair attrs={list(getattr(pair, '__dict__', {}).keys())} "
-            f"row keys={list(row.keys())} prompt_row keys={list(prow.keys())}"
-        )
+        # This field is only for audit output, so absence should not block the
+        # actual flip experiment.
+        return ""
+
     return str(cand)
 
 
-def open_image(path: str) -> Image.Image:
-    p = Path(path)
+def infer_image(
+    row: Mapping[str, Any],
+    records_by_sid: Mapping[int, Mapping[str, Any]],
+    pair: Any,
+) -> Tuple[Image.Image, str]:
+    """
+    Return the exact image used by prepare_pair when possible.
+
+    pair.image may already be a PIL image.  Otherwise fall back to common path
+    fields from pair/row/record.
+    """
+    sid = int(row["sid"])
+    rec = records_by_sid.get(sid, {})
+
+    cand = try_get_attr(pair, [
+        "image", "original_image", "image_path", "original_image_path",
+        "img_path", "image_file",
+    ])
+
+    if isinstance(cand, Image.Image):
+        return cand.convert("RGB"), f"<pair.image:sid={sid}>"
+
+    if cand is None:
+        cand = try_get_from_mapping(row, [
+            "image", "image_path", "img_path", "file_name", "filename",
+        ])
+
+    if isinstance(cand, Image.Image):
+        return cand.convert("RGB"), f"<row.image:sid={sid}>"
+
+    if cand is None:
+        cand = try_get_from_mapping(rec, [
+            "image", "image_path", "img_path", "file_name", "filename",
+        ])
+
+    if isinstance(cand, Image.Image):
+        return cand.convert("RGB"), f"<record.image:sid={sid}>"
+
+    if cand is None:
+        raise KeyError(
+            f"Could not infer image for sid={sid}. "
+            f"pair attrs={list(getattr(pair, '__dict__', {}).keys())} "
+            f"row keys={list(row.keys())} rec keys={list(rec.keys())}"
+        )
+
+    p = Path(str(cand))
     if not p.exists():
-        raise FileNotFoundError(p)
-    img = Image.open(p).convert("RGB")
-    return img
+        raise FileNotFoundError(
+            f"Image path does not exist for sid={sid}: {p}"
+        )
+
+    return Image.open(p).convert("RGB"), str(p)
 
 
 def horizontal_flip_pil(img: Image.Image) -> Image.Image:
-    return img.transpose(Image.FLIP_LEFT_RIGHT)
+    # New Pillow API where available; fall back for older versions.
+    try:
+        return img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    except AttributeError:
+        return img.transpose(Image.FLIP_LEFT_RIGHT)
 
 
-def encode_single(processor, prompt_text: str, image: Image.Image, device: torch.device):
-    # Try a few common call patterns across VLM processors.
-    errs = []
+def _processor_image_only(processor, image: Image.Image):
+    """
+    Run ONLY the image processor.
 
-    call_patterns = [
-        lambda: processor(text=[prompt_text], images=[image], return_tensors="pt"),
-        lambda: processor(text=prompt_text, images=image, return_tensors="pt"),
-        lambda: processor(images=[image], text=[prompt_text], return_tensors="pt"),
-        lambda: processor(images=image, text=prompt_text, return_tensors="pt"),
-    ]
+    This is deliberate: the clean pair.original_batch already contains the
+    exact prompt/chat-template tokenization.  We replace visual tensors only.
+    """
+    ip = getattr(processor, "image_processor", None)
+    if ip is None:
+        raise RuntimeError(
+            "processor has no image_processor; cannot preserve exact text batch "
+            "while replacing only the image."
+        )
 
-    out = None
-    for fn in call_patterns:
+    errors = []
+    for kwargs in (
+        {"images": [image], "return_tensors": "pt"},
+        {"images": image, "return_tensors": "pt"},
+    ):
         try:
-            out = fn()
-            break
+            return ip(**kwargs)
         except Exception as e:
-            errs.append(f"{type(e).__name__}: {e}")
+            errors.append(f"{type(e).__name__}: {e}")
 
-    if out is None:
-        raise RuntimeError("Processor encoding failed:\n" + "\n".join(errs))
+    raise RuntimeError(
+        "processor.image_processor failed on flipped image:\n"
+        + "\n".join(errors)
+    )
 
-    batch = {}
-    for k, v in out.items():
+
+def build_flip_batch_from_original(
+    processor,
+    original_batch: Mapping[str, Any],
+    flipped_image: Image.Image,
+    device: torch.device,
+) -> Dict[str, Any]:
+    """
+    Preserve exact clean text tokens and replace only visual model inputs.
+
+    For Qwen2/2.5-VL this typically replaces:
+        pixel_values
+        image_grid_thw
+
+    For LLaVA-style processors this typically replaces:
+        pixel_values
+
+    Other nonvisual tensors (input_ids, attention_mask, position ids, etc.) stay
+    exactly as in pair.original_batch.
+    """
+    batch: Dict[str, Any] = {}
+
+    for k, v in original_batch.items():
         if torch.is_tensor(v):
-            batch[k] = v.to(device)
+            batch[k] = v.clone()
         else:
             batch[k] = v
-    return batch
 
+    visual = _processor_image_only(processor, flipped_image)
+
+    replaced = []
+    visual_like_names = {
+        "pixel_values",
+        "pixel_values_images",
+        "image_grid_thw",
+        "image_sizes",
+        "aspect_ratio_ids",
+        "aspect_ratio_mask",
+    }
+
+    for k, v in visual.items():
+        if k in batch or k in visual_like_names:
+            if torch.is_tensor(v):
+                batch[k] = v.to(device)
+            else:
+                batch[k] = v
+            replaced.append(k)
+
+    if not replaced:
+        raise RuntimeError(
+            "No visual inputs were replaced. "
+            f"original_batch keys={list(original_batch.keys())}; "
+            f"image_processor keys={list(visual.keys())}"
+        )
+
+    # Sanity: textual input must remain bit-identical.
+    for k in ("input_ids", "attention_mask"):
+        if k in original_batch and k in batch:
+            a, b = original_batch[k], batch[k]
+            if torch.is_tensor(a) and torch.is_tensor(b):
+                if not torch.equal(a, b):
+                    raise RuntimeError(
+                        f"{k} changed while constructing flipped-image batch"
+                    )
+
+    return batch
 
 def relation_scores(logits_last: torch.Tensor, relation_token_map: Mapping[str, Sequence[int]]) -> Tuple[str, np.ndarray]:
     scores = []
@@ -466,12 +570,12 @@ def main():
                 )
 
                 prompt_text = infer_prompt_text(row, prompt_rows, pair)
-                image_path = infer_image_path(row, records_by_sid, pair)
-                img = open_image(image_path)
+                img, image_path = infer_image(row, records_by_sid, pair)
                 img_flip = horizontal_flip_pil(img)
 
                 if args.cache_flipped_images:
-                    ext = Path(image_path).suffix or ".jpg"
+                    ext = Path(image_path).suffix if not image_path.startswith("<") else ".jpg"
+                    ext = ext or ".jpg"
                     flip_path = outdir / "flipped_images" / f"{sid}{ext}"
                     img_flip.save(flip_path)
 
@@ -487,7 +591,12 @@ def main():
                 pred_clean, scores_clean = relation_scores(out_clean.logits[0, -1], relation_token_map)
                 del out_clean
 
-                flip_batch = encode_single(processor, prompt_text, img_flip, device)
+                flip_batch = build_flip_batch_from_original(
+                    processor=processor,
+                    original_batch=pair.original_batch,
+                    flipped_image=img_flip,
+                    device=device,
+                )
                 with torch.no_grad():
                     out_flip = model(
                         **flip_batch,
