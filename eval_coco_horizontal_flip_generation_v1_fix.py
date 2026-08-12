@@ -65,7 +65,7 @@ This script reuses the same repo helpers and model bundle as your earlier runs.
 
 Recommended
 ===========
-CUDA_VISIBLE_DEVICES=0 python -u eval_coco_horizontal_flip_generation_v1.py \
+CUDA_VISIBLE_DEVICES=0 python -u eval_coco_horizontal_flip_generation_v1_fix.py \
   --model qwen-3b \
   --source-output-dir output/spatial_storage_transport_utilization/coco/qwen-3b \
   --sample-scope das_eval \
@@ -390,6 +390,10 @@ def main():
     ioi = import_file(Path("analyze_coco_ioi_backward_circuit_v1.py"), "_flip_ioi")
     producer = import_file(Path("analyze_coco_producer_qk_ov_v1.py"), "_flip_prod")
     receiver = import_file(Path("analyze_coco_receiver_qkv_v1.py"), "_flip_recv")
+    v3 = import_file(
+        Path("analyze_spatial_storage_transport_utilization_v3.py"),
+        "_flip_v3",
+    )
     writer = import_file(Path("validate_writer_to_das_u_v1.py"), "_flip_writer")
 
     rows = [
@@ -456,7 +460,7 @@ def main():
                     records_by_sid=records_by_sid,
                     prompt_rows=prompt_rows,
                     base=base,
-                    v3=None,
+                    v3=v3,
                     processor=processor,
                     device=device,
                 )
