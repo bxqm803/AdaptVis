@@ -193,7 +193,7 @@ try:
 except Exception as exc:
     raise SystemExit(f"Unable to import transformers: {exc}")
 
-SCRIPT_VERSION = "coco-l26-block-decomposition-v1"
+SCRIPT_VERSION = "coco-l26-block-decomposition-v1.1"
 RELATIONS = ("left", "right", "above", "below")
 RID = {r: i for i, r in enumerate(RELATIONS)}
 OPPOSITE = {
@@ -442,6 +442,144 @@ def clear_sampling_defaults(model: Any) -> None:
     for name in ("temperature", "top_p", "top_k"):
         if hasattr(cfg, name):
             setattr(cfg, name, None)
+
+
+def candidate_token_id(
+    tokenizer: Any,
+    token: str,
+) -> Optional[int]:
+    """Safely resolve one special-token string to an ID."""
+    try:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+    except Exception:
+        return None
+    if token_id is None:
+        return None
+    try:
+        token_id = int(token_id)
+    except Exception:
+        return None
+    unknown = getattr(tokenizer, "unk_token_id", None)
+    if unknown is not None and token_id == int(unknown):
+        return None
+    return token_id
+
+
+def resolve_visual_indices(
+    model: Any,
+    processor: Any,
+    batch: Mapping[str, Any],
+    input_ids: Sequence[int],
+) -> List[int]:
+    """
+    Identify positions in the LANGUAGE sequence corresponding to visual tokens.
+
+    This is intentionally local to this script instead of relying on probe.base.
+    Order of preference:
+      1) mm_token_type_ids (Qwen2.5-VL newer processors)
+      2) token_type_ids
+      3) configured/special image-token IDs
+      4) positions strictly between vision-start / vision-end markers
+    """
+
+    # Newer Qwen2.5-VL processors can expose modality IDs directly:
+    # text=0, image=1, video=2.
+    mm_type_ids = batch.get("mm_token_type_ids")
+    if torch.is_tensor(mm_type_ids) and mm_type_ids.ndim == 2:
+        direct = (
+            torch.nonzero(mm_type_ids[0] == 1, as_tuple=False)
+            .flatten()
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        if direct:
+            return [int(x) for x in direct]
+
+    token_type_ids = batch.get("token_type_ids")
+    if torch.is_tensor(token_type_ids) and token_type_ids.ndim == 2:
+        values = token_type_ids[0].detach().cpu()
+        unique = set(int(x) for x in values.tolist())
+        if 1 in unique:
+            direct = (
+                torch.nonzero(values == 1, as_tuple=False)
+                .flatten()
+                .tolist()
+            )
+            if direct:
+                return [int(x) for x in direct]
+
+    token_ids = set()
+    objects = [
+        getattr(model, "config", None),
+        getattr(getattr(model, "config", None), "text_config", None),
+        getattr(getattr(model, "config", None), "vision_config", None),
+        processor,
+        getattr(processor, "tokenizer", None),
+    ]
+    for obj in objects:
+        if obj is None:
+            continue
+        for name in ("image_token_id", "image_token_index"):
+            value = getattr(obj, name, None)
+            if isinstance(value, (int, np.integer)) and int(value) >= 0:
+                token_ids.add(int(value))
+
+    tokenizer = processor.tokenizer
+    for token in (
+        "<|image_pad|>",
+        "<image>",
+        "<image_token>",
+        "<IMG_CONTEXT>",
+    ):
+        token_id = candidate_token_id(tokenizer, token)
+        if token_id is not None:
+            token_ids.add(token_id)
+
+    indices = [
+        index
+        for index, token_id in enumerate(input_ids)
+        if int(token_id) in token_ids
+    ]
+    if indices:
+        return indices
+
+    # Fallback: tokens strictly inside a vision-start / vision-end span.
+    start_ids = {
+        token_id
+        for token in ("<|vision_start|>", "<image_start>", "<img>")
+        if (token_id := candidate_token_id(tokenizer, token)) is not None
+    }
+    end_ids = {
+        token_id
+        for token in ("<|vision_end|>", "<image_end>", "</img>")
+        if (token_id := candidate_token_id(tokenizer, token)) is not None
+    }
+
+    starts = [
+        index for index, value in enumerate(input_ids)
+        if int(value) in start_ids
+    ]
+    ends = [
+        index for index, value in enumerate(input_ids)
+        if int(value) in end_ids
+    ]
+    spans = [
+        (start, end)
+        for start in starts
+        for end in ends
+        if start < end
+    ]
+    if spans:
+        start, end = min(spans, key=lambda pair: pair[1] - pair[0])
+        fallback = list(range(start + 1, end))
+        if fallback:
+            return fallback
+
+    raise ValueError(
+        "Could not identify visual-token positions. "
+        f"Candidate image token IDs were {sorted(token_ids)}."
+    )
 
 
 def relation_token_variants(tokenizer: Any) -> Dict[str, List[int]]:
@@ -1120,7 +1258,7 @@ def main() -> None:
                     set(map(int, a_positions + b_positions))
                 )
 
-                visual_positions = base.resolve_visual_indices(
+                visual_positions = resolve_visual_indices(
                     model,
                     processor,
                     dict(batch),
