@@ -30,8 +30,8 @@ cached messages from the unmodified forward. This keeps the intervention definit
 directly comparable with the prior single-head scan. It is not yet an online
 recomputed-message experiment.
 
-Requires the previous helper script in the repository root:
-    scan_coco_receiver_message_scaling_heads_v1.py
+This v1.1 file is standalone and does NOT require the previous
+single-head scan script as an import.
 
 Recommended:
 CUDA_VISIBLE_DEVICES=0 python -u eval_coco_receiver_prefix_bundles_v1.py \
@@ -47,16 +47,18 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 import gc
 import importlib
 import json
 import math
 import random
+import re
 import shutil
 import traceback
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -69,10 +71,462 @@ try:
 except Exception as exc:
     raise SystemExit(f"Unable to import transformers: {exc}")
 
-import scan_coco_receiver_message_scaling_heads_v1 as scan
+
+# =============================================================================
+# Standalone helpers formerly imported from the single-head scan
+# =============================================================================
+
+RELATIONS = ("left", "right", "above", "below")
 
 
-SCRIPT_VERSION = "coco-receiver-prefix-bundles-v1"
+def _hname(layer: int, head: int) -> str:
+    return f"L{int(layer)}H{int(head):02d}"
+
+
+def _normalize_relation(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in RELATIONS:
+        return text
+
+    hits = []
+    for relation in RELATIONS:
+        match = re.search(rf"\b{re.escape(relation)}\b", text)
+        if match:
+            hits.append((match.start(), relation))
+
+    for pattern, relation in (
+        (r"\bunder(?:neath)?\b|\bbeneath\b", "below"),
+        (r"\bover\b|\bon top\b", "above"),
+    ):
+        match = re.search(pattern, text)
+        if match:
+            hits.append((match.start(), relation))
+
+    if not hits:
+        return None
+    hits.sort()
+    return hits[0][1]
+
+
+def _parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {
+        "1", "true", "yes", "y", "t"
+    }
+
+
+def _read_csv(path: Path) -> List[Dict[str, str]]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _write_csv(
+    path: Path,
+    rows: Sequence[Mapping[str, Any]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+
+    fields: List[str] = []
+    seen = set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                fields.append(key)
+                seen.add(key)
+
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(dict(row))
+
+
+def _append_jsonl(
+    path: Path,
+    row: Mapping[str, Any],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(dict(row), ensure_ascii=False) + "\n"
+        )
+        handle.flush()
+
+
+def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def _safe_mean(values: Iterable[Any]) -> float:
+    xs = []
+    for value in values:
+        try:
+            x = float(value)
+        except Exception:
+            continue
+        if math.isfinite(x):
+            xs.append(x)
+    return float(np.mean(xs)) if xs else float("nan")
+
+
+def _clear_sampling_defaults(model: Any) -> None:
+    cfg = getattr(model, "generation_config", None)
+    if cfg is None:
+        return
+
+    for name in ("temperature", "top_p", "top_k"):
+        if hasattr(cfg, name):
+            setattr(cfg, name, None)
+
+
+def _relation_token_variants(
+    tokenizer: Any,
+) -> Dict[str, List[int]]:
+    out: Dict[str, List[int]] = {}
+
+    for relation in RELATIONS:
+        ids = set()
+        for candidate in (
+            relation,
+            " " + relation,
+            relation.capitalize(),
+            " " + relation.capitalize(),
+        ):
+            token_ids = tokenizer.encode(
+                candidate,
+                add_special_tokens=False,
+            )
+            if len(token_ids) == 1:
+                ids.add(int(token_ids[0]))
+
+        if not ids:
+            token_ids = tokenizer.encode(
+                " " + relation,
+                add_special_tokens=False,
+            )
+            if not token_ids:
+                raise RuntimeError(
+                    f"No token ID for relation {relation!r}"
+                )
+            ids.add(int(token_ids[-1]))
+
+        out[relation] = sorted(ids)
+
+    return out
+
+
+def _deterministic_stratified_subset(
+    rows: Sequence[Mapping[str, Any]],
+    limit: int,
+    seed: int,
+) -> List[Dict[str, Any]]:
+    rows = [dict(row) for row in rows]
+
+    if limit <= 0 or len(rows) <= limit:
+        return rows
+
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        gt = _normalize_relation(row.get("gt"))
+        if gt in RELATIONS:
+            grouped[gt].append(row)
+
+    rng = random.Random(seed)
+    for relation in RELATIONS:
+        rng.shuffle(grouped[relation])
+
+    cursors = {relation: 0 for relation in RELATIONS}
+    selected: List[Dict[str, Any]] = []
+
+    while len(selected) < limit:
+        moved = False
+        for relation in RELATIONS:
+            group = grouped[relation]
+            cursor = cursors[relation]
+            if cursor < len(group) and len(selected) < limit:
+                selected.append(group[cursor])
+                cursors[relation] += 1
+                moved = True
+        if not moved:
+            break
+
+    selected.sort(key=lambda row: int(row["sid"]))
+    return selected
+
+
+def _first_3d(output: Any) -> torch.Tensor:
+    if torch.is_tensor(output):
+        if output.ndim != 3:
+            raise RuntimeError(
+                "Expected attention output [B,S,D], "
+                f"got {tuple(output.shape)}"
+            )
+        return output
+
+    if isinstance(output, (tuple, list)):
+        for item in output:
+            if torch.is_tensor(item) and item.ndim == 3:
+                return item
+
+    raise RuntimeError(
+        "Could not find 3D attention output"
+    )
+
+
+def _replace_first_3d(
+    output: Any,
+    replacement: torch.Tensor,
+) -> Any:
+    if torch.is_tensor(output):
+        return replacement
+
+    if isinstance(output, tuple):
+        items = list(output)
+        for index, item in enumerate(items):
+            if torch.is_tensor(item) and item.ndim == 3:
+                items[index] = replacement
+                return tuple(items)
+
+    if isinstance(output, list):
+        items = list(output)
+        for index, item in enumerate(items):
+            if torch.is_tensor(item) and item.ndim == 3:
+                items[index] = replacement
+                return items
+
+    raise RuntimeError(
+        "Could not replace 3D attention output"
+    )
+
+
+def _trace_target_index(
+    trace: Any,
+    prompt_last: int,
+) -> int:
+    lookup = {
+        int(global_position): local
+        for local, global_position
+        in enumerate(trace.target_positions)
+    }
+
+    if int(prompt_last) not in lookup:
+        raise RuntimeError(
+            f"prompt_last={prompt_last} missing from "
+            f"trace targets {trace.target_positions}"
+        )
+
+    return int(lookup[int(prompt_last)])
+
+
+def _all_head_object_writes(
+    *,
+    trace: Any,
+    prompt_last: int,
+    object_positions: Sequence[int],
+) -> np.ndarray:
+    """
+    Clean post-W_O object-text -> prompt-last write for every query head.
+
+    Returns:
+        [n_query_heads, hidden_size]
+    """
+    object_positions = sorted(
+        set(map(int, object_positions))
+    )
+    if not object_positions:
+        raise RuntimeError(
+            "No object source positions"
+        )
+
+    local = _trace_target_index(
+        trace,
+        prompt_last,
+    )
+
+    source = torch.as_tensor(
+        object_positions,
+        dtype=torch.long,
+    )
+
+    if int(source.max()) >= int(trace.value_states.shape[1]):
+        raise RuntimeError(
+            f"Object source position {int(source.max())} "
+            f">= source length {trace.value_states.shape[1]}"
+        )
+
+    # Query-head-resolved attention probabilities.
+    weights = (
+        trace.attention_weights[:, local, :]
+        .index_select(1, source)
+        .float()
+    )  # [Hq, Sobj]
+
+    # Trace helper expands/shared GQA values in the same head convention
+    # used by the previous working single-head scan.
+    values = (
+        trace.value_states
+        .index_select(1, source)
+        .float()
+    )  # [Hq, Sobj, Dh]
+
+    pre = torch.einsum(
+        "hs,hsd->hd",
+        weights,
+        values,
+    )  # [Hq, Dh]
+
+    # [Dmodel, Hq, Dh]
+    post = torch.einsum(
+        "hd,ohd->ho",
+        pre,
+        trace.o_proj_weight.float(),
+    )  # [Hq, Dmodel]
+
+    return (
+        post.detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32)
+    )
+
+
+def _extract_clean_messages(
+    *,
+    attention_helper: Any,
+    model: Any,
+    batch: Mapping[str, Any],
+    relation_token_map: Mapping[str, Sequence[int]],
+    decoder_layers: Sequence[Any],
+    layers: Sequence[int],
+    prompt_last: int,
+    object_positions: Sequence[int],
+    chunk_size: int,
+) -> Tuple[
+    Dict[int, np.ndarray],
+    Dict[int, float],
+]:
+    """
+    One clean trace -> per-layer [H,D] object->last natural messages.
+    """
+    all_messages: Dict[int, np.ndarray] = {}
+    replay_errors: Dict[int, float] = {}
+    layers = list(map(int, layers))
+
+    if chunk_size <= 0:
+        chunks = [layers]
+    else:
+        chunks = [
+            layers[start : start + int(chunk_size)]
+            for start in range(
+                0,
+                len(layers),
+                int(chunk_size),
+            )
+        ]
+
+    for chunk in chunks:
+        _, traces = attention_helper.run_and_trace(
+            model=model,
+            batch=batch,
+            token_map=relation_token_map,
+            decoder_layers=decoder_layers,
+            layer_indices=chunk,
+            target_positions=[prompt_last],
+        )
+
+        for layer in chunk:
+            trace = traces[int(layer)]
+
+            all_messages[int(layer)] = (
+                _all_head_object_writes(
+                    trace=trace,
+                    prompt_last=prompt_last,
+                    object_positions=object_positions,
+                )
+            )
+
+            replay_errors[int(layer)] = float(
+                trace.replay_relative_error
+            )
+
+        del traces
+
+    return all_messages, replay_errors
+
+
+def _build_batch(
+    *,
+    probe: Any,
+    processor: Any,
+    question: str,
+    image: Image.Image,
+    device: torch.device,
+) -> Any:
+    rendered = probe.build_chat_prompt(
+        processor,
+        question,
+        True,
+    )
+
+    return probe.process_inputs(
+        processor,
+        rendered,
+        image,
+        device,
+    )
+
+
+class _StandaloneScanCompat:
+    # constants
+    RELATIONS = RELATIONS
+
+    # generic helpers
+    hname = staticmethod(_hname)
+    normalize_relation = staticmethod(_normalize_relation)
+    parse_bool = staticmethod(_parse_bool)
+    read_csv = staticmethod(_read_csv)
+    write_csv = staticmethod(_write_csv)
+    append_jsonl = staticmethod(_append_jsonl)
+    load_jsonl = staticmethod(_load_jsonl)
+    safe_mean = staticmethod(_safe_mean)
+    clear_sampling_defaults = staticmethod(
+        _clear_sampling_defaults
+    )
+    relation_token_variants = staticmethod(
+        _relation_token_variants
+    )
+    deterministic_stratified_subset = staticmethod(
+        _deterministic_stratified_subset
+    )
+
+    # attention / tracing helpers
+    first_3d = staticmethod(_first_3d)
+    replace_first_3d = staticmethod(_replace_first_3d)
+    extract_clean_messages = staticmethod(
+        _extract_clean_messages
+    )
+    build_batch = staticmethod(_build_batch)
+
+
+scan = _StandaloneScanCompat()
+
+
+SCRIPT_VERSION = "coco-receiver-prefix-bundles-v1.1"
 RANKED_HEADS: List[Tuple[int, int]] = [
     (26, 4),
     (26, 6),
