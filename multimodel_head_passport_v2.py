@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-qwen3b_head_passport_L18_L28_v1.py
+multimodel_head_passport_v2.py
 
-Pilot: build a READ-WRITE-EFFECT-CONTEXT "passport" for every attention head
-in Qwen2.5-VL-3B, restricted to decoder layers L18..L28 (inclusive), on
-COCO_two.
+Build a READ-WRITE-EFFECT-CONTEXT "passport" for every attention head
+for one of six supported VLMs, on user-selected decoder layers, on COCO_two.
 
 The script is designed to run from the AdaptVis llava16 repo root and reuses
 helpers already used by multimodel_spatial_grounding_ablation_v1.py.
@@ -62,7 +61,7 @@ Important semantics
 
 Outputs
 -------
-  output/head_passport_qwen3b_L18_L28_v1/
+  output/head_passport_<model>_<layers>_v2/
     config.json
     split.csv
     bbox_audit.json
@@ -75,17 +74,19 @@ Outputs
 
 Suggested pilot
 ---------------
-CUDA_VISIBLE_DEVICES=0 python -u qwen3b_head_passport_L18_L28_v1.py \
+CUDA_VISIBLE_DEVICES=0 python -u multimodel_head_passport_v2.py \
+  --model qwen25-3b \
+  --layers 18-28 \
   --data-root data \
-  --max-samples 200 \
-  --output-root output/head_passport_qwen3b_L18_L28_v1
+  --max-samples 200
 
 Full COCO_two
 -------------
-CUDA_VISIBLE_DEVICES=0 python -u qwen3b_head_passport_L18_L28_v1.py \
+CUDA_VISIBLE_DEVICES=0 python -u multimodel_head_passport_v2.py \
+  --model qwen25-3b \
+  --layers all \
   --data-root data \
-  --max-samples 0 \
-  --output-root output/head_passport_qwen3b_L18_L28_v1_full
+  --max-samples 0
 """
 
 from __future__ import annotations
@@ -118,8 +119,19 @@ import analyze_coco_head_object_residual_direction_probe_v1 as direction_base
 import scan_multimodel_spatial_logitlens_matrix_v1 as lens_base
 
 
-SCRIPT_VERSION = "qwen3b-head-passport-L18-L28-v1"
-MODEL_ALIAS = "qwen-3b"
+SCRIPT_VERSION = "multimodel-head-passport-v2"
+
+# User-facing aliases. Each entry lists likely AdaptVis SPECS keys / aliases in
+# preference order. Runtime resolution prints the actual key and repo_id.
+SUPPORTED_MODELS = {
+    "qwen2-2b":   ("qwen2-2b", "qwen-2b", "qwen2vl-2b", "qwen2-vl-2b"),
+    "qwen25-3b":  ("qwen-3b", "qwen25-3b", "qwen2.5-3b", "qwen2.5-vl-3b"),
+    "qwen25-7b":  ("qwen-7b", "qwen25-7b", "qwen2.5-7b", "qwen2.5-vl-7b"),
+    "llava15-7b": ("llava-7b", "llava15-7b", "llava1.5-7b"),
+    "llava15-13b":("llava-13b", "llava15-13b", "llava1.5-13b"),
+    "internvl-2b": ("internvl-2b", "internvl2-2b", "internvl2.5-2b", "internvl25-2b"),
+}
+
 DATASET = "coco_two"
 RELATIONS = ("left", "right", "above", "below")
 RID = {r: i for i, r in enumerate(RELATIONS)}
@@ -444,9 +456,67 @@ def resolve_dtype(name: str) -> torch.dtype:
     return {"float16":torch.float16, "bfloat16":torch.bfloat16, "float32":torch.float32}[name]
 
 
-def load_model(device: str):
-    actual = lens_base.resolve_model_alias(MODEL_ALIAS, base.SPECS)
-    spec = base.SPECS[actual]
+def resolve_supported_model(requested: str):
+    if requested not in SUPPORTED_MODELS:
+        raise ValueError(
+            f"Unsupported --model={requested!r}. Choose one of: {', '.join(SUPPORTED_MODELS)}"
+        )
+    tried = []
+    for cand in SUPPORTED_MODELS[requested]:
+        tried.append(cand)
+        if cand in base.SPECS:
+            return cand, base.SPECS[cand]
+        try:
+            actual = lens_base.resolve_model_alias(cand, base.SPECS)
+            if actual in base.SPECS:
+                return actual, base.SPECS[actual]
+        except Exception:
+            pass
+    raise RuntimeError(
+        f"Could not resolve model {requested!r}. Tried {tried}. "
+        f"Available base.SPECS keys: {sorted(base.SPECS.keys())}"
+    )
+
+
+def parse_layers(spec: str, n_total_layers: int) -> List[int]:
+    """Parse 'all', '18-28', or '0,3,7-12,20'. Layer ids are 0-based."""
+    text = str(spec).strip().lower()
+    if text in {"all", "*"}:
+        return list(range(n_total_layers))
+    out = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            a, b = int(a), int(b)
+            if a > b:
+                a, b = b, a
+            out.extend(range(a, b + 1))
+        else:
+            out.append(int(part))
+    out = sorted(set(out))
+    if not out:
+        raise ValueError(f"Empty --layers specification: {spec!r}")
+    bad = [x for x in out if x < 0 or x >= n_total_layers]
+    if bad:
+        raise ValueError(
+            f"Invalid layer ids {bad}; model has layers 0..{n_total_layers-1}"
+        )
+    return out
+
+
+def layer_tag(layers: Sequence[int], n_total_layers: int) -> str:
+    if list(layers) == list(range(n_total_layers)):
+        return "all"
+    if layers == list(range(layers[0], layers[-1] + 1)):
+        return f"L{layers[0]}-L{layers[-1]}"
+    return "L" + "_".join(map(str, layers))
+
+
+def load_model(requested: str, device: str):
+    actual, spec = resolve_supported_model(requested)
     model_cls = getattr(transformers, spec.model_class, None)
     if model_cls is None:
         raise RuntimeError(f"transformers=={transformers.__version__} has no {spec.model_class}")
@@ -459,7 +529,7 @@ def load_model(device: str):
         attn_implementation="eager",
     )
     model.eval()
-    # No parameter gradients: we cut the graph at L18 input and require grad there.
+    # No parameter gradients: the graph is cut at the earliest selected decoder layer.
     for p in model.parameters():
         p.requires_grad_(False)
     processor = AutoProcessor.from_pretrained(spec.repo_id, trust_remote_code=spec.trust_remote_code)
@@ -691,7 +761,7 @@ def forward_real_with_effects(
     batch = build_batch(processor, ex.question, image, device)
     ids, subject_index, reference_index, sp, rp = locate_positions(processor, batch, ex.subject, ex.reference)
 
-    # Parameters are frozen.  Cut the graph exactly at L18 input: forward values
+    # Parameters are frozen.  Cut the graph at the earliest selected decoder-layer input: forward values
     # are unchanged, but backward stores only L18+ decoder graph.
     with torch.enable_grad():
         with SelectedCapture(decoder_layers, layers, cut_layer=min(layers), need_grad=True) as cap:
@@ -946,12 +1016,12 @@ def summarize(sample_df: pd.DataFrame) -> pd.DataFrame:
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", choices=tuple(SUPPORTED_MODELS.keys()), default="qwen25-3b")
+    ap.add_argument("--layers", default="all", help="0-based decoder layers: all | 18-28 | 0,3,7-12,20")
     ap.add_argument("--data-root", type=Path, default=Path("data"))
-    ap.add_argument("--output-root", type=Path, default=Path("output/head_passport_qwen3b_L18_L28_v1"))
+    ap.add_argument("--output-root", type=Path, default=None, help="default: output/head_passport_<model>_<layers>_v2")
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--layer-start", type=int, default=18)
-    ap.add_argument("--layer-end", type=int, default=28)
-    ap.add_argument("--max-samples", type=int, default=200, help="0 = all COCO_two")
+    ap.add_argument("--max-samples", type=int, default=0, help="0 = all COCO_two")
     ap.add_argument("--train-ratio", type=float, default=0.15)
     ap.add_argument("--val-ratio", type=float, default=0.15)
     ap.add_argument("--seed", type=int, default=17)
@@ -965,22 +1035,10 @@ def main():
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    out = args.output_root
-    if out.exists() and args.force:
-        import shutil
-        shutil.rmtree(out)
-    out.mkdir(parents=True, exist_ok=True)
-
     examples, audit = load_examples(args.data_root, args.max_samples, args.seed)
     if len(examples) < 20:
         raise RuntimeError(f"Only {len(examples)} usable examples")
     train, val, test = stratified_split(examples, args.train_ratio, args.val_ratio, args.seed)
-
-    split_rows = []
-    for name, xs in (("train",train),("val",val),("test",test)):
-        for x in xs:
-            split_rows.append({"sid":x.sid,"split":name,"relation":x.relation,"subject":x.subject,"reference":x.reference})
-    pd.DataFrame(split_rows).to_csv(out/"split.csv", index=False)
 
     bbox_audit = {
         "examples": len(examples),
@@ -990,16 +1048,27 @@ def main():
         "bbox_format_requested": args.bbox_format,
         "note": "If coverage is zero, bbox-dependent passport fields are NaN; the script does not silently replace their definition.",
     }
-    (out/"bbox_audit.json").write_text(json.dumps(bbox_audit, indent=2, ensure_ascii=False), encoding="utf-8")
-
-    actual, spec, model, processor = load_model(args.device)
+    actual, spec, model, processor = load_model(args.model, args.device)
     device = torch.device(args.device)
     decoder_layers, decoder_path = lens_base.resolve_decoder_layers(model)
     n_total_layers = len(decoder_layers)
     n_heads, head_dim = direction_base.scan_shape(model, decoder_layers)
-    if args.layer_start < 0 or args.layer_end >= n_total_layers or args.layer_start > args.layer_end:
-        raise ValueError(f"Invalid layer range {args.layer_start}..{args.layer_end}; model has {n_total_layers} layers")
-    layers = list(range(args.layer_start, args.layer_end+1))
+    layers = parse_layers(args.layers, n_total_layers)
+
+    out = args.output_root
+    if out is None:
+        out = Path("output") / f"head_passport_{args.model}_{layer_tag(layers, n_total_layers)}_v2"
+    if out.exists() and args.force:
+        import shutil
+        shutil.rmtree(out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    split_rows = []
+    for name, xs in (("train",train),("val",val),("test",test)):
+        for x in xs:
+            split_rows.append({"sid":x.sid,"split":name,"relation":x.relation,"subject":x.subject,"reference":x.reference})
+    pd.DataFrame(split_rows).to_csv(out/"split.csv", index=False)
+    (out/"bbox_audit.json").write_text(json.dumps(bbox_audit, indent=2, ensure_ascii=False), encoding="utf-8")
 
     lm_head, lm_head_path = lens_base.resolve_output_embeddings(model)
     token_map = relation_token_map(processor.tokenizer)
@@ -1007,7 +1076,7 @@ def main():
 
     config = {
         "script_version": SCRIPT_VERSION,
-        "model_alias": MODEL_ALIAS,
+        "model_requested": args.model,
         "model_actual": actual,
         "repo_id": spec.repo_id,
         "dataset": DATASET,
@@ -1015,7 +1084,9 @@ def main():
         "train_N": len(train),
         "val_N": len(val),
         "test_N": len(test),
+        "layers_requested": args.layers,
         "layers": layers,
+        "layer_tag": layer_tag(layers, n_total_layers),
         "n_total_layers": n_total_layers,
         "n_heads": n_heads,
         "head_dim": head_dim,
@@ -1030,8 +1101,8 @@ def main():
     (out/"config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     (out/"dataset_audit.json").write_text(json.dumps(audit, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
 
-    print(f"[model] {actual} repo={spec.repo_id}")
-    print(f"[shape] layers={n_total_layers}, heads={n_heads}, head_dim={head_dim}; scanning {layers[0]}..{layers[-1]}")
+    print(f"[model] requested={args.model} actual={actual} repo={spec.repo_id}")
+    print(f"[shape] layers={n_total_layers}, heads={n_heads}, head_dim={head_dim}; selected={layers}")
     print(f"[data] N={len(examples)} train={len(train)} val={len(val)} test={len(test)}")
     print(f"[bbox] raw pair coverage={bbox_audit['with_bbox_pair_raw']}/{len(examples)}")
 
