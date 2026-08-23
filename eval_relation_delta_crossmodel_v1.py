@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Diagnose whether the failure of direct Direction-head mean injection comes from
-(1) the head-write averaging direction itself, or (2) harmful multi-layer edits.
+Cross-model diagnostic for consensus-guided relation-specific last-token repair.
 
-This script reuses the *previously successful* relation-specific last-token repair
-from eval_consensus_spatial_redeployment_v1.py, but removes DEV layer/alpha tuning
-and evaluates:
+This script reuses the relation-specific last-token repair from
+eval_consensus_spatial_redeployment_v1.py, but uses model-depth-relative windows
+so Qwen, LLaVA, InternVL, etc. can be compared fairly.
 
-  A) single-layer sweep (default L18-L31; use --single-layers 0-31 for full sweep)
-  B) fixed multi-layer windows:
-       late_26_31    = L26-L31
-       midlate_18_31 = L18-L31
-       all_layers    = every decoder layer
+It evaluates:
+
+  A) a single-layer sweep (default: every decoder layer)
+  B) model-relative multi-layer windows:
+       last_4       = final 4 decoder blocks
+       last_6       = final 6 decoder blocks
+       last_8       = final 8 decoder blocks
+       last_quarter = final 25% of decoder blocks
+       last_half    = final 50% of decoder blocks
+       all_layers   = every decoder block
 
 For every target layer l, the repair is layer-specific:
 
@@ -69,7 +73,7 @@ import analyze_coco_head_object_residual_direction_probe_v1 as direction_base
 import validate_grounded_spatial_consensus_v1 as feas
 import eval_consensus_spatial_redeployment_v1 as rd
 
-SCRIPT_VERSION = "eval-relation-delta-multilayer-diagnostic-v1"
+SCRIPT_VERSION = "eval-relation-delta-crossmodel-v1"
 RELATIONS = ("left", "right", "above", "below")
 EPS = 1e-12
 
@@ -92,8 +96,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--baseline-generation-jsonl", default=None)
     p.add_argument(
         "--single-layers",
-        default="18-31",
-        help="Single-layer diagnostic sweep. Use 0-31 for the complete decoder sweep.",
+        default="all",
+        help=(
+            "Single-layer diagnostic sweep. Supports 'all', 'last8', 'last6', "
+            "or explicit ranges such as 18-31 / 0,5,10."
+        ),
+    )
+    p.add_argument(
+        "--skip-single-sweep", action="store_true",
+        help="Skip single-layer sweep and run only the relative multi-layer windows."
     )
     p.add_argument("--alpha", type=float, default=1.0, help="Fixed alpha; no DEV tuning.")
     p.add_argument(
@@ -132,6 +143,40 @@ def parse_layers(text: str) -> List[int]:
         else:
             out.append(int(piece))
     return list(dict.fromkeys(out))
+
+
+def resolve_layer_spec(text: str, n_layers: int) -> List[int]:
+    raw = str(text).strip().lower()
+    if raw == "all":
+        return list(range(n_layers))
+    if raw.startswith("last") and raw[4:].isdigit():
+        k = max(1, int(raw[4:]))
+        return list(range(max(0, n_layers-k), n_layers))
+    return [L for L in parse_layers(text) if 0 <= L < n_layers]
+
+
+def relative_windows(n_layers: int) -> Dict[str, List[int]]:
+    def last_k(k: int) -> List[int]:
+        return list(range(max(0, n_layers-k), n_layers))
+    q = max(1, int(math.ceil(n_layers * 0.25)))
+    h = max(1, int(math.ceil(n_layers * 0.50)))
+    windows = {
+        "last_4": last_k(4),
+        "last_6": last_k(6),
+        "last_8": last_k(8),
+        "last_quarter": last_k(q),
+        "last_half": last_k(h),
+        "all_layers": list(range(n_layers)),
+    }
+    # Remove exact duplicate layer sets while preserving the first, more interpretable name.
+    out: Dict[str, List[int]] = {}
+    seen = set()
+    for name, layers in windows.items():
+        key = tuple(layers)
+        if key not in seen:
+            seen.add(key)
+            out[name] = layers
+    return out
 
 
 def safe_mean(xs: Iterable[float]) -> float:
@@ -534,17 +579,15 @@ def main() -> None:
     n_layers = len(decoder_layers)
     print(f"[model] decoder={decoder_path} n_layers={n_layers}")
 
-    single_layers = [L for L in parse_layers(args.single_layers) if 0 <= L < n_layers]
-    if not single_layers:
+    single_layers = [] if args.skip_single_sweep else resolve_layer_spec(args.single_layers, n_layers)
+    if not args.skip_single_sweep and not single_layers:
         raise ValueError("No valid --single-layers")
-    all_layers = list(range(n_layers))
-    windows = {
-        "late_26_31": [L for L in range(26, min(32, n_layers))],
-        "midlate_18_31": [L for L in range(18, min(32, n_layers))],
-        "all_layers": all_layers,
-    }
-    windows = {k: v for k, v in windows.items() if v}
-    required_layers = sorted(set(single_layers).union(*[set(v) for v in windows.values()]))
+    windows = relative_windows(n_layers)
+    required = set(single_layers)
+    for v in windows.values():
+        required.update(v)
+    required_layers = sorted(required)
+    print("[windows] " + "; ".join(f"{k}=L{v[0]}-L{v[-1]} ({len(v)})" for k,v in windows.items()))
 
     records, _audit = base.load_records(dataset, Path(args.data_root), None)
     record_by_sid = {int(r.sid): r for r in records}
@@ -613,6 +656,8 @@ def main() -> None:
         sample_path.unlink()
 
     print("\nStage 3/4: single-layer sweep")
+    if args.skip_single_sweep:
+        print("[single-layer sweep skipped]")
     for L in single_layers:
         name = f"single_L{L}"
         repaired = run_variant(
@@ -767,7 +812,7 @@ def main() -> None:
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("\n" + "=" * 100)
-    print("RELATION-SPECIFIC DELTA-H MULTI-LAYER DIAGNOSTIC")
+    print("CROSS-MODEL RELATION-SPECIFIC DELTA-H DIAGNOSTIC")
     print("=" * 100)
     print(f"TEST N / trigger policy          : {len(test_sids)} / {args.policy}")
     print(f"triggered                        : {len(trigger_sids)}")
