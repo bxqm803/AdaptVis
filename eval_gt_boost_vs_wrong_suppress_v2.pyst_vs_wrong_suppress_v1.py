@@ -379,18 +379,16 @@ def dual_edit_matrix(g: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """
     A=[g,w] and B=A(A^T A)^(-1), so A^T B = I.
 
-    Thus:
-      delta = B @ [dg, dw]
-    gives:
-      delta dot g = dg
-      delta dot w = dw
-    up to numerical precision.
+    BF16/FP16 linear algebra is not supported by torch.linalg.inv on CUDA,
+    so solve the tiny 2x2 system in float32 and cast the result back.
     """
-    A = torch.stack([g, w], dim=1)  # [D,2]
-    gram = A.transpose(0, 1) @ A
-    eye = torch.eye(2, device=A.device, dtype=A.dtype)
-    inv = torch.linalg.inv(gram + 1e-6 * eye)
-    return A @ inv  # [D,2]
+    orig_dtype = g.dtype
+    A32 = torch.stack([g.float(), w.float()], dim=1)  # [D,2], fp32
+    gram32 = A32.transpose(0, 1) @ A32
+    eye32 = torch.eye(2, device=A32.device, dtype=torch.float32)
+    inv32 = torch.linalg.inv(gram32 + 1e-6 * eye32)
+    B32 = A32 @ inv32
+    return B32.to(dtype=orig_dtype)  # [D,2]
 
 
 def random_orthogonal_delta(
@@ -402,30 +400,37 @@ def random_orthogonal_delta(
 ) -> torch.Tensor:
     """
     Same norm as true_delta, but orthogonal to span{g,w}.
-    Therefore it does not directly alter q dot g or q dot w.
+
+    The orthogonalization solve is done in float32 because torch.linalg.solve
+    does not support BF16/FP16 reliably here.
     """
-    target_norm = true_delta.norm()
-    if float(target_norm.detach().float().cpu()) <= EPS:
+    target_norm = true_delta.float().norm()
+    if float(target_norm.detach().cpu()) <= EPS:
         return torch.zeros_like(true_delta)
 
     rng = np.random.default_rng(seed)
-    rv = torch.from_numpy(
+    rv32 = torch.from_numpy(
         rng.standard_normal(true_delta.numel()).astype(np.float32)
-    ).to(device=true_delta.device, dtype=true_delta.dtype)
+    ).to(device=true_delta.device, dtype=torch.float32)
 
-    A = torch.stack([g, w], dim=1)  # [D,2]
-    gram = A.transpose(0, 1) @ A
-    eye = torch.eye(2, device=A.device, dtype=A.dtype)
-    coeff = torch.linalg.solve(
-        gram + 1e-6 * eye,
-        A.transpose(0, 1) @ rv,
+    g32 = g.float()
+    w32 = w.float()
+    A32 = torch.stack([g32, w32], dim=1)  # [D,2]
+    gram32 = A32.transpose(0, 1) @ A32
+    eye32 = torch.eye(2, device=A32.device, dtype=torch.float32)
+
+    coeff32 = torch.linalg.solve(
+        gram32 + 1e-6 * eye32,
+        A32.transpose(0, 1) @ rv32,
     )
-    rv = rv - A @ coeff
+    rv32 = rv32 - A32 @ coeff32
 
-    nr = rv.norm()
-    if float(nr.detach().float().cpu()) <= EPS:
+    nr = rv32.norm()
+    if float(nr.detach().cpu()) <= EPS:
         return torch.zeros_like(true_delta)
-    return rv * (target_norm / nr)
+
+    out32 = rv32 * (target_norm / nr)
+    return out32.to(dtype=true_delta.dtype)
 
 
 # =============================================================================
