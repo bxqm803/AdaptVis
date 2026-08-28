@@ -607,7 +607,7 @@ def select_eval_sids(
 ):
     sids = []
 
-    for sid in meta["idx_by_sid"]:
+    for sid in meta["sids"]:
         if split != "all" and meta["split"].get(sid, "") != split:
             continue
         if sid not in records:
@@ -2554,7 +2554,7 @@ def main():
     else:
         train_sids = [
             sid
-            for sid in meta["idx_by_sid"]
+            for sid in meta["sids"]
             if meta["split"].get(sid, "") == "train"
             and sid in records
             and meta["gt"].get(sid, "") in REL2ID
