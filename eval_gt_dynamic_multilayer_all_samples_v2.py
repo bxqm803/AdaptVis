@@ -68,7 +68,6 @@ Expected helper scripts in repo root:
   analyze_layerwise_direction_failure_scan_v1.py
   analyze_text_stream_visual_causal_transfer_v1.py
   analyze_direction_geometry_and_causality_v1.py
-  eval_gt_boost_vs_wrong_suppress_v2.py
 
 Recommended run
 ---------------
@@ -123,7 +122,6 @@ import extract_two_object_relation_states as base
 import analyze_layerwise_direction_failure_scan_v1 as dirscan
 import analyze_text_stream_visual_causal_transfer_v1 as causal
 import analyze_direction_geometry_and_causality_v1 as geom
-import eval_gt_boost_vs_wrong_suppress_v2 as single
 
 
 RELATIONS = ("left", "right", "above", "below")
@@ -267,6 +265,13 @@ def load_assets(
     )
 
 
+def _target_stat(vals, which):
+    x = np.asarray(vals, dtype=np.float64)
+    if len(x) == 0:
+        raise RuntimeError("Cannot compute target statistic from zero samples.")
+    return float(np.median(x) if which == "median" else np.mean(x))
+
+
 def build_targets(
     *,
     groups,
@@ -279,19 +284,139 @@ def build_targets(
     target_stat,
     min_controls,
 ):
-    # Reuse exactly the target definition from the successful single-layer v2
-    # experiment so single-layer vs multi-layer remains directly comparable.
-    return single.build_control_targets(
-        groups=groups,
-        idx_by_sid=idx_by_sid,
-        labels=labels,
-        residual=residual,
-        codebooks=codebooks,
-        layers=layers,
-        control_group=control_group,
-        target_stat=target_stat,
-        min_controls=min_controls,
+    """
+    Build the same correct-control targets used by the prior single-layer test.
+
+    gt_targets[(layer, gt)]:
+        typical q dot prototype_gt among restricted-correct + repr-strong
+        controls with the same GT.
+
+    wrong_targets[(layer, gt, foil)]:
+        typical q dot prototype_foil among those same correct controls.
+    """
+    controls = [
+        r for r in groups
+        if str(r["restricted_group"]) == control_group
+        and int(r["sid"]) in idx_by_sid
+    ]
+    if not controls:
+        raise RuntimeError(f"No controls found for {control_group}")
+
+    gt_targets = {}
+    wrong_targets = {}
+    audit = []
+
+    for li in layers:
+        cb = codebooks[li]
+        center = cb["center"]
+        protos = cb["protos"]
+
+        for gt in RELATIONS:
+            same_gt = []
+            for r in controls:
+                sid = int(r["sid"])
+                idx = idx_by_sid[sid]
+                row_gt = norm_rel(r.get("gt", labels[idx]))
+                if row_gt == gt:
+                    same_gt.append(r)
+
+            # Keep same-GT matching. min_controls is diagnostic only here;
+            # falling back across GTs would mix relation-specific scales.
+            if len(same_gt) == 0:
+                continue
+
+            q_list = []
+            for r in same_gt:
+                idx = idx_by_sid[int(r["sid"])]
+                q_list.append(residual[idx, li, :] - center)
+
+            gt_proto = protos[REL2ID[gt]]
+            gt_vals = [float(q @ gt_proto) for q in q_list]
+            gt_targets[(li, gt)] = _target_stat(gt_vals, target_stat)
+
+            audit.append({
+                "layer": li,
+                "gt": gt,
+                "foil": "GT",
+                "n_controls": len(q_list),
+                "below_min_controls": int(len(q_list) < min_controls),
+                "target_coordinate": gt_targets[(li, gt)],
+                "statistic": target_stat,
+            })
+
+            for foil in RELATIONS:
+                if foil == gt:
+                    continue
+                foil_proto = protos[REL2ID[foil]]
+                vals = [float(q @ foil_proto) for q in q_list]
+                wrong_targets[(li, gt, foil)] = _target_stat(
+                    vals, target_stat
+                )
+                audit.append({
+                    "layer": li,
+                    "gt": gt,
+                    "foil": foil,
+                    "n_controls": len(q_list),
+                    "below_min_controls": int(len(q_list) < min_controls),
+                    "target_coordinate": wrong_targets[(li, gt, foil)],
+                    "statistic": target_stat,
+                })
+
+    return gt_targets, wrong_targets, audit
+
+
+def dual_edit_matrix(g: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """
+    Minimum-L2 coordinate edit basis.
+
+    Compute in float32 because torch.linalg.inv does not support BF16/FP16
+    reliably on CUDA. Cast back to the model dtype afterward.
+    """
+    out_dtype = g.dtype
+    A32 = torch.stack([g.float(), w.float()], dim=1)  # [D, 2]
+    gram32 = A32.transpose(0, 1) @ A32
+    eye32 = torch.eye(2, device=A32.device, dtype=torch.float32)
+    inv32 = torch.linalg.inv(gram32 + 1e-6 * eye32)
+    return (A32 @ inv32).to(dtype=out_dtype)
+
+
+def random_orthogonal_delta(
+    *,
+    true_delta: torch.Tensor,
+    g: torch.Tensor,
+    w: torch.Tensor,
+    seed: int,
+) -> torch.Tensor:
+    """
+    Norm-matched random edit orthogonal to span{g,w}.
+    Linear solve is performed in float32 for BF16 compatibility.
+    """
+    target_norm = true_delta.float().norm()
+    if float(target_norm.detach().cpu()) <= EPS:
+        return torch.zeros_like(true_delta)
+
+    rng = np.random.default_rng(seed)
+    rv32 = torch.from_numpy(
+        rng.standard_normal(true_delta.numel()).astype(np.float32)
+    ).to(device=true_delta.device, dtype=torch.float32)
+
+    g32 = g.float()
+    w32 = w.float()
+    A32 = torch.stack([g32, w32], dim=1)
+    gram32 = A32.transpose(0, 1) @ A32
+    eye32 = torch.eye(2, device=A32.device, dtype=torch.float32)
+
+    coeff32 = torch.linalg.solve(
+        gram32 + 1e-6 * eye32,
+        A32.transpose(0, 1) @ rv32,
     )
+    rv32 = rv32 - A32 @ coeff32
+    nr = rv32.norm()
+
+    if float(nr.detach().cpu()) <= EPS:
+        return torch.zeros_like(true_delta)
+
+    return (rv32 * (target_norm / nr)).to(dtype=true_delta.dtype)
 
 
 # =============================================================================
@@ -395,7 +520,7 @@ class DynamicLayerEdit:
 
         # Solve the requested coordinate changes jointly. This lets suppress-only
         # hold the GT coordinate fixed rather than accidentally damaging it.
-        B = single.dual_edit_matrix(gt_proto, comp_proto)
+        B = dual_edit_matrix(gt_proto, comp_proto)
 
         if true_mode == "suppress":
             c = torch.stack([
@@ -413,7 +538,7 @@ class DynamicLayerEdit:
         true_delta = B @ c
 
         if is_random:
-            delta = single.random_orthogonal_delta(
+            delta = random_orthogonal_delta(
                 true_delta=true_delta,
                 g=gt_proto,
                 w=comp_proto,
@@ -1150,4 +1275,3 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
