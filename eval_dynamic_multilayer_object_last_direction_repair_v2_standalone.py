@@ -60,6 +60,7 @@ import gc
 import json
 import math
 import random
+import re
 import shutil
 from collections import defaultdict
 from pathlib import Path
@@ -74,11 +75,415 @@ from transformers import AutoProcessor
 
 import extract_two_object_relation_states as base
 import analyze_layerwise_direction_failure_scan_v1 as direction
-import eval_single_layer_direction_state_rescue_v2 as single
+from types import SimpleNamespace
 
 
 RELATIONS = ("left", "right", "above", "below")
 EPS = 1e-10
+
+
+# =============================================================================
+# Standalone compatibility helpers
+# =============================================================================
+# These functions were previously imported from
+# eval_single_layer_direction_state_rescue_v2.py.  They are inlined here so
+# this script only depends on the project-native extraction / direction files.
+
+def _norm_relation(x: Any) -> str:
+    return direction.norm_relation(x)
+
+
+def _read_csv(path: Path) -> List[Dict[str, str]]:
+    with path.open("r", encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _load_metadata(direction_dir: Path):
+    vec_path = direction_dir / "vectors.npz"
+    gen_path = direction_dir / "sample_split_and_generation.csv"
+
+    if not vec_path.exists():
+        raise FileNotFoundError(vec_path)
+    if not gen_path.exists():
+        raise FileNotFoundError(gen_path)
+
+    with np.load(vec_path, allow_pickle=True) as z:
+        sids = z["sample_index"].astype(np.int64)
+        labels = [_norm_relation(x) for x in z["relation"]]
+
+    gt = {
+        int(sid): str(labels[i])
+        for i, sid in enumerate(sids.tolist())
+    }
+
+    split = {}
+    generation = {}
+
+    for r in _read_csv(gen_path):
+        sid = int(r["sample_index"])
+        split[sid] = str(r.get("split", "")).strip()
+
+        pred = _norm_relation(r.get("generation_pred", ""))
+        group = str(r.get("generation_group", "")).strip().lower()
+
+        g = gt.get(sid, "")
+        if group not in ("correct", "wrong"):
+            if g in RELATIONS and pred in RELATIONS:
+                group = "correct" if pred == g else "wrong"
+
+        generation[sid] = {
+            "generation_group": group,
+            "generation_pred": pred,
+            "generation_text": str(r.get("generation_text", "")),
+        }
+
+    return {
+        "sids": [int(x) for x in sids.tolist()],
+        "gt": gt,
+        "split": split,
+        "generation": generation,
+    }
+
+
+def _get_attr_path(obj: Any, path: str):
+    cur = obj
+    for piece in path.split("."):
+        cur = getattr(cur, piece)
+    return cur
+
+
+def _resolve_decoder_layers(model):
+    candidates = [
+        "model.language_model.layers",
+        "language_model.layers",
+        "model.model.layers",
+        "model.layers",
+        "language_model.model.layers",
+    ]
+    for path in candidates:
+        try:
+            layers = _get_attr_path(model, path)
+            if len(layers) > 0 and hasattr(layers[0], "self_attn"):
+                return layers, path
+        except Exception:
+            pass
+    raise RuntimeError("Could not resolve decoder layers.")
+
+
+def _first_tensor(x: Any) -> torch.Tensor:
+    if torch.is_tensor(x):
+        return x
+    if isinstance(x, (tuple, list)):
+        for y in x:
+            if torch.is_tensor(y):
+                return y
+    raise RuntimeError(f"No tensor found in {type(x)}")
+
+
+def _pool_positions(
+    x: torch.Tensor,
+    positions: Sequence[int],
+) -> torch.Tensor:
+    valid = [
+        int(p)
+        for p in positions
+        if 0 <= int(p) < int(x.shape[0])
+    ]
+    if not valid:
+        raise RuntimeError("No valid object token positions.")
+
+    idx = torch.as_tensor(
+        valid,
+        device=x.device,
+        dtype=torch.long,
+    )
+    return x.index_select(0, idx).mean(dim=0)
+
+
+def _pair_diff(
+    x: torch.Tensor,
+    subj_pos: Sequence[int],
+    ref_pos: Sequence[int],
+) -> torch.Tensor:
+    return (
+        _pool_positions(x, subj_pos)
+        - _pool_positions(x, ref_pos)
+    )
+
+
+def _unit(v: np.ndarray) -> np.ndarray:
+    x = np.asarray(v, dtype=np.float64)
+    n = float(np.linalg.norm(x))
+    if n <= EPS:
+        return np.zeros_like(x, dtype=np.float32)
+    return (x / n).astype(np.float32)
+
+
+def _orthonormal_basis(
+    vectors: Sequence[np.ndarray],
+) -> np.ndarray:
+    vecs = [np.asarray(v, dtype=np.float64) for v in vectors]
+    A = np.stack(vecs, axis=1)
+
+    u, s, _ = np.linalg.svd(A, full_matrices=False)
+    scale = max(
+        float(s.max()) if len(s) else 0.0,
+        1.0,
+    )
+    keep = s > 1e-8 * scale
+
+    if not np.any(keep):
+        return np.zeros(
+            (A.shape[0], 0),
+            dtype=np.float32,
+        )
+
+    return u[:, keep].astype(np.float32)
+
+
+def _project_spatial(
+    v: np.ndarray,
+    B: np.ndarray,
+) -> np.ndarray:
+    v64 = np.asarray(v, dtype=np.float64)
+    B64 = np.asarray(B, dtype=np.float64)
+
+    if B64.ndim != 2 or B64.shape[1] == 0:
+        return np.zeros_like(v64, dtype=np.float32)
+
+    return (
+        B64 @ (B64.T @ v64)
+    ).astype(np.float32)
+
+
+def _fit_codebook(
+    X: np.ndarray,
+    labels: np.ndarray,
+):
+    center = X.mean(axis=0).astype(np.float32)
+    Xc = X - center
+
+    means = {}
+    protos = {}
+
+    for rel in RELATIONS:
+        mask = labels == rel
+        if not np.any(mask):
+            raise RuntimeError(
+                f"No TRAIN examples for relation={rel}"
+            )
+
+        mu = Xc[mask].mean(axis=0).astype(np.float32)
+        means[rel] = mu
+        protos[rel] = _unit(mu)
+
+    basis = _orthonormal_basis([
+        means["right"] - means["left"],
+        means["above"] - means["below"],
+    ])
+
+    return {
+        "center": center,
+        "means": means,
+        "protos": protos,
+        "basis": basis,
+        "basis_rank": int(basis.shape[1]),
+    }
+
+
+def _scores_and_margin(
+    q: np.ndarray,
+    cb,
+    gt: str,
+):
+    qc = (
+        np.asarray(q, dtype=np.float32)
+        - np.asarray(cb["center"], dtype=np.float32)
+    )
+
+    scores = {
+        rel: float(qc @ cb["protos"][rel])
+        for rel in RELATIONS
+    }
+
+    foil = max(
+        [r for r in RELATIONS if r != gt],
+        key=lambda r: scores[r],
+    )
+
+    margin = float(
+        scores[gt] - scores[foil]
+    )
+    return scores, foil, margin
+
+
+def _make_margin_correction(
+    *,
+    cb,
+    gt: str,
+    foil: str,
+    current_margin: float,
+    target_margin: float,
+    project_to_spatial: bool,
+    max_edit_norm: float,
+):
+    """
+    Exact one-axis correction for:
+        margin = score_GT - score_foil
+               = q dot (p_GT - p_foil)
+
+    Returns the same 6-tuple used by the previous helper script.
+    """
+    v = (
+        np.asarray(cb["protos"][gt], dtype=np.float32)
+        - np.asarray(cb["protos"][foil], dtype=np.float32)
+    )
+
+    used_spatial_projection = False
+    used_raw_fallback = False
+
+    basis_rank = int(
+        cb.get("basis_rank", cb["basis"].shape[1])
+    )
+
+    if project_to_spatial and basis_rank > 0:
+        axis_raw = _project_spatial(v, cb["basis"])
+        if float(np.linalg.norm(axis_raw)) > 1e-8:
+            used_spatial_projection = True
+        else:
+            axis_raw = v
+            used_raw_fallback = True
+    else:
+        axis_raw = v
+        if project_to_spatial:
+            used_raw_fallback = True
+
+    d = _unit(axis_raw)
+
+    denom = float(
+        np.asarray(v, dtype=np.float64)
+        @ np.asarray(d, dtype=np.float64)
+    )
+
+    if abs(denom) <= 1e-8:
+        return (
+            np.zeros_like(v, dtype=np.float32),
+            0.0,
+            0.0,
+            denom,
+            used_spatial_projection,
+            used_raw_fallback,
+        )
+
+    deficit = max(
+        0.0,
+        float(target_margin - current_margin),
+    )
+
+    if deficit <= EPS:
+        return (
+            np.zeros_like(v, dtype=np.float32),
+            0.0,
+            0.0,
+            denom,
+            used_spatial_projection,
+            used_raw_fallback,
+        )
+
+    alpha = deficit / denom
+    delta = (
+        float(alpha) * d
+    ).astype(np.float32)
+
+    raw_norm = float(np.linalg.norm(delta))
+
+    if (
+        max_edit_norm > 0
+        and raw_norm > max_edit_norm
+    ):
+        delta = (
+            delta
+            * (float(max_edit_norm) / raw_norm)
+        ).astype(np.float32)
+
+    achieved_margin_change = float(
+        np.asarray(delta, dtype=np.float64)
+        @ np.asarray(v, dtype=np.float64)
+    )
+
+    return (
+        delta,
+        achieved_margin_change,
+        raw_norm,
+        denom,
+        used_spatial_projection,
+        used_raw_fallback,
+    )
+
+
+def _parse_generated_relation(text: str):
+    s = str(text).strip().lower()
+
+    patterns = [
+        ("left", r"\bleft\b"),
+        ("right", r"\bright\b"),
+        ("above", r"\babove\b"),
+        ("below", r"\bbelow\b"),
+        ("above", r"\bon top of\b"),
+        ("below", r"\bunder(?:neath)?\b"),
+    ]
+
+    hits = []
+    for rel, pat in patterns:
+        m = re.search(pat, s)
+        if m:
+            hits.append((m.start(), rel))
+
+    if not hits:
+        return None
+
+    hits.sort()
+    return hits[0][1]
+
+
+def _generate_answer(
+    model,
+    processor,
+    batch,
+    max_new_tokens,
+):
+    input_len = int(batch["input_ids"].shape[1])
+
+    with torch.inference_mode():
+        generated = model.generate(
+            **batch,
+            do_sample=False,
+            max_new_tokens=max_new_tokens,
+            use_cache=True,
+        )
+
+    suffix = generated[0, input_len:]
+    text = processor.tokenizer.decode(
+        suffix,
+        skip_special_tokens=True,
+    ).strip()
+
+    pred = _parse_generated_relation(text)
+    del generated
+    return text, pred
+
+
+single = SimpleNamespace(
+    first_tensor=_first_tensor,
+    pair_diff=_pair_diff,
+    norm_relation=_norm_relation,
+    fit_codebook=_fit_codebook,
+    scores_and_margin=_scores_and_margin,
+    make_margin_correction=_make_margin_correction,
+    generate_answer=_generate_answer,
+    load_metadata=_load_metadata,
+    resolve_decoder_layers=_resolve_decoder_layers,
+)
 
 
 # =============================================================================
