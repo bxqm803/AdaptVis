@@ -722,20 +722,39 @@ def unit(v: np.ndarray) -> np.ndarray:
 
 
 def orthonormal_basis(vectors: Sequence[np.ndarray]) -> np.ndarray:
-    A = np.stack(
-        [np.asarray(v, dtype=np.float64) for v in vectors],
-        axis=1,
-    )
+    """
+    Return an orthonormal basis for the learned 2-D spatial subspace.
+
+    Some very early layers can be genuinely degenerate: TRAIN relation means
+    may not yet separate left/right or above/below.  That is a valid diagnostic
+    result, not a reason to abort an all-layer scan.  In that case return an
+    empty basis with shape [hidden_dim, 0].  Downstream repair code will fall
+    back to the raw GT-vs-foil Direction axis (or skip the edit if even that
+    axis is degenerate).
+    """
+    vecs = [np.asarray(v, dtype=np.float64) for v in vectors]
+    A = np.stack(vecs, axis=1)
     u, s, _ = np.linalg.svd(A, full_matrices=False)
-    keep = s > 1e-8 * max(float(s.max()), 1.0)
+
+    scale = max(float(s.max()) if len(s) else 0.0, 1.0)
+    keep = s > 1e-8 * scale
+
     if not np.any(keep):
-        raise RuntimeError("Degenerate spatial basis.")
+        return np.zeros((A.shape[0], 0), dtype=np.float32)
+
     return u[:, keep].astype(np.float32)
 
 
 def project_spatial(v: np.ndarray, B: np.ndarray) -> np.ndarray:
     v64 = np.asarray(v, dtype=np.float64)
     B64 = np.asarray(B, dtype=np.float64)
+
+    # Degenerate layer: no reliable TRAIN-derived 2-D spatial subspace exists.
+    # Return a zero projection and let the caller explicitly decide whether to
+    # fall back to the raw semantic Direction axis.
+    if B64.ndim != 2 or B64.shape[1] == 0:
+        return np.zeros_like(v64, dtype=np.float32)
+
     return (B64 @ (B64.T @ v64)).astype(np.float32)
 
 
@@ -767,6 +786,7 @@ def fit_codebook(X: np.ndarray, labels: np.ndarray):
         "means": means,
         "protos": protos,
         "basis": basis,
+        "basis_rank": int(basis.shape[1]),
     }
 
 
@@ -886,6 +906,7 @@ def load_codebooks_and_trajectory(
                     "layer": li,
                     "stage": stage,
                     "gt": gt,
+                    "spatial_basis_rank": int(cb.get("basis_rank", cb["basis"].shape[1])),
                     "n_generation_correct_train": int(len(vals)),
                     "q10_margin": q10,
                     "q25_margin": q25,
@@ -923,13 +944,25 @@ def make_margin_correction(
         - np.asarray(cb["protos"][foil], dtype=np.float32)
     )
 
-    if project_to_spatial:
+    used_spatial_projection = False
+    used_raw_fallback = False
+
+    if project_to_spatial and int(cb.get("basis_rank", cb["basis"].shape[1])) > 0:
         axis_raw = project_spatial(
             v,
             cb["basis"],
         )
+        # A particular GT-vs-foil contrast can still be nearly orthogonal to
+        # the learned spatial basis even when the basis itself has rank > 0.
+        if float(np.linalg.norm(axis_raw)) > 1e-8:
+            used_spatial_projection = True
+        else:
+            axis_raw = v
+            used_raw_fallback = True
     else:
         axis_raw = v
+        if project_to_spatial:
+            used_raw_fallback = True
 
     d = unit(axis_raw)
 
@@ -944,6 +977,8 @@ def make_margin_correction(
             0.0,
             0.0,
             denom,
+            used_spatial_projection,
+            used_raw_fallback,
         )
 
     deficit = float(target_margin - current_margin)
@@ -974,6 +1009,8 @@ def make_margin_correction(
         achieved_margin_change,
         raw_norm,
         denom,
+        used_spatial_projection,
+        used_raw_fallback,
     )
 
 
@@ -1309,6 +1346,8 @@ def run_experiment(
                 achieved_change = 0.0
                 expected_margin_after = margin
                 denom = float("nan")
+                used_spatial_projection = False
+                used_raw_fallback = False
 
                 if should_repair:
                     (
@@ -1316,6 +1355,8 @@ def run_experiment(
                         achieved_change,
                         raw_edit_norm,
                         denom,
+                        used_spatial_projection,
+                        used_raw_fallback,
                     ) = make_margin_correction(
                         cb=cb,
                         gt=gt,
@@ -1409,6 +1450,12 @@ def run_experiment(
                         edit_norm,
                     "margin_axis_denominator":
                         denom,
+                    "spatial_basis_rank":
+                        int(cb.get("basis_rank", cb["basis"].shape[1])),
+                    "used_spatial_projection":
+                        int(bool(used_spatial_projection)),
+                    "used_raw_direction_fallback":
+                        int(bool(used_raw_fallback)),
                     "expected_margin_change":
                         achieved_change,
                     "expected_margin_after":
