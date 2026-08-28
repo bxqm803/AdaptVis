@@ -2,188 +2,107 @@
 # -*- coding: utf-8 -*-
 
 """
-Per-sample Dynamic Spatial-Direction Repair (No Gradients)
-==========================================================
+All-layer Per-sample Spatial-Direction Repair (No Gradients)
+============================================================
 
-Research question
------------------
-Different wrong samples may fail in different layers and against different
-competing spatial relations.  Instead of using one global repair rule, diagnose
-and repair every sample dynamically, layer by layer, using ONLY the learned
-spatial Direction vectors.
+This version scans and can repair EVERY decoder layer for EACH sample.
 
-No gradients are used anywhere.
-
-For each active layer l
+Key differences from v1
 -----------------------
-We use the real image-grounded subject-reference relation vector:
+- --layers all is supported and is the default.
+- It does NOT require a pre-existing all-layer train_stage_vectors.npz.
+- It automatically collects and caches TRAIN pre_attn/post_attn image-grounded
+  Direction states for all requested layers.
+- Every wrong sample is then processed layer-by-layer on its CURRENT modified
+  trajectory.
+- No gradients are used.
 
-    r_pre  = (h_sub - h_ref)^img_pre  - (h_sub - h_ref)^noimg_pre
-    r_post = (h_sub - h_ref)^img_post - (h_sub - h_ref)^noimg_post
+Main diagnostic
+---------------
+At layer l:
 
-The image-grounded Attention update is therefore:
+    r_pre  = (h_sub-h_ref)^img_pre  - (h_sub-h_ref)^noimg_pre
+    r_post = (h_sub-h_ref)^img_post - (h_sub-h_ref)^noimg_post
 
     delta_r_attn = r_post - r_pre
 
-At the CURRENT layer and CURRENT modified trajectory, the Direction codebook
-selects the strongest non-GT competitor:
+Using TRAIN relation means, build a 2-D spatial subspace and for the current
+sample choose the strongest non-GT competitor at this layer:
 
-    foil_l = argmax_{r != GT} score(r_post, r)
+    foil_l = argmax_{c != GT} score_c(r_post)
 
-A pure spatial GT-vs-foil axis is then constructed from the TRAIN Direction
-prototypes and projected into the TRAIN 2-D spatial subspace:
+Then define:
 
-    d_l(GT, foil) =
-        unit(P_spatial [mu_GT - mu_foil])
+    d_l = unit(P_spatial(mu_GT - mu_foil))
 
-The layer's directional spatial contribution is:
+and measure whether this layer's Attention update is spatially helpful:
 
-    u_l = delta_r_attn dot d_l(GT, foil)
-
-Interpretation:
-
-    u_l > 0:
-        Attention pushes the relation representation toward GT relative to
-        the strongest local competitor.
-
-    u_l < 0:
-        Attention pushes it in the wrong spatial direction.
+    u_l = delta_r_attn dot d_l
 
 Repair modes
 ------------
-1) nonnegative
-   Only repair genuinely harmful layers:
+nonnegative:
+    if u_l < 0:
+        add (-u_l) d_l
+    else:
+        do nothing
 
-       target = 0
-       if u_l < 0:
-           delta = (-u_l) * d_l
-       else:
-           no edit
+correct_q10:
+    generation-correct TRAIN controls define a conservative lower bound
+    max(0, Q10_correct).  If u_l is below it, raise it only to that boundary.
 
-   This is the cleanest "keep every layer's spatial update non-negative" test.
+correct_q25:
+    same with Q25.
 
-2) correct_q25
-   Use generation-correct TRAIN samples to define a conservative positive
-   floor.  For each layer/GT/foil, estimate the 25th percentile of correct
-   u_l values:
+random_control:
+    same trigger and norm as correct_q25, but edit in a random direction
+    orthogonal to the learned spatial subspace.
 
-       target = max(0, Q25_correct)
+The repair is dynamic:
+    edit L0 -> recompute L1 on modified trajectory -> edit if needed -> ...
 
-   If current u_l is below this normal lower bound:
+The main output is fresh model.generate().
 
-       delta = (target - u_l) * d_l
-
-   This does NOT force the sample to the correct median.  It only moves an
-   abnormal layer back to the lower edge of the correct distribution.
-
-3) correct_q10
-   Same idea but even more conservative: max(0, Q10_correct).
-
-4) random_control
-   Uses the exact same trigger and norm as correct_q25, but redirects the edit
-   into a random direction orthogonal to the learned 2-D spatial subspace.
-
-Dynamic / sample-specific behavior
-----------------------------------
-- Every sample chooses its own strongest competitor at every layer.
-- Every sample chooses its own layers to repair.
-- A layer is untouched if its current spatial update is already healthy.
-- Earlier repairs change the trajectory; later layers are diagnosed again on
-  the modified trajectory.
-- No final generated wrong label is needed to choose the local foil.
-- GT is used, so this is an ORACLE mechanistic validation experiment.
-
-Primary experiment
-------------------
-Start with ALL cached generation-wrong test samples.  Run fresh baseline
-model.generate(), then run each dynamic repair mode and compare:
-
-    generation accuracy
-    W -> C
-    C -> W
-    net
-    number of repaired layers per sample
-
-You can later repeat on generation-correct samples or all samples with
---sample-group correct / all.
-
-Required existing files
------------------------
---direction-dir:
-    vectors.npz
-    sample_split_and_generation.csv
-
---prepost-dir:
-    train_stage_vectors.npz
-
-The train_stage_vectors.npz must contain pre_attn and post_attn vectors for all
-layers requested by --layers.
-
-Recommended first run
----------------------
-CUDA_VISIBLE_DEVICES=0 python eval_per_sample_direction_repair_v1.py \
+Recommended first all-layer run
+--------------------------------
+CUDA_VISIBLE_DEVICES=0 python eval_per_sample_direction_repair_all_layers_v2.py \
   --direction-dir output/qwen7b_layer_direction_scan_v1 \
-  --prepost-dir output/qwen7b_prepost_direction_causality_v2 \
   --dataset coco_two \
   --data-root data \
   --model qwen-7b \
   --device cuda:0 \
-  --layers 14-19 \
+  --layers all \
   --sample-group wrong \
-  --modes nonnegative,correct_q10,correct_q25,random_control \
-  --output-dir output/qwen7b_per_sample_direction_repair_v1 \
+  --modes nonnegative \
+  --output-dir output/qwen7b_per_sample_direction_repair_all_layers_v2 \
   --overwrite
 
-Smoke
------
-CUDA_VISIBLE_DEVICES=0 python eval_per_sample_direction_repair_v1.py \
+After the TRAIN cache has been built, add the stronger diagnostics:
+
+CUDA_VISIBLE_DEVICES=0 python eval_per_sample_direction_repair_all_layers_v2.py \
   --direction-dir output/qwen7b_layer_direction_scan_v1 \
-  --prepost-dir output/qwen7b_prepost_direction_causality_v2 \
   --dataset coco_two \
   --data-root data \
   --model qwen-7b \
   --device cuda:0 \
-  --layers 14,16,17,19 \
+  --layers all \
   --sample-group wrong \
-  --modes nonnegative,correct_q25,random_control \
-  --max-samples 12 \
-  --output-dir output/qwen7b_per_sample_direction_repair_smoke \
+  --modes nonnegative,correct_q10,correct_q25,random_control \
+  --train-cache output/qwen7b_per_sample_direction_repair_all_layers_v2/train_all_layer_direction_states.npz \
+  --output-dir output/qwen7b_per_sample_direction_repair_all_layers_v2_full \
   --overwrite
 
 Outputs
 -------
+train_all_layer_direction_states.npz
 correct_direction_update_targets.csv
-    TRAIN correct distributions of spatial update margin.
-
 generation_per_sample.csv
-    Baseline and final generation for every sample/mode.
-
 layer_diagnostics.csv
-    Every sample, every layer, every dynamic decision:
-        local foil
-        pre/post spatial margin
-        current update margin u_l
-        correct Q10/Q25/median
-        triggered?
-        edit norm
-        post-repair expected update margin
-
 generation_summary.csv
-    Main generation result.
-
 layer_summary.csv
-    Which layers are most frequently diagnosed/repaired for baseline-wrong
-    samples.
-
 repair_count_summary.csv
-    Accuracy / W->C as a function of number of repaired layers.
-
-Important caveat
-----------------
-This is an oracle validation because GT is known.  Its purpose is not yet a
-deployable repair method.  It tests whether spatial Direction vectors can
-diagnose sample-specific harmful layer updates and whether minimally removing
-those harmful spatial components changes actual generation.
+errors.csv
+summary.json
 """
 
 from __future__ import annotations
@@ -197,9 +116,9 @@ import math
 import random
 import re
 import shutil
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -218,7 +137,7 @@ EPS = 1e-10
 
 
 # =============================================================================
-# CLI / generic I/O
+# CLI / I/O
 # =============================================================================
 
 def parse_args():
@@ -227,7 +146,6 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--direction-dir", required=True)
-    p.add_argument("--prepost-dir", required=True)
     p.add_argument("--dataset", default="coco_two")
     p.add_argument("--data-root", default="data")
     p.add_argument("--model", default="qwen-7b")
@@ -246,42 +164,61 @@ def parse_args():
     )
     p.add_argument(
         "--layers",
-        default="14-19",
-        help=(
-            "Layers to diagnose sequentially. train_stage_vectors.npz must "
-            "contain pre_attn/post_attn vectors for every requested layer."
-        ),
+        default="all",
+        help="'all', comma-separated layers, or ranges such as 0-31.",
     )
     p.add_argument(
         "--sample-group",
         default="wrong",
         choices=["wrong", "correct", "all"],
-        help="Cached generation group used to select samples.",
     )
-    p.add_argument(
-        "--modes",
-        default="nonnegative,correct_q10,correct_q25,random_control",
-    )
-    p.add_argument("--max-samples", type=int, default=None)
     p.add_argument(
         "--eval-split",
         default="test",
         choices=["train", "test", "all"],
     )
     p.add_argument(
+        "--modes",
+        default="nonnegative",
+        help=(
+            "Comma-separated: nonnegative,correct_q10,"
+            "correct_q25,random_control"
+        ),
+    )
+    p.add_argument(
+        "--train-cache",
+        default="",
+        help=(
+            "Optional existing all-layer TRAIN cache. If omitted, a cache is "
+            "created under output-dir."
+        ),
+    )
+    p.add_argument(
+        "--rebuild-train-cache",
+        action="store_true",
+    )
+    p.add_argument(
+        "--train-max-samples",
+        type=int,
+        default=None,
+        help="Optional TRAIN cap for a smoke test. Do not use for final results.",
+    )
+    p.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Optional eval sample cap.",
+    )
+    p.add_argument(
         "--min-controls-pair",
         type=int,
         default=3,
-        help=(
-            "Minimum TRAIN correct controls for a layer/GT/local-foil pair. "
-            "If fewer exist, fall back to layer/GT pooled local-foil margins."
-        ),
     )
     p.add_argument(
         "--max-edit-norm",
         type=float,
         default=0.0,
-        help="Optional per-layer cap; <=0 disables.",
+        help="Per-layer edit norm cap; <=0 disables.",
     )
     p.add_argument("--max-new-tokens", type=int, default=8)
     p.add_argument("--seed", type=int, default=1)
@@ -342,6 +279,9 @@ def parse_words(text: str) -> List[str]:
 
 
 def parse_layers(text: str, n_layers: int) -> List[int]:
+    if str(text).strip().lower() == "all":
+        return list(range(n_layers))
+
     vals = []
     for piece in parse_words(text):
         if "-" in piece:
@@ -382,10 +322,7 @@ def load_metadata(direction_dir: Path):
 
     with np.load(vec_path, allow_pickle=True) as z:
         sids = z["sample_index"].astype(np.int64)
-        labels = [
-            norm_relation(x)
-            for x in z["relation"]
-        ]
+        labels = [norm_relation(x) for x in z["relation"]]
 
     gt = {
         int(sid): str(labels[i])
@@ -400,9 +337,7 @@ def load_metadata(direction_dir: Path):
         split[sid] = str(r.get("split", "")).strip()
 
         pred = norm_relation(r.get("generation_pred", ""))
-        group = str(
-            r.get("generation_group", "")
-        ).strip().lower()
+        group = str(r.get("generation_group", "")).strip().lower()
 
         g = gt.get(sid, "")
         if group not in ("correct", "wrong"):
@@ -424,7 +359,7 @@ def load_metadata(direction_dir: Path):
 
 
 # =============================================================================
-# Model / prompt helpers
+# Model helpers
 # =============================================================================
 
 def get_attr_path(obj: Any, path: str):
@@ -485,18 +420,13 @@ def replace_first_tensor(output: Any, new_tensor: torch.Tensor):
 
 def pool_positions(x: torch.Tensor, positions: Sequence[int]) -> torch.Tensor:
     valid = [
-        int(p)
-        for p in positions
+        int(p) for p in positions
         if 0 <= int(p) < int(x.shape[0])
     ]
     if not valid:
         raise RuntimeError("No valid object token positions.")
 
-    idx = torch.as_tensor(
-        valid,
-        device=x.device,
-        dtype=torch.long,
-    )
+    idx = torch.as_tensor(valid, device=x.device, dtype=torch.long)
     return x.index_select(0, idx).mean(dim=0)
 
 
@@ -507,13 +437,7 @@ def pair_diff(x: torch.Tensor, subj_pos, ref_pos) -> torch.Tensor:
     )
 
 
-def build_batch(
-    processor,
-    rec,
-    question,
-    image,
-    device,
-):
+def build_batch(processor, rec, question, image, device):
     rendered = direction.build_chat_prompt(
         processor,
         question,
@@ -544,12 +468,11 @@ def build_batch(
 
 
 # =============================================================================
-# Generation parsing
+# Generation
 # =============================================================================
 
 def parse_generated_relation(text: str) -> Optional[str]:
     s = str(text).strip().lower()
-
     patterns = [
         ("left", r"\bleft\b"),
         ("right", r"\bright\b"),
@@ -567,17 +490,11 @@ def parse_generated_relation(text: str) -> Optional[str]:
 
     if not hits:
         return None
-
     hits.sort()
     return hits[0][1]
 
 
-def generate_answer(
-    model,
-    processor,
-    batch,
-    max_new_tokens,
-):
+def generate_answer(model, processor, batch, max_new_tokens):
     input_len = int(batch["input_ids"].shape[1])
 
     with torch.inference_mode():
@@ -600,229 +517,7 @@ def generate_answer(
 
 
 # =============================================================================
-# TRAIN Direction codebooks and healthy-update distributions
-# =============================================================================
-
-def unit(v: np.ndarray) -> np.ndarray:
-    x = np.asarray(v, dtype=np.float64)
-    n = float(np.linalg.norm(x))
-    if n <= EPS:
-        return np.zeros_like(x, dtype=np.float32)
-    return (x / n).astype(np.float32)
-
-
-def orthonormal_basis(vectors: Sequence[np.ndarray]) -> np.ndarray:
-    A = np.stack(
-        [np.asarray(v, dtype=np.float64) for v in vectors],
-        axis=1,
-    )
-    u, s, _ = np.linalg.svd(A, full_matrices=False)
-    keep = s > 1e-8 * max(float(s.max()), 1.0)
-    if not np.any(keep):
-        raise RuntimeError("Degenerate spatial basis.")
-    return u[:, keep].astype(np.float32)
-
-
-def project_spatial(v: np.ndarray, B: np.ndarray) -> np.ndarray:
-    v64 = np.asarray(v, dtype=np.float64)
-    B64 = np.asarray(B, dtype=np.float64)
-    return (B64 @ (B64.T @ v64)).astype(np.float32)
-
-
-def fit_post_codebook(
-    X_post: np.ndarray,
-    labels: np.ndarray,
-):
-    center = X_post.mean(axis=0).astype(np.float32)
-    Xc = X_post - center
-
-    means = {}
-    protos = {}
-
-    for rel in RELATIONS:
-        mask = labels == rel
-        if not np.any(mask):
-            raise RuntimeError(f"No TRAIN examples for relation={rel}")
-        mu = Xc[mask].mean(axis=0).astype(np.float32)
-        means[rel] = mu
-        protos[rel] = unit(mu)
-
-    basis = orthonormal_basis([
-        means["right"] - means["left"],
-        means["above"] - means["below"],
-    ])
-
-    return {
-        "center": center,
-        "means": means,
-        "protos": protos,
-        "basis": basis,
-    }
-
-
-def spatial_pair_axis(cb, gt: str, foil: str) -> np.ndarray:
-    raw = (
-        np.asarray(cb["means"][gt], dtype=np.float32)
-        - np.asarray(cb["means"][foil], dtype=np.float32)
-    )
-    sp = project_spatial(raw, cb["basis"])
-    d = unit(sp)
-    if float(np.linalg.norm(d)) <= EPS:
-        raise RuntimeError(
-            f"Degenerate spatial pair axis for {gt} vs {foil}"
-        )
-    return d
-
-
-def direction_scores(
-    residual_vec: np.ndarray,
-    cb,
-):
-    q = (
-        np.asarray(residual_vec, dtype=np.float32)
-        - np.asarray(cb["center"], dtype=np.float32)
-    )
-    return {
-        rel: float(q @ cb["protos"][rel])
-        for rel in RELATIONS
-    }
-
-
-def strongest_non_gt(scores, gt):
-    return max(
-        [r for r in RELATIONS if r != gt],
-        key=lambda r: scores[r],
-    )
-
-
-def load_codebooks_and_targets(
-    *,
-    prepost_dir: Path,
-    metadata,
-    selected_layers,
-    min_controls_pair,
-):
-    path = prepost_dir / "train_stage_vectors.npz"
-    if not path.exists():
-        raise FileNotFoundError(path)
-
-    codebooks = {}
-    targets = {}
-    rows = []
-
-    with np.load(path, allow_pickle=True) as z:
-        train_sids = np.asarray(z["sid"], dtype=np.int64)
-        labels = np.asarray(
-            [norm_relation(x) for x in z["relation"]],
-            dtype=object,
-        )
-
-        correct_mask = np.asarray(
-            [
-                metadata["generation"].get(
-                    int(sid), {}
-                ).get("generation_group", "")
-                == "correct"
-                for sid in train_sids.tolist()
-            ],
-            dtype=bool,
-        )
-
-        if not np.any(correct_mask):
-            raise RuntimeError(
-                "No generation-correct TRAIN controls found."
-            )
-
-        for li in selected_layers:
-            kpre = f"L{li}_pre_attn"
-            kpost = f"L{li}_post_attn"
-
-            if kpre not in z.files or kpost not in z.files:
-                raise KeyError(
-                    f"{path} missing {kpre}/{kpost}. "
-                    f"Rerun pre/post Direction collection with L{li}."
-                )
-
-            Xpre = np.asarray(z[kpre], dtype=np.float32)
-            Xpost = np.asarray(z[kpost], dtype=np.float32)
-
-            cb = fit_post_codebook(Xpost, labels)
-            codebooks[li] = cb
-
-            delta = Xpost - Xpre
-
-            # First collect correct-sample local foil and update margin using
-            # exactly the same rule used at runtime.
-            per_gt_all = defaultdict(list)
-            per_pair = defaultdict(list)
-
-            for i in range(len(train_sids)):
-                if not bool(correct_mask[i]):
-                    continue
-
-                gt = str(labels[i])
-                post_scores = direction_scores(Xpost[i], cb)
-                foil = strongest_non_gt(post_scores, gt)
-                d = spatial_pair_axis(cb, gt, foil)
-                u = float(delta[i] @ d)
-
-                per_gt_all[gt].append(u)
-                per_pair[(gt, foil)].append(u)
-
-            for gt in RELATIONS:
-                pooled = np.asarray(
-                    per_gt_all.get(gt, []),
-                    dtype=np.float64,
-                )
-                if len(pooled) == 0:
-                    raise RuntimeError(
-                        f"No correct TRAIN healthy updates for L{li} GT={gt}"
-                    )
-
-                for foil in RELATIONS:
-                    if foil == gt:
-                        continue
-
-                    pair = np.asarray(
-                        per_pair.get((gt, foil), []),
-                        dtype=np.float64,
-                    )
-
-                    use_pair = len(pair) >= min_controls_pair
-                    vals = pair if use_pair else pooled
-                    source = "pair" if use_pair else "gt_pooled"
-
-                    q10 = float(np.quantile(vals, 0.10))
-                    q25 = float(np.quantile(vals, 0.25))
-                    med = float(np.median(vals))
-
-                    targets[(li, gt, foil)] = {
-                        "q10": q10,
-                        "q25": q25,
-                        "median": med,
-                        "n_pair": int(len(pair)),
-                        "n_used": int(len(vals)),
-                        "source": source,
-                    }
-
-                    rows.append({
-                        "layer": li,
-                        "gt": gt,
-                        "foil": foil,
-                        "n_pair_controls": int(len(pair)),
-                        "n_used_controls": int(len(vals)),
-                        "target_source": source,
-                        "q10_update_margin": q10,
-                        "q25_update_margin": q25,
-                        "median_update_margin": med,
-                        "nonnegative_floor": 0.0,
-                    })
-
-    return codebooks, targets, rows
-
-
-# =============================================================================
-# No-image captures
+# All-layer pre/post capture
 # =============================================================================
 
 class PrePostPairCapture:
@@ -856,11 +551,7 @@ class PrePostPairCapture:
                     ):
                         return None
                     self.pre[layer_id] = (
-                        pair_diff(
-                            seq,
-                            self.subj_pos,
-                            self.ref_pos,
-                        )
+                        pair_diff(seq, self.subj_pos, self.ref_pos)
                         .detach().float().cpu().numpy()
                         .astype(np.float32)
                     )
@@ -880,11 +571,7 @@ class PrePostPairCapture:
                     ):
                         return None
                     self.post[layer_id] = (
-                        pair_diff(
-                            seq,
-                            self.subj_pos,
-                            self.ref_pos,
-                        )
+                        pair_diff(seq, self.subj_pos, self.ref_pos)
                         .detach().float().cpu().numpy()
                         .astype(np.float32)
                     )
@@ -892,9 +579,7 @@ class PrePostPairCapture:
                 return hook
 
             self.handles.append(
-                block.register_forward_pre_hook(
-                    make_pre(li)
-                )
+                block.register_forward_pre_hook(make_pre(li))
             )
 
             if not hasattr(block, "post_attention_layernorm"):
@@ -921,13 +606,14 @@ class PrePostPairCapture:
         self.close()
 
 
-def capture_noimage_pairs(
+def capture_pair_states(
     *,
     model,
     processor,
     decoder_layers,
     selected_layers,
     rec,
+    image,
     device,
     prompt_template,
 ):
@@ -935,11 +621,12 @@ def capture_noimage_pairs(
         subject=rec.subject,
         reference=rec.reference,
     )
+
     batch, sp, rp = build_batch(
         processor,
         rec,
         question,
-        None,
+        image,
         device,
     )
 
@@ -964,24 +651,442 @@ def capture_noimage_pairs(
     ]
     if missing:
         raise RuntimeError(
-            f"Missing no-image captures for layers {missing}"
+            f"Missing pre/post captures for layers {missing}"
         )
 
-    out = {}
-    for li in selected_layers:
-        out[li] = {
+    out = {
+        li: {
             "pre": cap.pre[li],
             "post": cap.post[li],
-            "attn_delta":
-                cap.post[li] - cap.pre[li],
         }
+        for li in selected_layers
+    }
 
     del batch
     return out
 
 
 # =============================================================================
-# Dynamic per-sample repair
+# TRAIN cache collection
+# =============================================================================
+
+def select_train_sids(
+    metadata,
+    records,
+    max_samples,
+    seed,
+):
+    sids = [
+        sid for sid in metadata["sids"]
+        if metadata["split"].get(sid, "") == "train"
+        and sid in records
+        and metadata["gt"].get(sid, "") in REL2ID
+    ]
+
+    if max_samples is not None and len(sids) > max_samples:
+        rng = random.Random(seed)
+        rng.shuffle(sids)
+        sids = sids[:max_samples]
+
+    return sorted(sids)
+
+
+def collect_train_cache(
+    *,
+    cache_path,
+    model,
+    processor,
+    decoder_layers,
+    selected_layers,
+    records,
+    metadata,
+    device,
+    prompt_template,
+    max_samples,
+    seed,
+):
+    train_sids = select_train_sids(
+        metadata,
+        records,
+        max_samples,
+        seed,
+    )
+
+    if not train_sids:
+        raise RuntimeError("No TRAIN samples selected.")
+
+    print(
+        f"[train-cache] collecting N={len(train_sids)} samples, "
+        f"layers={selected_layers[0]}..{selected_layers[-1]} "
+        f"(n={len(selected_layers)})"
+    )
+
+    rows_sid = []
+    rows_rel = []
+    rows_group = []
+
+    pre_by_layer = {li: [] for li in selected_layers}
+    post_by_layer = {li: [] for li in selected_layers}
+
+    errors = []
+
+    for sid in tqdm(train_sids, desc="collect TRAIN all-layer states"):
+        rec = records[sid]
+        image = None
+
+        try:
+            image = Image.open(rec.image_path).convert("RGB")
+
+            img_states = capture_pair_states(
+                model=model,
+                processor=processor,
+                decoder_layers=decoder_layers,
+                selected_layers=selected_layers,
+                rec=rec,
+                image=image,
+                device=device,
+                prompt_template=prompt_template,
+            )
+
+            noimg_states = capture_pair_states(
+                model=model,
+                processor=processor,
+                decoder_layers=decoder_layers,
+                selected_layers=selected_layers,
+                rec=rec,
+                image=None,
+                device=device,
+                prompt_template=prompt_template,
+            )
+
+            for li in selected_layers:
+                r_pre = (
+                    img_states[li]["pre"]
+                    - noimg_states[li]["pre"]
+                ).astype(np.float32)
+                r_post = (
+                    img_states[li]["post"]
+                    - noimg_states[li]["post"]
+                ).astype(np.float32)
+
+                pre_by_layer[li].append(r_pre)
+                post_by_layer[li].append(r_post)
+
+            rows_sid.append(int(sid))
+            rows_rel.append(metadata["gt"][sid])
+            rows_group.append(
+                metadata["generation"].get(
+                    sid, {}
+                ).get("generation_group", "")
+            )
+
+        except Exception as e:
+            errors.append({
+                "sid": sid,
+                "error_type": type(e).__name__,
+                "error": str(e),
+            })
+            tqdm.write(
+                f"[TRAIN ERROR sid={sid}] "
+                f"{type(e).__name__}: {e}"
+            )
+
+        finally:
+            if image is not None:
+                image.close()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    if not rows_sid:
+        raise RuntimeError("TRAIN cache collection produced zero samples.")
+
+    payload = {
+        "sid": np.asarray(rows_sid, dtype=np.int64),
+        "relation": np.asarray(rows_rel, dtype=object),
+        "generation_group": np.asarray(rows_group, dtype=object),
+        "selected_layers": np.asarray(selected_layers, dtype=np.int64),
+    }
+
+    for li in selected_layers:
+        payload[f"L{li}_pre_attn"] = np.stack(
+            pre_by_layer[li], axis=0
+        ).astype(np.float32)
+        payload[f"L{li}_post_attn"] = np.stack(
+            post_by_layer[li], axis=0
+        ).astype(np.float32)
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(cache_path, **payload)
+
+    err_path = cache_path.with_suffix(".errors.csv")
+    write_csv(err_path, errors)
+
+    print(
+        f"[train-cache] saved {cache_path}; "
+        f"N={len(rows_sid)}, errors={len(errors)}"
+    )
+
+
+def validate_train_cache(cache_path, selected_layers):
+    with np.load(cache_path, allow_pickle=True) as z:
+        available = set(
+            int(x) for x in z["selected_layers"].tolist()
+        )
+        missing = [
+            li for li in selected_layers
+            if li not in available
+            or f"L{li}_pre_attn" not in z.files
+            or f"L{li}_post_attn" not in z.files
+        ]
+
+    if missing:
+        raise RuntimeError(
+            f"TRAIN cache {cache_path} is missing layers {missing}. "
+            f"Use --rebuild-train-cache or a different cache."
+        )
+
+
+# =============================================================================
+# Direction codebooks / healthy targets
+# =============================================================================
+
+def unit(v: np.ndarray) -> np.ndarray:
+    x = np.asarray(v, dtype=np.float64)
+    n = float(np.linalg.norm(x))
+    if n <= EPS:
+        return np.zeros_like(x, dtype=np.float32)
+    return (x / n).astype(np.float32)
+
+
+def orthonormal_basis(vectors: Sequence[np.ndarray]) -> np.ndarray:
+    A = np.stack(
+        [np.asarray(v, dtype=np.float64) for v in vectors],
+        axis=1,
+    )
+    u, s, _ = np.linalg.svd(A, full_matrices=False)
+    keep = s > 1e-8 * max(float(s.max()), 1.0)
+    if not np.any(keep):
+        raise RuntimeError("Degenerate spatial basis.")
+    return u[:, keep].astype(np.float32)
+
+
+def project_spatial(v: np.ndarray, B: np.ndarray) -> np.ndarray:
+    v64 = np.asarray(v, dtype=np.float64)
+    B64 = np.asarray(B, dtype=np.float64)
+    return (B64 @ (B64.T @ v64)).astype(np.float32)
+
+
+def fit_post_codebook(X_post: np.ndarray, labels: np.ndarray):
+    center = X_post.mean(axis=0).astype(np.float32)
+    Xc = X_post - center
+
+    means = {}
+    protos = {}
+
+    for rel in RELATIONS:
+        mask = labels == rel
+        if not np.any(mask):
+            raise RuntimeError(
+                f"No TRAIN examples for relation={rel}"
+            )
+        mu = Xc[mask].mean(axis=0).astype(np.float32)
+        means[rel] = mu
+        protos[rel] = unit(mu)
+
+    basis = orthonormal_basis([
+        means["right"] - means["left"],
+        means["above"] - means["below"],
+    ])
+
+    return {
+        "center": center,
+        "means": means,
+        "protos": protos,
+        "basis": basis,
+    }
+
+
+def spatial_pair_axis(cb, gt: str, foil: str) -> np.ndarray:
+    raw = (
+        np.asarray(cb["means"][gt], dtype=np.float32)
+        - np.asarray(cb["means"][foil], dtype=np.float32)
+    )
+    sp = project_spatial(raw, cb["basis"])
+    d = unit(sp)
+
+    if float(np.linalg.norm(d)) <= EPS:
+        raise RuntimeError(
+            f"Degenerate spatial axis for {gt} vs {foil}"
+        )
+    return d
+
+
+def direction_scores(residual_vec: np.ndarray, cb):
+    q = (
+        np.asarray(residual_vec, dtype=np.float32)
+        - np.asarray(cb["center"], dtype=np.float32)
+    )
+    return {
+        rel: float(q @ cb["protos"][rel])
+        for rel in RELATIONS
+    }
+
+
+def strongest_non_gt(scores, gt):
+    return max(
+        [r for r in RELATIONS if r != gt],
+        key=lambda r: scores[r],
+    )
+
+
+def load_codebooks_and_targets(
+    *,
+    cache_path,
+    selected_layers,
+    min_controls_pair,
+):
+    codebooks = {}
+    targets = {}
+    target_rows = []
+
+    with np.load(cache_path, allow_pickle=True) as z:
+        labels = np.asarray(
+            [norm_relation(x) for x in z["relation"]],
+            dtype=object,
+        )
+        groups = np.asarray(
+            [str(x).strip().lower() for x in z["generation_group"]],
+            dtype=object,
+        )
+
+        correct_mask = groups == "correct"
+
+        if not np.any(correct_mask):
+            raise RuntimeError(
+                "TRAIN cache contains no generation-correct controls."
+            )
+
+        for li in selected_layers:
+            Xpre = np.asarray(
+                z[f"L{li}_pre_attn"],
+                dtype=np.float32,
+            )
+            Xpost = np.asarray(
+                z[f"L{li}_post_attn"],
+                dtype=np.float32,
+            )
+
+            cb = fit_post_codebook(Xpost, labels)
+            codebooks[li] = cb
+
+            delta = Xpost - Xpre
+
+            per_gt_all = defaultdict(list)
+            per_pair = defaultdict(list)
+
+            for i in range(len(labels)):
+                if not bool(correct_mask[i]):
+                    continue
+
+                gt = str(labels[i])
+                post_scores = direction_scores(Xpost[i], cb)
+                foil = strongest_non_gt(post_scores, gt)
+                d = spatial_pair_axis(cb, gt, foil)
+                u = float(delta[i] @ d)
+
+                per_gt_all[gt].append(u)
+                per_pair[(gt, foil)].append(u)
+
+            for gt in RELATIONS:
+                pooled = np.asarray(
+                    per_gt_all.get(gt, []),
+                    dtype=np.float64,
+                )
+                if len(pooled) == 0:
+                    raise RuntimeError(
+                        f"No correct controls at L{li}, GT={gt}"
+                    )
+
+                for foil in RELATIONS:
+                    if foil == gt:
+                        continue
+
+                    pair = np.asarray(
+                        per_pair.get((gt, foil), []),
+                        dtype=np.float64,
+                    )
+
+                    use_pair = len(pair) >= min_controls_pair
+                    vals = pair if use_pair else pooled
+                    source = "pair" if use_pair else "gt_pooled"
+
+                    q10 = float(np.quantile(vals, 0.10))
+                    q25 = float(np.quantile(vals, 0.25))
+                    med = float(np.median(vals))
+
+                    targets[(li, gt, foil)] = {
+                        "q10": q10,
+                        "q25": q25,
+                        "median": med,
+                        "source": source,
+                        "n_used": int(len(vals)),
+                        "n_pair": int(len(pair)),
+                    }
+
+                    target_rows.append({
+                        "layer": li,
+                        "gt": gt,
+                        "foil": foil,
+                        "n_pair_controls": int(len(pair)),
+                        "n_used_controls": int(len(vals)),
+                        "target_source": source,
+                        "q10_update_margin": q10,
+                        "q25_update_margin": q25,
+                        "median_update_margin": med,
+                    })
+
+    return codebooks, targets, target_rows
+
+
+# =============================================================================
+# No-image runtime reference
+# =============================================================================
+
+def capture_noimage_pairs(
+    *,
+    model,
+    processor,
+    decoder_layers,
+    selected_layers,
+    rec,
+    device,
+    prompt_template,
+):
+    states = capture_pair_states(
+        model=model,
+        processor=processor,
+        decoder_layers=decoder_layers,
+        selected_layers=selected_layers,
+        rec=rec,
+        image=None,
+        device=device,
+        prompt_template=prompt_template,
+    )
+
+    return {
+        li: {
+            "pre": states[li]["pre"],
+            "post": states[li]["post"],
+            "attn_delta":
+                states[li]["post"] - states[li]["pre"],
+        }
+        for li in selected_layers
+    }
+
+
+# =============================================================================
+# Dynamic all-layer repair
 # =============================================================================
 
 def clip_delta(delta: np.ndarray, max_norm: float) -> np.ndarray:
@@ -1019,15 +1124,10 @@ def random_orthogonal_delta(
                 v / n * float(norm)
             ).astype(np.float32)
 
-    raise RuntimeError("Failed to create orthogonal random control.")
+    raise RuntimeError("Failed to sample orthogonal random direction.")
 
 
-class DynamicDirectionRepair:
-    """
-    Diagnose each layer from the CURRENT trajectory and repair only if the
-    spatial GT-vs-local-foil Attention update margin is below the chosen floor.
-    """
-
+class DynamicAllLayerDirectionRepair:
     def __init__(
         self,
         *,
@@ -1044,7 +1144,6 @@ class DynamicDirectionRepair:
         sid,
         seed,
     ):
-        self.decoder_layers = decoder_layers
         self.selected_layers = list(map(int, selected_layers))
         self.subj_pos = list(map(int, subj_pos))
         self.ref_pos = list(map(int, ref_pos))
@@ -1134,101 +1233,66 @@ class DynamicDirectionRepair:
                 .astype(np.float32)
             )
 
-            # Current modified real post-attention pair state.
             post_real = pre_real + attn_pair_real
 
-            # Image-grounded relation states.
             r_pre = (
-                pre_real
-                - self.noimg_pairs[li]["pre"]
+                pre_real - self.noimg_pairs[li]["pre"]
             )
             r_post = (
-                post_real
-                - self.noimg_pairs[li]["post"]
+                post_real - self.noimg_pairs[li]["post"]
             )
-
-            # Image-grounded Attention update.
             delta_r = r_post - r_pre
 
             cb = self.codebooks[li]
+            post_scores = direction_scores(r_post, cb)
+            foil = strongest_non_gt(post_scores, self.gt)
+            d = spatial_pair_axis(cb, self.gt, foil)
 
-            post_scores = direction_scores(
-                r_post,
-                cb,
-            )
-            foil = strongest_non_gt(
-                post_scores,
-                self.gt,
-            )
-
-            d = spatial_pair_axis(
-                cb,
-                self.gt,
-                foil,
-            )
-
-            pre_pair_margin = float(
+            pre_margin = float(
                 (
                     np.asarray(r_pre, dtype=np.float32)
                     - cb["center"]
                 ) @ d
             )
-            post_pair_margin = float(
+            post_margin = float(
                 (
                     np.asarray(r_post, dtype=np.float32)
                     - cb["center"]
                 ) @ d
             )
-
             current_u = float(
                 np.asarray(delta_r, dtype=np.float32) @ d
             )
 
-            t = self.targets[
-                (li, self.gt, foil)
-            ]
+            t = self.targets[(li, self.gt, foil)]
 
             if self.mode == "nonnegative":
                 target_u = 0.0
-
             elif self.mode == "correct_q10":
-                target_u = max(
-                    0.0,
-                    float(t["q10"]),
-                )
-
-            elif self.mode in (
-                "correct_q25",
-                "random_control",
-            ):
-                target_u = max(
-                    0.0,
-                    float(t["q25"]),
-                )
-
+                target_u = max(0.0, float(t["q10"]))
+            elif self.mode in ("correct_q25", "random_control"):
+                target_u = max(0.0, float(t["q25"]))
             else:
-                raise ValueError(
-                    f"Unknown mode: {self.mode}"
-                )
+                raise ValueError(f"Unknown mode: {self.mode}")
 
             requested = max(
                 0.0,
                 target_u - current_u,
             )
 
-            targeted_delta = (
+            targeted = (
                 requested * d
             ).astype(np.float32)
-            targeted_delta = clip_delta(
-                targeted_delta,
+            targeted = clip_delta(
+                targeted,
                 self.max_edit_norm,
             )
 
             if self.mode == "random_control":
                 delta = random_orthogonal_delta(
-                    float(np.linalg.norm(targeted_delta)),
+                    float(np.linalg.norm(targeted)),
                     cb["basis"],
-                    len(targeted_delta),
+                    len(targeted),
                     seed=(
                         self.seed
                         + self.sid * 100003
@@ -1236,29 +1300,24 @@ class DynamicDirectionRepair:
                     ),
                 )
             else:
-                delta = targeted_delta
+                delta = targeted
 
             delta_norm = float(np.linalg.norm(delta))
-            y = x.clone()
 
+            y = x.clone()
             if delta_norm > EPS:
-                half = 0.5 * torch.from_numpy(
-                    delta
-                ).to(
+                half = 0.5 * torch.from_numpy(delta).to(
                     device=y.device,
                     dtype=y.dtype,
                 )
-
                 y[0, self.subj_pos, :] = (
-                    y[0, self.subj_pos, :]
-                    + half
+                    y[0, self.subj_pos, :] + half
                 )
                 y[0, self.ref_pos, :] = (
-                    y[0, self.ref_pos, :]
-                    - half
+                    y[0, self.ref_pos, :] - half
                 )
 
-            achieved_u = float(
+            achieved = float(
                 np.asarray(delta, dtype=np.float32) @ d
             )
 
@@ -1269,41 +1328,25 @@ class DynamicDirectionRepair:
                 "gt": self.gt,
                 "local_foil": foil,
 
-                "pre_pair_margin": pre_pair_margin,
-                "post_pair_margin_before":
-                    post_pair_margin,
+                "pre_pair_margin": pre_margin,
+                "post_pair_margin_before": post_margin,
+                "current_update_margin": current_u,
 
-                "current_update_margin":
-                    current_u,
+                "correct_q10": float(t["q10"]),
+                "correct_q25": float(t["q25"]),
+                "correct_median": float(t["median"]),
+                "target_source": str(t["source"]),
+                "n_target_controls": int(t["n_used"]),
 
-                "correct_q10":
-                    float(t["q10"]),
-                "correct_q25":
-                    float(t["q25"]),
-                "correct_median":
-                    float(t["median"]),
-                "target_source":
-                    str(t["source"]),
-                "n_target_controls":
-                    int(t["n_used"]),
-
-                "target_update_margin":
-                    target_u,
-                "requested_correction":
-                    requested,
-
-                "edit_norm":
-                    delta_norm,
-                "achieved_spatial_correction":
-                    achieved_u,
-
+                "target_update_margin": target_u,
+                "requested_correction": requested,
+                "edit_norm": delta_norm,
+                "achieved_spatial_correction": achieved,
                 "expected_update_margin_after":
-                    current_u + achieved_u,
+                    current_u + achieved,
 
-                "triggered":
-                    int(delta_norm > EPS),
-                "was_harmful":
-                    int(current_u < 0.0),
+                "triggered": int(delta_norm > EPS),
+                "was_harmful": int(current_u < 0.0),
                 "was_below_q10":
                     int(current_u < max(0.0, float(t["q10"]))),
                 "was_below_q25":
@@ -1311,10 +1354,7 @@ class DynamicDirectionRepair:
             })
 
             self.applied.add(li)
-            return replace_first_tensor(
-                output,
-                y,
-            )
+            return replace_first_tensor(output, y)
 
         return hook
 
@@ -1332,7 +1372,7 @@ class DynamicDirectionRepair:
 
 
 # =============================================================================
-# Sample selection
+# Eval selection / run
 # =============================================================================
 
 def select_eval_sids(
@@ -1346,42 +1386,29 @@ def select_eval_sids(
     sids = []
 
     for sid in metadata["sids"]:
-        if (
-            split != "all"
-            and metadata["split"].get(sid, "") != split
-        ):
+        if split != "all" and metadata["split"].get(sid, "") != split:
             continue
-
         if sid not in records:
             continue
-
-        gt = metadata["gt"].get(sid, "")
-        if gt not in REL2ID:
+        if metadata["gt"].get(sid, "") not in REL2ID:
             continue
 
         group = metadata["generation"].get(
             sid, {}
         ).get("generation_group", "")
 
-        if (
-            sample_group != "all"
-            and group != sample_group
-        ):
+        if sample_group != "all" and group != sample_group:
             continue
 
         sids.append(sid)
 
-    if max_samples is None or len(sids) <= max_samples:
-        return sorted(sids)
+    if max_samples is not None and len(sids) > max_samples:
+        rng = random.Random(seed)
+        rng.shuffle(sids)
+        sids = sids[:max_samples]
 
-    rng = random.Random(seed)
-    rng.shuffle(sids)
-    return sorted(sids[:max_samples])
+    return sorted(sids)
 
-
-# =============================================================================
-# Experiment
-# =============================================================================
 
 def run_experiment(
     *,
@@ -1408,10 +1435,7 @@ def run_experiment(
     errors = []
 
     for i, sid in enumerate(
-        tqdm(
-            eval_sids,
-            desc="per-sample Direction repair",
-        ),
+        tqdm(eval_sids, desc="all-layer per-sample repair"),
         1,
     ):
         rec = records[sid]
@@ -1419,10 +1443,7 @@ def run_experiment(
 
         try:
             gt = metadata["gt"][sid]
-
-            image = Image.open(
-                rec.image_path
-            ).convert("RGB")
+            image = Image.open(rec.image_path).convert("RGB")
 
             question = prompt_template.format(
                 subject=rec.subject,
@@ -1453,49 +1474,31 @@ def run_experiment(
                 real_batch,
                 max_new_tokens,
             )
-            baseline_correct = int(
-                baseline_pred == gt
-            )
+            baseline_correct = int(baseline_pred == gt)
 
-            cached = metadata["generation"].get(
-                sid, {}
-            )
+            cached = metadata["generation"].get(sid, {})
 
             generation_rows.append({
                 "sid": sid,
                 "mode": "baseline",
                 "gt": gt,
-                "cached_group":
-                    cached.get("generation_group", ""),
-                "cached_pred":
-                    cached.get("generation_pred", ""),
-
-                "baseline_text":
-                    baseline_text,
-                "baseline_pred":
-                    baseline_pred or "",
-                "baseline_correct":
-                    baseline_correct,
-
-                "edited_text":
-                    baseline_text,
-                "edited_pred":
-                    baseline_pred or "",
-                "edited_correct":
-                    baseline_correct,
-
-                "n_layers_scanned":
-                    len(selected_layers),
-                "n_layers_triggered":
-                    0,
+                "cached_group": cached.get("generation_group", ""),
+                "cached_pred": cached.get("generation_pred", ""),
+                "baseline_text": baseline_text,
+                "baseline_pred": baseline_pred or "",
+                "baseline_correct": baseline_correct,
+                "edited_text": baseline_text,
+                "edited_pred": baseline_pred or "",
+                "edited_correct": baseline_correct,
+                "n_layers_scanned": len(selected_layers),
+                "n_layers_triggered": 0,
                 "triggered_layers": "",
-
                 "W2C": 0,
                 "C2W": 0,
             })
 
             for mode in modes:
-                with DynamicDirectionRepair(
+                with DynamicAllLayerDirectionRepair(
                     decoder_layers=decoder_layers,
                     selected_layers=selected_layers,
                     subj_pos=sp,
@@ -1516,9 +1519,7 @@ def run_experiment(
                         max_new_tokens,
                     )
 
-                edited_correct = int(
-                    edited_pred == gt
-                )
+                edited_correct = int(edited_pred == gt)
 
                 triggered_layers = [
                     int(r["layer"])
@@ -1530,34 +1531,18 @@ def run_experiment(
                     "sid": sid,
                     "mode": mode,
                     "gt": gt,
-                    "cached_group":
-                        cached.get("generation_group", ""),
-                    "cached_pred":
-                        cached.get("generation_pred", ""),
-
-                    "baseline_text":
-                        baseline_text,
-                    "baseline_pred":
-                        baseline_pred or "",
-                    "baseline_correct":
-                        baseline_correct,
-
-                    "edited_text":
-                        edited_text,
-                    "edited_pred":
-                        edited_pred or "",
-                    "edited_correct":
-                        edited_correct,
-
-                    "n_layers_scanned":
-                        len(selected_layers),
-                    "n_layers_triggered":
-                        len(triggered_layers),
+                    "cached_group": cached.get("generation_group", ""),
+                    "cached_pred": cached.get("generation_pred", ""),
+                    "baseline_text": baseline_text,
+                    "baseline_pred": baseline_pred or "",
+                    "baseline_correct": baseline_correct,
+                    "edited_text": edited_text,
+                    "edited_pred": edited_pred or "",
+                    "edited_correct": edited_correct,
+                    "n_layers_scanned": len(selected_layers),
+                    "n_layers_triggered": len(triggered_layers),
                     "triggered_layers":
-                        ",".join(
-                            str(x) for x in triggered_layers
-                        ),
-
+                        ",".join(str(x) for x in triggered_layers),
                     "W2C": int(
                         baseline_correct == 0
                         and edited_correct == 1
@@ -1571,14 +1556,10 @@ def run_experiment(
                 for row in repair.logs:
                     rr = dict(row)
                     rr.update({
-                        "baseline_pred":
-                            baseline_pred or "",
-                        "baseline_correct":
-                            baseline_correct,
-                        "edited_pred":
-                            edited_pred or "",
-                        "edited_correct":
-                            edited_correct,
+                        "baseline_pred": baseline_pred or "",
+                        "baseline_correct": baseline_correct,
+                        "edited_pred": edited_pred or "",
+                        "edited_correct": edited_correct,
                     })
                     layer_rows.append(rr)
 
@@ -1612,18 +1593,9 @@ def run_experiment(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    write_csv(
-        out_dir / "generation_per_sample.csv",
-        generation_rows,
-    )
-    write_csv(
-        out_dir / "layer_diagnostics.csv",
-        layer_rows,
-    )
-    write_csv(
-        out_dir / "errors.csv",
-        errors,
-    )
+    write_csv(out_dir / "generation_per_sample.csv", generation_rows)
+    write_csv(out_dir / "layer_diagnostics.csv", layer_rows)
+    write_csv(out_dir / "errors.csv", errors)
 
     return generation_rows, layer_rows, errors
 
@@ -1636,35 +1608,19 @@ def summarize_generation(rows):
     buckets = defaultdict(list)
 
     for r in rows:
-        if r["mode"] == "baseline":
-            continue
-        buckets[str(r["mode"])].append(r)
+        if r["mode"] != "baseline":
+            buckets[str(r["mode"])].append(r)
 
     out = []
 
     for mode, rr in sorted(buckets.items()):
-        bacc = safe_mean(
-            r["baseline_correct"] for r in rr
-        )
-        eacc = safe_mean(
-            r["edited_correct"] for r in rr
-        )
+        bacc = safe_mean(r["baseline_correct"] for r in rr)
+        eacc = safe_mean(r["edited_correct"] for r in rr)
 
-        nw = int(
-            sum(
-                int(r["baseline_correct"]) == 0
-                for r in rr
-            )
-        )
-        nc = int(
-            sum(
-                int(r["baseline_correct"]) == 1
-                for r in rr
-            )
-        )
-
-        W2C = int(sum(int(r["W2C"]) for r in rr))
-        C2W = int(sum(int(r["C2W"]) for r in rr))
+        nw = sum(int(r["baseline_correct"]) == 0 for r in rr)
+        nc = sum(int(r["baseline_correct"]) == 1 for r in rr)
+        W2C = sum(int(r["W2C"]) for r in rr)
+        C2W = sum(int(r["C2W"]) for r in rr)
 
         out.append({
             "mode": mode,
@@ -1672,34 +1628,30 @@ def summarize_generation(rows):
             "baseline_acc": bacc,
             "edited_acc": eacc,
             "acc_gain": eacc - bacc,
-
             "mean_layers_triggered": safe_mean(
+                r["n_layers_triggered"] for r in rr
+            ),
+            "median_layers_triggered": safe_median(
                 r["n_layers_triggered"] for r in rr
             ),
             "zero_trigger_rate": safe_frac(
                 int(r["n_layers_triggered"]) == 0
                 for r in rr
             ),
-
-            "n_baseline_wrong": nw,
-            "W2C": W2C,
+            "n_baseline_wrong": int(nw),
+            "W2C": int(W2C),
             "W2C_over_wrong":
                 W2C / nw if nw else float("nan"),
-
-            "n_baseline_correct": nc,
-            "C2W": C2W,
+            "n_baseline_correct": int(nc),
+            "C2W": int(C2W),
             "C2W_over_correct":
                 C2W / nc if nc else float("nan"),
-
-            "net": W2C - C2W,
+            "net": int(W2C - C2W),
         })
 
     return sorted(
         out,
-        key=lambda r: (
-            float(r["acc_gain"]),
-            int(r["net"]),
-        ),
+        key=lambda r: (float(r["acc_gain"]), int(r["net"])),
         reverse=True,
     )
 
@@ -1708,11 +1660,7 @@ def summarize_layers(rows):
     buckets = defaultdict(list)
 
     for r in rows:
-        key = (
-            str(r["mode"]),
-            int(r["layer"]),
-        )
-        buckets[key].append(r)
+        buckets[(str(r["mode"]), int(r["layer"]))].append(r)
 
     out = []
 
@@ -1721,53 +1669,26 @@ def summarize_layers(rows):
             "mode": mode,
             "layer": li,
             "n": len(rr),
-
             "trigger_rate": safe_frac(
-                int(r["triggered"]) == 1
-                for r in rr
+                int(r["triggered"]) == 1 for r in rr
             ),
             "harmful_rate": safe_frac(
-                int(r["was_harmful"]) == 1
-                for r in rr
+                int(r["was_harmful"]) == 1 for r in rr
             ),
             "below_q10_rate": safe_frac(
-                int(r["was_below_q10"]) == 1
-                for r in rr
+                int(r["was_below_q10"]) == 1 for r in rr
             ),
             "below_q25_rate": safe_frac(
-                int(r["was_below_q25"]) == 1
-                for r in rr
+                int(r["was_below_q25"]) == 1 for r in rr
             ),
-
             "mean_current_update_margin": safe_mean(
                 r["current_update_margin"] for r in rr
             ),
             "median_current_update_margin": safe_median(
                 r["current_update_margin"] for r in rr
             ),
-            "mean_target_update_margin": safe_mean(
-                r["target_update_margin"] for r in rr
-            ),
-
             "mean_edit_norm": safe_mean(
                 r["edit_norm"] for r in rr
-            ),
-
-            "local_foil_left_rate": safe_frac(
-                r["local_foil"] == "left"
-                for r in rr
-            ),
-            "local_foil_right_rate": safe_frac(
-                r["local_foil"] == "right"
-                for r in rr
-            ),
-            "local_foil_above_rate": safe_frac(
-                r["local_foil"] == "above"
-                for r in rr
-            ),
-            "local_foil_below_rate": safe_frac(
-                r["local_foil"] == "below"
-                for r in rr
             ),
         })
 
@@ -1780,12 +1701,9 @@ def summarize_repair_counts(generation_rows):
     for r in generation_rows:
         if r["mode"] == "baseline":
             continue
-
-        key = (
-            str(r["mode"]),
-            int(r["n_layers_triggered"]),
-        )
-        buckets[key].append(r)
+        buckets[
+            (str(r["mode"]), int(r["n_layers_triggered"]))
+        ].append(r)
 
     out = []
 
@@ -1800,23 +1718,19 @@ def summarize_repair_counts(generation_rows):
             "edited_acc": safe_mean(
                 r["edited_correct"] for r in rr
             ),
-            "W2C": int(
-                sum(int(r["W2C"]) for r in rr)
-            ),
-            "C2W": int(
-                sum(int(r["C2W"]) for r in rr)
-            ),
+            "W2C": sum(int(r["W2C"]) for r in rr),
+            "C2W": sum(int(r["C2W"]) for r in rr),
         })
 
     return out
 
 
 def print_generation_summary(rows):
-    print("\n" + "=" * 136)
-    print("ACTUAL model.generate() — PER-SAMPLE DIRECTION REPAIR")
-    print("=" * 136)
+    print("\n" + "=" * 142)
+    print("ACTUAL model.generate() — ALL-LAYER PER-SAMPLE DIRECTION REPAIR")
+    print("=" * 142)
     print(
-        "mode N | acc base->edit gain | mean repaired layers | "
+        "mode N | acc base->edit gain | mean/median repaired layers | "
         "zeroRepair | W2C/wrong C2W/correct net"
     )
 
@@ -1827,7 +1741,8 @@ def print_generation_summary(rows):
             f"{float(r['baseline_acc']):.4f}->"
             f"{float(r['edited_acc']):.4f} "
             f"{float(r['acc_gain']):+7.4f} | "
-            f"{float(r['mean_layers_triggered']):6.3f} | "
+            f"{float(r['mean_layers_triggered']):6.2f}/"
+            f"{float(r['median_layers_triggered']):5.1f} | "
             f"{float(r['zero_trigger_rate']):.3f} | "
             f"{int(r['W2C']):3d}/"
             f"{float(r['W2C_over_wrong']):.3f} "
@@ -1838,12 +1753,12 @@ def print_generation_summary(rows):
 
 
 def print_layer_summary(rows):
-    print("\n" + "=" * 146)
-    print("DIRECTION-DIAGNOSED LAYER FAILURES")
-    print("=" * 146)
+    print("\n" + "=" * 132)
+    print("ALL-LAYER DIRECTION DIAGNOSTICS")
+    print("=" * 132)
     print(
         "mode layer N | trigger harmful belowQ10 belowQ25 | "
-        "update mean/median target | editNorm"
+        "update mean/median | editNorm"
     )
 
     for r in rows:
@@ -1856,8 +1771,7 @@ def print_layer_summary(rows):
             f"{float(r['below_q10_rate']):.3f} "
             f"{float(r['below_q25_rate']):.3f} | "
             f"{float(r['mean_current_update_margin']):+7.3f}/"
-            f"{float(r['median_current_update_margin']):+7.3f} "
-            f"{float(r['mean_target_update_margin']):+7.3f} | "
+            f"{float(r['median_current_update_margin']):+7.3f} | "
             f"{float(r['mean_edit_norm']):6.3f}"
         )
 
@@ -1869,10 +1783,7 @@ def print_layer_summary(rows):
 def main():
     args = parse_args()
 
-    if (
-        args.device.startswith("cuda")
-        and not torch.cuda.is_available()
-    ):
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable.")
 
     out_dir = Path(args.output_dir)
@@ -1880,19 +1791,14 @@ def main():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    metadata = load_metadata(
-        Path(args.direction_dir)
-    )
+    metadata = load_metadata(Path(args.direction_dir))
 
     records_list, _audit = base.load_records(
         args.dataset,
         Path(args.data_root),
         None,
     )
-    records = {
-        int(r.sid): r
-        for r in records_list
-    }
+    records = {int(r.sid): r for r in records_list}
 
     spec = base.SPECS[args.model]
     cls = getattr(transformers, spec.model_class)
@@ -1906,9 +1812,7 @@ def main():
     if args.attn_impl != "none":
         kw["attn_implementation"] = args.attn_impl
 
-    print(
-        f"[model] loading {spec.repo_id} on {args.device}"
-    )
+    print(f"[model] loading {spec.repo_id} on {args.device}")
 
     try:
         model = cls.from_pretrained(
@@ -1929,25 +1833,17 @@ def main():
         spec.repo_id,
         trust_remote_code=spec.trust_remote_code,
     )
-    base.configure_processor(
-        model,
-        processor,
-    )
+    base.configure_processor(model, processor)
 
     device = torch.device(args.device)
 
-    decoder_layers, layer_path = resolve_decoder_layers(
-        model
-    )
+    decoder_layers, layer_path = resolve_decoder_layers(model)
     n_layers = len(decoder_layers)
-
-    selected_layers = parse_layers(
-        args.layers,
-        n_layers,
-    )
+    selected_layers = parse_layers(args.layers, n_layers)
 
     print(
-        f"[decoder] {layer_path}; selected layers={selected_layers}"
+        f"[decoder] {layer_path}; n_layers={n_layers}; "
+        f"selected={selected_layers}"
     )
 
     modes = parse_words(args.modes)
@@ -1961,9 +1857,35 @@ def main():
     if bad:
         raise ValueError(f"Unknown modes: {bad}")
 
+    if args.train_cache:
+        cache_path = Path(args.train_cache)
+    else:
+        cache_path = out_dir / "train_all_layer_direction_states.npz"
+
+    need_collect = (
+        args.rebuild_train_cache
+        or not cache_path.exists()
+    )
+
+    if need_collect:
+        collect_train_cache(
+            cache_path=cache_path,
+            model=model,
+            processor=processor,
+            decoder_layers=decoder_layers,
+            selected_layers=selected_layers,
+            records=records,
+            metadata=metadata,
+            device=device,
+            prompt_template=args.prompt_template,
+            max_samples=args.train_max_samples,
+            seed=args.seed,
+        )
+
+    validate_train_cache(cache_path, selected_layers)
+
     codebooks, targets, target_rows = load_codebooks_and_targets(
-        prepost_dir=Path(args.prepost_dir),
-        metadata=metadata,
+        cache_path=cache_path,
         selected_layers=selected_layers,
         min_controls_pair=args.min_controls_pair,
     )
@@ -1983,8 +1905,8 @@ def main():
     )
 
     print(
-        f"[eval] sample_group={args.sample_group}, "
-        f"N={len(eval_sids)}"
+        f"[eval] group={args.sample_group}, N={len(eval_sids)}, "
+        f"modes={modes}"
     )
 
     generation_rows, layer_rows, errors = run_experiment(
@@ -2007,95 +1929,41 @@ def main():
         save_every=args.save_every,
     )
 
-    generation_summary = summarize_generation(
-        generation_rows
-    )
-    layer_summary = summarize_layers(
-        layer_rows
-    )
-    repair_count_summary = summarize_repair_counts(
-        generation_rows
-    )
+    gen_summary = summarize_generation(generation_rows)
+    layer_summary = summarize_layers(layer_rows)
+    count_summary = summarize_repair_counts(generation_rows)
 
-    write_csv(
-        out_dir / "generation_summary.csv",
-        generation_summary,
-    )
-    write_csv(
-        out_dir / "layer_summary.csv",
-        layer_summary,
-    )
-    write_csv(
-        out_dir / "repair_count_summary.csv",
-        repair_count_summary,
-    )
+    write_csv(out_dir / "generation_summary.csv", gen_summary)
+    write_csv(out_dir / "layer_summary.csv", layer_summary)
+    write_csv(out_dir / "repair_count_summary.csv", count_summary)
 
-    print_generation_summary(
-        generation_summary
-    )
-    print_layer_summary(
-        layer_summary
-    )
+    print_generation_summary(gen_summary)
+    print_layer_summary(layer_summary)
 
     summary = {
         "experiment":
-            "per-sample dynamic Direction-only spatial repair",
-
-        "sample_group":
-            args.sample_group,
-
-        "selected_layers":
-            selected_layers,
-
-        "modes":
-            modes,
-
-        "diagnosis":
-            "At every layer, select the strongest current non-GT relation "
-            "from the Direction codebook, then measure the image-grounded "
-            "Attention update along the pure spatial GT-vs-local-foil axis.",
-
-        "nonnegative_mode":
-            "Only cancel a negative spatial update margin.",
-
-        "correct_q10_mode":
-            "Raise update margin only to the lower 10th-percentile boundary "
-            "of generation-correct TRAIN controls.",
-
-        "correct_q25_mode":
-            "Raise update margin only to the lower 25th-percentile boundary "
-            "of generation-correct TRAIN controls.",
-
-        "gradient_used":
-            False,
-
-        "gt_oracle":
-            True,
-
-        "dynamic":
-            True,
-
-        "primary_metric":
-            "fresh model.generate() W2C/C2W",
-
-        "n_samples":
-            len(eval_sids),
-
-        "n_errors":
-            len(errors),
+            "all-layer per-sample dynamic Direction-only spatial repair",
+        "sample_group": args.sample_group,
+        "selected_layers": selected_layers,
+        "n_decoder_layers": n_layers,
+        "modes": modes,
+        "train_cache": str(cache_path),
+        "gradient_used": False,
+        "gt_oracle": True,
+        "dynamic": True,
+        "primary_metric": "fresh model.generate() W2C/C2W",
+        "n_eval": len(eval_sids),
+        "n_errors": len(errors),
     }
 
     (out_dir / "summary.json").write_text(
-        json.dumps(
-            summary,
-            indent=2,
-            ensure_ascii=False,
-        ),
+        json.dumps(summary, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 
     print("\nSaved:")
     for name in [
+        "train_all_layer_direction_states.npz",
         "correct_direction_update_targets.csv",
         "generation_per_sample.csv",
         "layer_diagnostics.csv",
@@ -2105,7 +1973,12 @@ def main():
         "errors.csv",
         "summary.json",
     ]:
-        print(" ", out_dir / name)
+        p = (
+            cache_path
+            if name == "train_all_layer_direction_states.npz"
+            else out_dir / name
+        )
+        print(" ", p)
 
     del model, processor
     gc.collect()
