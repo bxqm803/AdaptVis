@@ -1,4 +1,4 @@
-
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
@@ -1212,66 +1212,3 @@ def main():
             if img is not None:
                 img.close()
             del batch
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    write_csv(final_path, final_rows)
-    write_csv(trace_path, trace_rows)
-
-    summarize_final(final_rows, out_dir)
-
-    # Use public mode labels in trace summary.
-    public_traces = []
-    for t in trace_rows:
-        x = dict(t)
-        x["mode"] = x["public_mode"]
-        public_traces.append(x)
-    summarize_layer_traces(public_traces, final_rows, out_dir)
-    summarize_relation(final_rows, out_dir)
-
-    meta = {
-        "experiment": "GT oracle dynamic multi-layer Direction correction",
-        "split": args.split,
-        "n": len(final_rows),
-        "layers": layers,
-        "control_group": args.control_group,
-        "target_stat": args.target_stat,
-        "max_edit_norm": args.max_edit_norm,
-        "conditions": {
-            "multi_suppress": (
-                "At each layer dynamically suppress strongest non-GT "
-                "relation excess while holding GT coordinate fixed."
-            ),
-            "multi_both": (
-                "At each layer dynamically boost GT deficit and suppress "
-                "strongest non-GT excess jointly."
-            ),
-            "random_controls": (
-                "Same intended per-layer edit norm, but random direction "
-                "orthogonal to GT/current-competitor prototype span."
-            ),
-        },
-        "oracle": True,
-    }
-    (out_dir / "summary.json").write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-    print("\nSaved to:", out_dir)
-    print("  control_targets.csv")
-    print("  per_sample_final.csv")
-    print("  per_layer_trace.csv")
-    print("  final_summary.csv")
-    print("  specific_vs_random.csv")
-    print("  layer_trace_summary.csv")
-    print("  summary_by_relation.csv")
-
-    del model, processor
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
-if __name__ == "__main__":
