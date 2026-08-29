@@ -69,7 +69,7 @@ def parse_args():
     p.add_argument("--list-direction-keys", action="store_true")
     p.add_argument("--data-root", default="data")
     p.add_argument("--dataset", default="coco_two")
-    p.add_argument("--records-csv", default="")
+    p.add_argument("--records-csv", default="", help="CSV/JSONL record file; for coco_two typically prompts/COCO_QA_two_obj_with_answer_four_options.jsonl")
     p.add_argument("--model-id", default="Qwen/Qwen2.5-VL-7B-Instruct")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--dtype", default="bfloat16",
@@ -342,26 +342,59 @@ def first_present(row, keys):
     return None
 
 
+def unwrap_phrase(x):
+    """Handle records where subject/reference are nested dicts such as
+    {"phrase": "dog"} instead of plain strings.
+    """
+    if isinstance(x, Mapping):
+        for key in ("phrase", "name", "text", "label", "object"):
+            if key in x and x[key] is not None:
+                return str(x[key]).strip()
+    return str(x).strip()
+
+
 def parse_record(row, source_dir, data_root):
     sid = first_present(row, SID_KEYS)
     image = first_present(row, IMAGE_KEYS)
     subj = first_present(row, SUBJ_KEYS)
     ref = first_present(row, REF_KEYS)
+
     if sid is None or image is None or subj is None or ref is None:
         return None
+
     try:
         sid = int(float(str(sid)))
     except Exception:
         return None
+
+    subj = unwrap_phrase(subj)
+    ref = unwrap_phrase(ref)
+
     p = Path(str(image))
+
     if not p.is_absolute():
-        choices = [source_dir / p, data_root / p, p]
-        p = next((q for q in choices if q.exists()), source_dir / p)
+        choices = [
+            source_dir / p,
+            data_root / p,
+            p,
+            # Common COCO layouts.
+            data_root / "coco" / "val2017" / p.name,
+            data_root / "COCO" / "val2017" / p.name,
+            data_root / "val2017" / p.name,
+            data_root / "coco_two" / p.name,
+            data_root / "images" / "val2017" / p.name,
+        ]
+
+        p = next(
+            (q for q in choices if q.exists()),
+            source_dir / p,
+        )
+
     return {
         "sid": sid,
         "image_path": str(p),
-        "subject": str(subj).strip(),
-        "reference": str(ref).strip(),
+        "subject": subj,
+        "reference": ref,
     }
 
 
@@ -391,12 +424,36 @@ def load_records_file(path, data_root):
 def discover_records(explicit, data_root, dataset, target_sids):
     if explicit:
         p = Path(explicit)
-        return load_records_file(p, data_root), p
+        if not p.exists():
+            raise FileNotFoundError(p)
+        records = load_records_file(p, data_root)
+        overlap = len(set(records) & target_sids)
+        print(
+            f"[records] explicit source={p}, "
+            f"records={len(records)}, target overlap={overlap}"
+        )
+        if overlap == 0:
+            raise RuntimeError(
+                f"Explicit records file {p} produced zero overlap with "
+                "vectors.npz sample ids."
+            )
+        return records, p
+
+    # Search not only data/, but also the project's prompts/ directory.
     roots = []
     dp = data_root / dataset
     if dp.exists():
         roots.append(dp)
+
     roots.append(data_root)
+
+    prompts_dir = Path("prompts")
+    if prompts_dir.exists():
+        roots.append(prompts_dir)
+
+    cwd = Path(".")
+    if cwd.exists():
+        roots.append(cwd)
     candidates, seen = [], set()
     for root in roots:
         if not root.exists():
