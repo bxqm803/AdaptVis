@@ -398,26 +398,208 @@ def parse_record(row, source_dir, data_root):
     }
 
 
-def load_records_file(path, data_root):
+
+def parse_coco_two_question(question):
+    """
+    Parse prompt rows such as:
+      <image>\nUSER: Where is the dining table in relation to the refrigerator?
+    """
+    q = str(question)
+
+    m = re.search(
+        r"Where\s+is\s+(.+?)\s+in\s+relation\s+to\s+(.+?)\?\s*Answer",
+        q,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    if m is None:
+        m = re.search(
+            r"Where\s+is\s+(.+?)\s+in\s+relation\s+to\s+(.+?)\?",
+            q,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+    if m is None:
+        return None, None
+
+    subject = re.sub(r"\s+", " ", m.group(1)).strip()
+    reference = re.sub(r"\s+", " ", m.group(2)).strip()
+
+    return subject, reference
+
+
+def load_coco_two_prompt_records(prompt_path, data_root):
+    """
+    AdaptVis COCO_QA_two_obj prompt JSONL contains only:
+        {"id": ..., "question": ..., "answer": [...]}
+
+    It DOES NOT contain image paths.
+
+    The image id comes from:
+        data/coco_qa_two_obj.json
+
+    Original AdaptVis COCO_QA loader uses:
+        test_case = dataset[index]
+        image_id = test_case[0]
+        image = data/val2017/{image_id:012d}.jpg
+
+    Therefore prompt row id/index is paired with annotation entry at the
+    same index.
+    """
+    annotation_path = data_root / "coco_qa_two_obj.json"
+
+    if not annotation_path.exists():
+        raise FileNotFoundError(
+            f"Required COCO two-object annotation not found: {annotation_path}"
+        )
+
+    with annotation_path.open("r", encoding="utf-8") as f:
+        annotations = json.load(f)
+
+    prompt_rows = []
+
+    with prompt_path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f):
+            line = line.strip()
+
+            if not line:
+                continue
+
+            row = json.loads(line)
+
+            if not isinstance(row, Mapping):
+                continue
+
+            prompt_rows.append(row)
+
     records = {}
+
+    for row_no, row in enumerate(prompt_rows):
+        try:
+            sid = int(row.get("id", row_no))
+        except Exception:
+            continue
+
+        # In the official prompt file id == dataset index.
+        ann_index = sid
+
+        if ann_index < 0 or ann_index >= len(annotations):
+            continue
+
+        ann = annotations[ann_index]
+
+        if not isinstance(ann, (list, tuple)) or len(ann) < 1:
+            continue
+
+        try:
+            image_id = int(ann[0])
+        except Exception:
+            continue
+
+        subject, reference = parse_coco_two_question(
+            row.get("question", "")
+        )
+
+        # Fallback: try to extract subject/reference from the positive caption.
+        # The prompt parser should normally succeed.
+        if subject is None or reference is None:
+            caption = str(ann[1]) if len(ann) > 1 else ""
+
+            patterns = [
+                r"(.+?)\s+is\s+to\s+the\s+left\s+of\s+(.+)",
+                r"(.+?)\s+is\s+to\s+the\s+right\s+of\s+(.+)",
+                r"(.+?)\s+is\s+above\s+(.+)",
+                r"(.+?)\s+is\s+below\s+(.+)",
+            ]
+
+            for pat in patterns:
+                m = re.search(pat, caption, flags=re.IGNORECASE)
+                if m:
+                    subject = m.group(1).strip()
+                    reference = m.group(2).strip().rstrip(".")
+                    break
+
+        if subject is None or reference is None:
+            continue
+
+        image_path = (
+            data_root
+            / "val2017"
+            / f"{image_id:012d}.jpg"
+        )
+
+        records[sid] = {
+            "sid": sid,
+            "image_path": str(image_path),
+            "subject": subject,
+            "reference": reference,
+            "question": str(row.get("question", "")),
+            "answer": row.get("answer", []),
+            "image_id": image_id,
+        }
+
+    print(
+        f"[COCO two-object loader] prompts={len(prompt_rows)}, "
+        f"annotations={len(annotations)}, records={len(records)}"
+    )
+
+    if records:
+        first_sid = sorted(records)[0]
+        example = records[first_sid]
+        print(
+            "[COCO two-object example] "
+            f"sid={first_sid}, image_id={example['image_id']}, "
+            f"subject={example['subject']!r}, "
+            f"reference={example['reference']!r}, "
+            f"image={example['image_path']}"
+        )
+
+    return records
+
+
+def load_records_file(path, data_root):
+    # Special handling for the official AdaptVis COCO two-object prompt file.
+    # It contains id/question/answer but no image path.
+    if (
+        path.suffix.lower() == ".jsonl"
+        and "COCO_QA_two_obj" in path.name
+    ):
+        return load_coco_two_prompt_records(
+            path,
+            data_root,
+        )
+
+    records = {}
+
     if path.suffix.lower() == ".csv":
         rows = read_csv(path)
+
     elif path.suffix.lower() == ".jsonl":
         rows = []
+
         with path.open("r", encoding="utf-8") as f:
             for line in f:
                 try:
                     rows.append(json.loads(line))
                 except Exception:
                     pass
+
     else:
         raise ValueError("records file must be CSV or JSONL")
+
     for r in rows:
         if not isinstance(r, Mapping):
             continue
-        x = parse_record(r, path.parent, data_root)
+
+        x = parse_record(
+            r,
+            path.parent,
+            data_root,
+        )
+
         if x:
             records[x["sid"]] = x
+
     return records
 
 
@@ -428,9 +610,14 @@ def discover_records(explicit, data_root, dataset, target_sids):
             raise FileNotFoundError(p)
         records = load_records_file(p, data_root)
         overlap = len(set(records) & target_sids)
+        existing_images = sum(
+            Path(r["image_path"]).exists()
+            for r in records.values()
+        )
         print(
             f"[records] explicit source={p}, "
-            f"records={len(records)}, target overlap={overlap}"
+            f"records={len(records)}, target overlap={overlap}, "
+            f"existing_images={existing_images}/{len(records)}"
         )
         if overlap == 0:
             raise RuntimeError(
