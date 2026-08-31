@@ -1,4 +1,4 @@
-
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
@@ -68,7 +68,37 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     p.add_argument("--model-id", default="OpenGVLab/InternVL2_5-2B")
-    p.add_argument("--direction-dir", required=True)
+    p.add_argument(
+        "--direction-dir",
+        default="",
+        help=(
+            "Optional existing directory containing vectors.npz and "
+            "sample_split_and_generation.csv. If omitted or missing, this "
+            "script builds both automatically, then continues the causal experiment."
+        ),
+    )
+    p.add_argument(
+        "--direction-output-dir",
+        default="",
+        help=(
+            "Where to create vectors.npz when --direction-dir is absent. "
+            "Default: <output-dir>/direction_bundle"
+        ),
+    )
+    p.add_argument(
+        "--split-source-dir",
+        default="",
+        help=(
+            "Optional directory containing an existing "
+            "sample_split_and_generation.csv whose train/test split should be reused."
+        ),
+    )
+    p.add_argument(
+        "--train-frac",
+        type=float,
+        default=0.30,
+        help="Train fraction used only when a split must be created from scratch.",
+    )
     p.add_argument("--direction-key", default="residual")
     p.add_argument(
         "--prompt-jsonl",
@@ -209,6 +239,888 @@ def cleanup():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+
+# ---------------------------------------------------------------------
+# automatic residual Direction bundle builder
+# ---------------------------------------------------------------------
+
+def load_all_records_without_split(args):
+    """Load all valid COCO-two records before any train/test split exists."""
+    with open(args.annotation_json, "r", encoding="utf-8") as f:
+        anns = json.load(f)
+
+    prompts = []
+    with open(args.prompt_jsonl, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                prompts.append(json.loads(line))
+
+    records = {}
+
+    for row_no, row in enumerate(prompts):
+        sid = int(row.get("id", row_no))
+
+        if not (0 <= sid < len(anns)):
+            continue
+
+        sub, ref = parse_sr(row.get("question", ""))
+
+        if sub is None or ref is None:
+            continue
+
+        gt = norm_rel(row.get("answer", ""))
+
+        if gt not in RELSET:
+            continue
+
+        image_id = int(anns[sid][0])
+
+        path = (
+            Path(args.data_root)
+            / "val2017"
+            / f"{image_id:012d}.jpg"
+        )
+
+        records[sid] = {
+            "sid": sid,
+            "gt": gt,
+            "subject": sub,
+            "reference": ref,
+            "image_path": str(path),
+        }
+
+    if not records:
+        raise RuntimeError("No valid COCO-two records found.")
+
+    return records
+
+
+def make_stratified_train_test_split(records, train_frac, seed):
+    rng = random.Random(seed)
+
+    split = {}
+
+    for relation in RELS:
+        xs = sorted(
+            sid
+            for sid, rec in records.items()
+            if rec["gt"] == relation
+        )
+
+        rng.shuffle(xs)
+
+        n_train = int(round(len(xs) * float(train_frac)))
+        n_train = max(1, min(n_train, len(xs) - 1))
+
+        train_set = set(xs[:n_train])
+
+        for sid in xs:
+            split[sid] = "train" if sid in train_set else "test"
+
+    return split
+
+
+def load_split_from_csv(path):
+    rows = read_csv(path)
+
+    return {
+        int(row["sample_index"]): str(row.get("split", "")).strip().lower()
+        for row in rows
+    }
+
+
+def find_subsequence(sequence, pattern, start=0):
+    if not pattern:
+        return None
+
+    n = len(pattern)
+
+    for i in range(start, len(sequence) - n + 1):
+        if sequence[i:i+n] == pattern:
+            return list(range(i, i+n))
+
+    return None
+
+
+def token_span_for_phrase(tokenizer, input_ids, phrase, start=0):
+    """
+    Locate an object phrase in the exact InternVL chat input token sequence.
+    We try variants because BPE/SentencePiece may absorb preceding whitespace.
+    """
+    candidates = []
+
+    for variant in [
+        " " + phrase,
+        phrase,
+        "\n" + phrase,
+    ]:
+        ids = tokenizer(
+            variant,
+            add_special_tokens=False,
+        ).input_ids
+
+        if ids:
+            candidates.append(ids)
+
+    for ids in candidates:
+        span = find_subsequence(
+            input_ids,
+            ids,
+            start=start,
+        )
+
+        if span is not None:
+            return span
+
+    # Last fallback: search phrase without its first token, then include one token
+    # before it only if necessary. This helps tokenizers whose first word token
+    # merges whitespace differently in the full prompt.
+    raw = tokenizer(
+        phrase,
+        add_special_tokens=False,
+    ).input_ids
+
+    if len(raw) >= 2:
+        span = find_subsequence(
+            input_ids,
+            raw[1:],
+            start=start,
+        )
+
+        if span is not None:
+            first = max(
+                start,
+                span[0] - 1,
+            )
+
+            return list(
+                range(
+                    first,
+                    span[-1] + 1,
+                )
+            )
+
+    return None
+
+
+def build_exact_internvl_query_and_spans(
+    model,
+    tokenizer,
+    rec,
+    args,
+    num_patches,
+):
+    """
+    Reproduce InternVL2.5 chat() prompt construction closely enough to recover
+    subject/reference text token positions in the LLM sequence.
+
+    InternVL chat constructs a conversation prompt, replaces <image> with
+    <img> + repeated <IMG_CONTEXT> + </img>, then tokenizes the full query.
+    """
+    question = (
+        "<image>\n"
+        + args.prompt_template.format(
+            subject=rec["subject"],
+            reference=rec["reference"],
+        )
+    )
+
+    get_conv_template = model.chat.__globals__.get(
+        "get_conv_template",
+        None,
+    )
+
+    if get_conv_template is None:
+        raise RuntimeError(
+            "Could not access InternVL get_conv_template from model.chat."
+        )
+
+    template = get_conv_template(
+        model.template
+    )
+
+    if hasattr(
+        model,
+        "system_message",
+    ):
+        template.system_message = model.system_message
+
+    template.append_message(
+        template.roles[0],
+        question,
+    )
+
+    template.append_message(
+        template.roles[1],
+        None,
+    )
+
+    query = template.get_prompt()
+
+    img_start = "<img>"
+    img_end = "</img>"
+    img_context = "<IMG_CONTEXT>"
+
+    image_tokens = (
+        img_start
+        + img_context
+        * int(model.num_image_token)
+        * int(num_patches)
+        + img_end
+    )
+
+    query = query.replace(
+        "<image>",
+        image_tokens,
+        1,
+    )
+
+    tokenized = tokenizer(
+        query,
+        return_tensors="pt",
+    )
+
+    input_ids = tokenized[
+        "input_ids"
+    ][0].tolist()
+
+    context_token_id = tokenizer.convert_tokens_to_ids(
+        img_context
+    )
+
+    context_positions = [
+        i
+        for i, token_id in enumerate(input_ids)
+        if token_id == context_token_id
+    ]
+
+    search_start = (
+        context_positions[-1] + 1
+        if context_positions
+        else 0
+    )
+
+    subject_span = token_span_for_phrase(
+        tokenizer,
+        input_ids,
+        rec["subject"],
+        start=search_start,
+    )
+
+    if subject_span is None:
+        raise RuntimeError(
+            f"Could not locate subject tokens: {rec['subject']!r}"
+        )
+
+    reference_span = token_span_for_phrase(
+        tokenizer,
+        input_ids,
+        rec["reference"],
+        start=subject_span[-1] + 1,
+    )
+
+    if reference_span is None:
+        # In unusual prompts reference text may tokenize before a repeated subject
+        # occurrence; retry from after the image region.
+        reference_span = token_span_for_phrase(
+            tokenizer,
+            input_ids,
+            rec["reference"],
+            start=search_start,
+        )
+
+    if reference_span is None:
+        raise RuntimeError(
+            f"Could not locate reference tokens: {rec['reference']!r}"
+        )
+
+    return (
+        input_ids,
+        subject_span,
+        reference_span,
+    )
+
+
+class CapturePairDirection:
+    """
+    Capture q_l = mean(h_subject) - mean(h_reference)
+    at every selected decoder block on the first prefill call.
+    """
+
+    def __init__(
+        self,
+        layers,
+        selected,
+        subject_span,
+        reference_span,
+    ):
+        self.handles = []
+        self.states = {}
+
+        self.subject_span = list(subject_span)
+        self.reference_span = list(reference_span)
+
+        self.done = {
+            l: False
+            for l in selected
+        }
+
+        for l in selected:
+            self.handles.append(
+                layers[l].register_forward_hook(
+                    self._hook(l)
+                )
+            )
+
+    def _hook(self, l):
+        def hook(_m, _inp, out):
+            if self.done[l]:
+                return out
+
+            h, _ = get_hidden(out)
+
+            if h.ndim != 3:
+                return out
+
+            seq_len = int(h.shape[1])
+
+            if (
+                max(self.subject_span) >= seq_len
+                or max(self.reference_span) >= seq_len
+            ):
+                raise RuntimeError(
+                    f"L{l}: text span exceeds decoder seq_len={seq_len}. "
+                    f"subject={self.subject_span} reference={self.reference_span}"
+                )
+
+            hs = h[
+                0,
+                self.subject_span,
+                :
+            ].mean(dim=0)
+
+            hr = h[
+                0,
+                self.reference_span,
+                :
+            ].mean(dim=0)
+
+            self.states[l] = (
+                (hs - hr)
+                .detach()
+                .float()
+                .cpu()
+                .numpy()
+                .astype(np.float32)
+            )
+
+            self.done[l] = True
+
+            return out
+
+        return hook
+
+    def close(self):
+        for handle in reversed(self.handles):
+            with contextlib.suppress(Exception):
+                handle.remove()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+def collect_pair_direction_one_image(
+    model,
+    tokenizer,
+    layers,
+    image,
+    rec,
+    selected,
+    args,
+    dtype,
+):
+    pixels = pixels_from_pil(
+        image,
+        args,
+    )
+
+    (
+        _input_ids,
+        subject_span,
+        reference_span,
+    ) = build_exact_internvl_query_and_spans(
+        model,
+        tokenizer,
+        rec,
+        args,
+        num_patches=int(pixels.shape[0]),
+    )
+
+    with CapturePairDirection(
+        layers,
+        selected,
+        subject_span,
+        reference_span,
+    ) as capture:
+
+        text, pred = generate(
+            model,
+            tokenizer,
+            pixels,
+            rec,
+            args,
+            dtype,
+        )
+
+        states = dict(
+            capture.states
+        )
+
+    del pixels
+
+    return (
+        text,
+        pred,
+        states,
+    )
+
+
+def build_direction_bundle(
+    model,
+    tokenizer,
+    layers,
+    args,
+    dtype,
+    direction_dir,
+):
+    """
+    Build the old-style object-pair residual Direction vectors internally:
+
+      r_l^res =
+        [(h_sub-h_ref)_real] -
+        [(h_sub-h_ref)_gray]
+
+    for every sample and every decoder layer.
+
+    This creates exactly the two files expected by the causal experiment:
+      vectors.npz
+      sample_split_and_generation.csv
+    """
+    direction_dir = Path(
+        direction_dir
+    )
+
+    direction_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    vectors_path = (
+        direction_dir
+        / "vectors.npz"
+    )
+
+    split_path = (
+        direction_dir
+        / "sample_split_and_generation.csv"
+    )
+
+    all_records = load_all_records_without_split(
+        args
+    )
+
+    # Reuse an existing split if requested.
+    split = None
+
+    if args.split_source_dir:
+        source_split = (
+            Path(args.split_source_dir)
+            / "sample_split_and_generation.csv"
+        )
+
+        if not source_split.exists():
+            raise FileNotFoundError(
+                source_split
+            )
+
+        split = load_split_from_csv(
+            source_split
+        )
+
+        missing = [
+            sid
+            for sid in all_records
+            if sid not in split
+        ]
+
+        if missing:
+            raise RuntimeError(
+                f"split source is missing {len(missing)} dataset samples"
+            )
+
+        print(
+            f"[direction build] reusing split from {source_split}"
+        )
+
+    else:
+        split = make_stratified_train_test_split(
+            all_records,
+            args.train_frac,
+            args.seed,
+        )
+
+        print(
+            f"[direction build] created stratified split "
+            f"train_frac={args.train_frac:.3f}"
+        )
+
+    selected = list(
+        range(
+            len(layers)
+        )
+    )
+
+    sample_ids = sorted(
+        all_records
+    )
+
+    residual_vectors = []
+    labels = []
+    metadata_rows = []
+
+    failed = []
+
+    for sid in tqdm(
+        sample_ids,
+        desc="BUILD residual Direction vectors",
+    ):
+        rec = all_records[
+            sid
+        ]
+
+        real = None
+        gray = None
+
+        try:
+            real = Image.open(
+                rec["image_path"]
+            ).convert(
+                "RGB"
+            )
+
+            gray = gray_image(
+                real,
+                args.gray_value,
+            )
+
+            (
+                real_text,
+                real_pred,
+                real_states,
+            ) = collect_pair_direction_one_image(
+                model,
+                tokenizer,
+                layers,
+                real,
+                rec,
+                selected,
+                args,
+                dtype,
+            )
+
+            (
+                gray_text,
+                gray_pred,
+                gray_states,
+            ) = collect_pair_direction_one_image(
+                model,
+                tokenizer,
+                layers,
+                gray,
+                rec,
+                selected,
+                args,
+                dtype,
+            )
+
+            if (
+                len(real_states) != len(selected)
+                or len(gray_states) != len(selected)
+            ):
+                raise RuntimeError(
+                    f"incomplete layer capture "
+                    f"real={len(real_states)} gray={len(gray_states)} "
+                    f"expected={len(selected)}"
+                )
+
+            residual = np.stack(
+                [
+                    (
+                        real_states[l]
+                        - gray_states[l]
+                    ).astype(np.float32)
+                    for l in selected
+                ],
+                axis=0,
+            )
+
+            residual_vectors.append(
+                residual
+            )
+
+            labels.append(
+                rec["gt"]
+            )
+
+            metadata_rows.append({
+                "sample_index":
+                    sid,
+                "split":
+                    split[sid],
+                "generation_group":
+                    (
+                        "correct"
+                        if real_pred == rec["gt"]
+                        else "wrong"
+                    ),
+                "relation":
+                    rec["gt"],
+                "real_pred":
+                    real_pred
+                    or "",
+                "gray_pred":
+                    gray_pred
+                    or "",
+                "real_correct":
+                    int(
+                        real_pred
+                        == rec["gt"]
+                    ),
+                "gray_correct":
+                    int(
+                        gray_pred
+                        == rec["gt"]
+                    ),
+                "real_text":
+                    real_text,
+                "gray_text":
+                    gray_text,
+            })
+
+        except Exception as exc:
+            failed.append(
+                (
+                    sid,
+                    f"{type(exc).__name__}: {exc}",
+                )
+            )
+
+            tqdm.write(
+                f"[DIRECTION BUILD ERROR sid={sid}] "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        finally:
+            if real is not None:
+                real.close()
+
+            if gray is not None:
+                gray.close()
+
+            cleanup()
+
+    if failed:
+        fail_path = (
+            direction_dir
+            / "direction_build_failures.csv"
+        )
+
+        write_csv(
+            fail_path,
+            [
+                {
+                    "sample_index":
+                        sid,
+                    "error":
+                        error,
+                }
+                for sid, error in failed
+            ],
+        )
+
+        raise RuntimeError(
+            f"Direction bundle build failed for {len(failed)} samples. "
+            f"See {fail_path}. Fix span/prompt issues before causal evaluation."
+        )
+
+    residual_vectors = np.stack(
+        residual_vectors,
+        axis=0,
+    ).astype(
+        np.float32
+    )
+
+    saved_sids = np.asarray(
+        [
+            int(
+                row[
+                    "sample_index"
+                ]
+            )
+            for row in metadata_rows
+        ],
+        dtype=np.int64,
+    )
+
+    saved_labels = np.asarray(
+        labels,
+        dtype=object,
+    )
+
+    np.savez_compressed(
+        vectors_path,
+        sample_index=
+            saved_sids,
+        relation=
+            saved_labels,
+        residual=
+            residual_vectors,
+    )
+
+    write_csv(
+        split_path,
+        metadata_rows,
+    )
+
+    print(
+        "\n"
+        + "=" * 120
+    )
+
+    print(
+        "BUILT DIRECTION BUNDLE"
+    )
+
+    print(
+        "=" * 120
+    )
+
+    print(
+        f"dir={direction_dir}"
+    )
+
+    print(
+        f"vectors={vectors_path}"
+    )
+
+    print(
+        f"shape={residual_vectors.shape}"
+    )
+
+    print(
+        f"split_csv={split_path}"
+    )
+
+    print(
+        f"TRAIN={sum(row['split']=='train' for row in metadata_rows)} "
+        f"TEST={sum(row['split']=='test' for row in metadata_rows)}"
+    )
+
+    return direction_dir
+
+
+def resolve_or_build_direction_dir(
+    model,
+    tokenizer,
+    layers,
+    args,
+    dtype,
+):
+    # Explicit existing directory.
+    if args.direction_dir:
+        d = Path(
+            args.direction_dir
+        )
+
+        vectors_path = (
+            d
+            / "vectors.npz"
+        )
+
+        split_path = (
+            d
+            / "sample_split_and_generation.csv"
+        )
+
+        if (
+            vectors_path.exists()
+            and split_path.exists()
+        ):
+            print(
+                f"[direction] reusing existing bundle: {d}"
+            )
+
+            return d
+
+        print(
+            f"[direction] requested dir is incomplete; building it: {d}"
+        )
+
+        return build_direction_bundle(
+            model,
+            tokenizer,
+            layers,
+            args,
+            dtype,
+            d,
+        )
+
+    # Default location under current experiment output.
+    if args.direction_output_dir:
+        d = Path(
+            args.direction_output_dir
+        )
+
+    else:
+        d = (
+            Path(args.output_dir)
+            / "direction_bundle"
+        )
+
+    vectors_path = (
+        d
+        / "vectors.npz"
+    )
+
+    split_path = (
+        d
+        / "sample_split_and_generation.csv"
+    )
+
+    if (
+        vectors_path.exists()
+        and split_path.exists()
+        and not args.overwrite
+    ):
+        print(
+            f"[direction] reusing existing bundle: {d}"
+        )
+
+        return d
+
+    return build_direction_bundle(
+        model,
+        tokenizer,
+        layers,
+        args,
+        dtype,
+        d,
+    )
 
 
 # ---------------------------------------------------------------------
@@ -1067,9 +1979,35 @@ def main():
         shutil.rmtree(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    bundle = load_bundle(args.direction_dir, args.direction_key)
-    records = load_records(args, bundle)
-    fit_sids, val_sids = fit_val_split(records, args)
+    # Load model first because vectors.npz is now built automatically when absent.
+    model, tokenizer, dtype = load_model(args)
+    layers, layer_path = resolve_layers(model)
+    n_layers = len(layers)
+    scan = layer_spec(args.scan_layers, n_layers)
+
+    direction_dir = resolve_or_build_direction_dir(
+        model,
+        tokenizer,
+        layers,
+        args,
+        dtype,
+    )
+
+    bundle = load_bundle(
+        direction_dir,
+        args.direction_key,
+    )
+
+    records = load_records(
+        args,
+        bundle,
+    )
+
+    fit_sids, val_sids = fit_val_split(
+        records,
+        args,
+    )
+
     test_sids = sorted(
         sid for sid, rec in records.items()
         if rec["split"] == "test"
@@ -1081,11 +2019,6 @@ def main():
         val_sids = val_sids[:args.max_val]
     if args.max_test is not None:
         test_sids = test_sids[:args.max_test]
-
-    model, tokenizer, dtype = load_model(args)
-    layers, layer_path = resolve_layers(model)
-    n_layers = len(layers)
-    scan = layer_spec(args.scan_layers, n_layers)
 
     print("\n" + "=" * 125)
     print(f"MODEL={args.model_id}")
@@ -1330,6 +2263,7 @@ def main():
         json.dumps(
             {
                 "model_id": args.model_id,
+                "direction_dir": str(direction_dir),
                 "decoder_blocks": n_layers,
                 "fit_n": len(fit_sids),
                 "val_n": len(val_sids),
