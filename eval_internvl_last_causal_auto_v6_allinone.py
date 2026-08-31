@@ -54,8 +54,10 @@ from PIL import Image
 from tqdm import tqdm
 import torchvision.transforms as T
 from torchvision.transforms.functional import InterpolationMode
+import transformers
+from packaging import version as packaging_version
 from transformers import AutoModel, AutoTokenizer
-from transformers.generation import GenerationMixin
+from transformers.generation import GenerationMixin, GenerationConfig
 
 RELS = ("left", "right", "above", "below")
 RELSET = set(RELS)
@@ -689,6 +691,264 @@ def collect_pair_direction_one_image(
         pred,
         states,
     )
+
+
+def run_compatibility_preflight(
+    model,
+    tokenizer,
+    layers,
+    args,
+    dtype,
+):
+    """
+    Run one real sample through all fragile parts BEFORE the 440-sample job:
+
+      1) model.chat() / inner LM generation
+      2) InternVL multimodal prompt expansion
+      3) subject/reference token-span recovery
+      4) decoder-block pair-direction hooks
+      5) last-token steering hook (zero edit, so behavior is unchanged)
+
+    This converts a 3-minute, 440/440 repeated failure into an immediate,
+    informative failure.
+    """
+    records = load_all_records_without_split(
+        args
+    )
+
+    sid = sorted(
+        records
+    )[0]
+
+    rec = records[
+        sid
+    ]
+
+    image = None
+
+    print(
+        "\n"
+        + "=" * 120
+    )
+
+    print(
+        "INTERNVL COMPATIBILITY PREFLIGHT"
+    )
+
+    print(
+        "=" * 120
+    )
+
+    print(
+        f"sample={sid} | gt={rec['gt']} | "
+        f"subject={rec['subject']!r} | "
+        f"reference={rec['reference']!r}"
+    )
+
+    try:
+        image = Image.open(
+            rec[
+                "image_path"
+            ]
+        ).convert(
+            "RGB"
+        )
+
+        # ----------------------------------------------------------
+        # 1-4. Actual model.chat + prompt-span + pair hook.
+        # Capture first and last decoder layer; enough to validate the path.
+        # ----------------------------------------------------------
+        probe_layers = sorted(
+            set(
+                [
+                    0,
+                    len(
+                        layers
+                    )
+                    - 1,
+                ]
+            )
+        )
+
+        (
+            text,
+            pred,
+            states,
+        ) = collect_pair_direction_one_image(
+            model,
+            tokenizer,
+            layers,
+            image,
+            rec,
+            probe_layers,
+            args,
+            dtype,
+        )
+
+        if len(
+            states
+        ) != len(
+            probe_layers
+        ):
+            raise RuntimeError(
+                f"pair-direction preflight captured "
+                f"{len(states)}/{len(probe_layers)} layers"
+            )
+
+        print(
+            f"[preflight] model.chat generation: OK | "
+            f"pred={pred!r} | text={text!r}"
+        )
+
+        print(
+            f"[preflight] subject/reference span + pair hooks: "
+            f"OK | layers={probe_layers}"
+        )
+
+        # ----------------------------------------------------------
+        # 5. Validate last-token steering hook with a ZERO vector.
+        # It must not alter the activation, only verify hook compatibility.
+        # ----------------------------------------------------------
+        hidden_size = int(
+            getattr(
+                model.language_model.config,
+                "hidden_size",
+            )
+        )
+
+        last_layer = (
+            len(
+                layers
+            )
+            - 1
+        )
+
+        zero = np.zeros(
+            hidden_size,
+            dtype=np.float32,
+        )
+
+        zero_templates = {
+            last_layer: {
+                "shared": {
+                    relation:
+                        zero
+                    for relation in RELS
+                }
+            }
+        }
+
+        pixels = pixels_from_pil(
+            image,
+            args,
+        )
+
+        with SteerLast(
+            layers,
+            zero_templates,
+            [
+                last_layer
+            ],
+            target=rec[
+                "gt"
+            ],
+            scale=1.0,
+            mode="add",
+            source=None,
+        ):
+            zero_text, zero_pred = generate(
+                model,
+                tokenizer,
+                pixels,
+                rec,
+                args,
+                dtype,
+            )
+
+        del pixels
+
+        print(
+            f"[preflight] zero last-token steering hook: OK | "
+            f"pred={zero_pred!r} | text={zero_text!r}"
+        )
+
+        # A zero edit should not normally change deterministic generation.
+        # Do not hard-fail on parser differences, but flag any discrepancy.
+        if (
+            text
+            != zero_text
+        ):
+            print(
+                "[preflight WARNING] zero steering changed decoded text. "
+                "This should be investigated before interpreting causal results."
+            )
+
+        print(
+            "[preflight] ALL CRITICAL COMPATIBILITY CHECKS PASSED"
+        )
+
+        print(
+            "=" * 120
+        )
+
+    except Exception as exc:
+        print(
+            "\n"
+            + "!" * 120
+        )
+
+        print(
+            "PREFLIGHT FAILED"
+        )
+
+        print(
+            "!" * 120
+        )
+
+        print(
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        print(
+            f"transformers={transformers.__version__}"
+        )
+
+        print(
+            f"wrapper_model={model.__class__.__name__}"
+        )
+
+        print(
+            f"language_model={model.language_model.__class__.__name__}"
+        )
+
+        print(
+            f"has_generate={hasattr(model.language_model, 'generate')}"
+        )
+
+        print(
+            "generation_config="
+            + repr(
+                getattr(
+                    model.language_model,
+                    "generation_config",
+                    None,
+                )
+            )
+        )
+
+        print(
+            "\nIf this is an InternLM2 backbone and runtime compatibility "
+            "still fails, use Transformers 4.49.x as the conservative "
+            "environment fallback."
+        )
+
+        raise
+
+    finally:
+        if image is not None:
+            image.close()
+
+        cleanup()
 
 
 def build_direction_bundle(
@@ -1337,54 +1597,310 @@ def resolve_layers(model):
     raise RuntimeError("cannot resolve InternVL LLM decoder layers")
 
 
-def ensure_language_model_generation_mixin(model):
+def ensure_language_model_generation_mixin(
+    model,
+    model_id=None,
+):
     """
-    Compatibility for InternVL2.5 models whose language model is InternLM2.
+    Comprehensive compatibility shim for InternVL2.5 + InternLM2 backbones.
 
-    In Transformers >= 4.50, PreTrainedModel no longer automatically inherits
-    GenerationMixin. Older InternVL remote code still calls
-    self.language_model.generate(...), so InternLM2ForCausalLM can lose
-    generate() even though its generation hooks are implemented.
+    Why this is needed
+    ------------------
+    InternVL2.5-2B / 8B use InternLM2ForCausalLM. The checkpoint's remote
+    modeling code was written for older Transformers releases. In
+    Transformers >= 4.50, PreTrainedModel no longer automatically provides
+    GenerationMixin to custom remote-code models.
 
-    This patches only the runtime class; checkpoint weights/files are unchanged.
+    We proactively handle the compatibility points that can break greedy
+    model.chat() generation:
+
+      A. missing language_model.generate()
+      B. language_model.generation_config is None
+      C. repo generation_config.json not loaded into the inner LM
+      D. newer Dynamic/Static Cache machinery being selected for old
+         InternLM2 prepare_inputs_for_generation code
+      E. missing prepare_inputs_for_generation()
+      F. generation config fields needed for deterministic greedy decoding
+
+    This modifies only the in-memory Python object/class. It does NOT modify
+    checkpoint weights or files on disk.
     """
-    lm = getattr(model, "language_model", None)
+    tf_version = packaging_version.parse(
+        transformers.__version__
+    )
+
+    print(
+        f"[compat] transformers={transformers.__version__}"
+    )
+
+    lm = getattr(
+        model,
+        "language_model",
+        None,
+    )
 
     if lm is None:
-        raise RuntimeError("InternVL model has no language_model attribute.")
-
-    if hasattr(lm, "generate"):
-        print(
-            f"[compat] language_model={lm.__class__.__name__} "
-            "already has generate()"
+        raise RuntimeError(
+            "InternVL model has no language_model attribute."
         )
-        return model
 
     original_cls = lm.__class__
 
-    patched_cls = type(
-        original_cls.__name__ + "WithGenerationMixin",
-        (original_cls, GenerationMixin),
-        {},
+    print(
+        f"[compat] language_model={original_cls.__name__}"
     )
+
+    is_internlm2 = (
+        "internlm2"
+        in original_cls.__name__.lower()
+    )
+
+    # --------------------------------------------------------------
+    # A. Restore generate() for custom remote-code models.
+    # --------------------------------------------------------------
+    if not hasattr(
+        lm,
+        "generate",
+    ):
+        patched_cls = type(
+            original_cls.__name__
+            + "WithGenerationMixin",
+            (
+                original_cls,
+                GenerationMixin,
+            ),
+            {},
+        )
+
+        try:
+            lm.__class__ = patched_cls
+
+        except TypeError as exc:
+            raise RuntimeError(
+                "Could not attach GenerationMixin at runtime. "
+                "For InternVL2.5 InternLM2 backbones, a known-safe "
+                "fallback is Transformers 4.49.x."
+            ) from exc
+
+        if not hasattr(
+            lm,
+            "generate",
+        ):
+            raise RuntimeError(
+                "GenerationMixin patch failed to expose generate()."
+            )
+
+        print(
+            f"[compat] patched {original_cls.__name__} -> "
+            f"{patched_cls.__name__}; generate() restored"
+        )
+
+    else:
+        print(
+            "[compat] language_model.generate() already available"
+        )
+
+    # --------------------------------------------------------------
+    # B/C. Initialize the INNER LM generation config.
+    #
+    # Prefer the checkpoint's generation_config.json. The official
+    # InternVL2.5-2B repo includes model-specific EOS ids. If loading
+    # that fails, fall back to the inner LM config.
+    # --------------------------------------------------------------
+    loaded_generation_config = None
+
+    if model_id:
+        try:
+            loaded_generation_config = (
+                GenerationConfig.from_pretrained(
+                    model_id
+                )
+            )
+
+            print(
+                "[compat] loaded generation_config.json "
+                "from checkpoint"
+            )
+
+        except Exception as exc:
+            print(
+                "[compat] checkpoint GenerationConfig load failed; "
+                f"fallback to lm.config: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    if loaded_generation_config is None:
+        loaded_generation_config = (
+            GenerationConfig.from_model_config(
+                lm.config
+            )
+        )
+
+        print(
+            "[compat] built generation_config from language_model.config"
+        )
+
+    lm.generation_config = loaded_generation_config
+
+    # Some versions use this metadata field to decide whether to rebuild
+    # GenerationConfig from model.config. We have explicitly initialized it,
+    # so disable the legacy "rebuild from model config" path.
+    if hasattr(
+        lm.generation_config,
+        "_from_model_config",
+    ):
+        lm.generation_config._from_model_config = False
+
+    # --------------------------------------------------------------
+    # D. Keep old InternLM2 on legacy cache behavior.
+    #
+    # The checkpoint's prepare_inputs_for_generation implementation is
+    # legacy-tuple oriented in the original InternVL2.5 remote code.
+    # New Transformers can default to DynamicCache. Prevent that path.
+    # --------------------------------------------------------------
+    if is_internlm2:
+        for obj in (
+            lm,
+            lm.__class__,
+        ):
+            for attr in (
+                "_supports_cache_class",
+                "_supports_static_cache",
+                "_supports_quantized_cache",
+            ):
+                try:
+                    setattr(
+                        obj,
+                        attr,
+                        False,
+                    )
+                except Exception:
+                    pass
+
+        # Some Transformers versions consult this method instead of the
+        # class flags above.
+        if hasattr(
+            lm,
+            "_supports_default_dynamic_cache",
+        ):
+            try:
+                import types
+
+                lm._supports_default_dynamic_cache = (
+                    types.MethodType(
+                        lambda self: False,
+                        lm,
+                    )
+                )
+
+                print(
+                    "[compat] disabled default DynamicCache for InternLM2"
+                )
+
+            except Exception:
+                pass
+
+        if hasattr(
+            lm.generation_config,
+            "cache_implementation",
+        ):
+            lm.generation_config.cache_implementation = None
+
+        if hasattr(
+            lm.generation_config,
+            "return_legacy_cache",
+        ):
+            lm.generation_config.return_legacy_cache = True
+
+    # --------------------------------------------------------------
+    # E. GenerationMixin needs a model-specific generation-preparation
+    # method. InternLM2 remote code normally provides it; fail here rather
+    # than after hundreds of images.
+    # --------------------------------------------------------------
+    if not hasattr(
+        lm,
+        "prepare_inputs_for_generation",
+    ):
+        raise RuntimeError(
+            f"{lm.__class__.__name__} has no "
+            "prepare_inputs_for_generation(). "
+            "This checkpoint's remote code is incompatible with the "
+            "installed Transformers version."
+        )
+
+    # Beam search is not used, so _reorder_cache is not required.
+    # But report whether it is available for diagnostics.
+    print(
+        "[compat] prepare_inputs_for_generation=YES | "
+        f"_reorder_cache={'YES' if hasattr(lm, '_reorder_cache') else 'NO'}"
+    )
+
+    # --------------------------------------------------------------
+    # F. Deterministic generation defaults.
+    # model.chat() passes max_new_tokens/do_sample/eos_token_id explicitly,
+    # but these safe defaults prevent newer GenerationMixin from inheriting
+    # incompatible sampling/cache settings.
+    # --------------------------------------------------------------
+    try:
+        lm.generation_config.do_sample = False
+    except Exception:
+        pass
 
     try:
-        lm.__class__ = patched_cls
-    except TypeError as exc:
-        raise RuntimeError(
-            "Could not attach GenerationMixin at runtime. "
-            "Fallback: install transformers<=4.49.0."
-        ) from exc
+        lm.config.use_cache = True
+    except Exception:
+        pass
 
-    if not hasattr(lm, "generate"):
-        raise RuntimeError("GenerationMixin patch failed to expose generate().")
+    # Wrapper generation_config is not normally used by InternVLChatModel's
+    # custom generate(), but initialize it defensively when possible.
+    if (
+        hasattr(
+            model,
+            "generation_config",
+        )
+        and getattr(
+            model,
+            "generation_config",
+            None,
+        )
+        is None
+    ):
+        try:
+            model.generation_config = GenerationConfig.from_model_config(
+                model.config
+            )
 
-    print(
-        f"[compat] patched {original_cls.__name__} -> "
-        f"{patched_cls.__name__}; generate() restored"
-    )
+            if hasattr(
+                model.generation_config,
+                "_from_model_config",
+            ):
+                model.generation_config._from_model_config = False
+
+            print(
+                "[compat] initialized wrapper model.generation_config"
+            )
+
+        except Exception as exc:
+            print(
+                "[compat] wrapper generation_config not initialized "
+                f"(non-fatal): {type(exc).__name__}: {exc}"
+            )
+
+    # Explicit warning for the known breaking boundary.
+    if (
+        is_internlm2
+        and tf_version
+        >= packaging_version.parse(
+            "4.50.0"
+        )
+    ):
+        print(
+            "[compat] InternLM2 + Transformers>=4.50 detected; "
+            "compatibility mode active"
+        )
 
     return model
+
 
 
 def load_model(args):
@@ -1397,7 +1913,10 @@ def load_model(args):
         trust_remote_code=True,
     ).eval().to(args.device)
 
-    model = ensure_language_model_generation_mixin(model)
+    model = ensure_language_model_generation_mixin(
+        model,
+        model_id=args.model_id,
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_id,
@@ -2038,6 +2557,14 @@ def main():
     n_layers = len(layers)
     scan = layer_spec(args.scan_layers, n_layers)
 
+    run_compatibility_preflight(
+        model,
+        tokenizer,
+        layers,
+        args,
+        dtype,
+    )
+
     direction_dir = resolve_or_build_direction_dir(
         model,
         tokenizer,
@@ -2316,6 +2843,8 @@ def main():
         json.dumps(
             {
                 "model_id": args.model_id,
+                "transformers_version": transformers.__version__,
+                "language_model_class": model.language_model.__class__.__name__,
                 "direction_dir": str(direction_dir),
                 "decoder_blocks": n_layers,
                 "fit_n": len(fit_sids),
