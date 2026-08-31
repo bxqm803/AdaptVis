@@ -55,6 +55,7 @@ from tqdm import tqdm
 import torchvision.transforms as T
 from torchvision.transforms.functional import InterpolationMode
 from transformers import AutoModel, AutoTokenizer
+from transformers.generation import GenerationMixin
 
 RELS = ("left", "right", "above", "below")
 RELSET = set(RELS)
@@ -1336,6 +1337,56 @@ def resolve_layers(model):
     raise RuntimeError("cannot resolve InternVL LLM decoder layers")
 
 
+def ensure_language_model_generation_mixin(model):
+    """
+    Compatibility for InternVL2.5 models whose language model is InternLM2.
+
+    In Transformers >= 4.50, PreTrainedModel no longer automatically inherits
+    GenerationMixin. Older InternVL remote code still calls
+    self.language_model.generate(...), so InternLM2ForCausalLM can lose
+    generate() even though its generation hooks are implemented.
+
+    This patches only the runtime class; checkpoint weights/files are unchanged.
+    """
+    lm = getattr(model, "language_model", None)
+
+    if lm is None:
+        raise RuntimeError("InternVL model has no language_model attribute.")
+
+    if hasattr(lm, "generate"):
+        print(
+            f"[compat] language_model={lm.__class__.__name__} "
+            "already has generate()"
+        )
+        return model
+
+    original_cls = lm.__class__
+
+    patched_cls = type(
+        original_cls.__name__ + "WithGenerationMixin",
+        (original_cls, GenerationMixin),
+        {},
+    )
+
+    try:
+        lm.__class__ = patched_cls
+    except TypeError as exc:
+        raise RuntimeError(
+            "Could not attach GenerationMixin at runtime. "
+            "Fallback: install transformers<=4.49.0."
+        ) from exc
+
+    if not hasattr(lm, "generate"):
+        raise RuntimeError("GenerationMixin patch failed to expose generate().")
+
+    print(
+        f"[compat] patched {original_cls.__name__} -> "
+        f"{patched_cls.__name__}; generate() restored"
+    )
+
+    return model
+
+
 def load_model(args):
     dtype = dtype_from_name(args.dtype)
     model = AutoModel.from_pretrained(
@@ -1345,6 +1396,8 @@ def load_model(args):
         use_flash_attn=bool(args.use_flash_attn),
         trust_remote_code=True,
     ).eval().to(args.device)
+
+    model = ensure_language_model_generation_mixin(model)
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_id,
