@@ -144,9 +144,10 @@ def parse_args():
 
     p.add_argument(
         "--vg-image-root",
-        default="data/vg/images",
+        default="auto",
         help=(
-            "Visual Genome image root used by the existing repo VG2 analysis."
+            "Visual Genome image root. 'auto' searches common local layouts "
+            "under --data-root and verifies them against actual VG image ids."
         ),
     )
 
@@ -748,6 +749,71 @@ def find_vg_image(image_root, image_id):
     return None
 
 
+def resolve_vg_image_root(args, data):
+    if args.vg_image_root != "auto":
+        root = Path(args.vg_image_root)
+        if not root.exists():
+            raise FileNotFoundError(
+                f"Explicit --vg-image-root does not exist: {root}"
+            )
+        return root
+
+    data_root = Path(args.data_root)
+
+    candidates = [
+        data_root / "vg" / "images",
+        data_root / "vg",
+        data_root / "visual_genome" / "images",
+        data_root / "visual_genome",
+        data_root / "VisualGenome" / "images",
+        data_root / "VisualGenome",
+        data_root / "VG",
+        data_root,
+    ]
+
+    probe_ids = []
+    for item in data[:50]:
+        if isinstance(item, (list, tuple)) and item:
+            probe_ids.append(item[0])
+        if len(probe_ids) >= 8:
+            break
+
+    for root in candidates:
+        if not root.exists():
+            continue
+
+        hits = sum(
+            find_vg_image(root, image_id) is not None
+            for image_id in probe_ids
+        )
+
+        if hits:
+            print(
+                f"[VG2] auto image root={root} "
+                f"(resolved {hits}/{len(probe_ids)} probe ids)"
+            )
+            return root
+
+    if probe_ids:
+        stem = str(probe_ids[0]).strip()
+
+        for suffix in VG_IMAGE_SUFFIXES:
+            matches = list(data_root.rglob(f"{stem}{suffix}"))
+            if matches:
+                root = matches[0].parent
+                print(
+                    f"[VG2] recursive image discovery found {matches[0]}; "
+                    f"using root={root}"
+                )
+                return root
+
+    raise FileNotFoundError(
+        "Could not locate Visual Genome images automatically. "
+        "Run: find data -type f -name '<image_id>.jpg' | head "
+        "and pass that directory with --vg-image-root."
+    )
+
+
 def load_vg2(args):
     """
     Exact format already used by analyze_vg2_centroid_generation_step1_v1.py:
@@ -770,18 +836,9 @@ def load_vg2(args):
         args.vg_prompt_jsonl
     )
 
-    image_root = Path(
-        args.vg_image_root
-    )
-
     if not data_path.exists():
         raise FileNotFoundError(
             f"Missing repo-native VG2 data JSON: {data_path}"
-        )
-
-    if not image_root.exists():
-        raise FileNotFoundError(
-            f"Missing VG2 image root: {image_root}"
         )
 
     with data_path.open(
@@ -800,6 +857,11 @@ def load_vg2(args):
             f"{data_path} must contain a top-level list, got "
             f"{type(data).__name__}"
         )
+
+    image_root = resolve_vg_image_root(
+        args,
+        data,
+    )
 
     prompts = load_vg_standard_prompts(
         prompt_path
