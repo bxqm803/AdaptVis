@@ -1,4 +1,4 @@
-
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
@@ -27,21 +27,15 @@ controlled_a:
     cross TRAIN/TEST.
 
 vg2:
-    Auto-detects one of:
-      data/vg_spatial_4dir.jsonl
-      data/vg_spatial_4dir.json
-      data/vg_qa_two_obj_filtered.json
-      data/vg_qa_two_obj.json
-    or pass --vg-json explicitly.
+    Uses the repo-native four-option VG2 files already used by
+    analyze_vg2_centroid_generation_step1_v1.py:
 
-    The loader accepts:
-      - dict records with image/image_path, subject, reference, relation
-      - standard AdaptVis tuples [image_id, positive_caption, negative_caption]
+      data/vg_qa_two_obj_four_options.json
+      prompts/VG_QA_two_obj_with_answer_four_options.jsonl
+      data/vg/images/
 
-    It keeps only four canonical relations:
-      left, right, above, below
-    with aliases top/on-top -> above and under/bottom/beneath -> below.
-    front/behind are excluded.
+    The data JSON supplies image_id; the prompt JSONL is authoritative for
+    subject/reference and the four-way GT relation.
 
 Core method
 -----------
@@ -133,8 +127,27 @@ def parse_args():
 
     p.add_argument(
         "--vg-json",
-        default="",
-        help="Optional explicit VG2 JSON/JSONL path.",
+        default="data/vg_qa_two_obj_four_options.json",
+        help=(
+            "Repo-native filtered VG2 data JSON. This is aligned one-to-one "
+            "with --vg-prompt-jsonl and each row starts with image_id."
+        ),
+    )
+
+    p.add_argument(
+        "--vg-prompt-jsonl",
+        default="prompts/VG_QA_two_obj_with_answer_four_options.jsonl",
+        help=(
+            "Repo-native four-option VG2 prompt JSONL with id/question/answer."
+        ),
+    )
+
+    p.add_argument(
+        "--vg-image-root",
+        default="data/vg/images",
+        help=(
+            "Visual Genome image root used by the existing repo VG2 analysis."
+        ),
     )
 
     p.add_argument("--device", default="cuda:0")
@@ -533,286 +546,297 @@ def load_controlled_a(args):
 
 
 # =============================================================================
-# VG2 loader
+# VG2 loader -- exact repo-native four-option schema
 # =============================================================================
 
-def auto_vg_json(args):
-    if args.vg_json:
-        path = Path(args.vg_json)
+VG_IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
 
-        if not path.exists():
-            raise FileNotFoundError(path)
 
-        return path
+def extract_standard_user_text(raw_question):
+    """
+    Match the existing repo's VG2 loader:
+    remove a leading <image>, then extract the USER text if the stored prompt
+    contains USER:/ASSISTANT: wrappers.
+    """
+    text = str(raw_question).strip()
 
-    # Prefer the actual four-direction Visual Genome file used by this project.
-    # Do not silently fall back to vg_qa_two_obj.json: that is a different
-    # AdaptVis VG subset and is not the intended four-direction VG2 benchmark.
-    candidates = [
-        Path(args.data_root) / "visual_genome" / "vg_spatial_4dir.json",
-        Path(args.data_root) / "visual_genome" / "vg_spatial_4dir.jsonl",
-        Path(args.data_root) / "vg_spatial_4dir.jsonl",
-        Path(args.data_root) / "vg_spatial_4dir.json",
-        Path(args.data_root) / "vg_qa_two_obj_filtered.json",
-    ]
-
-    for path in candidates:
-        if path.exists():
-            print(f"[VG2] auto-selected annotation: {path}")
-            return path
-
-    raise FileNotFoundError(
-        "Could not find the intended four-direction VG2 annotation. Tried:\n"
-        + "\n".join(str(x) for x in candidates)
-        + "\nPass it explicitly with --vg-json. "
-          "The intended project file is normally "
-          "data/visual_genome/vg_spatial_4dir.json."
+    text = re.sub(
+        r"^\s*<image>\s*",
+        "",
+        text,
+        flags=re.I,
     )
 
+    match = re.search(
+        r"\bUSER\s*:\s*(.*?)(?:\s*\bASSISTANT\s*:|\Z)",
+        text,
+        flags=re.I | re.S,
+    )
 
-def load_json_or_jsonl(path):
-    if path.suffix.lower() == ".jsonl":
-        rows = []
+    if match:
+        text = match.group(1)
 
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    rows.append(json.loads(line))
-
-        return rows
-
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return text.strip()
 
 
-def resolve_vg_image_path(row, image_id, args):
-    if isinstance(row, dict):
-        for key in [
-            "image_path",
-            "image",
-            "path",
-            "file_name",
-        ]:
-            value = row.get(key)
+VG_STANDARD_OBJECT_RE = re.compile(
+    r"Where\s+(?:is|are)\s+the\s+(.+?)\s+in\s+relation\s+to\s+the\s+(.+?)\?"
+    r"\s*Answer\s+with",
+    flags=re.I | re.S,
+)
 
-            if isinstance(value, str) and value:
-                candidate = Path(value)
 
-                if candidate.exists():
-                    return str(candidate)
+def parse_vg_standard_objects(question_text):
+    compact = normalize_spaces(question_text)
 
-                candidate2 = Path(args.data_root) / value
+    match = VG_STANDARD_OBJECT_RE.search(
+        compact
+    )
 
-                if candidate2.exists():
-                    return str(candidate2)
+    if not match:
+        raise ValueError(
+            "Could not parse subject/reference from standard VG2 question: "
+            f"{compact!r}"
+        )
 
-    if image_id is not None:
-        for suffix in [
-            ".jpg",
-            ".jpeg",
-            ".png",
-        ]:
+    subject = match.group(1).strip()
+    reference = match.group(2).strip()
+
+    if not subject or not reference:
+        raise ValueError(
+            f"Empty subject/reference in VG2 question: {compact!r}"
+        )
+
+    return subject, reference
+
+
+def standard_answer_value(value):
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+
+    return value
+
+
+def load_vg_standard_prompts(path):
+    path = Path(path)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing repo-native VG2 prompt JSONL: {path}"
+        )
+
+    rows = {}
+
+    with path.open(
+        "r",
+        encoding="utf-8",
+    ) as handle:
+
+        for line_no, line in enumerate(
+            handle,
+            1,
+        ):
+            line = line.strip()
+
+            if not line:
+                continue
+
+            row = json.loads(
+                line
+            )
+
+            required = {
+                "id",
+                "question",
+                "answer",
+            }
+
+            if not required.issubset(
+                row
+            ):
+                raise ValueError(
+                    f"{path}:{line_no} must contain id/question/answer; "
+                    f"keys={sorted(row.keys())}"
+                )
+
+            sid = int(
+                row["id"]
+            )
+
+            if sid in rows:
+                raise ValueError(
+                    f"Duplicate VG2 prompt id={sid} in {path}"
+                )
+
+            raw_question = str(
+                row["question"]
+            )
+
+            question_text = extract_standard_user_text(
+                raw_question
+            )
+
+            subject, reference = parse_vg_standard_objects(
+                question_text
+            )
+
+            relation = normalize_relation(
+                standard_answer_value(
+                    row["answer"]
+                ),
+                "vg2",
+            )
+
+            rows[sid] = {
+                "sid": sid,
+                "raw_question": raw_question,
+                "question_text": question_text,
+                "subject": subject,
+                "reference": reference,
+                "relation": relation,
+            }
+
+    if not rows:
+        raise RuntimeError(
+            f"No VG2 prompts loaded from {path}"
+        )
+
+    return rows
+
+
+def find_vg_image(image_root, image_id):
+    """
+    Mirrors the existing repo VG2 image resolver. It supports the flat
+    data/vg/images layout as well as common Visual Genome subdirectories.
+    """
+    image_root = Path(
+        image_root
+    )
+
+    stem = str(
+        image_id
+    ).strip()
+
+    for suffix in VG_IMAGE_SUFFIXES:
+        candidate = (
+            image_root
+            / f"{stem}{suffix}"
+        )
+
+        if candidate.exists():
+            return candidate
+
+    for subdir in (
+        "VG_100K",
+        "VG_100K_2",
+        "images",
+    ):
+        base = (
+            image_root
+            / subdir
+        )
+
+        for suffix in VG_IMAGE_SUFFIXES:
             candidate = (
-                Path(args.data_root)
-                / "vg_images"
-                / f"{image_id}{suffix}"
+                base
+                / f"{stem}{suffix}"
             )
 
             if candidate.exists():
-                return str(candidate)
-
-        # use the canonical path even if existence check fails so the later
-        # error message is informative
-        return str(
-            Path(args.data_root)
-            / "vg_images"
-            / f"{image_id}.jpg"
-        )
-
-    return ""
-
-
-def dict_first(row, keys, default=None):
-    for key in keys:
-        if key in row and row[key] not in (None, ""):
-            return row[key]
-
-    return default
-
-
-def parse_vg_dict(row, args):
-    image_id = dict_first(
-        row,
-        [
-            "image_id",
-            "imageId",
-            "img_id",
-            "id",
-        ],
-    )
-
-    relation_raw = dict_first(
-        row,
-        [
-            "relation",
-            "target_relation",
-            "answer",
-            "label",
-            "spatial_relation",
-        ],
-    )
-
-    subject = dict_first(
-        row,
-        [
-            "subject",
-            "subject_name",
-            "object1",
-            "obj1",
-            "source",
-        ],
-    )
-
-    reference = dict_first(
-        row,
-        [
-            "reference",
-            "reference_name",
-            "object2",
-            "obj2",
-            "target",
-        ],
-    )
-
-    relation = (
-        normalize_relation(
-            relation_raw,
-            "vg2",
-        )
-        if relation_raw is not None
-        else None
-    )
-
-    if (
-        relation is not None
-        and subject is not None
-        and reference is not None
-    ):
-        return {
-            "image_id": image_id,
-            "image_path": resolve_vg_image_path(
-                row,
-                image_id,
-                args,
-            ),
-            "subject": remove_article(subject),
-            "reference": remove_article(reference),
-            "relation": relation,
-        }
-
-    caption = dict_first(
-        row,
-        [
-            "caption",
-            "positive_caption",
-            "question",
-            "statement",
-        ],
-    )
-
-    if caption is None:
-        options = row.get(
-            "caption_options",
-            row.get(
-                "captions",
-                None,
-            ),
-        )
-
-        if (
-            isinstance(options, list)
-            and options
-        ):
-            caption = options[0]
-
-    if caption:
-        subject2, reference2, relation2 = parse_caption_relation(
-            caption,
-            "vg2",
-        )
-
-        if relation2:
-            return {
-                "image_id": image_id,
-                "image_path": resolve_vg_image_path(
-                    row,
-                    image_id,
-                    args,
-                ),
-                "subject": subject2,
-                "reference": reference2,
-                "relation": relation2,
-            }
+                return candidate
 
     return None
 
 
-def parse_vg_sequence(row, args):
-    if len(row) < 2:
-        return None
+def load_vg2(args):
+    """
+    Exact format already used by analyze_vg2_centroid_generation_step1_v1.py:
 
-    image_id = row[0]
-    positive = row[1]
+      data/vg_qa_two_obj_four_options.json
+          top-level list; each item starts with image_id
 
-    subject, reference, relation = parse_caption_relation(
-        positive,
-        "vg2",
+      prompts/VG_QA_two_obj_with_answer_four_options.jsonl
+          {"id": ..., "question": ..., "answer": ...}
+
+    The two files are aligned by sequential id. We intentionally do NOT parse
+    captions from the data JSON; the standard prompt JSONL is the authoritative
+    source for GT relation and subject/reference surface strings.
+    """
+    data_path = Path(
+        args.vg_json
     )
 
-    if relation is None:
-        return None
+    prompt_path = Path(
+        args.vg_prompt_jsonl
+    )
 
-    return {
-        "image_id": image_id,
-        "image_path": resolve_vg_image_path(
-            {},
-            image_id,
-            args,
-        ),
-        "subject": subject,
-        "reference": reference,
-        "relation": relation,
-    }
+    image_root = Path(
+        args.vg_image_root
+    )
 
+    if not data_path.exists():
+        raise FileNotFoundError(
+            f"Missing repo-native VG2 data JSON: {data_path}"
+        )
 
-def load_vg2(args):
-    path = auto_vg_json(args)
-    data = load_json_or_jsonl(path)
+    if not image_root.exists():
+        raise FileNotFoundError(
+            f"Missing VG2 image root: {image_root}"
+        )
+
+    with data_path.open(
+        "r",
+        encoding="utf-8",
+    ) as handle:
+        data = json.load(
+            handle
+        )
+
+    if not isinstance(
+        data,
+        list,
+    ):
+        raise TypeError(
+            f"{data_path} must contain a top-level list, got "
+            f"{type(data).__name__}"
+        )
+
+    prompts = load_vg_standard_prompts(
+        prompt_path
+    )
 
     records = []
     skipped = Counter()
+    missing_images = []
 
-    for i, row in enumerate(data):
-        if isinstance(row, dict):
-            parsed = parse_vg_dict(
-                row,
-                args,
+    for sid, item in enumerate(
+        data
+    ):
+        if (
+            not isinstance(
+                item,
+                (list, tuple),
             )
-
-        elif isinstance(row, (list, tuple)):
-            parsed = parse_vg_sequence(
-                row,
-                args,
-            )
-
-        else:
-            parsed = None
-
-        if parsed is None:
-            skipped["unparsed_or_non4dir"] += 1
+            or len(item) < 1
+        ):
+            skipped[
+                "malformed_data_row"
+            ] += 1
             continue
 
-        relation = parsed["relation"]
+        if sid not in prompts:
+            skipped[
+                "missing_prompt"
+            ] += 1
+            continue
+
+        prompt = prompts[
+            sid
+        ]
+
+        relation = prompt[
+            "relation"
+        ]
 
         if relation not in {
             "left",
@@ -820,37 +844,83 @@ def load_vg2(args):
             "above",
             "below",
         }:
-            skipped["non4dir"] += 1
+            skipped[
+                "non4dir_or_bad_answer"
+            ] += 1
+            continue
+
+        image_id = item[
+            0
+        ]
+
+        image_path = find_vg_image(
+            image_root,
+            image_id,
+        )
+
+        if image_path is None:
+            skipped[
+                "missing_image"
+            ] += 1
+
+            if len(
+                missing_images
+            ) < 20:
+                missing_images.append(
+                    str(
+                        image_id
+                    )
+                )
+
             continue
 
         records.append({
-            "sid": i,
+            "sid": sid,
             "dataset": "vg2",
-            "image_path": parsed["image_path"],
-            "subject": parsed["subject"],
-            "reference": parsed["reference"],
+            "image_id": str(image_id),
+            "image_path": str(image_path),
+            "subject": prompt["subject"],
+            "reference": prompt["reference"],
             "relation": relation,
+            "question_text": prompt["question_text"],
+            "raw_question": prompt["raw_question"],
             "pair_group": " || ".join(
                 sorted(
                     [
-                        parsed["subject"].lower(),
-                        parsed["reference"].lower(),
+                        prompt["subject"].lower(),
+                        prompt["reference"].lower(),
                     ]
                 )
             ),
         })
 
     counts = Counter(
-        r["relation"]
-        for r in records
+        record[
+            "relation"
+        ]
+        for record in records
     )
 
     print(
-        f"[VG2] annotation={path} | loaded={len(records)} | "
-        f"relations={dict(counts)} | skipped={dict(skipped)}"
+        f"[VG2 repo-native] data={data_path} | prompt={prompt_path} | "
+        f"image_root={image_root}"
     )
 
-    missing = [
+    print(
+        f"[VG2 repo-native] source_rows={len(data)} | prompts={len(prompts)} | "
+        f"loaded={len(records)} | relations={dict(counts)} | "
+        f"skipped={dict(skipped)}"
+    )
+
+    if missing_images:
+        print(
+            "[VG2 repo-native] missing image examples="
+            + ", ".join(
+                missing_images
+            )
+        )
+
+    missing_relations = [
         relation
         for relation in (
             "left",
@@ -858,13 +928,16 @@ def load_vg2(args):
             "above",
             "below",
         )
-        if counts[relation] == 0
+        if counts[
+            relation
+        ] == 0
     ]
 
-    if missing:
+    if missing_relations:
         raise RuntimeError(
-            f"VG2 loader is missing canonical relations {missing}. "
-            "If you have the 4-direction VG file, pass it explicitly with --vg-json."
+            "Repo-native VG2 loader still lacks canonical relations "
+            f"{missing_relations}. Check that these two files match: "
+            f"{data_path} and {prompt_path}."
         )
 
     return records
@@ -1099,6 +1172,14 @@ def resolve_layers(model):
 
 
 def prompt_text(record, answer_words):
+    # For repo-native VG2, preserve the exact standard prompt used by the
+    # existing VG2 experiments. This keeps prompting aligned with prior runs.
+    if (
+        record.get("dataset") == "vg2"
+        and record.get("question_text")
+    ):
+        return record["question_text"]
+
     answer_text = ", ".join(
         answer_words[:-1]
     ) + f", or {answer_words[-1]}"
