@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 # -*- coding: utf-8 -*-
 
 """
@@ -545,11 +545,15 @@ def auto_vg_json(args):
 
         return path
 
+    # Prefer the actual four-direction Visual Genome file used by this project.
+    # Do not silently fall back to vg_qa_two_obj.json: that is a different
+    # AdaptVis VG subset and is not the intended four-direction VG2 benchmark.
     candidates = [
+        Path(args.data_root) / "visual_genome" / "vg_spatial_4dir.json",
+        Path(args.data_root) / "visual_genome" / "vg_spatial_4dir.jsonl",
         Path(args.data_root) / "vg_spatial_4dir.jsonl",
         Path(args.data_root) / "vg_spatial_4dir.json",
         Path(args.data_root) / "vg_qa_two_obj_filtered.json",
-        Path(args.data_root) / "vg_qa_two_obj.json",
     ]
 
     for path in candidates:
@@ -558,8 +562,11 @@ def auto_vg_json(args):
             return path
 
     raise FileNotFoundError(
-        "Could not find VG2 annotation. Tried:\n"
+        "Could not find the intended four-direction VG2 annotation. Tried:\n"
         + "\n".join(str(x) for x in candidates)
+        + "\nPass it explicitly with --vg-json. "
+          "The intended project file is normally "
+          "data/visual_genome/vg_spatial_4dir.json."
     )
 
 
