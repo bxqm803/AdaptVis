@@ -1,4 +1,4 @@
-
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
@@ -1728,3 +1728,8 @@ def main():
     print(
         f"[saved] "
         f"{outdir / 'final_spatial_sadi_mask.npz'}"
+    )
+
+
+if __name__ == "__main__":
+    main()
