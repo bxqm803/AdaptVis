@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-verify_llava_attention_boost_as_direction_v1.py
+verify_llava_attention_boost_as_direction_v3.py
 
 Verify whether LLaVA early last-token -> visual-token attention enhancement
 acts primarily as a model-generated spatial steering vector.
@@ -110,7 +110,7 @@ EXAMPLE: LLaVA-1.5-7B / COCO-two
 
 First run the representation diagnostic only:
 
-CUDA_VISIBLE_DEVICES=0 python verify_llava_attention_boost_as_direction_v1.py \
+CUDA_VISIBLE_DEVICES=0 python verify_llava_attention_boost_as_direction_v3.py \
   --model llava-7b \
   --dataset coco_two \
   --data-root data \
@@ -125,7 +125,7 @@ CUDA_VISIBLE_DEVICES=0 python verify_llava_attention_boost_as_direction_v1.py \
 
 Then causal replay:
 
-CUDA_VISIBLE_DEVICES=0 python verify_llava_attention_boost_as_direction_v1.py \
+CUDA_VISIBLE_DEVICES=0 python verify_llava_attention_boost_as_direction_v3.py \
   --model llava-7b \
   --dataset coco_two \
   --data-root data \
@@ -637,12 +637,20 @@ def load_model_and_processor(
         **processor_kwargs,
     )
 
-    # Same compatibility fix used by current repository diagnostics.
-    data_helpers.configure_processor(
-        model,
-        processor,
-    )
-
+    # IMPORTANT:
+    # Do NOT call data_helpers.configure_processor() here.
+    #
+    # This repository's custom LlavaForConditionalGenerationScal uses the
+    # legacy merge path:
+    #     ONE <image> placeholder -> model internally expands to 576 patches.
+    #
+    # Recent LlavaProcessor versions may pre-expand <image> into ~576
+    # placeholders when patch_size / vision_feature_select_strategy are set.
+    # That is incompatible with the custom legacy merge.
+    #
+    # We therefore never use processor(text=..., images=...) below. Text and
+    # image preprocessing are performed separately with processor.tokenizer
+    # and processor.image_processor.
     return model, processor
 
 
@@ -743,17 +751,135 @@ def move_batch(
     }
 
 
+def _tokenize_text_only(
+    processor: Any,
+    text: str,
+) -> Dict[str, torch.Tensor]:
+    """
+    Tokenize WITHOUT invoking LlavaProcessor.__call__.
+
+    This is intentional: recent LlavaProcessor versions can expand one
+    <image> marker into hundreds of image placeholders, while this repository's
+    custom LlavaForConditionalGenerationScal expects exactly ONE placeholder.
+    """
+    tok = processor.tokenizer(
+        text,
+        return_tensors="pt",
+        padding=False,
+        truncation=False,
+        add_special_tokens=True,
+    )
+
+    result: Dict[str, torch.Tensor] = {
+        "input_ids": tok["input_ids"],
+    }
+
+    if "attention_mask" in tok:
+        result["attention_mask"] = tok["attention_mask"]
+    else:
+        result["attention_mask"] = torch.ones_like(
+            tok["input_ids"],
+            dtype=torch.long,
+        )
+
+    return result
+
+
+def _process_image_only(
+    processor: Any,
+    image: Image.Image,
+) -> Dict[str, torch.Tensor]:
+    """
+    Image preprocessing WITHOUT any text/image placeholder manipulation.
+    """
+    image_processor = getattr(
+        processor,
+        "image_processor",
+        None,
+    )
+
+    if image_processor is None:
+        raise RuntimeError(
+            "AutoProcessor has no image_processor; cannot build legacy "
+            "LLaVA input safely."
+        )
+
+    img = image_processor(
+        images=image,
+        return_tensors="pt",
+    )
+
+    if "pixel_values" not in img:
+        raise RuntimeError(
+            f"image_processor returned keys={list(img.keys())}, "
+            "but no pixel_values."
+        )
+
+    return {
+        "pixel_values": img["pixel_values"],
+    }
+
+
 def build_real_batch(
     processor: Any,
     prompt: str,
     image: Image.Image,
     device: str,
+    image_token_index: int,
 ) -> Dict[str, Any]:
-    batch = processor(
-        text=[prompt],
-        images=[image],
-        return_tensors="pt",
+    """
+    Legacy-compatible input for this repository's custom LLaVA model.
+
+    Critical invariant:
+        exactly ONE image-token placeholder must be present in input_ids.
+
+    The custom model then internally expands that single token into the 576
+    projected visual tokens.
+    """
+    text_batch = _tokenize_text_only(
+        processor,
+        prompt,
     )
+
+    image_batch = _process_image_only(
+        processor,
+        image,
+    )
+
+    input_ids = text_batch["input_ids"]
+
+    count = int(
+        (input_ids == int(image_token_index))
+        .sum()
+        .item()
+    )
+
+    if count != 1:
+        # Helpful diagnostics for the exact failure that caused v1/v2 to break.
+        image_token = getattr(
+            processor,
+            "image_token",
+            "<image>",
+        )
+
+        raw_marker_count = str(prompt).count(
+            str(image_token)
+        )
+
+        raise RuntimeError(
+            "Legacy LlavaForConditionalGenerationScal requires exactly ONE "
+            f"image placeholder token before model-side merge, but got {count}. "
+            f"model.config.image_token_index={image_token_index}; "
+            f"raw prompt marker count={raw_marker_count}; "
+            f"input_len={input_ids.shape[1]}. "
+            "Do not pass this prompt through LlavaProcessor multimodal "
+            "placeholder expansion."
+        )
+
+    batch: Dict[str, Any] = {
+        **text_batch,
+        **image_batch,
+    }
 
     return move_batch(
         batch,
@@ -770,10 +896,40 @@ def build_noimage_batch(
         prompt
     )
 
-    batch = processor(
-        text=[text],
-        return_tensors="pt",
+    batch = _tokenize_text_only(
+        processor,
+        text,
     )
+
+    # Sanity check: no-image branch must contain no image placeholder.
+    image_token_id = getattr(
+        processor.tokenizer,
+        "image_token_id",
+        None,
+    )
+
+    if image_token_id is None:
+        try:
+            image_token_id = processor.tokenizer.convert_tokens_to_ids(
+                "<image>"
+            )
+        except Exception:
+            image_token_id = None
+
+    if image_token_id is not None:
+        count = int(
+            (
+                batch["input_ids"]
+                == int(image_token_id)
+            )
+            .sum()
+            .item()
+        )
+
+        if count != 0:
+            raise RuntimeError(
+                f"NoImage branch still contains {count} image tokens."
+            )
 
     return move_batch(
         batch,
@@ -1465,6 +1621,7 @@ def extract_vectors(
                 prompt,
                 image,
                 args.device,
+                int(model.config.image_token_index),
             )
 
             no_batch = build_noimage_batch(
@@ -1735,6 +1892,7 @@ def run_generation_replay(
                 prompt,
                 image,
                 args.device,
+                int(model.config.image_token_index),
             )
 
             base_text, base_pred = (
@@ -1955,6 +2113,7 @@ def run_oracle_mean_delta_replay(
                 prompt,
                 image,
                 args.device,
+                int(model.config.image_token_index),
             )
 
             base_text, base_pred = (
@@ -2214,6 +2373,13 @@ def main() -> None:
     print(
         f"split={args.train_ratio:.2f}/{1.0-args.train_ratio:.2f} "
         f"repeats={args.repeats}"
+    )
+    print(
+        "input_builder=legacy_manual "
+        "(tokenizer + image_processor; exactly one <image> token)"
+    )
+    print(
+        f"image_token_index={int(model.config.image_token_index)}"
     )
     print(
         "=" * 154
