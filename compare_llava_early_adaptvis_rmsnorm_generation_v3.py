@@ -2,14 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-compare_llava_early_attention_lasttoken_v1.py
+compare_llava_early_adaptvis_rmsnorm_generation_v3.py
 
-Compare how the LLaVA LAST TOKEN changes when its attention to VISUAL TOKENS
-is multiplied in only the first few decoder layers.
+Compare LLaVA LAST TOKEN under three conditions: original RMSNorm epsilon,
+RMSNorm epsilon 1e-6 alone, and epsilon 1e-6 plus early AdaptVis.
 
 Default experiment:
-    baseline: no attention scaling
-    boost:    L0-L3 last-query -> visual-token attention scaled by 1.2
+    baseline: no AdaptVis scaling
+    adaptvis:  L0-L3 last-query -> visual-token PRE-SOFTMAX logits scaled by 0.5
+
+For mul_img the repository applies:
+    s_img_new = weight * s_img
+BEFORE softmax. When visual logits are negative, weight=0.5 shrinks them
+toward zero and therefore can INCREASE their post-softmax attention mass.
 
 The script measures, at every decoder layer:
 
@@ -66,28 +71,28 @@ and preserves its LEGACY input contract:
 
 Example
 -------
-CUDA_VISIBLE_DEVICES=0 python compare_llava_early_attention_lasttoken_v1.py \
+CUDA_VISIBLE_DEVICES=0 python compare_llava_early_adaptvis_rmsnorm_generation_v3.py \
   --model llava-7b \
   --dataset coco_two \
   --data-root data \
   --prompt-jsonl prompts/COCO_QA_two_obj_with_answer_four_options.jsonl \
   --boost-layers 0-3 \
-  --boost-weight 1.2 \
+  --boost-weight 0.5 \
   --attention-variant mul_img \
   --train-ratio 0.30 \
   --repeats 5 \
   --save-vectors \
-  --output-dir output/llava7b_early4_lasttoken_compare_v1 \
+  --output-dir output/llava7b_early4_adaptvis_rmsnorm_v3 \
   --overwrite
 
 Smoke test:
-CUDA_VISIBLE_DEVICES=0 python compare_llava_early_attention_lasttoken_v1.py \
+CUDA_VISIBLE_DEVICES=0 python compare_llava_early_adaptvis_rmsnorm_generation_v3.py \
   --model llava-7b \
   --dataset coco_two \
   --data-root data \
   --prompt-jsonl prompts/COCO_QA_two_obj_with_answer_four_options.jsonl \
   --boost-layers 0-3 \
-  --boost-weight 1.2 \
+  --boost-weight 0.5 \
   --attention-variant mul_img \
   --max-samples 20 \
   --repeats 2 \
@@ -175,8 +180,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--boost-weight",
         type=float,
-        default=1.2,
-        help="Multiplicative coefficient (>1 for mul_img).",
+        default=0.5,
+        help=(
+            "For mul_img this multiplies PRE-SOFTMAX visual attention logits. "
+            "With predominantly negative visual logits, 0<weight<1 shrinks "
+            "them toward zero and can increase post-softmax visual attention."
+        ),
     )
     p.add_argument(
         "--attention-variant",
@@ -206,6 +215,37 @@ def parse_args() -> argparse.Namespace:
         "--max-samples",
         type=int,
         default=None,
+    )
+
+    p.add_argument(
+        "--base-rms-eps",
+        type=float,
+        default=1e-5,
+        help="Original/before RMSNorm epsilon.",
+    )
+    p.add_argument(
+        "--enhanced-rms-eps",
+        type=float,
+        default=1e-6,
+        help="Enhanced/after RMSNorm epsilon.",
+    )
+
+    p.add_argument(
+        "--skip-generation",
+        action="store_true",
+        help="Skip actual model.generate() A/B/C accuracy verification.",
+    )
+    p.add_argument(
+        "--generation-max-samples",
+        type=int,
+        default=None,
+        help="Optional cap for generation verification only.",
+    )
+    p.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=32,
+        help="Maximum generated tokens for accuracy verification.",
     )
 
     p.add_argument("--save-vectors", action="store_true")
@@ -631,6 +671,441 @@ def build_noimage_batch(
         batch,
         device,
     )
+
+
+
+# =============================================================================
+# RMSNorm epsilon control
+# =============================================================================
+
+def get_rmsnorm_eps_values(model: Any) -> Dict[str, float]:
+    """
+    Return runtime epsilon values from RMSNorm modules.
+
+    This repository's custom RMSNorm stores epsilon in `variance_epsilon`.
+    We also support modules using `.eps` for robustness.
+    """
+    values: Dict[str, float] = {}
+
+    for name, module in model.named_modules():
+        class_name = module.__class__.__name__.lower()
+
+        if "rmsnorm" not in class_name:
+            continue
+
+        if hasattr(module, "variance_epsilon"):
+            values[name] = float(module.variance_epsilon)
+        elif hasattr(module, "eps"):
+            values[name] = float(module.eps)
+
+    return values
+
+
+def set_rmsnorm_eps(
+    model: Any,
+    eps: float,
+) -> int:
+    """
+    Change RMSNorm epsilon at runtime.
+
+    Important:
+        Changing model.config alone is NOT sufficient after model creation,
+        because the actual RMSNorm modules already hold their own epsilon.
+
+    Therefore this function updates both configs and every instantiated
+    RMSNorm module.
+    """
+    eps = float(eps)
+
+    # Update all obvious config objects.
+    config_candidates = [
+        getattr(model, "config", None),
+        getattr(getattr(model, "config", None), "text_config", None),
+        getattr(getattr(model, "language_model", None), "config", None),
+        getattr(
+            getattr(
+                getattr(model, "language_model", None),
+                "model",
+                None,
+            ),
+            "config",
+            None,
+        ),
+    ]
+
+    for cfg in config_candidates:
+        if cfg is not None and hasattr(cfg, "rms_norm_eps"):
+            cfg.rms_norm_eps = eps
+
+    changed = 0
+
+    for _, module in model.named_modules():
+        class_name = module.__class__.__name__.lower()
+
+        if "rmsnorm" not in class_name:
+            continue
+
+        touched = False
+
+        if hasattr(module, "variance_epsilon"):
+            module.variance_epsilon = eps
+            touched = True
+
+        if hasattr(module, "eps"):
+            module.eps = eps
+            touched = True
+
+        changed += int(touched)
+
+    if changed == 0:
+        raise RuntimeError(
+            "No RMSNorm modules were found. "
+            "Cannot verify epsilon intervention."
+        )
+
+    return changed
+
+
+# =============================================================================
+# Actual generation verification
+# =============================================================================
+
+def install_repository_weighted_generation() -> None:
+    """
+    Reuse the branch's own generation patch so `weight` and `adjust_method`
+    are passed into LlavaForConditionalGenerationScal during generation.
+    """
+    from model_zoo.llava15 import change_greedy_to_add_weight
+
+    change_greedy_to_add_weight()
+
+
+def decode_generated(
+    processor: Any,
+    output: Any,
+    prompt_len: int,
+) -> str:
+    sequences = getattr(output, "sequences", None)
+
+    if sequences is None and isinstance(output, Mapping):
+        sequences = output.get("sequences", None)
+
+    if sequences is None:
+        if torch.is_tensor(output):
+            sequences = output
+        else:
+            raise RuntimeError("Generation returned no sequences.")
+
+    return (
+        processor.decode(
+            sequences[0, int(prompt_len):],
+            skip_special_tokens=True,
+        )
+        .strip()
+    )
+
+
+def generate_relation_once(
+    model: Any,
+    processor: Any,
+    batch: Mapping[str, Any],
+    *,
+    weight: Optional[float],
+    attention_variant: str,
+    max_new_tokens: int,
+) -> Tuple[str, Optional[str]]:
+    kwargs: Dict[str, Any] = {
+        **batch,
+        "max_new_tokens": int(max_new_tokens),
+        "do_sample": False,
+        "output_scores": True,
+        "return_dict_in_generate": True,
+    }
+
+    if weight is not None:
+        kwargs["weight"] = float(weight)
+        kwargs["adjust_method"] = attention_variant
+
+    with torch.inference_mode():
+        output = model.generate(**kwargs)
+
+    text = decode_generated(
+        processor,
+        output,
+        prompt_len=int(batch["input_ids"].shape[1]),
+    )
+
+    return text, normalize_relation(text)
+
+
+def evaluate_generation_conditions(
+    *,
+    model: Any,
+    processor: Any,
+    records_by_sid: Mapping[int, Any],
+    sids: Sequence[int],
+    labels_by_sid: Mapping[int, str],
+    prompt_map: Mapping[int, Mapping[str, Any]],
+    args: argparse.Namespace,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Evaluate exactly three conditions on the SAME samples:
+
+      A: base_rms_eps, no AdaptVis
+      B: enhanced_rms_eps, no AdaptVis
+      C: enhanced_rms_eps, AdaptVis
+
+    This verifies that the hidden-state analysis is attached to a real
+    generation improvement.
+    """
+    install_repository_weighted_generation()
+
+    selected_sids = list(sids)
+
+    if args.generation_max_samples is not None:
+        selected_sids = selected_sids[
+            : int(args.generation_max_samples)
+        ]
+
+    rows: List[Dict[str, Any]] = []
+
+    for sid in tqdm(
+        selected_sids,
+        desc="generation A/B/C",
+    ):
+        sid = int(sid)
+        rec = records_by_sid[sid]
+        gt = str(labels_by_sid[sid])
+
+        prompt = prompt_for_record(
+            rec,
+            prompt_map,
+        )
+
+        image = None
+        batch = None
+
+        try:
+            image = Image.open(
+                rec.image_path
+            ).convert("RGB")
+
+            batch = build_real_batch(
+                model,
+                processor,
+                prompt,
+                image,
+                args.device,
+            )
+
+            # A: original epsilon, no AdaptVis.
+            set_rmsnorm_eps(
+                model,
+                args.base_rms_eps,
+            )
+
+            base_text, base_pred = generate_relation_once(
+                model,
+                processor,
+                batch,
+                weight=None,
+                attention_variant=args.attention_variant,
+                max_new_tokens=args.max_new_tokens,
+            )
+
+            # B: changed epsilon only.
+            set_rmsnorm_eps(
+                model,
+                args.enhanced_rms_eps,
+            )
+
+            eps_text, eps_pred = generate_relation_once(
+                model,
+                processor,
+                batch,
+                weight=None,
+                attention_variant=args.attention_variant,
+                max_new_tokens=args.max_new_tokens,
+            )
+
+            # C: changed epsilon + early AdaptVis.
+            full_text, full_pred = generate_relation_once(
+                model,
+                processor,
+                batch,
+                weight=args.boost_weight,
+                attention_variant=args.attention_variant,
+                max_new_tokens=args.max_new_tokens,
+            )
+
+            rows.append({
+                "sid": sid,
+                "gt": gt,
+
+                "base_pred": base_pred or "",
+                "eps_only_pred": eps_pred or "",
+                "full_pred": full_pred or "",
+
+                "base_correct": int(base_pred == gt),
+                "eps_only_correct": int(eps_pred == gt),
+                "full_correct": int(full_pred == gt),
+
+                "base_to_full_W2C": int(
+                    base_pred != gt
+                    and full_pred == gt
+                ),
+                "base_to_full_C2W": int(
+                    base_pred == gt
+                    and full_pred != gt
+                ),
+
+                "base_text": base_text,
+                "eps_only_text": eps_text,
+                "full_text": full_text,
+            })
+
+        finally:
+            if image is not None:
+                image.close()
+
+            if batch is not None:
+                del batch
+
+            cleanup()
+
+    base_acc = safe_mean(
+        row["base_correct"]
+        for row in rows
+    )
+
+    eps_acc = safe_mean(
+        row["eps_only_correct"]
+        for row in rows
+    )
+
+    full_acc = safe_mean(
+        row["full_correct"]
+        for row in rows
+    )
+
+    w2c = sum(
+        int(row["base_to_full_W2C"])
+        for row in rows
+    )
+
+    c2w = sum(
+        int(row["base_to_full_C2W"])
+        for row in rows
+    )
+
+    summary = {
+        "N": len(rows),
+
+        "base_rms_eps": args.base_rms_eps,
+        "enhanced_rms_eps": args.enhanced_rms_eps,
+
+        "boost_layers": args.boost_layers,
+        "attention_variant": args.attention_variant,
+        "boost_weight": args.boost_weight,
+
+        "base_acc": base_acc,
+        "eps_only_acc": eps_acc,
+        "full_acc": full_acc,
+
+        "eps_gain_vs_base": eps_acc - base_acc,
+        "adaptvis_gain_over_eps": full_acc - eps_acc,
+        "total_gain_vs_base": full_acc - base_acc,
+
+        "W2C": w2c,
+        "C2W": c2w,
+        "net": w2c - c2w,
+    }
+
+    return summary, rows
+
+
+# =============================================================================
+# Generic direction probe for arbitrary representation sets
+# =============================================================================
+
+def direction_probe_many(
+    *,
+    representations: Mapping[str, np.ndarray],
+    labels: np.ndarray,
+    layers: Sequence[int],
+    train_ratio: float,
+    repeats: int,
+    seed: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+
+    repeat_rows: List[Dict[str, Any]] = []
+
+    for rep in range(repeats):
+        train_idx, test_idx = stratified_split(
+            labels,
+            train_ratio,
+            seed + rep,
+        )
+
+        for name, tensor in representations.items():
+            for li, layer in enumerate(layers):
+                metrics = evaluate_probe(
+                    tensor[:, li, :],
+                    labels,
+                    train_idx,
+                    test_idx,
+                )
+
+                repeat_rows.append({
+                    "repeat": rep,
+                    "representation": name,
+                    "layer": layer,
+                    **metrics,
+                })
+
+    summary_rows: List[Dict[str, Any]] = []
+
+    for name in representations:
+        for layer in layers:
+            rows = [
+                row
+                for row in repeat_rows
+                if (
+                    row["representation"] == name
+                    and int(row["layer"]) == int(layer)
+                )
+            ]
+
+            summary_rows.append({
+                "representation": name,
+                "layer": layer,
+                "accuracy_mean": safe_mean(
+                    row["accuracy"]
+                    for row in rows
+                ),
+                "accuracy_std": safe_std(
+                    row["accuracy"]
+                    for row in rows
+                ),
+                "left_accuracy": safe_mean(
+                    row["left_accuracy"]
+                    for row in rows
+                ),
+                "right_accuracy": safe_mean(
+                    row["right_accuracy"]
+                    for row in rows
+                ),
+                "above_accuracy": safe_mean(
+                    row["above_accuracy"]
+                    for row in rows
+                ),
+                "below_accuracy": safe_mean(
+                    row["below_accuracy"]
+                    for row in rows
+                ),
+            })
+
+    return repeat_rows, summary_rows
 
 
 # =============================================================================
@@ -1115,41 +1590,105 @@ def main() -> None:
             )
         )
 
-    if (
-        args.attention_variant == "mul_img"
-        and args.boost_weight <= 1.0
-    ):
-        print(
-            f"[warning] mul_img with weight={args.boost_weight} "
-            "is not an enhancement (>1 expected)."
-        )
-
-    print("\n" + "=" * 156)
-    print(
-        "LLaVA LAST-TOKEN TRAJECTORY: BASELINE vs EARLY LAST->VISUAL ATTENTION BOOST"
+    original_eps_values = get_rmsnorm_eps_values(
+        model
     )
-    print("=" * 156)
+
+    original_unique_eps = sorted({
+        float(v)
+        for v in original_eps_values.values()
+    })
+
+    # Verify that runtime mutation reaches actual modules.
+    n_rms = set_rmsnorm_eps(
+        model,
+        args.base_rms_eps,
+    )
+
+    base_eps_after_set = sorted({
+        float(v)
+        for v in get_rmsnorm_eps_values(model).values()
+    })
+
+    set_rmsnorm_eps(
+        model,
+        args.enhanced_rms_eps,
+    )
+
+    enhanced_eps_after_set = sorted({
+        float(v)
+        for v in get_rmsnorm_eps_values(model).values()
+    })
+
+    # Restore A before extraction begins.
+    set_rmsnorm_eps(
+        model,
+        args.base_rms_eps,
+    )
+
+    if args.attention_variant == "mul_img":
+        if 0.0 < args.boost_weight < 1.0:
+            print(
+                f"[AdaptVis] mul_img weight={args.boost_weight}: "
+                "pre-softmax visual logits are shrunk toward zero. "
+                "For negative logits this can increase post-softmax "
+                "visual attention."
+            )
+
+    print("\n" + "=" * 166)
+    print(
+        "LLaVA THREE-CONDITION TEST: RMSNorm epsilon + EARLY AdaptVis"
+    )
+    print("=" * 166)
+
     print(
         f"model={args.model} | dataset={args.dataset} | N={len(records)}"
     )
+
     print(
-        f"boost_layers={boost_layers} | boundary=L{boundary_layer}"
+        f"A ORIGINAL : rms_eps={args.base_rms_eps:g}, no AdaptVis"
     )
+
     print(
-        f"attention_variant={args.attention_variant} | "
-        f"boost_weight={args.boost_weight}"
+        f"B EPS ONLY : rms_eps={args.enhanced_rms_eps:g}, no AdaptVis"
     )
+
     print(
-        f"probe_layers={probe_layers}"
+        f"C FULL     : rms_eps={args.enhanced_rms_eps:g}, "
+        f"{args.attention_variant} weight={args.boost_weight} "
+        f"on layers={boost_layers}"
     )
+
+    print(
+        f"RMSNorm modules changed={n_rms} | "
+        f"loaded eps values={original_unique_eps}"
+    )
+
+    print(
+        f"verified A eps={base_eps_after_set} | "
+        f"verified B/C eps={enhanced_eps_after_set}"
+    )
+
     print(
         "legacy_input=True | exactly one <image> placeholder"
     )
-    print("=" * 156)
 
-    base_rows: List[np.ndarray] = []
-    boost_rows: List[np.ndarray] = []
-    noimage_rows: List[np.ndarray] = []
+    print("=" * 166)
+
+    # ---------------------------------------------------------------------
+    # Arrays:
+    #
+    # A = base eps, no AdaptVis
+    # B = enhanced eps, no AdaptVis
+    # C = enhanced eps + AdaptVis
+    # ---------------------------------------------------------------------
+    A_real_rows: List[np.ndarray] = []
+    A_no_rows: List[np.ndarray] = []
+
+    B_real_rows: List[np.ndarray] = []
+    B_no_rows: List[np.ndarray] = []
+
+    C_real_rows: List[np.ndarray] = []
 
     saved_sids: List[int] = []
     saved_labels: List[str] = []
@@ -1163,7 +1702,7 @@ def main() -> None:
     ):
         for rec in tqdm(
             records,
-            desc="baseline / boost / noimage",
+            desc="A(base eps) / B(eps only) / C(eps+AdaptVis)",
         ):
             image = None
             real_batch = None
@@ -1197,141 +1736,193 @@ def main() -> None:
                     args.device,
                 )
 
-                base_out = forward_real(
+                # =========================================================
+                # A: original epsilon, no AdaptVis.
+                # =========================================================
+                set_rmsnorm_eps(
+                    model,
+                    args.base_rms_eps,
+                )
+
+                A_real_out = forward_real(
                     model,
                     real_batch,
                     boost_weight=None,
                     attention_variant=args.attention_variant,
                 )
 
-                boost_out = forward_real(
+                A_no_out = forward_noimage(
+                    model,
+                    no_batch,
+                )
+
+                # =========================================================
+                # B: enhanced epsilon only.
+                # =========================================================
+                set_rmsnorm_eps(
+                    model,
+                    args.enhanced_rms_eps,
+                )
+
+                B_real_out = forward_real(
+                    model,
+                    real_batch,
+                    boost_weight=None,
+                    attention_variant=args.attention_variant,
+                )
+
+                B_no_out = forward_noimage(
+                    model,
+                    no_batch,
+                )
+
+                # =========================================================
+                # C: enhanced epsilon + early AdaptVis.
+                # =========================================================
+                C_real_out = forward_real(
                     model,
                     real_batch,
                     boost_weight=args.boost_weight,
                     attention_variant=args.attention_variant,
                 )
 
-                no_out = forward_noimage(
-                    model,
-                    no_batch,
-                )
-
-                base_map = last_token_trajectory(
-                    base_out,
+                A_real_map = last_token_trajectory(
+                    A_real_out,
                     probe_layers,
                 )
 
-                boost_map = last_token_trajectory(
-                    boost_out,
+                A_no_map = last_token_trajectory(
+                    A_no_out,
                     probe_layers,
                 )
 
-                no_map = last_token_trajectory(
-                    no_out,
+                B_real_map = last_token_trajectory(
+                    B_real_out,
                     probe_layers,
                 )
 
-                base_arr = np.stack(
-                    [
-                        base_map[layer]
-                        for layer in probe_layers
-                    ],
-                    axis=0,
+                B_no_map = last_token_trajectory(
+                    B_no_out,
+                    probe_layers,
+                )
+
+                C_real_map = last_token_trajectory(
+                    C_real_out,
+                    probe_layers,
+                )
+
+                def stack_map(m):
+                    return np.stack(
+                        [
+                            m[layer]
+                            for layer in probe_layers
+                        ],
+                        axis=0,
+                    ).astype(np.float32)
+
+                A_real = stack_map(A_real_map)
+                A_no = stack_map(A_no_map)
+
+                B_real = stack_map(B_real_map)
+                B_no = stack_map(B_no_map)
+
+                C_real = stack_map(C_real_map)
+
+                d_eps = (
+                    B_real
+                    - A_real
                 ).astype(np.float32)
 
-                boost_arr = np.stack(
-                    [
-                        boost_map[layer]
-                        for layer in probe_layers
-                    ],
-                    axis=0,
+                d_adapt = (
+                    C_real
+                    - B_real
                 ).astype(np.float32)
 
-                no_arr = np.stack(
-                    [
-                        no_map[layer]
-                        for layer in probe_layers
-                    ],
-                    axis=0,
-                ).astype(np.float32)
-
-                delta_arr = (
-                    boost_arr
-                    - base_arr
+                d_total = (
+                    C_real
+                    - A_real
                 ).astype(np.float32)
 
                 boundary_li = probe_layers.index(
                     boundary_layer
                 )
 
-                boundary_delta = delta_arr[
+                d_adapt_boundary = d_adapt[
                     boundary_li
                 ]
 
-                previous_delta: Optional[np.ndarray] = None
+                d_total_boundary = d_total[
+                    boundary_li
+                ]
 
                 for li, layer in enumerate(probe_layers):
-                    hb = base_arr[li]
-                    hs = boost_arr[li]
-                    d = delta_arr[li]
+                    hA = A_real[li]
+                    hB = B_real[li]
+                    hC = C_real[li]
 
-                    base_norm = float(
-                        np.linalg.norm(hb)
+                    de = d_eps[li]
+                    da = d_adapt[li]
+                    dt = d_total[li]
+
+                    A_norm = float(
+                        np.linalg.norm(hA)
                     )
 
-                    boost_norm = float(
-                        np.linalg.norm(hs)
-                    )
-
-                    delta_norm = float(
-                        np.linalg.norm(d)
-                    )
-
-                    row = {
+                    per_sample_geometry.append({
                         "sid": int(rec.sid),
                         "relation": relation,
                         "layer": layer,
-                        "is_boosted_layer": int(
+
+                        "is_adaptvis_layer": int(
                             layer in set(boost_layers)
                         ),
-                        "base_norm": base_norm,
-                        "boost_norm": boost_norm,
-                        "boost_minus_base_norm": (
-                            boost_norm
-                            - base_norm
-                        ),
-                        "delta_norm": delta_norm,
-                        "relative_delta_norm": (
-                            delta_norm
-                            / max(base_norm, EPS)
-                        ),
-                        "cos_base_boost": cosine_np(
-                            hb,
-                            hs,
-                        ),
-                        "cos_delta_boundary": cosine_np(
-                            d,
-                            boundary_delta,
-                        ),
-                        "cos_delta_prev_probe": (
-                            cosine_np(
-                                d,
-                                previous_delta,
-                            )
-                            if previous_delta is not None
-                            else float("nan")
-                        ),
-                    }
 
-                    per_sample_geometry.append(
-                        row
-                    )
+                        "A_base_norm": A_norm,
+                        "B_eps_only_norm": float(
+                            np.linalg.norm(hB)
+                        ),
+                        "C_full_norm": float(
+                            np.linalg.norm(hC)
+                        ),
 
-                    previous_delta = d
+                        "delta_eps_norm": float(
+                            np.linalg.norm(de)
+                        ),
+                        "delta_adaptvis_norm": float(
+                            np.linalg.norm(da)
+                        ),
+                        "delta_total_norm": float(
+                            np.linalg.norm(dt)
+                        ),
 
-                base_rows.append(base_arr)
-                boost_rows.append(boost_arr)
-                noimage_rows.append(no_arr)
+                        "relative_total_delta_norm": (
+                            float(np.linalg.norm(dt))
+                            / max(A_norm, EPS)
+                        ),
+
+                        "cos_A_C": cosine_np(
+                            hA,
+                            hC,
+                        ),
+
+                        "cos_adapt_delta_boundary": cosine_np(
+                            da,
+                            d_adapt_boundary,
+                        ),
+
+                        "cos_total_delta_boundary": cosine_np(
+                            dt,
+                            d_total_boundary,
+                        ),
+                    })
+
+                A_real_rows.append(A_real)
+                A_no_rows.append(A_no)
+
+                B_real_rows.append(B_real)
+                B_no_rows.append(B_no)
+
+                C_real_rows.append(C_real)
 
                 saved_sids.append(
                     int(rec.sid)
@@ -1341,18 +1932,16 @@ def main() -> None:
                     str(relation)
                 )
 
-                del base_out
-                del boost_out
-                del no_out
+                del A_real_out
+                del A_no_out
+                del B_real_out
+                del B_no_out
+                del C_real_out
 
             except Exception as exc:
                 errors.append({
                     "sid": int(
-                        getattr(
-                            rec,
-                            "sid",
-                            -1,
-                        )
+                        getattr(rec, "sid", -1)
                     ),
                     "error_type": type(exc).__name__,
                     "error": str(exc),
@@ -1379,39 +1968,66 @@ def main() -> None:
 
                 cleanup()
 
-    if not base_rows:
+    if not A_real_rows:
         raise RuntimeError(
             "No samples were extracted successfully."
         )
 
-    base_last = np.stack(
-        base_rows,
+    A_real = np.stack(
+        A_real_rows,
         axis=0,
     ).astype(np.float32)
 
-    boost_last = np.stack(
-        boost_rows,
+    A_no = np.stack(
+        A_no_rows,
         axis=0,
     ).astype(np.float32)
 
-    noimage_last = np.stack(
-        noimage_rows,
+    B_real = np.stack(
+        B_real_rows,
         axis=0,
     ).astype(np.float32)
 
-    delta = (
-        boost_last
-        - base_last
+    B_no = np.stack(
+        B_no_rows,
+        axis=0,
     ).astype(np.float32)
 
-    base_residual = (
-        base_last
-        - noimage_last
+    C_real = np.stack(
+        C_real_rows,
+        axis=0,
     ).astype(np.float32)
 
-    boost_residual = (
-        boost_last
-        - noimage_last
+    d_eps = (
+        B_real
+        - A_real
+    ).astype(np.float32)
+
+    d_adapt = (
+        C_real
+        - B_real
+    ).astype(np.float32)
+
+    d_total = (
+        C_real
+        - A_real
+    ).astype(np.float32)
+
+    A_residual = (
+        A_real
+        - A_no
+    ).astype(np.float32)
+
+    B_residual = (
+        B_real
+        - B_no
+    ).astype(np.float32)
+
+    # No-image has no visual tokens, hence condition C's corresponding
+    # no-image branch is identical to B: same epsilon, no AdaptVis applicable.
+    C_residual = (
+        C_real
+        - B_no
     ).astype(np.float32)
 
     labels = np.asarray(
@@ -1419,9 +2035,9 @@ def main() -> None:
         dtype=object,
     )
 
-    # -------------------------------------------------------------------------
-    # Aggregate geometry.
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # Aggregate geometric state change.
+    # ---------------------------------------------------------------------
     geometry_summary: List[Dict[str, Any]] = []
 
     for layer in probe_layers:
@@ -1433,56 +2049,78 @@ def main() -> None:
 
         geometry_summary.append({
             "layer": layer,
-            "is_boosted_layer": int(
+            "is_adaptvis_layer": int(
                 layer in set(boost_layers)
             ),
             "N": len(rows),
-            "base_norm": safe_mean(
-                row["base_norm"]
+
+            "A_base_norm": safe_mean(
+                row["A_base_norm"]
                 for row in rows
             ),
-            "boost_norm": safe_mean(
-                row["boost_norm"]
+
+            "B_eps_only_norm": safe_mean(
+                row["B_eps_only_norm"]
                 for row in rows
             ),
-            "boost_minus_base_norm": safe_mean(
-                row["boost_minus_base_norm"]
+
+            "C_full_norm": safe_mean(
+                row["C_full_norm"]
                 for row in rows
             ),
-            "delta_norm": safe_mean(
-                row["delta_norm"]
+
+            "delta_eps_norm": safe_mean(
+                row["delta_eps_norm"]
                 for row in rows
             ),
-            "delta_norm_std": safe_std(
-                row["delta_norm"]
+
+            "delta_adaptvis_norm": safe_mean(
+                row["delta_adaptvis_norm"]
                 for row in rows
             ),
-            "relative_delta_norm": safe_mean(
-                row["relative_delta_norm"]
+
+            "delta_total_norm": safe_mean(
+                row["delta_total_norm"]
                 for row in rows
             ),
-            "cos_base_boost": safe_mean(
-                row["cos_base_boost"]
+
+            "relative_total_delta_norm": safe_mean(
+                row["relative_total_delta_norm"]
                 for row in rows
             ),
-            "cos_delta_boundary": safe_mean(
-                row["cos_delta_boundary"]
+
+            "cos_A_C": safe_mean(
+                row["cos_A_C"]
                 for row in rows
             ),
-            "cos_delta_prev_probe": safe_mean(
-                row["cos_delta_prev_probe"]
+
+            "cos_adapt_delta_boundary": safe_mean(
+                row["cos_adapt_delta_boundary"]
+                for row in rows
+            ),
+
+            "cos_total_delta_boundary": safe_mean(
+                row["cos_total_delta_boundary"]
                 for row in rows
             ),
         })
 
-    # -------------------------------------------------------------------------
-    # Direction readout.
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # Direction readout for states and decomposed deltas.
+    # ---------------------------------------------------------------------
+    representations = {
+        "A_base_residual": A_residual,
+        "B_eps_only_residual": B_residual,
+        "C_full_residual": C_residual,
+
+        "delta_eps": d_eps,
+        "delta_adaptvis": d_adapt,
+        "delta_total": d_total,
+    }
+
     probe_repeat_rows, probe_summary_rows = (
-        direction_probe_all(
-            base_residual=base_residual,
-            boost_residual=boost_residual,
-            delta=delta,
+        direction_probe_many(
+            representations=representations,
             labels=labels,
             layers=probe_layers,
             train_ratio=args.train_ratio,
@@ -1499,52 +2137,42 @@ def main() -> None:
         for row in probe_summary_rows
     }
 
-    # Merge useful direction metrics into geometry summary.
     combined_summary: List[Dict[str, Any]] = []
 
     for row in geometry_summary:
         layer = int(row["layer"])
 
-        base_probe = probe_lookup[
-            ("base_residual", layer)
-        ]
-
-        boost_probe = probe_lookup[
-            ("boost_residual", layer)
-        ]
-
-        delta_probe = probe_lookup[
-            ("boost_delta", layer)
-        ]
-
         combined_summary.append({
             **row,
-            "base_spatial_acc": base_probe[
-                "accuracy_mean"
-            ],
-            "boost_spatial_acc": boost_probe[
-                "accuracy_mean"
-            ],
-            "boost_minus_base_spatial_acc": (
-                boost_probe[
-                    "accuracy_mean"
-                ]
-                -
-                base_probe[
-                    "accuracy_mean"
-                ]
-            ),
-            "delta_spatial_acc": delta_probe[
-                "accuracy_mean"
-            ],
-            "delta_spatial_acc_std": delta_probe[
-                "accuracy_std"
-            ],
+
+            "A_base_spatial_acc": probe_lookup[
+                ("A_base_residual", layer)
+            ]["accuracy_mean"],
+
+            "B_eps_only_spatial_acc": probe_lookup[
+                ("B_eps_only_residual", layer)
+            ]["accuracy_mean"],
+
+            "C_full_spatial_acc": probe_lookup[
+                ("C_full_residual", layer)
+            ]["accuracy_mean"],
+
+            "delta_eps_spatial_acc": probe_lookup[
+                ("delta_eps", layer)
+            ]["accuracy_mean"],
+
+            "delta_adaptvis_spatial_acc": probe_lookup[
+                ("delta_adaptvis", layer)
+            ]["accuracy_mean"],
+
+            "delta_total_spatial_acc": probe_lookup[
+                ("delta_total", layer)
+            ]["accuracy_mean"],
         })
 
-    # -------------------------------------------------------------------------
-    # Save.
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # Save hidden-state analysis.
+    # ---------------------------------------------------------------------
     write_csv(
         outdir / "lasttoken_geometry_per_sample.csv",
         per_sample_geometry,
@@ -1583,123 +2211,241 @@ def main() -> None:
 
     if args.save_vectors:
         np.savez_compressed(
-            outdir / "lasttoken_vectors.npz",
+            outdir / "lasttoken_vectors_ABC.npz",
+
             sample_index=np.asarray(
                 saved_sids,
                 dtype=np.int64,
             ),
+
             relation=labels,
+
             layers=np.asarray(
                 probe_layers,
                 dtype=np.int32,
             ),
+
             boost_layers=np.asarray(
                 boost_layers,
                 dtype=np.int32,
             ),
-            boost_weight=np.asarray(
-                [args.boost_weight],
-                dtype=np.float32,
-            ),
-            base_last=base_last.astype(
-                np.float16
-            ),
-            boost_last=boost_last.astype(
-                np.float16
-            ),
-            noimage_last=noimage_last.astype(
-                np.float16
-            ),
-            base_residual=base_residual.astype(
-                np.float16
-            ),
-            boost_residual=boost_residual.astype(
-                np.float16
-            ),
-            boost_delta=delta.astype(
-                np.float16
-            ),
+
+            A_real=A_real.astype(np.float16),
+            A_noimage=A_no.astype(np.float16),
+
+            B_real=B_real.astype(np.float16),
+            B_noimage=B_no.astype(np.float16),
+
+            C_real=C_real.astype(np.float16),
+
+            A_residual=A_residual.astype(np.float16),
+            B_residual=B_residual.astype(np.float16),
+            C_residual=C_residual.astype(np.float16),
+
+            delta_eps=d_eps.astype(np.float16),
+            delta_adaptvis=d_adapt.astype(np.float16),
+            delta_total=d_total.astype(np.float16),
         )
 
-    # -------------------------------------------------------------------------
-    # Console.
-    # -------------------------------------------------------------------------
-    print("\n" + "=" * 176)
+    # ---------------------------------------------------------------------
+    # Console table 1: actual hidden-state geometry.
+    # ---------------------------------------------------------------------
+    print("\n" + "=" * 184)
     print(
-        "HOW DOES THE LAST TOKEN CHANGE?  "
-        "BASELINE vs EARLY LAST->VISUAL ATTENTION BOOST"
+        "LAST-TOKEN GEOMETRY: "
+        "A(eps1e-5) -> B(eps1e-6) -> C(eps1e-6 + AdaptVis)"
     )
-    print("=" * 176)
+    print("=" * 184)
 
     print(
         f"{'layer':>5s} | "
-        f"{'||delta||':>10s} | "
-        f"{'||d||/||h||':>12s} | "
-        f"{'cos(base,boost)':>15s} | "
-        f"{'cos(d,d@L'+str(boundary_layer)+')':>13s} | "
-        f"{'base_sp':>8s} | "
-        f"{'boost_sp':>8s} | "
-        f"{'delta_sp':>8s}"
+        f"{'||d_eps||':>10s} | "
+        f"{'||d_adapt||':>11s} | "
+        f"{'||d_total||':>11s} | "
+        f"{'||dt||/||A||':>12s} | "
+        f"{'cos(A,C)':>10s} | "
+        f"{'cos(dA,dA@L'+str(boundary_layer)+')':>15s}"
     )
 
-    print("-" * 176)
+    print("-" * 184)
 
     for row in combined_summary:
         layer = int(row["layer"])
-        marker = "*" if int(row["is_boosted_layer"]) else " "
+        marker = "*" if int(row["is_adaptvis_layer"]) else " "
 
         print(
             f"{marker}L{layer:02d} | "
-            f"{row['delta_norm']:10.4f} | "
-            f"{row['relative_delta_norm']:12.5f} | "
-            f"{row['cos_base_boost']:15.6f} | "
-            f"{row['cos_delta_boundary']:13.6f} | "
-            f"{row['base_spatial_acc']:8.4f} | "
-            f"{row['boost_spatial_acc']:8.4f} | "
-            f"{row['delta_spatial_acc']:8.4f}"
+            f"{row['delta_eps_norm']:10.4f} | "
+            f"{row['delta_adaptvis_norm']:11.4f} | "
+            f"{row['delta_total_norm']:11.4f} | "
+            f"{row['relative_total_delta_norm']:12.5f} | "
+            f"{row['cos_A_C']:10.6f} | "
+            f"{row['cos_adapt_delta_boundary']:15.6f}"
         )
 
-    print("=" * 176)
+    print("=" * 184)
     print(
-        f"* = boosted layer | boost={args.attention_variant} "
-        f"weight={args.boost_weight} on {boost_layers}"
+        "* = AdaptVis active on this layer"
     )
 
+    # ---------------------------------------------------------------------
+    # Console table 2: spatial information.
+    # ---------------------------------------------------------------------
+    print("\n" + "=" * 184)
     print(
-        "\nInterpretation keys:"
+        "DIRECTION READOUT: SPATIAL INFORMATION IN STATE AND EACH CHANGE COMPONENT"
     )
+    print("=" * 184)
+
     print(
-        "  cos(base,boost) ~ 1 : state direction barely rotates."
+        f"{'layer':>5s} | "
+        f"{'A_base':>8s} | "
+        f"{'B_eps':>8s} | "
+        f"{'C_full':>8s} | "
+        f"{'d_eps':>8s} | "
+        f"{'d_adapt':>8s} | "
+        f"{'d_total':>8s}"
     )
-    print(
-        "  cos(delta,delta@boundary) high after boundary : "
-        "early perturbation is preserved."
-    )
-    print(
-        "  cos(delta,delta@boundary) drops while delta_sp rises : "
-        "downstream layers transform the early visual perturbation "
-        "into a more relation-specific representation."
-    )
-    print(
-        "  boost_sp - base_sp : whether total last-token spatial "
-        "decodability itself improves."
+
+    print("-" * 184)
+
+    for row in combined_summary:
+        layer = int(row["layer"])
+        marker = "*" if int(row["is_adaptvis_layer"]) else " "
+
+        print(
+            f"{marker}L{layer:02d} | "
+            f"{row['A_base_spatial_acc']:8.4f} | "
+            f"{row['B_eps_only_spatial_acc']:8.4f} | "
+            f"{row['C_full_spatial_acc']:8.4f} | "
+            f"{row['delta_eps_spatial_acc']:8.4f} | "
+            f"{row['delta_adaptvis_spatial_acc']:8.4f} | "
+            f"{row['delta_total_spatial_acc']:8.4f}"
+        )
+
+    print("=" * 184)
+
+    # ---------------------------------------------------------------------
+    # Actual model.generate() verification.
+    # ---------------------------------------------------------------------
+    generation_summary = None
+    generation_rows = None
+
+    if not args.skip_generation:
+        records_by_sid = {
+            int(rec.sid): rec
+            for rec in records
+        }
+
+        labels_by_sid = {
+            int(sid): str(labels[i])
+            for i, sid in enumerate(saved_sids)
+        }
+
+        # RestrictBoostLayers must remain active for the full condition.
+        with RestrictBoostLayers(
+            decoder_layers,
+            boost_layers,
+        ):
+            generation_summary, generation_rows = (
+                evaluate_generation_conditions(
+                    model=model,
+                    processor=processor,
+                    records_by_sid=records_by_sid,
+                    sids=saved_sids,
+                    labels_by_sid=labels_by_sid,
+                    prompt_map=prompt_map,
+                    args=args,
+                )
+            )
+
+        write_csv(
+            outdir / "generation_summary.csv",
+            [generation_summary],
+        )
+
+        write_csv(
+            outdir / "generation_details.csv",
+            generation_rows,
+        )
+
+        print("\n" + "=" * 166)
+        print(
+            "ACTUAL model.generate() ACCURACY CHECK"
+        )
+        print("=" * 166)
+
+        print(
+            f"N={generation_summary['N']}"
+        )
+
+        print(
+            f"A original   eps={args.base_rms_eps:g}, no AdaptVis"
+            f"                         : "
+            f"{generation_summary['base_acc']:.4f}"
+        )
+
+        print(
+            f"B eps-only   eps={args.enhanced_rms_eps:g}, no AdaptVis"
+            f"                         : "
+            f"{generation_summary['eps_only_acc']:.4f} "
+            f"({generation_summary['eps_gain_vs_base']:+.4f})"
+        )
+
+        print(
+            f"C full       eps={args.enhanced_rms_eps:g}, "
+            f"{args.attention_variant}={args.boost_weight}, L{boost_layers[0]}-L{boost_layers[-1]}"
+            f" : "
+            f"{generation_summary['full_acc']:.4f} "
+            f"({generation_summary['total_gain_vs_base']:+.4f} vs A)"
+        )
+
+        print(
+            f"AdaptVis incremental gain over eps-only: "
+            f"{generation_summary['adaptvis_gain_over_eps']:+.4f}"
+        )
+
+        print(
+            f"A -> C: W2C={generation_summary['W2C']} "
+            f"C2W={generation_summary['C2W']} "
+            f"net={generation_summary['net']:+d}"
+        )
+
+        print("=" * 166)
+
+    # Restore enhanced epsilon because that is the final condition under study.
+    set_rmsnorm_eps(
+        model,
+        args.enhanced_rms_eps,
     )
 
     config = {
         "model": args.model,
         "repo_id": MODEL_REPOS[args.model],
         "dataset": args.dataset,
+
         "N_requested": len(records),
         "N_success": len(saved_sids),
         "N_errors": len(errors),
+
+        "base_rms_eps": args.base_rms_eps,
+        "enhanced_rms_eps": args.enhanced_rms_eps,
+        "n_rmsnorm_modules": n_rms,
+
         "boost_layers": boost_layers,
         "boundary_layer": boundary_layer,
         "boost_weight": args.boost_weight,
         "attention_variant": args.attention_variant,
+
         "probe_layers": probe_layers,
         "train_ratio": args.train_ratio,
         "repeats": args.repeats,
         "seed": args.seed,
+
+        "generation_enabled": not args.skip_generation,
+        "generation_max_samples": args.generation_max_samples,
+        "max_new_tokens": args.max_new_tokens,
+
         "prompt_jsonl": args.prompt_jsonl,
     }
 
@@ -1717,19 +2463,21 @@ def main() -> None:
     print(
         f"\n[saved] {outdir / 'combined_layer_summary.csv'}"
     )
-    print(
-        f"[saved] {outdir / 'lasttoken_geometry_per_sample.csv'}"
-    )
+
     print(
         f"[saved] {outdir / 'direction_probe_summary.csv'}"
     )
 
+    if not args.skip_generation:
+        print(
+            f"[saved] {outdir / 'generation_summary.csv'}"
+        )
+
     if args.save_vectors:
         print(
-            f"[saved] {outdir / 'lasttoken_vectors.npz'}"
+            f"[saved] {outdir / 'lasttoken_vectors_ABC.npz'}"
         )
 
 
 if __name__ == "__main__":
     main()
-
