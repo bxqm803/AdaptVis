@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-eval_controlledA_C_plus_enhanced_direction_oracle_v1.py
+eval_controlledA_C_plus_enhanced_direction_oracle_v2.py
 
 Question
 ========
@@ -78,7 +78,7 @@ and:
 
 Intervention
 ============
-At the output residual stream of decoder block L18:
+At the output residual stream of decoder block L18 (custom AdaptVis decoder returns a list):
 
     h_last <- h_last + scale * v_r
 
@@ -112,7 +112,7 @@ Input NPZ:
 
 Example
 =======
-CUDA_VISIBLE_DEVICES=0 python eval_controlledA_C_plus_enhanced_direction_oracle_v1.py \
+CUDA_VISIBLE_DEVICES=0 python eval_controlledA_C_plus_enhanced_direction_oracle_v2.py \
   --vectors output/llava_controlledA_lasttoken_reproduce_v5/lasttoken_vectors_ABC.npz \
   --inject-layers 18 \
   --state-scale 1.0 \
@@ -665,37 +665,57 @@ class AddLastTokenDirections:
                     inputs,
                     output,
                 ):
-                    # LLaMA decoder layer usually returns tuple:
-                    #   (hidden_states, ...)
-                    # but support raw tensor too.
-                    if isinstance(
-                        output,
-                        tuple,
-                    ):
+                    # IMPORTANT:
+                    # AdaptVis/model_zoo/llama/modeling_llama_add_attn.py
+                    # returns a Python LIST from LLaMADecoderLayer.forward():
+                    #
+                    #     outputs = [hidden_states,]
+                    #     ...
+                    #     return outputs
+                    #
+                    # Standard HF implementations often return tuples.
+                    # Preserve the original container type exactly.
+                    if isinstance(output, list):
+                        if len(output) == 0:
+                            raise RuntimeError(
+                                f"L{lid}: decoder returned an empty list"
+                            )
                         hidden = output[0]
-                        rest = output[1:]
-                    else:
+                        container_kind = "list"
+
+                    elif isinstance(output, tuple):
+                        if len(output) == 0:
+                            raise RuntimeError(
+                                f"L{lid}: decoder returned an empty tuple"
+                            )
+                        hidden = output[0]
+                        container_kind = "tuple"
+
+                    elif torch.is_tensor(output):
                         hidden = output
-                        rest = None
+                        container_kind = "tensor"
+
+                    else:
+                        raise RuntimeError(
+                            f"L{lid}: unsupported decoder output type="
+                            f"{type(output)}"
+                        )
 
                     if (
-                        not torch.is_tensor(
-                            hidden
-                        )
+                        not torch.is_tensor(hidden)
                         or hidden.ndim != 3
                     ):
                         raise RuntimeError(
-                            f"L{lid}: unexpected decoder output "
+                            f"L{lid}: unexpected hidden state "
                             f"type/shape={type(hidden)} / "
-                            f"{getattr(hidden, 'shape', None)}"
+                            f"{getattr(hidden, 'shape', None)}; "
+                            f"outer output type={type(output)}"
                         )
 
                     # Full prompt has sequence length > 1.
-                    # Do not touch cached one-token continuation if the hook
-                    # is ever accidentally left installed.
-                    if int(
-                        hidden.shape[1]
-                    ) <= 1:
+                    # The steering context is removed before autoregressive
+                    # continuation, but keep this guard for safety.
+                    if int(hidden.shape[1]) <= 1:
                         return output
 
                     vec = vec_cpu.to(
@@ -703,34 +723,31 @@ class AddLastTokenDirections:
                         dtype=hidden.dtype,
                     )
 
+                    if int(vec.numel()) != int(hidden.shape[-1]):
+                        raise RuntimeError(
+                            f"L{lid}: direction dim={int(vec.numel())} "
+                            f"does not match hidden dim={int(hidden.shape[-1])}"
+                        )
+
                     edited = hidden.clone()
 
-                    # No padding in v5 build_input; merged textual decision
-                    # token is the final sequence position.
-                    edited[
-                        :,
-                        -1,
-                        :,
-                    ] = (
-                        edited[
-                            :,
-                            -1,
-                            :,
-                        ]
-                        + float(alpha)
-                        * vec[
-                            None,
-                            :,
-                        ]
+                    # The direction was extracted from the decoder-block output
+                    # hidden_states[layer+1], at the last prompt token.
+                    edited[:, -1, :] = (
+                        edited[:, -1, :]
+                        + float(alpha) * vec.unsqueeze(0)
                     )
 
-                    if rest is None:
-                        return edited
+                    # Preserve the custom AdaptVis decoder's output structure.
+                    if container_kind == "list":
+                        result = list(output)
+                        result[0] = edited
+                        return result
 
-                    return (
-                        edited,
-                        *rest,
-                    )
+                    if container_kind == "tuple":
+                        return (edited,) + tuple(output[1:])
+
+                    return edited
 
                 return hook
 
