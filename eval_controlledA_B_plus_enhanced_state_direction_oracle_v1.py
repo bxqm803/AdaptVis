@@ -2,128 +2,37 @@
 # -*- coding: utf-8 -*-
 
 """
-eval_controlledA_C_plus_enhanced_direction_oracle_v2.py
+Test whether the relation directions learned from the successfully enhanced
+Controlled-A state C can improve the unenhanced baseline B.
 
-Question
-========
-After the successful Controlled-A enhancement C:
+B:
+    eps=1e-6, weight=1.0, no AdaptVis.
 
-    C = eps=1e-6 + dynamic AdaptVis
-        (confidence<0.4 -> weight=0.5, else weight=1.5)
+Direction source:
+    C-correct TRAIN samples from the saved v5 hidden-state cache.
 
-can the NEW, clean relation directions learned from the enhanced C states
-further improve actual generation when added to the LAST TOKEN?
+For each selected layer:
+    center = mean(h_C | C-correct TRAIN)
+    v_r = mean(h_C | relation=r, C-correct TRAIN) - center
 
-This is deliberately an ORACLE causal test:
-    TEST GT chooses which of the four directions to inject.
+TEST intervention (oracle relation selection):
+    h_B[last] <- h_B[last] + scale * v_r
 
-Why oracle first?
-=================
-We want to isolate the actuator question:
+This isolates cross-state causal transfer:
+    enhanced C relation geometry -> unenhanced B residual stream.
 
-    "Are the enhanced directions causally useful?"
+Default:
+    L18, scale=1.0, relation-stratified 30/70 TRAIN/TEST.
 
-If a non-oracle selector is used at the same time, a failure could be caused
-either by a bad direction or by a bad selector.
-
-TRAIN / TEST
-============
-Relation-stratified 30/70 split.
-
-TRAIN only:
-    use C-correct samples to fit relation vectors.
-
-TEST:
-    C baseline generation
-    C + enhanced-state direction
-    C + AdaptVis-delta direction
-
-No TEST hidden state or TEST correctness is used to fit directions.
-
-Vector sources
-==============
-
-1. enhanced_state
-   From successful C last-token states:
-
-       center_l = mean(h_C TRAIN, C-correct)
-       v^C_{r,l}
-           = mean(h_C | relation=r, C-correct) - center_l
-
-2. adapt_delta
-   From the actual AdaptVis-induced change:
-
-       delta_i,l = h_C - h_B
-
-       center_delta_l = mean(delta TRAIN, C-correct)
-       v^delta_{r,l}
-           = mean(delta | relation=r, C-correct) - center_delta_l
-
-Both are RAW centered mean offsets by default, not unit vectors.
-This keeps a natural learned magnitude.
-
-Default injection layer
-=======================
-L18, because the preceding direction experiment found:
-
-    enhanced_correct_on_enhanced:
-        L18 overall = 0.9009
-        On          = 0.7764
-        On stability= 0.9952
-
-and:
-    adapt_delta_correct_on_delta:
-        L18 = 0.8804
-        delta On stability = 0.9963
-
-Intervention
-============
-At the output residual stream of decoder block L18 (custom AdaptVis decoder returns a list):
-
-    h_last <- h_last + scale * v_r
-
-Only the full-prompt forward is edited.
-The hook is removed before cached autoregressive continuation.
-
-Evaluation
-==========
-Actual greedy generation:
-
-    C baseline
-    C + state-direction oracle
-    C + delta-direction oracle
-
-Report:
-    accuracy
-    W2C / C2W / net vs C
-    per relation
-    correction rate on C-wrong TEST samples
-    damage rate on C-correct TEST samples
-
-Dependencies
-============
-Run from the AdaptVis llava16 repository root and keep:
-    analyze_llava_controlledA_lasttoken_reproduce_v5.py
-
-in the same repo root.
-
-Input NPZ:
-    output/llava_controlledA_lasttoken_reproduce_v5/lasttoken_vectors_ABC.npz
-
-Example
-=======
-CUDA_VISIBLE_DEVICES=0 python eval_controlledA_C_plus_enhanced_direction_oracle_v2.py \
+Example:
+CUDA_VISIBLE_DEVICES=0 python eval_controlledA_B_plus_enhanced_state_direction_oracle_v1.py \
   --vectors output/llava_controlledA_lasttoken_reproduce_v5/lasttoken_vectors_ABC.npz \
   --inject-layers 18 \
   --state-scale 1.0 \
-  --delta-scale 1.0 \
   --train-frac 0.30 \
   --seed 1 \
-  --output-dir output/controlledA_C_plus_enhanced_direction_oracle_v1 \
+  --output-dir output/controlledA_B_plus_enhanced_state_direction_oracle_v1 \
   --overwrite
-
-Multi-layer exploratory run:
-    --inject-layers 16-20
 """
 
 from __future__ import annotations
@@ -1877,5 +1786,441 @@ def main() -> None:
     )
 
 
+
+def main_B_plus_enhanced_state_direction() -> None:
+    args = parse_args()
+
+    if not (0.0 < args.train_frac < 1.0):
+        raise ValueError("--train-frac must be in (0,1)")
+
+    src = Path(args.vectors)
+    if not src.exists():
+        raise FileNotFoundError(f"Missing vector cache: {src}")
+
+    outdir = Path(args.output_dir)
+    if args.overwrite and outdir.exists():
+        shutil.rmtree(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    seed_all(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    # ------------------------------------------------------------------
+    # Read saved A/B/C states. Directions are fitted ONLY from C-correct
+    # TRAIN samples. TEST uses B with no AdaptVis.
+    # ------------------------------------------------------------------
+    with np.load(src, allow_pickle=True) as z:
+        required = {
+            "sample_index",
+            "relation",
+            "layers",
+            "B_last",
+            "C_last",
+            "transition_group",
+        }
+        missing = sorted(required.difference(z.files))
+        if missing:
+            raise KeyError(
+                f"Vector NPZ missing={missing}; available={z.files}"
+            )
+
+        sample_index = np.asarray(z["sample_index"], dtype=np.int64)
+        labels = np.asarray(
+            [str(x).strip().lower() for x in z["relation"].tolist()],
+            dtype=object,
+        )
+        vector_layers = np.asarray(z["layers"], dtype=np.int64)
+        C = np.asarray(z["C_last"], dtype=np.float32)
+        transition = np.asarray(z["transition_group"], dtype=object)
+
+    unexpected = sorted(set(labels.tolist()) - set(RELATIONS))
+    if unexpected:
+        raise RuntimeError(
+            f"Unexpected labels={unexpected}; expected={RELATIONS}"
+        )
+
+    inject_layers = parse_layer_spec(
+        args.inject_layers,
+        vector_layers,
+    )
+
+    C_correct = np.isin(
+        transition,
+        ["W2C", "C2C"],
+    )
+
+    train_sids, test_sids = stratified_split_sids(
+        labels,
+        sample_index,
+        args.train_frac,
+        args.seed,
+    )
+
+    state_bank, _, state_counts = fit_raw_direction_bank(
+        C,
+        labels,
+        sample_index,
+        C_correct,
+        train_sids,
+        vector_layers,
+        inject_layers,
+        min_train_per_class=args.min_train_per_class,
+    )
+
+    print("\n" + "=" * 150)
+    print("B (NO ADAPTVIS) + ENHANCED C-STATE DIRECTION ORACLE TEST")
+    print("=" * 150)
+    print(f"vectors={src}")
+    print(
+        f"TRAIN={len(train_sids)} | TEST={len(test_sids)} | "
+        f"inject_layers={inject_layers}"
+    )
+    print(f"C-correct TRAIN counts={state_counts}")
+    print(f"state_scale={args.state_scale}")
+    print(
+        "TEST condition: eps=1e-6, weight=1.0, AdaptVis OFF"
+    )
+
+    for layer in inject_layers:
+        print(
+            f"L{layer:02d} enhanced-state vector norms | "
+            + " | ".join(
+                f"{r}={np.linalg.norm(state_bank[layer][r]):.4f}"
+                for r in RELATIONS
+            )
+        )
+
+    print("=" * 150)
+
+    prompts, answers = base.load_prompts(
+        "Controlled_Images_A",
+        "four",
+    )
+
+    dataset = get_dataset(
+        "Controlled_Images_A",
+        image_preprocess=None,
+        download=False,
+    )
+
+    wrapper, _ = get_model(
+        "llava1.5",
+        args.device,
+        method="adapt_vis",
+        root_dir=args.root_dir,
+    )
+
+    model = wrapper.model
+    tokenizer = wrapper.processor.tokenizer
+
+    # B and C share eps=1e-6. The attention intervention is the only thing
+    # removed here.
+    base.set_rms_eps(
+        model,
+        args.enhanced_rms_eps,
+    )
+
+    rows = []
+
+    # Keep the same repo model/path, but every TEST prompt is run with
+    # weight=1.0, so AdaptVis is neutral/off.
+    with base.RestrictAdaptVisLayers(
+        model,
+        args.adaptvis_max_layers,
+    ):
+        iterator = base.iter_samples(
+            dataset,
+            prompts,
+            answers,
+            num_workers=args.num_workers,
+            max_samples=args.max_samples,
+        )
+
+        for sid, image, prompt, gold in tqdm(
+            iterator,
+            desc="TEST B vs B+enhanced-state-direction",
+        ):
+            sid = int(sid)
+
+            if sid not in test_sids:
+                continue
+
+            relation = base.normalize_relation(gold)
+
+            if relation not in REL_TO_ID:
+                raise RuntimeError(
+                    f"sid={sid}: unsupported relation={relation!r}"
+                )
+
+            batch = base.build_input(
+                wrapper,
+                prompt,
+                image,
+            )
+
+            # ----------------------------------------------------------
+            # B baseline: eps=1e-6, neutral weight=1.0, no AdaptVis.
+            # ----------------------------------------------------------
+            B_out = base.full_prompt_forward(
+                model,
+                batch,
+                weight=1.0,
+                output_attentions=False,
+                output_hidden_states=False,
+                use_cache=True,
+            )[0]
+
+            B_text = continue_text(
+                model,
+                tokenizer,
+                batch,
+                B_out,
+                args,
+            )
+            del B_out
+
+            B_ok = bool(
+                base._is_correct(
+                    gold,
+                    B_text,
+                )
+            )
+
+            # ----------------------------------------------------------
+            # B + direction learned from C-correct TRAIN states.
+            # Still weight=1.0: AdaptVis remains OFF.
+            # GT relation is used ONLY as an oracle actuator test.
+            # ----------------------------------------------------------
+            with AddLastTokenDirections(
+                model,
+                state_bank,
+                relation,
+                args.state_scale,
+            ):
+                edited_out = base.full_prompt_forward(
+                    model,
+                    batch,
+                    weight=1.0,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                    use_cache=True,
+                )[0]
+
+            edited_text = continue_text(
+                model,
+                tokenizer,
+                batch,
+                edited_out,
+                args,
+            )
+            del edited_out
+
+            edited_ok = bool(
+                base._is_correct(
+                    gold,
+                    edited_text,
+                )
+            )
+
+            transition_name = classify_transition(
+                B_ok,
+                edited_ok,
+            )
+
+            rows.append({
+                "sid": sid,
+                "relation": relation,
+                "B_text": B_text,
+                "B_correct": int(B_ok),
+                "edited_text": edited_text,
+                "edited_correct": int(edited_ok),
+                "transition": transition_name,
+                "W2C": int(transition_name == "W2C"),
+                "C2W": int(transition_name == "C2W"),
+            })
+
+            del batch
+            cleanup()
+
+    if not rows:
+        raise RuntimeError("No TEST rows evaluated.")
+
+    B_acc = safe_mean(
+        row["B_correct"]
+        for row in rows
+    )
+
+    edited_acc = safe_mean(
+        row["edited_correct"]
+        for row in rows
+    )
+
+    W2C = int(sum(row["W2C"] for row in rows))
+    C2W = int(sum(row["C2W"] for row in rows))
+
+    B_wrong = [
+        row for row in rows
+        if int(row["B_correct"]) == 0
+    ]
+    B_correct_rows = [
+        row for row in rows
+        if int(row["B_correct"]) == 1
+    ]
+
+    summary = {
+        "N": len(rows),
+        "B_acc": B_acc,
+        "B_plus_enhanced_state_oracle_acc": edited_acc,
+        "gain": edited_acc - B_acc,
+        "W2C": W2C,
+        "C2W": C2W,
+        "net": W2C - C2W,
+        "B_wrong_N": len(B_wrong),
+        "repair_rate_on_B_wrong": safe_mean(
+            row["edited_correct"]
+            for row in B_wrong
+        ),
+        "B_correct_N": len(B_correct_rows),
+        "preserve_rate_on_B_correct": safe_mean(
+            row["edited_correct"]
+            for row in B_correct_rows
+        ),
+    }
+
+    relation_rows = []
+
+    for relation in RELATIONS:
+        subset = [
+            row for row in rows
+            if row["relation"] == relation
+        ]
+
+        base_acc = safe_mean(
+            row["B_correct"]
+            for row in subset
+        )
+        edit_acc = safe_mean(
+            row["edited_correct"]
+            for row in subset
+        )
+
+        relation_rows.append({
+            "relation": relation,
+            "N": len(subset),
+            "B_acc": base_acc,
+            "edited_acc": edit_acc,
+            "gain": edit_acc - base_acc,
+            "W2C": int(sum(row["W2C"] for row in subset)),
+            "C2W": int(sum(row["C2W"] for row in subset)),
+        })
+
+    print("\n" + "=" * 150)
+    print(
+        "ACTUAL GREEDY GENERATION: "
+        "B (NO ADAPTVIS) + ENHANCED C-STATE DIRECTION"
+    )
+    print("=" * 150)
+    print(f"N_TEST={len(rows)}")
+    print(f"B no-AdaptVis baseline            : {B_acc:.4f}")
+    print(
+        f"B + enhanced-state oracle        : "
+        f"{edited_acc:.4f} ({edited_acc - B_acc:+.4f}) | "
+        f"W2C={W2C} C2W={C2W} net={W2C-C2W:+d} | "
+        f"repair(B-wrong)={summary['repair_rate_on_B_wrong']:.4f} | "
+        f"preserve(B-correct)={summary['preserve_rate_on_B_correct']:.4f}"
+    )
+
+    print("\nPer relation:")
+    for row in relation_rows:
+        print(
+            f"{row['relation']:>5s} | "
+            f"N={row['N']:3d} | "
+            f"B={row['B_acc']:.4f} | "
+            f"+state={row['edited_acc']:.4f} "
+            f"({row['gain']:+.4f}) | "
+            f"W2C/C2W={row['W2C']}/{row['C2W']}"
+        )
+
+    print("=" * 150)
+
+    write_csv(
+        outdir / "generation_details.csv",
+        rows,
+    )
+    write_csv(
+        outdir / "summary.csv",
+        [summary],
+    )
+    write_csv(
+        outdir / "per_relation.csv",
+        relation_rows,
+    )
+
+    arrays = {
+        "relation_order": np.asarray(
+            RELATIONS,
+            dtype=object,
+        ),
+        "inject_layers": np.asarray(
+            inject_layers,
+            dtype=np.int64,
+        ),
+    }
+
+    for layer in inject_layers:
+        for relation in RELATIONS:
+            arrays[
+                f"enhanced_state_L{layer}_{relation}"
+            ] = state_bank[layer][relation]
+
+    np.savez_compressed(
+        outdir / "enhanced_state_direction_vectors.npz",
+        **arrays,
+    )
+
+    metadata = {
+        "source_vectors": str(src),
+        "dataset": "Controlled_Images_A",
+        "N_train": len(train_sids),
+        "N_test": len(rows),
+        "train_frac": args.train_frac,
+        "seed": args.seed,
+        "direction_source": (
+            "C-correct TRAIN last-token states"
+        ),
+        "direction_definition": (
+            "raw centered relation mean offset"
+        ),
+        "inject_layers": inject_layers,
+        "state_scale": args.state_scale,
+        "test_condition": {
+            "name": "B",
+            "rms_eps": args.enhanced_rms_eps,
+            "weight": 1.0,
+            "adaptvis": False,
+        },
+        "routing": (
+            "GT oracle on TEST, used only to test causal transfer "
+            "of enhanced-state direction to baseline B"
+        ),
+        "state_fit_counts": state_counts,
+    }
+
+    (outdir / "config.json").write_text(
+        json.dumps(
+            metadata,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    print(f"\n[saved] {outdir / 'summary.csv'}")
+    print(f"[saved] {outdir / 'generation_details.csv'}")
+    print(f"[saved] {outdir / 'enhanced_state_direction_vectors.npz'}")
+
+
 if __name__ == "__main__":
-    main()
+    main_B_plus_enhanced_state_direction()
