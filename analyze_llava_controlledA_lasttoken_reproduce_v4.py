@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-analyze_llava_adaptvis_lasttoken_reproduce_v3.py
+analyze_llava_controlledA_lasttoken_reproduce_v4.py
 
-Version-agnostic mechanistic reproduction for bxqm803/AdaptVis llava16.
+Controlled_Images_A mechanistic reproduction for bxqm803/AdaptVis llava16.
 
 Designed for the user's current environment (e.g. transformers 4.57.6) where
 the custom LlavaForConditionalGenerationScal may not expose `.generate()`.
@@ -19,9 +19,9 @@ Crucially, it reproduces the ORIGINAL AdaptVis dynamic routing policy:
         -> first-step confidence c
 
     if round(c, 2) < threshold:
-        selected weight = weight1 (COCO-two default 0.5)
+        selected weight = weight1 (Controlled-A default 0.5)
     else:
-        selected weight = weight2 (COCO-two default 1.2)
+        selected weight = weight2 (Controlled-A default 1.5)
 
 Then C uses that sample-specific selected weight.
 
@@ -95,8 +95,8 @@ Dynamic routing groups:
 Example
 =======
 
-CUDA_VISIBLE_DEVICES=0 python analyze_llava_adaptvis_lasttoken_reproduce_v3.py \
-  --dataset COCO_QA_two_obj \
+CUDA_VISIBLE_DEVICES=0 python analyze_llava_controlledA_lasttoken_reproduce_v4.py \
+  --dataset Controlled_Images_A \
   --option four \
   --base-rms-eps 1e-5 \
   --enhanced-rms-eps 1e-6 \
@@ -161,15 +161,13 @@ def parse_args():
 
     p.add_argument(
         "--dataset",
-        default="COCO_QA_two_obj",
-        choices=[
-            "Controlled_Images_A",
-            "Controlled_Images_B",
-            "COCO_QA_one_obj",
-            "COCO_QA_two_obj",
-            "VG_QA_one_obj",
-            "VG_QA_two_obj",
-        ],
+        default="Controlled_Images_A",
+        choices=["Controlled_Images_A"],
+        help=(
+            "This mechanistic reproduction is intentionally restricted to "
+            "Controlled_Images_A, where the AdaptVis improvement of interest "
+            "was observed."
+        ),
     )
 
     p.add_argument(
@@ -196,8 +194,8 @@ def parse_args():
     )
 
     p.add_argument("--weight1", type=float, default=0.5)
-    p.add_argument("--weight2", type=float, default=1.2)
-    p.add_argument("--threshold", type=float, default=0.3)
+    p.add_argument("--weight2", type=float, default=1.5)
+    p.add_argument("--threshold", type=float, default=0.4)
 
     p.add_argument(
         "--adaptvis-max-layers",
@@ -209,7 +207,8 @@ def parse_args():
     p.add_argument(
         "--max-new-tokens",
         type=int,
-        default=32,
+        default=100,
+        help="Match repository llava15.py Controlled-A generation.",
     )
 
     p.add_argument(
@@ -1517,8 +1516,13 @@ def main():
         )
     )
 
+    if args.dataset != "Controlled_Images_A":
+        raise RuntimeError(
+            "This v4 script is intentionally Controlled_Images_A only."
+        )
+
     print("\n" + "=" * 150)
-    print("EXPERIMENT")
+    print("CONTROLLED-A EXPERIMENT")
     print("=" * 150)
     print(
         f"A: eps={args.base_rms_eps:g}, weight=1.0"
@@ -1530,6 +1534,20 @@ def main():
         f"C: eps={args.enhanced_rms_eps:g}, dynamic AdaptVis "
         f"({args.weight1}/{args.weight2}, threshold={args.threshold})"
     )
+    print(
+        "Controlled-A canonical repo params: "
+        "weight1=0.5, weight2=1.5, threshold=0.4"
+    )
+    if not (
+        abs(float(args.weight1) - 0.5) < 1e-8
+        and abs(float(args.weight2) - 1.5) < 1e-8
+        and abs(float(args.threshold) - 0.4) < 1e-8
+    ):
+        print(
+            "[WARNING] Current routing parameters differ from the repository "
+            "Controlled_Images_A AdaptVis setting (0.5, 1.5, 0.4)."
+        )
+
     print(
         f"AdaptVis scope=L0-L{args.adaptvis_max_layers-1}"
     )
