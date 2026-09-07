@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-analyze_llava_controlledA_lasttoken_reproduce_v4.py
+analyze_llava_controlledA_lasttoken_reproduce_v5.py
 
 Controlled_Images_A mechanistic reproduction for bxqm803/AdaptVis llava16.
 
@@ -95,7 +95,7 @@ Dynamic routing groups:
 Example
 =======
 
-CUDA_VISIBLE_DEVICES=0 python analyze_llava_controlledA_lasttoken_reproduce_v4.py \
+CUDA_VISIBLE_DEVICES=0 python analyze_llava_controlledA_lasttoken_reproduce_v5.py \
   --dataset Controlled_Images_A \
   --option four \
   --base-rms-eps 1e-5 \
@@ -144,7 +144,7 @@ from model_zoo import get_model
 from model_zoo.llava15 import _is_correct, _norm_gold
 
 
-RELATIONS = ("left", "right", "above", "below")
+RELATIONS = ("left", "right", "on", "under")
 REL_TO_ID = {r: i for i, r in enumerate(RELATIONS)}
 EPS = 1e-12
 
@@ -356,6 +356,16 @@ def normalize_rows(x):
 
 
 def normalize_relation(value):
+    """
+    Controlled_Images_A native four-way label space:
+        left / right / on / under
+
+    The prompt file itself asks:
+        "Answer with left, right, on or under."
+
+    We keep a few semantic aliases only for robustness, but all probing,
+    TRAIN prototypes and reported classes use the native Controlled-A labels.
+    """
     if isinstance(value, (list, tuple)):
         value = value[0] if value else ""
 
@@ -368,23 +378,33 @@ def normalize_relation(value):
 
     toks = text.split()
 
+    # Exact native labels first.
     for tok in toks[:12]:
         if tok in REL_TO_ID:
             return tok
 
     if " left " in f" {text} ":
         return "left"
+
     if " right " in f" {text} ":
         return "right"
-    if "above" in toks or "top" in toks:
-        return "above"
+
+    # Controlled-A "on" is the vertical-above relation.
     if (
-        "below" in toks
-        or "under" in toks
+        "on" in toks
+        or "above" in toks
+        or "top" in toks
+    ):
+        return "on"
+
+    # Controlled-A "under" is the vertical-below relation.
+    if (
+        "under" in toks
         or "underneath" in toks
+        or "below" in toks
         or "bottom" in toks
     ):
-        return "below"
+        return "under"
 
     return None
 
@@ -1550,6 +1570,9 @@ def main():
 
     print(
         f"AdaptVis scope=L0-L{args.adaptvis_max_layers-1}"
+    )
+    print(
+        "Controlled-A relation labels=left/right/on/under"
     )
     print(
         "dataloader_collate=misc._default_collate "
