@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-analyze_llava_adaptvis_lasttoken_reproduce_v2.py
+analyze_llava_adaptvis_lasttoken_reproduce_v3.py
 
 Version-agnostic mechanistic reproduction for bxqm803/AdaptVis llava16.
 
@@ -95,7 +95,7 @@ Dynamic routing groups:
 Example
 =======
 
-CUDA_VISIBLE_DEVICES=0 python analyze_llava_adaptvis_lasttoken_reproduce_v2.py \
+CUDA_VISIBLE_DEVICES=0 python analyze_llava_adaptvis_lasttoken_reproduce_v3.py \
   --dataset COCO_QA_two_obj \
   --option four \
   --base-rms-eps 1e-5 \
@@ -139,7 +139,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 
 from dataset_zoo import get_dataset
-from misc import seed_all
+from misc import seed_all, _default_collate
 from model_zoo import get_model
 from model_zoo.llava15 import _is_correct, _norm_gold
 
@@ -505,12 +505,16 @@ def iter_samples(
     num_workers,
     max_samples,
 ):
+    # Match repository main_aro.py exactly for LLaVA:
+    # image_preprocess=None means dataset items contain raw PIL images, so the
+    # repository's custom _default_collate must be used. PyTorch's default
+    # collate cannot batch PIL.Image.Image objects.
     loader = DataLoader(
         dataset,
         batch_size=1,
         shuffle=False,
         num_workers=int(num_workers),
-        collate_fn=None,
+        collate_fn=_default_collate,
     )
 
     sid = 0
@@ -1528,6 +1532,10 @@ def main():
     )
     print(
         f"AdaptVis scope=L0-L{args.adaptvis_max_layers-1}"
+    )
+    print(
+        "dataloader_collate=misc._default_collate "
+        "(repository PIL-safe path)"
     )
     print("=" * 150)
 
