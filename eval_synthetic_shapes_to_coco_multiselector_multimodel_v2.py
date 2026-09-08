@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-eval_synthetic_shapes_to_coco_multiselector_multimodel_v1.py
+eval_synthetic_shapes_to_coco_multiselector_multimodel_v2.py
 
 Train EVERYTHING only on the synthetic shapes dataset, then evaluate on the
 completely held-out COCO_two target.
@@ -132,7 +132,7 @@ Important:
         (b) for the explicitly labeled oracle control.
 
 Example:
-CUDA_VISIBLE_DEVICES=0 python eval_synthetic_shapes_to_coco_multiselector_multimodel_v1.py \
+CUDA_VISIBLE_DEVICES=0 python eval_synthetic_shapes_to_coco_multiselector_multimodel_v2.py \
   --model qwen-3b \
   --synthetic-dir synthetic_shapes_4dir_400 \
   --data-root data \
@@ -674,6 +674,83 @@ def open_coco_image(
 # Model
 # =============================================================================
 
+def validate_runtime_device(
+    args: argparse.Namespace,
+) -> torch.device:
+    device = torch.device(
+        args.device
+    )
+
+    print("\n" + "=" * 120)
+    print("RUNTIME DEVICE CHECK")
+    print("=" * 120)
+    print(
+        f"torch={torch.__version__} | "
+        f"torch_cuda={torch.version.cuda} | "
+        f"cuda_available={torch.cuda.is_available()} | "
+        f"cuda_count={torch.cuda.device_count()}"
+    )
+
+    import os
+
+    print(
+        f"CUDA_VISIBLE_DEVICES="
+        f"{os.environ.get('CUDA_VISIBLE_DEVICES')}"
+    )
+
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"--device={args.device}, but torch.cuda.is_available() is False."
+            )
+
+        index = (
+            0
+            if device.index is None
+            else int(device.index)
+        )
+
+        if not (
+            0
+            <= index
+            < torch.cuda.device_count()
+        ):
+            raise RuntimeError(
+                f"Requested logical CUDA device {index}, "
+                f"but torch sees {torch.cuda.device_count()} device(s)."
+            )
+
+        # Explicitly establish CUDA context BEFORE transformers loading.
+        torch.cuda.set_device(
+            index
+        )
+
+        # Small allocation verifies this Python process can really use it.
+        probe = torch.empty(
+            1,
+            device=device,
+        )
+        del probe
+
+        name = torch.cuda.get_device_name(
+            index
+        )
+
+        free, total = torch.cuda.mem_get_info(
+            index
+        )
+
+        print(
+            f"using logical GPU {index}: {name} | "
+            f"free={free / 1024**3:.2f} GiB / "
+            f"total={total / 1024**3:.2f} GiB"
+        )
+
+    print("=" * 120)
+
+    return device
+
+
 def load_model(
     args: argparse.Namespace,
 ):
@@ -687,7 +764,9 @@ def load_model(
             f"Repo aliases={sorted(specs)}"
         )
 
-    spec = specs[args.model]
+    spec = specs[
+        args.model
+    ]
 
     model_cls = getattr(
         transformers,
@@ -706,17 +785,40 @@ def load_model(
         spec,
     )
 
-    kwargs: Dict[str, Any] = {
+    device = validate_runtime_device(
+        args
+    )
+
+    # IMPORTANT:
+    # Do NOT pass device_map here.
+    #
+    # The previous v1 used:
+    #
+    #     device_map={"": "cuda:0"}
+    #
+    # which routes model loading through Transformers/Accelerate device-map
+    # memory probing.  On the user's cluster this entered Accelerate's
+    # torch.cuda.mem_get_info() path and incorrectly raised
+    # "No CUDA GPUs are available", even though ordinary PyTorch sees the
+    # allocated A100 correctly.
+    #
+    # These models fit comfortably on one 80GB A100, so explicit placement is
+    # both simpler and more deterministic.
+    kwargs: Dict[
+        str,
+        Any,
+    ] = {
         "low_cpu_mem_usage": True,
         "trust_remote_code": bool(
             spec.trust_remote_code
         ),
-        "device_map": {
-            "": args.device
-        },
-        # Required for attention-centroid extraction.
         "attn_implementation": "eager",
     }
+
+    print(
+        f"[load] {spec.repo_id} "
+        f"dtype={dtype} on CPU, then move -> {device}"
+    )
 
     try:
         model = model_cls.from_pretrained(
@@ -724,6 +826,7 @@ def load_model(
             dtype=dtype,
             **kwargs,
         )
+
     except TypeError:
         model = model_cls.from_pretrained(
             spec.repo_id,
@@ -731,7 +834,39 @@ def load_model(
             **kwargs,
         )
 
+    # Explicit single-GPU placement. No Accelerate device-map dispatch.
+    model = model.to(
+        device
+    )
+
     model.eval()
+
+    # Verify actual parameter device after movement.
+    try:
+        first_param = next(
+            model.parameters()
+        )
+
+        print(
+            f"[load] first parameter device="
+            f"{first_param.device}, dtype={first_param.dtype}"
+        )
+
+    except StopIteration:
+        pass
+
+    if device.type == "cuda":
+        free, total = torch.cuda.mem_get_info(
+            device.index
+            if device.index is not None
+            else 0
+        )
+
+        print(
+            f"[load] after model placement: "
+            f"free={free / 1024**3:.2f} GiB / "
+            f"total={total / 1024**3:.2f} GiB"
+        )
 
     generation_config = getattr(
         model,
@@ -763,6 +898,7 @@ def load_model(
             ),
             use_fast=False,
         )
+
     except TypeError:
         processor = AutoProcessor.from_pretrained(
             spec.repo_id,
@@ -3789,7 +3925,7 @@ def main() -> None:
     # ---------------------------------------------------------------------
     metadata = {
         "script": (
-            "eval_synthetic_shapes_to_coco_multiselector_multimodel_v1.py"
+            "eval_synthetic_shapes_to_coco_multiselector_multimodel_v2.py"
         ),
         "model_alias": args.model,
         "repo_id": spec.repo_id,
