@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Can selected MIDDLE TOKENS reproduce the strong OLD late Image-Gray writer effect?
+Expanded multi-layer search: can selected MIDDLE TOKENS more closely reproduce the strong OLD late Image-Gray writer effect?
 
 Oracle proof-of-mechanism experiment for Qwen2.5-VL.
 
@@ -67,31 +67,21 @@ Notes
   nonlinear causal validation.
 - K means K selected tokens PER source layer in a bundle.
 
-Quick Qwen3B run:
-CUDA_VISIBLE_DEVICES=0 python -u eval_qwen_middle_token_amplify_reproduce_writer_quick.py \
+Expanded Qwen3B search (positive only; controls were already validated):
+CUDA_VISIBLE_DEVICES=0 python -u eval_qwen_middle_token_amplify_multilayer_search_v2.py \
   --model qwen-3b \
-  --source-bundles "22;24;22+24" \
+  --source-bundles "22+24;20+22+24;22+24+26;18+20+22+24+26" \
+  --selection-strategies global,global_unique \
   --target-layers 32,34,35 \
-  --ks 1,2,4,8 \
-  --alphas 0.5,1.0,2.0 \
-  --conditions positive,random,negative \
-  --direct-writer-alphas 1.0 \
-  --eval-max-samples 32 \
-  --output-dir output/qwen3b_middle_token_amplify_writer_quick \
-  --overwrite
-
-Faster first smoke test:
-CUDA_VISIBLE_DEVICES=0 python -u eval_qwen_middle_token_amplify_reproduce_writer_quick.py \
-  --model qwen-3b \
-  --source-bundles "24" \
-  --target-layers 32,34,35 \
-  --ks 1,2,4,8 \
-  --alphas 0.5,1.0,2.0 \
+  --ks 4,8,12,16,24,32 \
+  --alphas 0.125,0.25,0.5,0.75,1.0 \
   --conditions positive \
   --direct-writer-alphas 1.0 \
-  --eval-max-samples 16 \
-  --output-dir output/qwen3b_L24_token_amplify_smoke \
+  --eval-max-samples 32 \
+  --output-dir output/qwen3b_middle_token_multilayer_search_v2 \
   --overwrite
+
+Then rerun the best few settings at N=80.
 """
 from __future__ import annotations
 
@@ -132,16 +122,27 @@ def parse_args():
     p.add_argument("--model", default="qwen-3b", choices=["qwen-3b", "qwen-7b"])
     p.add_argument(
         "--source-bundles",
-        default="22;24;22+24",
+        default="22+24;20+22+24;22+24+26;18+20+22+24+26",
         help='Semicolon-separated source-layer bundles, e.g. "22;24;22+24".',
     )
     p.add_argument("--target-layers", default="32,34,35")
-    p.add_argument("--ks", default="1,2,4,8")
-    p.add_argument("--alphas", default="0.5,1.0,2.0")
+    p.add_argument("--ks", default="4,8,12,16,24,32")
+    p.add_argument("--alphas", default="0.125,0.25,0.5,0.75,1.0")
     p.add_argument(
         "--conditions",
-        default="positive,random,negative",
-        help="Subset of positive,random,negative.",
+        default="positive",
+        help="Subset of positive,random,negative. Positive-only is recommended for the expanded search.",
+    )
+    p.add_argument(
+        "--selection-strategies",
+        default="global,global_unique",
+        help=(
+            "Comma-separated: per_layer, global, global_unique. "
+            "per_layer means K per source layer (old behavior); "
+            "global means K total (layer,position) edits across the bundle; "
+            "global_unique means K total and edits each token position at most once, "
+            "choosing the strongest source layer for that position."
+        ),
     )
     p.add_argument("--direct-writer-alphas", default="1.0")
     p.add_argument("--writer-mode", default="centered", choices=["centered", "raw"])
@@ -612,36 +613,153 @@ def choose_random_matched(rows, positive_rows, rng):
     return chosen
 
 
-def make_specs(bundle, rows_by_layer, mode, k, sid, seed):
-    specs = {}
+def _global_random_matched(candidates, positive_rows, rng, k):
+    """Category-match a global positive selection as closely as possible."""
+    selected_keys = {(int(r["source_layer"]), int(r["position"])) for r in positive_rows}
+    by_cat = defaultdict(list)
+    for r in candidates:
+        key = (int(r["source_layer"]), int(r["position"]))
+        if key not in selected_keys:
+            by_cat[r["broad_category"]].append(r)
+
+    chosen = []
+    used = set()
+    for ref in positive_rows[:k]:
+        cat = ref["broad_category"]
+        pool = [
+            x for x in by_cat[cat]
+            if (int(x["source_layer"]), int(x["position"])) not in used
+        ]
+        if not pool:
+            pool = [
+                x for x in candidates
+                if (int(x["source_layer"]), int(x["position"])) not in selected_keys
+                and (int(x["source_layer"]), int(x["position"])) not in used
+            ]
+        if not pool:
+            break
+        x = rng.choice(pool)
+        chosen.append(x)
+        used.add((int(x["source_layer"]), int(x["position"])))
+    return chosen
+
+
+def make_specs(bundle, rows_by_layer, mode, k, sid, seed, strategy="per_layer"):
+    """
+    strategy:
+      per_layer     : old behavior, K edits per source layer.
+      global        : K total (layer,position) edits across the whole bundle.
+      global_unique : K total edits, each token position used at most once;
+                      for each position keep the strongest eligible source layer.
+    """
+    if strategy not in {"per_layer", "global", "global_unique"}:
+        raise ValueError(strategy)
+
     selected = []
-    for L in bundle:
-        rows = rows_by_layer.get(L, [])
-        pos = choose_positive(rows, k)
+
+    if strategy == "per_layer":
+        for L in bundle:
+            rows = rows_by_layer.get(L, [])
+            pos = choose_positive(rows, k)
+            if mode == "positive":
+                use = pos
+            elif mode == "negative":
+                use = choose_negative(rows, k)
+            elif mode == "random":
+                rng = random.Random(seed * 1000003 + int(sid) * 1009 + L * 97 + k)
+                use = choose_random_matched(rows, pos, rng)
+            else:
+                raise ValueError(mode)
+
+            for r in use:
+                rr = dict(r)
+                rr["source_layer"] = L
+                selected.append(rr)
+
+    else:
+        candidates = []
+        for L in bundle:
+            for r in rows_by_layer.get(L, []):
+                rr = dict(r)
+                rr["source_layer"] = L
+                candidates.append(rr)
+
         if mode == "positive":
-            use = pos
+            eligible = [r for r in candidates if r["mediation"] > 0]
+            reverse = True
         elif mode == "negative":
-            use = choose_negative(rows, k)
+            eligible = [r for r in candidates if r["mediation"] < 0]
+            reverse = False
         elif mode == "random":
-            rng = random.Random(seed * 1000003 + int(sid) * 1009 + L * 97 + k)
-            use = choose_random_matched(rows, pos, rng)
+            eligible = candidates
+            reverse = True
         else:
             raise ValueError(mode)
 
-        specs[L] = [(int(r["position"]), r["delta_h"]) for r in use]
-        for rank, r in enumerate(use, 1):
-            selected.append({
-                "source_layer": L,
-                "rank": rank,
-                "position": int(r["position"]),
-                "token": r["token"],
-                "category": r["category"],
-                "broad_category": r["broad_category"],
-                "mediation": float(r["mediation"]),
-                "delta_h_norm": float(r["delta_h_norm"]),
-                "grad_norm": float(r["grad_norm"]),
-            })
-    return specs, selected
+        if strategy == "global_unique":
+            # Keep only the strongest eligible layer for each token position.
+            best_by_pos = {}
+            for r in eligible:
+                pos = int(r["position"])
+                if pos not in best_by_pos:
+                    best_by_pos[pos] = r
+                    continue
+                cur = best_by_pos[pos]
+                if mode == "negative":
+                    if r["mediation"] < cur["mediation"]:
+                        best_by_pos[pos] = r
+                else:
+                    if r["mediation"] > cur["mediation"]:
+                        best_by_pos[pos] = r
+            eligible = list(best_by_pos.values())
+
+        if mode == "positive":
+            eligible.sort(key=lambda x: x["mediation"], reverse=True)
+            use = eligible[:k]
+        elif mode == "negative":
+            eligible.sort(key=lambda x: x["mediation"])
+            use = eligible[:k]
+        else:
+            positive_all = [r for r in candidates if r["mediation"] > 0]
+            if strategy == "global_unique":
+                tmp = {}
+                for r in positive_all:
+                    pos = int(r["position"])
+                    if pos not in tmp or r["mediation"] > tmp[pos]["mediation"]:
+                        tmp[pos] = r
+                positive_all = list(tmp.values())
+            positive_all.sort(key=lambda x: x["mediation"], reverse=True)
+            pos_ref = positive_all[:k]
+            rng = random.Random(seed * 1000003 + int(sid) * 1009 + k * 97 + len(bundle))
+            use = _global_random_matched(eligible, pos_ref, rng, k)
+
+        selected.extend(use)
+
+    # Build hook specs.
+    specs = defaultdict(list)
+    selected_export = []
+    # Re-rank globally for interpretable output.
+    if mode == "negative":
+        selected = sorted(selected, key=lambda x: x["mediation"])
+    else:
+        selected = sorted(selected, key=lambda x: x["mediation"], reverse=True)
+
+    for rank, r in enumerate(selected, 1):
+        L = int(r["source_layer"])
+        specs[L].append((int(r["position"]), r["delta_h"]))
+        selected_export.append({
+            "source_layer": L,
+            "rank": rank,
+            "position": int(r["position"]),
+            "token": r["token"],
+            "category": r["category"],
+            "broad_category": r["broad_category"],
+            "mediation": float(r["mediation"]),
+            "delta_h_norm": float(r["delta_h_norm"]),
+            "grad_norm": float(r["grad_norm"]),
+        })
+
+    return dict(specs), selected_export
 
 
 def summarize(eval_rows, condition_rows):
@@ -719,6 +837,15 @@ def main():
     bad = [x for x in conditions if x not in {"positive", "random", "negative"}]
     if bad:
         raise ValueError(f"Unknown conditions: {bad}")
+    selection_strategies = [
+        x.strip().lower() for x in a.selection_strategies.split(",") if x.strip()
+    ]
+    bad_strategy = [
+        x for x in selection_strategies
+        if x not in {"per_layer", "global", "global_unique"}
+    ]
+    if bad_strategy:
+        raise ValueError(f"Unknown selection strategies: {bad_strategy}")
 
     outdir = Path(a.output_dir)
     if a.overwrite and outdir.exists():
@@ -801,7 +928,7 @@ def main():
         print(f"train/test={len(train)}/{len(test)}")
         print(f"source bundles={[bundle_name(b) for b in bundles]}")
         print(f"target writer layers={targets}")
-        print(f"K={ks} | alpha={alphas} | controls={conditions}")
+        print(f"K={ks} | alpha={alphas} | conditions={conditions} | selection={selection_strategies}")
         print("source last token EXCLUDED")
         print("selection is ORACLE: correct relation chooses learned s_r")
         print()
@@ -996,6 +1123,7 @@ def main():
                         "sid": sid,
                         "gt": DISPLAY[gt],
                         "condition": "direct_late_writer",
+                        "selection_strategy": "direct",
                         "source_bundle": "late:" + "+".join(f"L{T}" for T in targets),
                         "k": 0,
                         "alpha": da,
@@ -1010,55 +1138,60 @@ def main():
                         },
                     })
 
-                # Middle-token amplification conditions.
+                # Expanded multi-layer middle-token amplification search.
                 for bundle in bundles:
-                    for k in ks:
-                        # Selection itself is independent of alpha; build once per
-                        # condition because random/negative differ.
-                        for mode in conditions:
-                            token_specs, selected = make_specs(
-                                bundle, rows_by_layer, mode, k, sid, a.seed
-                            )
-                            if not selected:
-                                continue
-
-                            for sel in selected:
-                                selection_rows.append({
-                                    "sid": sid,
-                                    "relation": DISPLAY[gt],
-                                    "condition": mode,
-                                    "source_bundle": bundle_name(bundle),
-                                    "k": k,
-                                    **sel,
-                                })
-
-                            for alpha in alphas:
-                                edited = run_generation_with_hooks(
-                                    model, processor, decoder_layers, rb,
-                                    targets, writers_r, a.max_new_tokens,
-                                    token_specs=token_specs,
-                                    token_alpha=alpha,
+                    for strategy in selection_strategies:
+                        labeled_bundle = f"{bundle_name(bundle)}[{strategy}]"
+                        for k in ks:
+                            # For global/global_unique, K is TOTAL edits in the bundle.
+                            # For per_layer, K retains the old meaning: K per source layer.
+                            for mode in conditions:
+                                token_specs, selected = make_specs(
+                                    bundle, rows_by_layer, mode, k, sid, a.seed,
+                                    strategy=strategy,
                                 )
+                                if not selected:
+                                    continue
 
-                                condition_rows.append({
-                                    "sid": sid,
-                                    "gt": DISPLAY[gt],
-                                    "condition": f"middle_{mode}",
-                                    "source_bundle": bundle_name(bundle),
-                                    "k": k,
-                                    "alpha": alpha,
-                                    "prediction": DISPLAY.get(
-                                        edited["prediction"], edited["prediction"]
-                                    ),
-                                    "correct": edited["prediction"] == gt,
-                                    "text": edited["text"],
-                                    "mean_projection": edited["mean_projection"],
-                                    "n_selected_total": len(selected),
-                                    **{
-                                        f"proj_L{T}": edited["projection_by_target"][T]
-                                        for T in targets
-                                    },
-                                })
+                                for sel in selected:
+                                    selection_rows.append({
+                                        "sid": sid,
+                                        "relation": DISPLAY[gt],
+                                        "condition": mode,
+                                        "selection_strategy": strategy,
+                                        "source_bundle": labeled_bundle,
+                                        "k": k,
+                                        **sel,
+                                    })
+
+                                for alpha in alphas:
+                                    edited = run_generation_with_hooks(
+                                        model, processor, decoder_layers, rb,
+                                        targets, writers_r, a.max_new_tokens,
+                                        token_specs=token_specs,
+                                        token_alpha=alpha,
+                                    )
+
+                                    condition_rows.append({
+                                        "sid": sid,
+                                        "gt": DISPLAY[gt],
+                                        "condition": f"middle_{mode}",
+                                        "selection_strategy": strategy,
+                                        "source_bundle": labeled_bundle,
+                                        "k": k,
+                                        "alpha": alpha,
+                                        "prediction": DISPLAY.get(
+                                            edited["prediction"], edited["prediction"]
+                                        ),
+                                        "correct": edited["prediction"] == gt,
+                                        "text": edited["text"],
+                                        "mean_projection": edited["mean_projection"],
+                                        "n_selected_total": len(selected),
+                                        **{
+                                            f"proj_L{T}": edited["projection_by_target"][T]
+                                            for T in targets
+                                        },
+                                    })
 
             finally:
                 if cap is not None:
@@ -1088,33 +1221,56 @@ def main():
         # Console report.
         # ------------------------------------------------------------
         print("\n" + "=" * 146)
-        print("MIDDLE TOKEN AMPLIFICATION -> ACTUAL GENERATION")
+        print("EXPANDED MULTI-LAYER MIDDLE TOKEN AMPLIFICATION -> ACTUAL GENERATION")
         print("=" * 146)
-        print(
-            f"Baseline: N={len(eval_rows)} "
-            f"acc={safe_mean(float(r['baseline_correct']) for r in eval_rows):.4f}"
+        baseline_acc = safe_mean(float(r["baseline_correct"]) for r in eval_rows)
+        print(f"Baseline: N={len(eval_rows)} acc={baseline_acc:.4f}")
+
+        direct_rows = [r for r in summary if r["condition"] == "direct_late_writer"]
+        middle_rows = [r for r in summary if r["condition"] != "direct_late_writer"]
+        middle_rows = sorted(
+            middle_rows,
+            key=lambda r: (
+                float(r["edited_acc"]),
+                int(r["net"]),
+                float(r["mean_writer_projection_gain"]),
+            ),
+            reverse=True,
         )
+
+        print("\nDirect late-writer reference:")
+        for r in direct_rows:
+            print(
+                f"  acc={float(r['edited_acc']):.4f} "
+                f"gain={float(r['delta_acc']):+.4f} "
+                f"W2C/C2W={int(r['W2C'])}/{int(r['C2W'])} "
+                f"dWriterProj={float(r['mean_writer_projection_gain']):+.4f}"
+            )
+
+        print("\nTop 30 middle-token configurations:")
         print(
-            f"{'condition':<22s} {'bundle':<18s} {'K':>3s} {'alpha':>6s} "
+            f"{'bundle[strategy]':<48s} {'K':>4s} {'alpha':>7s} "
             f"{'acc':>8s} {'gain':>8s} {'W2C':>5s} {'C2W':>5s} {'net':>5s} "
-            f"{'dWriterProj':>12s}"
+            f"{'nEdit':>7s} {'dWriterProj':>12s}"
         )
         print("-" * 146)
-        for r in summary:
+        for r in middle_rows[:30]:
             print(
-                f"{r['condition']:<22s} "
-                f"{r['source_bundle']:<18s} "
-                f"{int(r['k']):>3d} "
-                f"{float(r['alpha']):>6.2f} "
+                f"{r['source_bundle']:<48s} "
+                f"{int(r['k']):>4d} "
+                f"{float(r['alpha']):>7.3f} "
                 f"{float(r['edited_acc']):>8.4f} "
                 f"{float(r['delta_acc']):>+8.4f} "
                 f"{int(r['W2C']):>5d} "
                 f"{int(r['C2W']):>5d} "
                 f"{int(r['net']):>5d} "
+                f"{float(r['mean_selected_tokens']):>7.1f} "
                 f"{float(r['mean_writer_projection_gain']):>+12.4f}"
             )
-        print("=" * 146)
 
+        best_path = outdir / "best_configs.csv"
+        write_csv(best_path, middle_rows)
+        print(f"\nFull ranked middle configurations: {best_path}")
         # Also print globally strongest concrete non-last tokens.
         print("\nTop concrete positive mediation tokens (across held-out samples):")
         strongest = sorted(
@@ -1164,6 +1320,7 @@ def main():
                 "alphas": alphas,
                 "direct_writer_alphas": direct_alphas,
                 "conditions": conditions,
+                "selection_strategies": selection_strategies,
                 "train_N": len(train),
                 "test_N": len(test),
                 "seed": a.seed,
