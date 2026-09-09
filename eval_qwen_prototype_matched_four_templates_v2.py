@@ -85,7 +85,7 @@ samples.  Default --eval-scope unseen excludes those discovery sample IDs.
 
 Example
 -------
-CUDA_VISIBLE_DEVICES=0 python -u eval_qwen_prototype_matched_four_templates_v1.py \
+CUDA_VISIBLE_DEVICES=0 python -u eval_qwen_prototype_matched_four_templates_v2.py \
   --model qwen-3b \
   --selected-csv output/qwen3b_coco_minimal_token_search/selected_tokens.csv \
   --discovery-bundle "L22+L24+L26[global_unique]" \
@@ -96,8 +96,8 @@ CUDA_VISIBLE_DEVICES=0 python -u eval_qwen_prototype_matched_four_templates_v1.p
   --methods hard,soft,oracle,random \
   --soft-temperatures 0.25,0.5,1.0 \
   --alphas 0.5,0.75,1.0 \
-  --eval-scope unseen \
-  --eval-max-samples 80 \
+  --eval-scope all_data \
+  --eval-max-samples 0 \
   --output-dir output/qwen3b_coco_prototype_four_templates_unseen80 \
   --overwrite
 """
@@ -189,12 +189,24 @@ def parse_args():
     p.add_argument(
         "--eval-scope",
         default="unseen",
-        choices=["unseen", "selected", "all_test"],
+        choices=["unseen", "selected", "all_test", "all_data"],
     )
     p.add_argument("--train-ratio", type=float, default=0.30)
     p.add_argument("--seed", type=int, default=17)
     p.add_argument("--max-samples", type=int, default=0)
     p.add_argument("--eval-max-samples", type=int, default=80)
+
+    p.add_argument(
+        "--prototype-bank",
+        default="",
+        help=(
+            "Optional .pt prototype-bank path. If it exists, load the fixed "
+            "four-direction prototypes and skip prototype calibration forwards. "
+            "If it does not exist, estimate prototypes once and save them there. "
+            "If omitted, prototypes are estimated and saved to "
+            "<output-dir>/prototype_bank.pt."
+        ),
+    )
 
     p.add_argument("--gray-value", type=int, default=128)
     p.add_argument("--max-new-tokens", type=int, default=6)
@@ -840,6 +852,102 @@ def estimate_prototypes(
             })
 
     return centered, proto_rows
+
+
+def save_prototype_bank(path, prototypes, prototype_rows, metadata):
+    """Save fixed prototype vectors so later runs need no recalibration forward."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    packed = {
+        "version": 1,
+        "metadata": metadata,
+        "prototype_rows": prototype_rows,
+        "prototypes": {
+            rel: {
+                cand: (
+                    None
+                    if vec is None
+                    else torch.from_numpy(
+                        np.asarray(vec, np.float32)
+                    ).cpu()
+                )
+                for cand, vec in prototypes[rel].items()
+            }
+            for rel in REL
+        },
+    }
+    torch.save(packed, path)
+
+
+def load_prototype_bank(path):
+    """Load a previously fixed prototype bank."""
+    path = Path(path)
+    try:
+        packed = torch.load(
+            path,
+            map_location="cpu",
+            weights_only=False,
+        )
+    except TypeError:
+        packed = torch.load(
+            path,
+            map_location="cpu",
+        )
+
+    if int(packed.get("version", -1)) != 1:
+        raise RuntimeError(
+            f"Unsupported prototype bank version: {packed.get('version')}"
+        )
+
+    prototypes = {
+        rel: {
+            cand: (
+                None
+                if vec is None
+                else vec.detach().cpu().numpy().astype(np.float32)
+            )
+            for cand, vec in packed["prototypes"][rel].items()
+        }
+        for rel in REL
+    }
+
+    return (
+        prototypes,
+        packed.get("prototype_rows", []),
+        packed.get("metadata", {}),
+    )
+
+
+def validate_prototype_bank(bank_meta, candidate_meta, args, model_repo_id):
+    expected_candidates = sorted(candidate_meta.keys())
+    got_candidates = sorted(bank_meta.get("candidates", []))
+
+    problems = []
+
+    if got_candidates and got_candidates != expected_candidates:
+        problems.append("candidate set differs")
+
+    checks = {
+        "model": args.model,
+        "repo_id": model_repo_id,
+        "discovery_bundle": args.discovery_bundle,
+        "discovery_k": int(args.discovery_k),
+        "template_k": int(args.template_k),
+        "visual_bins": int(args.visual_bins),
+    }
+
+    for key, expected in checks.items():
+        if key in bank_meta and bank_meta[key] != expected:
+            problems.append(
+                f"{key}: bank={bank_meta[key]!r}, current={expected!r}"
+            )
+
+    if problems:
+        raise RuntimeError(
+            "Prototype bank is incompatible with this run: "
+            + "; ".join(problems)
+        )
 
 
 # =============================================================================
@@ -1573,8 +1681,18 @@ def main():
             if int(r["sid"]) in discovery_sids
         ]
 
-    else:
+    elif a.eval_scope == "all_test":
         eval_pool = list(test)
+
+    elif a.eval_scope == "all_data":
+        # True full-dataset diagnostic: all 440 COCO_two samples when
+        # --max-samples 0.  This includes prototype-discovery/calibration
+        # samples, so report it as an all-data diagnostic rather than a
+        # disjoint generalization score.
+        eval_pool = list(meta)
+
+    else:
+        raise ValueError(f"Unknown eval_scope={a.eval_scope}")
 
     eval_set = stratified_take(
         eval_pool,
@@ -1714,20 +1832,71 @@ def main():
         )
 
         # ---------------------------------------------------------------------
-        # Prototype estimation from discovery samples.
+        # Fixed prototype bank: load if available, otherwise estimate ONCE
+        # from discovery samples and save it for later evaluation runs.
         # ---------------------------------------------------------------------
-        prototypes, prototype_rows = estimate_prototypes(
-            discovery_meta=discovery_meta,
-            candidate_meta=candidate_meta,
-            prompts=prompts,
-            rec_by_sid=rec_by_sid,
-            processor=processor,
-            model=model,
-            decoder_layers=decoder_layers,
-            device=device,
-            visual_bins=a.visual_bins,
-            gray_value=a.gray_value,
+        prototype_bank_path = (
+            Path(a.prototype_bank)
+            if str(a.prototype_bank).strip()
+            else (outdir / "prototype_bank.pt")
         )
+
+        if prototype_bank_path.exists():
+            print(
+                f"Loading fixed prototype bank: {prototype_bank_path}"
+            )
+            prototypes, prototype_rows, bank_meta = load_prototype_bank(
+                prototype_bank_path
+            )
+            validate_prototype_bank(
+                bank_meta,
+                candidate_meta,
+                a,
+                spec.repo_id,
+            )
+            prototype_bank_source = "loaded"
+
+        else:
+            print(
+                "Prototype bank not found; estimating prototypes once from "
+                f"{len(discovery_meta)} discovery samples..."
+            )
+
+            prototypes, prototype_rows = estimate_prototypes(
+                discovery_meta=discovery_meta,
+                candidate_meta=candidate_meta,
+                prompts=prompts,
+                rec_by_sid=rec_by_sid,
+                processor=processor,
+                model=model,
+                decoder_layers=decoder_layers,
+                device=device,
+                visual_bins=a.visual_bins,
+                gray_value=a.gray_value,
+            )
+
+            bank_meta = {
+                "model": a.model,
+                "repo_id": spec.repo_id,
+                "discovery_bundle": a.discovery_bundle,
+                "discovery_k": int(a.discovery_k),
+                "template_k": int(a.template_k),
+                "visual_bins": int(a.visual_bins),
+                "gray_value": int(a.gray_value),
+                "discovery_sids": sorted(int(x) for x in discovery_sids),
+                "candidates": sorted(candidate_meta.keys()),
+            }
+
+            save_prototype_bank(
+                prototype_bank_path,
+                prototypes,
+                prototype_rows,
+                bank_meta,
+            )
+            print(
+                f"Saved fixed prototype bank: {prototype_bank_path}"
+            )
+            prototype_bank_source = "estimated_and_saved"
 
         write_csv(
             outdir / "prototype_geometry.csv",
@@ -2361,6 +2530,12 @@ def main():
                 a.eval_scope,
             "eval_N":
                 len(eval_set),
+            "all_data_includes_prototype_discovery_samples":
+                a.eval_scope == "all_data",
+            "prototype_bank_path":
+                str(prototype_bank_path),
+            "prototype_bank_source":
+                prototype_bank_source,
             "discovery_eval_overlap":
                 len(
                     discovery_sids
