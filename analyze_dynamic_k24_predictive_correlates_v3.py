@@ -72,7 +72,7 @@ can be resumed by rerunning without --overwrite.
 
 Example
 -------
-CUDA_VISIBLE_DEVICES=0 python -u analyze_dynamic_k24_predictive_correlates_v1.py \
+CUDA_VISIBLE_DEVICES=0 python -u analyze_dynamic_k24_predictive_correlates_v3.py \
   --run-dir output/qwen3b_coco_dynamic_k24_all440 \
   --model qwen-3b \
   --bundle "L22+L24+L26[global_unique]" \
@@ -273,6 +273,17 @@ def safe_ap(y, score):
     if len(y) < 4 or y.sum() == 0:
         return float("nan")
     return float(average_precision_score(y, score))
+
+
+def safe_mean(values):
+    """Mean over finite numeric values; NaN if none are finite."""
+    arr = np.asarray(list(values), dtype=np.float64)
+    if arr.size == 0:
+        return float("nan")
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan")
+    return float(arr.mean())
 
 
 def infer_source_layers(bundle):
@@ -1023,13 +1034,48 @@ def build_sample_features(
 
         if late_cos_cols:
             C = np.stack(late_cos_cols, axis=1)
-            feat["delta_cos_late_mean"] = np.nanmean(C, axis=1)
-            feat["delta_cos_late_max"] = np.nanmax(C, axis=1)
-            feat["delta_cos_late_maxabs"] = np.nanmax(np.abs(C), axis=1)
+            valid = np.isfinite(C)
+            nvalid = valid.sum(axis=1)
+
+            # Warning-free row-wise reductions. Some candidate tokens can have
+            # zero Real-Gray displacement, making cosine undefined against all
+            # late targets. Preserve those rows as NaN instead of emitting an
+            # "All-NaN slice" warning for every sample.
+            csum = np.where(valid, C, 0.0).sum(axis=1)
+            cmean = np.full(C.shape[0], np.nan, dtype=np.float32)
+            np.divide(
+                csum,
+                nvalid,
+                out=cmean,
+                where=nvalid > 0,
+            )
+
+            cmax_src = np.where(valid, C, -np.inf)
+            cmax = cmax_src.max(axis=1).astype(np.float32)
+            cmax[nvalid == 0] = np.nan
+
+            cabs_src = np.where(valid, np.abs(C), -np.inf)
+            cmaxabs = cabs_src.max(axis=1).astype(np.float32)
+            cmaxabs[nvalid == 0] = np.nan
+
+            feat["delta_cos_late_mean"] = cmean
+            feat["delta_cos_late_max"] = cmax
+            feat["delta_cos_late_maxabs"] = cmaxabs
+            feat["delta_cos_late_nvalid"] = nvalid.astype(np.float32)
 
         if late_dot_cols:
             X = np.stack(late_dot_cols, axis=1)
-            feat["delta_dot_late_mean"] = np.nanmean(X, axis=1)
+            valid_x = np.isfinite(X)
+            nx = valid_x.sum(axis=1)
+            xsum = np.where(valid_x, X, 0.0).sum(axis=1)
+            xmean = np.full(X.shape[0], np.nan, dtype=np.float32)
+            np.divide(
+                xsum,
+                nx,
+                out=xmean,
+                where=nx > 0,
+            )
+            feat["delta_dot_late_mean"] = xmean
 
         # Role-centroid similarities at the same source layer.
         role_feats = role_centroid_cos_features(
