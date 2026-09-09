@@ -522,6 +522,54 @@ def mapping_invariance_rows(rows, vectors):
     return out
 
 
+
+def relation_specificity_control(rows, vectors):
+    """Balanced relation centroids and 4x4 between-relation cosine matrices.
+
+    For each relation, first build a centroid separately for each output letter from
+    unit-normalized per-sample pullbacks, then average the available letter centroids
+    equally. This avoids a relation centroid being driven by one answer letter.
+    """
+    results = []
+    for L in sorted({r["source_layer"] for r in rows}):
+        for cond in sorted({r["target_condition"] for r in rows}):
+            rel_centroids = {}
+            rel_letter_counts = {}
+            for rel in REL:
+                letter_centroids = []
+                counts = {}
+                for a in LETTERS:
+                    vs = [vectors[i] for i, r in enumerate(rows)
+                          if r["source_layer"] == L and r["target_condition"] == cond
+                          and r["target_relation"] == rel and r["target_letter"] == a]
+                    if vs:
+                        c = np.mean(np.stack([unit_np(v) for v in vs]), axis=0).astype(np.float32)
+                        letter_centroids.append(unit_np(c))
+                        counts[a] = len(vs)
+                if letter_centroids:
+                    rc = np.mean(np.stack(letter_centroids), axis=0).astype(np.float32)
+                    rel_centroids[rel] = unit_np(rc)
+                    rel_letter_counts[rel] = counts
+
+            # 4x4 matrix rows
+            for r1 in REL:
+                if r1 not in rel_centroids:
+                    continue
+                row = {
+                    "source_layer": L,
+                    "target_condition": cond,
+                    "relation": r1,
+                    "counts": "|".join(f"{a}:{rel_letter_counts[r1].get(a,0)}" for a in LETTERS),
+                }
+                for r2 in REL:
+                    row[f"cos_{r2}"] = (
+                        cosine_np(rel_centroids[r1], rel_centroids[r2])
+                        if r2 in rel_centroids else float("nan")
+                    )
+                results.append(row)
+    return results
+
+
 def main():
     a = parse_args()
     writer_candidates = parse_ints(a.writer_candidates)
@@ -819,6 +867,8 @@ def main():
         traj.write_csv(outdir / "pullback_summary.csv", summary)
         inv = mapping_invariance_rows(pull_rows, pull_vecs)
         traj.write_csv(outdir / "mapping_invariance.csv", inv)
+        relctl = relation_specificity_control(pull_rows, pull_vecs)
+        traj.write_csv(outdir / "relation_specificity_control.csv", relctl)
 
         print("\n" + "=" * 116)
         print(f"PULLBACK SUMMARY | late writer target L{writer_layer}")
@@ -837,10 +887,38 @@ def main():
             print(msg)
 
         if inv:
-            print("\nMAPPING-INVARIANCE: same relation, different final letters")
-            for r in inv:
-                if r["target_condition"] == "opposite":
-                    print(f"L{r['source_layer']:02d} {r['target_relation']:5s} "
+            print("\nRELATION-SPECIFICITY CONTROL: between-relation cosine of balanced pullback centroids")
+        for L in valid_sources:
+            for cond in targets:
+                sub = [r for r in relctl if r["source_layer"] == L and r["target_condition"] == cond]
+                if not sub:
+                    continue
+                print(f"L{L} {cond}")
+                print("          " + "  ".join(f"{r:>7}" for r in REL))
+                for rr in REL:
+                    row = next((x for x in sub if x["relation"] == rr), None)
+                    if row is None:
+                        continue
+                    vals = "  ".join(f"{row[f'cos_{c}']:+.4f}" for c in REL)
+                    print(f"{rr:>7}  {vals}")
+                # summary contrast: within-relation cross-letter vs between-relation centroids
+                same = [x["mean_cross_letter_cos"] for x in inv
+                        if x["source_layer"] == L and x["target_condition"] == cond]
+                cent = {x["relation"]: x for x in sub}
+                between=[]
+                for i,r1 in enumerate(REL):
+                    for r2 in REL[i+1:]:
+                        if r1 in cent and r2 in cent:
+                            between.append(cent[r1][f"cos_{r2}"])
+                if same and between:
+                    print(f"  mean same-relation cross-letter={np.mean(same):+.4f} | "
+                          f"mean between-relation={np.mean(between):+.4f} | "
+                          f"gap={np.mean(same)-np.mean(between):+.4f}")
+
+        print("\nMAPPING-INVARIANCE: same relation, different final letters")
+        for r in inv:
+            if r["target_condition"] == "opposite":
+                print(f"L{r['source_layer']:02d} {r['target_relation']:5s} "
                           f"letters={r['letters_present']} cross-letter-cos={r['mean_cross_letter_cos']:+.4f}")
 
         meta_out = dict(
