@@ -55,7 +55,7 @@ overall edited accuracy for the requested dynamic-K24 configuration unless
 
 Example
 -------
-python analyze_dynamic_k24_patterns_v1.py \
+python analyze_dynamic_k24_patterns_v2.py \
   --run-dir output/qwen3b_coco_dynamic_k24_all440 \
   --bundle "L22+L24+L26[global_unique]" \
   --k 24 \
@@ -515,19 +515,38 @@ def sample_composition(sel, baseline, generation):
 
 
 def layer_role_group_summary(sel, sample_df, group_col, group_values=None):
-    meta = sample_df[
-        ["sid", "relation", "baseline_correct", "repair_outcome"]
-    ].copy()
+    # Keep the requested grouping column when it lives only in sample_df
+    # (e.g. baseline_status).  The v1 script hard-coded four metadata columns
+    # and therefore dropped baseline_status before the merge.
+    meta_cols = ["sid", "relation", "baseline_correct", "repair_outcome"]
+    if group_col in sample_df.columns and group_col not in meta_cols:
+        meta_cols.append(group_col)
+
+    meta = sample_df[meta_cols].copy()
     x = sel.merge(meta, on="sid", how="left", suffixes=("", "_meta"))
 
+    # If both sel and sample_df contained the same grouping column, pandas may
+    # have suffixed the sample-level copy. Prefer the unsuffixed column when
+    # present; otherwise use the suffixed metadata copy.
+    effective_group_col = group_col
+    if effective_group_col not in x.columns:
+        alt = f"{group_col}_meta"
+        if alt in x.columns:
+            effective_group_col = alt
+        else:
+            raise KeyError(
+                f"Grouping column {group_col!r} is unavailable after merge. "
+                f"Available columns: {list(x.columns)}"
+            )
+
     if group_values is None:
-        group_values = sorted(x[group_col].dropna().unique())
+        group_values = sorted(x[effective_group_col].dropna().unique())
 
     units = sorted(x["layer_role"].unique())
     rows = []
 
     for gv in group_values:
-        g = x[x[group_col] == gv]
+        g = x[x[effective_group_col] == gv]
         n_samples = int(g["sid"].nunique())
         n_tokens = len(g)
         if not n_samples:
