@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Standalone Core50 WHERE-vs-WHEN behavioral diagnostic.
@@ -1707,10 +1707,9 @@ def write_csv(path, rows):
         w.writerows(rows)
 
 
-def canon_rel(x):
-    return E.canon_rel(x)
-
-
+# Reuse the embedded helper's canon_rel() defined above.
+# Do NOT redefine it via E.canon_rel here, because E points to this same module
+# in the standalone build and that would recurse forever.
 def safe_div(a, b):
     return float(a / b) if b else float("nan")
 
