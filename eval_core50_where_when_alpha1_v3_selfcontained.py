@@ -1,4 +1,4 @@
-!/usr/bin/env python3
+# !/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Standalone Core50 WHERE-vs-WHEN behavioral diagnostic.
