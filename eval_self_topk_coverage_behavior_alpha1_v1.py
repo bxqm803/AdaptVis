@@ -1,4 +1,4 @@
-# !/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Standalone Core50 WHERE-vs-WHEN behavioral diagnostic.
@@ -1621,33 +1621,7 @@ def main():
     print("Saved:", outdir)
 
 
-
-# ===== Focused Core50 WHERE/WHEN experiment =====
-
-import argparse
-import contextlib
-import csv
-import gc
-import json
-import random
-import shutil
-from collections import defaultdict
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
-import torch
-import transformers
-from transformers import AutoProcessor
-from tqdm import tqdm
-
-import sys as _sys
-E = _sys.modules[__name__]
-
-
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
+# ===== Focused Top-K coverage sweep: Core50 =====
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -1668,11 +1642,32 @@ def parse_args():
     p.add_argument("--condition", default="positive")
     p.add_argument("--selection-strategy", default="global_unique")
     p.add_argument("--oracle-k", type=int, default=36)
+    p.add_argument("--core-mass", type=float, default=0.5)
     p.add_argument(
-        "--core-mass",
-        type=float,
-        default=0.5,
-        help="Default Core50; keep 0.5 for this diagnostic.",
+        "--ks",
+        default="7,14,19,24,36",
+        help="Comma-separated number of self-selected positions.",
+    )
+    p.add_argument(
+        "--selector",
+        default="attn_ensemble",
+        choices=[
+            "attn_ensemble",
+            "attn_delta_max",
+            "attn_delta_top2",
+            "attn_delta_mean",
+            "attn_posdelta_max",
+            "attn75_prior25",
+        ],
+    )
+    p.add_argument(
+        "--modes",
+        default="oracle_layer,self_soft_all",
+        help=(
+            "Comma separated. oracle_layer = self positions + oracle best layer; "
+            "self_soft_all = self positions + relation-free soft trajectory over L20-L26. "
+            "For the fastest coverage diagnostic use --modes oracle_layer."
+        ),
     )
     p.add_argument("--alpha", type=float, default=1.0)
     p.add_argument("--gray-value", type=int, default=128)
@@ -1690,340 +1685,258 @@ def parse_args():
     return p.parse_args()
 
 
-def write_csv(path, rows):
-    path = Path(path)
-    if not rows:
-        path.write_text("", encoding="utf-8")
-        return
-    keys, seen = [], set()
-    for row in rows:
-        for k in row:
-            if k not in seen:
-                seen.add(k)
-                keys.append(k)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=keys)
-        w.writeheader()
-        w.writerows(rows)
+def parse_ints(s):
+    vals = [int(x.strip()) for x in str(s).split(",") if x.strip()]
+    vals = sorted(set(vals))
+    if not vals or min(vals) <= 0:
+        raise ValueError("--ks must contain positive integers")
+    return vals
 
 
-# Reuse the embedded helper's canon_rel() defined above.
-# Do NOT redefine it via E.canon_rel here, because E points to this same module
-# in the standalone build and that would recurse forever.
-def safe_div(a, b):
-    return float(a / b) if b else float("nan")
+def parse_names(s):
+    return [x.strip() for x in str(s).split(",") if x.strip()]
 
 
-def safe_mean(xs):
-    a = np.asarray(list(xs), dtype=np.float64)
-    a = a[np.isfinite(a)]
-    return float(a.mean()) if len(a) else float("nan")
-
-
-# -----------------------------------------------------------------------------
-# Layer-rule helpers
-# -----------------------------------------------------------------------------
-
-def ensure_feature(df, col):
-    if col not in df.columns or df[col].notna().sum() == 0:
-        raise RuntimeError(
-            f"Required feature {col!r} is missing/all-NaN in feature cache."
-        )
-
-
-def choose_layer_rows_for_oracle_positions(
+def build_soft_all_specs_for_self_positions(
+    chosen_positions,
     feature_sid,
-    oracle_core_rows,
-    rule,
+    hreal,
+    hgray,
     source_layers,
+    score_col="RANK_last_attn_next_delta_mean",
 ):
     """
-    Return rows:
-      position, [(edit_layer, weight), ...], score
-    Oracle is used ONLY to provide position identity.
-    Layer selection itself uses relation-free cached features.
+    For each already-selected POSITION, edit that same position across all
+    available source layers.  The per-position weights sum to exactly 1.
+
+    Thus alpha=1 means total nominal intervention weight per selected position
+    stays 1, rather than becoming 7 when L20..L26 are all edited.
     """
-    if rule in {
-        "next_delta_peak",
-        "next_delta_top2_split",
-        "next_delta_top3_split",
-        "next_delta_pm1_split",
-        "next_delta_soft_all",
-    }:
-        score_col = "RANK_last_attn_next_delta_mean"
-    elif rule == "next_posdelta_peak":
-        score_col = "last_attn_next_max_positive_delta"
-    elif rule == "attn_ensemble_peak":
-        score_col = "SCORE_attn_ensemble"
-    else:
-        raise ValueError(rule)
+    if score_col not in feature_sid.columns:
+        raise RuntimeError(f"Missing layer score column: {score_col}")
 
-    ensure_feature(feature_sid, score_col)
     allowed = set(int(x) for x in source_layers)
-    out = []
+    specs = defaultdict(list)
+    export = []
 
-    for core_rank, cr in enumerate(oracle_core_rows, 1):
-        pos = int(cr["position"])
+    for rank, r in enumerate(chosen_positions.itertuples(), 1):
+        pos = int(r.position)
         q = feature_sid[feature_sid["position"] == pos].copy()
-        q["_score"] = pd.to_numeric(q[score_col], errors="coerce")
+        q["_layer_score"] = pd.to_numeric(q[score_col], errors="coerce")
         q = q[
             q["source_layer"].astype(int).isin(allowed)
-            & np.isfinite(q["_score"])
+            & np.isfinite(q["_layer_score"])
         ].copy()
         if not len(q):
             continue
 
-        q = q.sort_values(
-            ["_score", "source_layer"],
-            ascending=[False, True],
-        ).reset_index(drop=True)
-
-        peak_layer = int(q.iloc[0]["source_layer"])
-        peak_score = float(q.iloc[0]["_score"])
-
-        if rule in {
-            "next_delta_peak",
-            "next_posdelta_peak",
-            "attn_ensemble_peak",
-        }:
-            layers_weights = [(peak_layer, 1.0)]
-
-        elif rule == "next_delta_top2_split":
-            qq = q.drop_duplicates("source_layer").head(2)
-            layers = [int(x) for x in qq["source_layer"]]
-            layers_weights = [(L, 1.0 / len(layers)) for L in layers]
-
-        elif rule == "next_delta_top3_split":
-            qq = q.drop_duplicates("source_layer").head(3)
-            layers = [int(x) for x in qq["source_layer"]]
-            layers_weights = [(L, 1.0 / len(layers)) for L in layers]
-
-        elif rule == "next_delta_pm1_split":
-            layers = [
-                L for L in [peak_layer - 1, peak_layer, peak_layer + 1]
-                if L in allowed
-            ]
-            layers_weights = [(L, 1.0 / len(layers)) for L in layers]
-
-        elif rule == "next_delta_soft_all":
-            # Score is a within-sample/layer percentile rank in [0,1].
-            # Normalize across available layers for this position.
-            qq = q.drop_duplicates("source_layer").copy()
-            vals = np.maximum(
-                pd.to_numeric(qq["_score"], errors="coerce").to_numpy(float),
-                0.0,
+        # One row per source layer.
+        q = (
+            q.sort_values(
+                ["source_layer", "_layer_score"],
+                ascending=[True, False],
             )
-            if vals.sum() <= 1e-12:
-                vals = np.ones(len(vals), dtype=float)
-            vals = vals / vals.sum()
-            layers_weights = [
-                (int(L), float(w))
-                for L, w in zip(qq["source_layer"], vals)
-            ]
-        else:
-            raise AssertionError(rule)
-
-        out.append(
-            {
-                "core_rank": core_rank,
-                "position": pos,
-                "oracle_layer": int(cr["source_layer"]),
-                "oracle_mediation": float(cr["mediation"]),
-                "peak_self_layer": peak_layer,
-                "peak_self_score": peak_score,
-                "score_col": score_col,
-                "layers_weights": layers_weights,
-            }
+            .drop_duplicates("source_layer", keep="first")
         )
-    return out
 
+        # RANK_* is nonnegative. Clamp defensively and normalize so each
+        # selected position has total weight 1.
+        vals = np.maximum(q["_layer_score"].to_numpy(dtype=float), 0.0)
+        if vals.sum() <= 1e-12:
+            vals = np.ones(len(vals), dtype=float)
+        vals = vals / vals.sum()
 
-def specs_from_layer_rows(layer_rows, hreal, hgray):
-    specs = defaultdict(list)
-    export = []
-    for r in layer_rows:
-        pos = int(r["position"])
-        for L, w in r["layers_weights"]:
-            d = E.delta_at(hreal, hgray, int(L), pos)
+        for (_, rr), w in zip(q.iterrows(), vals):
+            L = int(rr["source_layer"])
+            d = delta_at(hreal, hgray, L, pos)
             if d is None:
                 continue
-            specs[int(L)].append((pos, d, float(w)))
+            specs[L].append((pos, d, float(w)))
             export.append(
                 {
+                    "rank": rank,
                     "position": pos,
-                    "core_rank": int(r["core_rank"]),
-                    "oracle_layer": int(r["oracle_layer"]),
-                    "oracle_mediation": float(r["oracle_mediation"]),
-                    "peak_self_layer": int(r["peak_self_layer"]),
-                    "edit_layer": int(L),
+                    "position_score": float(r.position_score),
+                    "peak_selector_layer": int(r.peak_layer),
+                    "edit_layer": L,
                     "edit_weight": float(w),
-                    "self_score": float(r["peak_self_score"]),
-                    "score_col": str(r["score_col"]),
+                    "layer_score": float(rr["_layer_score"]),
+                    "broad_category": str(r.broad_category),
                 }
             )
+
     return dict(specs), export
 
 
-# -----------------------------------------------------------------------------
-# Behavioral summaries
-# -----------------------------------------------------------------------------
+def core50_overlap_stats(chosen_positions, oracle_core_rows):
+    selected = set(int(x) for x in chosen_positions["position"].tolist())
+    oracle = set(int(r["position"]) for r in oracle_core_rows)
+    hits = len(selected & oracle)
+    recall = safe_div(hits, len(oracle))
+    precision = safe_div(hits, len(selected))
+    return {
+        "core_hits": hits,
+        "core_size": len(oracle),
+        "selected_size": len(selected),
+        "core_position_recall": recall,
+        "core_position_precision": precision,
+    }
 
-def summarize(rows):
+
+def summarize_k_sweep(rows):
     df = pd.DataFrame(rows)
-    out = []
     if not len(df):
         return pd.DataFrame()
 
-    for key, g in df.groupby(
-        ["axis", "method", "method_kind", "alpha"],
-        dropna=False,
-    ):
-        axis, method, kind, alpha = key
-        base = g["baseline_correct"].astype(bool).to_numpy()
-        edit = g["correct"].astype(bool).to_numpy()
-        bpred = g["baseline_prediction"].astype(str).to_numpy()
-        epred = g["prediction"].astype(str).to_numpy()
-
-        wrong_n = int((~base).sum())
-        correct_n = int(base.sum())
-        w2c = int(((~base) & edit).sum())
-        c2w = int((base & (~edit)).sum())
+    out = []
+    for key, g in df.groupby(["mode", "selector", "K", "alpha"], dropna=False):
+        mode, selector, K, alpha = key
+        base_ok = g["baseline_correct"].astype(bool).to_numpy()
+        edit_ok = g["correct"].astype(bool).to_numpy()
+        bp = g["baseline_prediction"].astype(str).to_numpy()
+        ep = g["prediction"].astype(str).to_numpy()
+        wrong_n = int((~base_ok).sum())
+        correct_n = int(base_ok.sum())
+        w2c = int(((~base_ok) & edit_ok).sum())
+        c2w = int((base_ok & (~edit_ok)).sum())
 
         out.append(
             {
-                "axis": axis,
-                "method": method,
-                "method_kind": kind,
+                "mode": mode,
+                "selector": selector,
+                "K": int(K),
                 "alpha": float(alpha),
                 "N": len(g),
-                "baseline_acc": float(base.mean()),
-                "edited_acc": float(edit.mean()),
-                "gain": float(edit.mean() - base.mean()),
+                "baseline_acc": float(base_ok.mean()),
+                "edited_acc": float(edit_ok.mean()),
+                "gain": float(edit_ok.mean() - base_ok.mean()),
                 "W2C": w2c,
                 "C2W": c2w,
                 "net": w2c - c2w,
                 "repair_rate_given_wrong": safe_div(w2c, wrong_n),
                 "preserve_rate_given_correct": safe_div(correct_n - c2w, correct_n),
-                "changed": int(np.sum(bpred != epred)),
-                "mean_selected_positions": safe_mean(g["n_selected_positions"]),
+                "changed": int(np.sum(bp != ep)),
+                "mean_core_hits": safe_mean(g["core_hits"]),
+                "mean_core_size": safe_mean(g["core_size"]),
+                "mean_core_position_recall": safe_mean(g["core_position_recall"]),
+                "mean_core_position_precision": safe_mean(g["core_position_precision"]),
+                "mean_selected_positions": safe_mean(g["selected_size"]),
                 "mean_edit_pairs": safe_mean(g["n_edit_pairs"]),
             }
         )
 
     return pd.DataFrame(out).sort_values(
-        ["axis", "edited_acc", "net"],
-        ascending=[True, False, False],
+        ["mode", "K"], ascending=[True, True]
     )
 
 
-def summarize_by_relation(rows):
+def summarize_reference(rows):
     df = pd.DataFrame(rows)
-    out = []
     if not len(df):
-        return pd.DataFrame()
-
-    for key, g in df.groupby(
-        ["axis", "method", "method_kind", "alpha", "gt"],
-        dropna=False,
-    ):
-        axis, method, kind, alpha, gt = key
-        base = g["baseline_correct"].astype(bool).to_numpy()
-        edit = g["correct"].astype(bool).to_numpy()
-        out.append(
-            {
-                "axis": axis,
-                "method": method,
-                "method_kind": kind,
-                "alpha": float(alpha),
-                "relation": gt,
-                "N": len(g),
-                "baseline_acc": float(base.mean()),
-                "edited_acc": float(edit.mean()),
-                "gain": float(edit.mean() - base.mean()),
-                "W2C": int(((~base) & edit).sum()),
-                "C2W": int((base & (~edit)).sum()),
-            }
-        )
-    return pd.DataFrame(out)
+        return {}
+    base_ok = df["baseline_correct"].astype(bool).to_numpy()
+    edit_ok = df["correct"].astype(bool).to_numpy()
+    wrong_n = int((~base_ok).sum())
+    correct_n = int(base_ok.sum())
+    w2c = int(((~base_ok) & edit_ok).sum())
+    c2w = int((base_ok & (~edit_ok)).sum())
+    return {
+        "N": len(df),
+        "baseline_acc": float(base_ok.mean()),
+        "edited_acc": float(edit_ok.mean()),
+        "gain": float(edit_ok.mean() - base_ok.mean()),
+        "W2C": w2c,
+        "C2W": c2w,
+        "repair_rate_given_wrong": safe_div(w2c, wrong_n),
+        "preserve_rate_given_correct": safe_div(correct_n - c2w, correct_n),
+        "mean_core_size": safe_mean(df["core_size"]),
+        "mean_edit_pairs": safe_mean(df["n_edit_pairs"]),
+    }
 
 
-def render_summary(summary, core_sizes, fixed_k, a):
+def render_k_summary(summary, reference, a, target, ks):
     lines = []
-    lines.append("=" * 144)
-    lines.append("CORE POSITION vs LAYER DIAGNOSTIC — ALPHA FIXED TO 1")
-    lines.append("=" * 144)
+    lines.append("=" * 152)
+    lines.append("SELF TOP-K COVERAGE -> ACTUAL GENERATION (ALPHA FIXED TO 1)")
+    lines.append("=" * 152)
     lines.append(
-        f"core={E.fmt_core(a.core_mass)} | "
-        f"true core size mean={core_sizes[E.fmt_core(a.core_mass)+'_N'].mean():.2f}, "
-        f"median={core_sizes[E.fmt_core(a.core_mass)+'_N'].median():.1f} | "
-        f"self position K={fixed_k}"
+        f"target={target} | selector={a.selector} | K={','.join(map(str, ks))}"
+    )
+    lines.append(
+        "Core overlap uses oracle Core50 ONLY as an evaluation label. "
+        "Selection itself does not use LEFT/RIGHT/ON/UNDER."
     )
     lines.append("")
-    lines.append(
-        "Axis POSITION: self-select position + ORACLE best layer. "
-        "Higher acc means better relation-free position localization."
-    )
-    lines.append(
-        "Axis LAYER: ORACLE core positions + self-selected layer rule. "
-        "Higher acc means better layer assignment."
-    )
-    lines.append(
-        "Multi-layer layer rules preserve total per-position intervention weight = alpha=1."
-    )
 
-    for axis in ["reference", "position", "layer"]:
-        g = summary[summary["axis"] == axis].copy()
+    if reference:
+        lines.append("ORACLE CORE REFERENCE")
+        lines.append("-" * 152)
+        lines.append(
+            f"oracle_core_exact  "
+            f"acc={reference['edited_acc']:.4f} "
+            f"gain={reference['gain']:+.4f} "
+            f"W2C/C2W={reference['W2C']:3d}/{reference['C2W']:3d} "
+            f"repair={reference['repair_rate_given_wrong']:.3f} "
+            f"preserve={reference['preserve_rate_given_correct']:.3f} "
+            f"core/edit={reference['mean_core_size']:.1f}/{reference['mean_edit_pairs']:.1f}"
+        )
+        lines.append("")
+
+    for mode in ["oracle_layer", "self_soft_all"]:
+        g = summary[summary["mode"] == mode].copy()
         if not len(g):
             continue
-        lines.append("")
-        lines.append("-" * 144)
-        lines.append(axis.upper())
-        lines.append("-" * 144)
-        for r in g.sort_values("edited_acc", ascending=False).itertuples():
+        if mode == "oracle_layer":
+            desc = "SELF TOP-K POSITIONS + ORACLE BEST LAYER (coverage diagnostic)"
+        else:
+            desc = "SELF TOP-K POSITIONS + SELF SOFT-ALL DEPTH TRAJECTORY"
+        lines.append(desc)
+        lines.append("-" * 152)
+        for r in g.sort_values("K").itertuples():
             lines.append(
-                f"{r.method:<34s} "
+                f"K={int(r.K):2d}  "
                 f"acc={r.edited_acc:.4f} gain={r.gain:+.4f} "
-                f"W2C/C2W={int(r.W2C):3d}/{int(r.C2W):3d} "
-                f"net={int(r.net):+3d} "
+                f"W2C/C2W={int(r.W2C):3d}/{int(r.C2W):3d} net={int(r.net):+3d}  "
+                f"Core50 hit={r.mean_core_hits:.2f}/{r.mean_core_size:.2f} "
+                f"recall={r.mean_core_position_recall:.3f} "
+                f"precision={r.mean_core_position_precision:.3f}  "
                 f"repair={r.repair_rate_given_wrong:.3f} "
                 f"preserve={r.preserve_rate_given_correct:.3f} "
-                f"pos/edit={r.mean_selected_positions:.1f}/{r.mean_edit_pairs:.1f}"
+                f"editPairs={r.mean_edit_pairs:.1f}"
             )
+        lines.append("")
 
-    lines.append("")
-    lines.append("Readout:")
+    lines.append("Main question:")
     lines.append(
-        "  Best POSITION method tells us which self signal finds behaviorally useful token positions "
-        "when exact layer is no longer the bottleneck."
+        "  If Core50 recall rises strongly with K while behavioral accuracy also rises, "
+        "the self signal is better viewed as a noisy ranking whose useful operating point "
+        "is overcomplete rather than a precise Top-7 selector."
     )
     lines.append(
-        "  Best LAYER method tells us how to intervene on a known causal position without knowing its oracle layer."
-    )
-    lines.append(
-        "  If multi-layer split beats hard peak, exact layer should be treated as a trajectory/window rather than "
-        "a single discrete layer."
+        "  If recall rises but behavior falls, extra selected positions are causally contaminating "
+        "the intervention; simply increasing K cannot solve self-selection."
     )
     return "\n".join(lines) + "\n"
 
 
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
-
 def main():
     a = parse_args()
     if abs(float(a.alpha) - 1.0) > 1e-12:
-        raise ValueError(
-            "This focused script intentionally fixes alpha=1.0. "
-            "Run with --alpha 1.0."
-        )
+        raise ValueError("This script intentionally fixes alpha=1.0.")
+
+    ks = parse_ints(a.ks)
+    modes = parse_names(a.modes)
+    allowed_modes = {"oracle_layer", "self_soft_all"}
+    bad_modes = sorted(set(modes) - allowed_modes)
+    if bad_modes:
+        raise ValueError(f"Unknown --modes: {bad_modes}")
 
     random.seed(a.seed)
     np.random.seed(a.seed)
     torch.manual_seed(a.seed)
 
-    source_layers = E.infer_source_layers(a.bundle)
-    target = E.fmt_core(a.core_mass)
+    source_layers = infer_source_layers(a.bundle)
+    target = fmt_core(a.core_mass)
 
     outdir = Path(a.output_dir)
     if a.overwrite and outdir.exists():
@@ -2032,7 +1945,7 @@ def main():
     chunk_dir = outdir / "chunks"
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
-    baseline, med, sel, valid_sids = E.load_existing_run(a, source_layers)
+    baseline, med, sel, valid_sids = load_existing_run(a, source_layers)
 
     if a.max_eval_samples and a.max_eval_samples > 0:
         rng = np.random.default_rng(a.seed)
@@ -2047,15 +1960,17 @@ def main():
         med = med[med["sid"].isin(valid_sids)].copy()
         sel = sel[sel["sid"].isin(valid_sids)].copy()
 
-    truth, core_sizes = E.build_core_truth(sel, [a.core_mass])
-    fixed_k = int(round(float(core_sizes[target + "_N"].median())))
+    truth, core_sizes = build_core_truth(sel, [a.core_mass])
+    features = load_features(a, valid_sids, source_layers)
 
-    features = E.load_features(a, valid_sids, source_layers)
-    features_prior, prior_mix_col = E.add_loo_role_prior(
-        features, truth[target], target
-    )
+    # Only needed for the optional calibrated selector.
+    prior_mix_col = None
+    features_for_selector = features
+    if a.selector == "attn75_prior25":
+        features_for_selector, prior_mix_col = add_loo_role_prior(
+            features, truth[target], target
+        )
 
-    # Baseline lookup.
     baseline_by_sid = {}
     for r in baseline.itertuples():
         baseline_by_sid[int(r.sid)] = {
@@ -2064,18 +1979,17 @@ def main():
             "baseline_correct": bool(r.baseline_correct),
         }
 
-    # Data/model.
-    two = E.base.import_two_object_module()
-    prompts = E.base.load_standard_prompts(Path(a.prompt_jsonl))
+    two = base.import_two_object_module()
+    prompts = base.load_standard_prompts(Path(a.prompt_jsonl))
     records, _ = two.load_records("coco_two", Path(a.data_root), None)
     rec_by_sid = {int(r.sid): r for r in records}
 
-    specs = E.base.merged_model_specs(two)
+    specs = base.merged_model_specs(two)
     spec = specs[a.model]
     model_cls = getattr(transformers, spec.model_class)
 
     load_kw = dict(
-        dtype=E.base.resolve_dtype(spec.dtype_name),
+        dtype=base.resolve_dtype(spec.dtype_name),
         low_cpu_mem_usage=True,
         trust_remote_code=spec.trust_remote_code,
         device_map={"": a.device},
@@ -2090,233 +2004,240 @@ def main():
         spec.repo_id,
         trust_remote_code=spec.trust_remote_code,
     )
-    E.base.configure_processor(model, processor)
+    base.configure_processor(model, processor)
     for p in model.parameters():
         p.requires_grad_(False)
 
-    decoder_layers, decoder_path = E.base.resolve_decoder_layers(model)
+    decoder_layers, decoder_path = base.resolve_decoder_layers(model)
 
-    position_methods = [
-        "attn_delta_max",
-        "attn_delta_top2",
-        "attn_delta_mean",
-        "attn_posdelta_max",
-        "attn_ensemble",
-        "attn75_prior25",
-        "random_pos_self_layer",
-    ]
-    layer_methods = [
-        "next_delta_peak",
-        "next_posdelta_peak",
-        "attn_ensemble_peak",
-        "next_delta_top2_split",
-        "next_delta_top3_split",
-        "next_delta_pm1_split",
-        "next_delta_soft_all",
-    ]
-
-    print("=" * 144)
-    print("CORE50 WHERE vs WHEN — alpha=1")
-    print("=" * 144)
+    print("=" * 152)
+    print("SELF TOP-K COVERAGE SWEEP — alpha=1")
+    print("=" * 152)
     print("N:", len(valid_sids))
     print("source layers:", source_layers)
-    print("self position K:", fixed_k)
-    print("position methods:", position_methods)
-    print("layer methods:", layer_methods)
-    print("generations/sample:", 1 + len(position_methods) + len(layer_methods))
+    print("target:", target)
+    print("selector:", a.selector)
+    print("K sweep:", ks)
+    print("modes:", modes)
+    print(
+        "generations/sample:",
+        1 + len(ks) * len(modes),
+        "(1 oracle Core50 reference + K sweep)",
+    )
     print()
 
     all_rows = []
+    reference_rows = []
     selected_rows = []
 
     try:
-        for sid in tqdm(valid_sids, desc="WHERE/WHEN"):
+        for sid in tqdm(valid_sids, desc="TopK sweep"):
             sid = int(sid)
             cache = chunk_dir / f"sid_{sid}.pkl.gz"
             if cache.exists():
                 obj = pd.read_pickle(cache, compression="gzip")
-                all_rows.extend(obj["rows"])
-                selected_rows.extend(obj["selected"])
+                all_rows.extend(obj.get("rows", []))
+                reference_rows.extend(obj.get("reference", []))
+                selected_rows.extend(obj.get("selected", []))
                 continue
 
             gt = baseline_by_sid[sid]["gt"]
             if not gt:
                 gt = canon_rel(sel[sel["sid"] == sid]["relation"].iloc[0])
 
-            pr = prompts[sid]
             real = gray = rb = gb = None
-            sid_rows, sid_selected = [], []
+            sid_rows = []
+            sid_reference = []
+            sid_selected = []
 
             try:
-                real = E.base.record_image(rec_by_sid[sid])
+                real = base.record_image(rec_by_sid[sid])
                 if hasattr(real, "convert"):
                     real = real.convert("RGB")
-                gray = E.make_gray_image(real, a.gray_value)
+                gray = make_gray_image(real, a.gray_value)
 
                 device = torch.device(a.device)
-                rb = E.base.make_question_batch(
+                rb = base.make_question_batch(
                     processor=processor,
                     image=real,
-                    question_text=str(pr["question_text"]),
+                    question_text=str(prompts[sid]["question_text"]),
                     device=device,
                 )
-                gb = E.base.make_question_batch(
+                gb = base.make_question_batch(
                     processor=processor,
                     image=gray,
-                    question_text=str(pr["question_text"]),
+                    question_text=str(prompts[sid]["question_text"]),
                     device=device,
                 )
 
-                hreal = E.capture_cpu(model, decoder_layers, rb, source_layers)
-                hgray = E.capture_cpu(model, decoder_layers, gb, source_layers)
+                hreal = capture_cpu(model, decoder_layers, rb, source_layers)
+                hgray = capture_cpu(model, decoder_layers, gb, source_layers)
 
                 f_sid = features[features["sid"] == sid].copy()
-                fp_sid = features_prior[features_prior["sid"] == sid].copy()
+                fs_sid = features_for_selector[
+                    features_for_selector["sid"] == sid
+                ].copy()
                 med_sid = med[med["sid"] == sid].copy()
                 oracle_core = truth[target][sid]
 
-                def add_result(axis, method, kind, gen_out, npos):
-                    sid_rows.append(
-                        {
-                            "sid": sid,
-                            "gt": gt,
-                            "baseline_prediction": baseline_by_sid[sid][
-                                "baseline_prediction"
-                            ],
-                            "baseline_correct": baseline_by_sid[sid][
-                                "baseline_correct"
-                            ],
-                            "axis": axis,
-                            "method": method,
-                            "method_kind": kind,
-                            "alpha": 1.0,
-                            "prediction": gen_out["prediction"],
-                            "correct": gen_out["prediction"] == gt,
-                            "text": gen_out["text"],
-                            "n_selected_positions": int(npos),
-                            "n_edit_pairs": int(gen_out["n_edit_pairs"]),
-                        }
-                    )
-
-                # ---------------------------------------------------------
-                # Reference: oracle Core50 exact.
-                # ---------------------------------------------------------
-                specs_mid, exp = E.build_oracle_exact_specs(
+                # ------------------------------------------------------
+                # One exact Core50 reference per sample.
+                # ------------------------------------------------------
+                oracle_specs, oracle_export = build_oracle_exact_specs(
                     oracle_core, hreal, hgray
                 )
-                out = E.generate_with_specs(
-                    model, processor, decoder_layers, rb,
-                    specs_mid, 1.0, a.max_new_tokens
+                oracle_out = generate_with_specs(
+                    model,
+                    processor,
+                    decoder_layers,
+                    rb,
+                    oracle_specs,
+                    1.0,
+                    a.max_new_tokens,
                 )
-                add_result(
-                    "reference", "oracle_core_exact", "diagnostic_oracle",
-                    out, len(oracle_core)
+                sid_reference.append(
+                    {
+                        "sid": sid,
+                        "gt": gt,
+                        "baseline_prediction": baseline_by_sid[sid][
+                            "baseline_prediction"
+                        ],
+                        "baseline_correct": baseline_by_sid[sid][
+                            "baseline_correct"
+                        ],
+                        "prediction": oracle_out["prediction"],
+                        "correct": oracle_out["prediction"] == gt,
+                        "core_size": len(oracle_core),
+                        "n_edit_pairs": oracle_out["n_edit_pairs"],
+                    }
                 )
 
-                # ---------------------------------------------------------
-                # Axis A: self position + oracle layer.
-                # ---------------------------------------------------------
-                for method in position_methods:
-                    use_df = fp_sid if method == "attn75_prior25" else f_sid
-                    chosen_self = E.select_self_positions(
-                        use_df,
-                        method=method,
-                        k=fixed_k,
-                        sid=sid,
-                        seed=a.seed,
-                        target_prior_mix_col=(
-                            prior_mix_col if method == "attn75_prior25" else None
-                        ),
-                    )
+                # ------------------------------------------------------
+                # Rank positions ONCE. Larger K are prefixes of same rank.
+                # ------------------------------------------------------
+                max_k = max(ks)
+                ranked_all = select_self_positions(
+                    fs_sid,
+                    method=a.selector,
+                    k=max_k,
+                    sid=sid,
+                    seed=a.seed,
+                    target_prior_mix_col=prior_mix_col,
+                )
 
-                    chosen_oracle_layer = E.choose_oracle_layer_for_self_positions(
-                        chosen_self,
-                        med_sid,
-                    )
-                    specs_mid, exp = E.build_specs_from_selected(
-                        chosen_oracle_layer,
-                        hreal,
-                        hgray,
-                        source_layers,
-                        "peak",
-                    )
-                    out = E.generate_with_specs(
-                        model, processor, decoder_layers, rb,
-                        specs_mid, 1.0, a.max_new_tokens
-                    )
+                for K in ks:
+                    chosen = ranked_all.iloc[: min(K, len(ranked_all))].copy()
+                    overlap = core50_overlap_stats(chosen, oracle_core)
 
-                    kind = (
-                        "random_control_oracle_layer"
-                        if method == "random_pos_self_layer"
-                        else (
-                            "calibrated_self_pos_oracle_layer"
-                            if method == "attn75_prior25"
-                            else "self_pos_oracle_layer"
-                        )
-                    )
-                    add_result(
-                        "position",
-                        method.replace("random_pos_self_layer",
-                                       "random_pos_oracle_layer"),
-                        kind,
-                        out,
-                        len(chosen_oracle_layer),
-                    )
-
-                    for rank, r in enumerate(chosen_oracle_layer.itertuples(), 1):
+                    # Save ranking/coverage for later inspection.
+                    oracle_pos = set(int(r["position"]) for r in oracle_core)
+                    for rank, rr in enumerate(chosen.itertuples(), 1):
                         sid_selected.append(
                             {
                                 "sid": sid,
-                                "axis": "position",
-                                "method": method,
+                                "selector": a.selector,
+                                "K": K,
                                 "rank": rank,
-                                "position": int(r.position),
-                                "oracle_edit_layer": int(r.peak_layer),
-                                "position_score": float(r.position_score),
+                                "position": int(rr.position),
+                                "position_score": float(rr.position_score),
+                                "peak_selector_layer": int(rr.peak_layer),
+                                "broad_category": str(rr.broad_category),
+                                "is_core50_position": int(
+                                    int(rr.position) in oracle_pos
+                                ),
                             }
                         )
 
-                # ---------------------------------------------------------
-                # Axis B: oracle positions + self layer rule.
-                # ---------------------------------------------------------
-                for rule in layer_methods:
-                    layer_rows = choose_layer_rows_for_oracle_positions(
-                        f_sid,
-                        oracle_core,
-                        rule,
-                        source_layers,
-                    )
-                    specs_mid, exp = specs_from_layer_rows(
-                        layer_rows, hreal, hgray
-                    )
-                    out = E.generate_with_specs(
-                        model, processor, decoder_layers, rb,
-                        specs_mid, 1.0, a.max_new_tokens
-                    )
-                    add_result(
-                        "layer",
-                        rule,
-                        "oracle_pos_self_layer",
-                        out,
-                        len(layer_rows),
-                    )
-
-                    for e in exp:
-                        sid_selected.append(
+                    if "oracle_layer" in modes:
+                        chosen_ol = choose_oracle_layer_for_self_positions(
+                            chosen, med_sid
+                        )
+                        specs_ol, exp_ol = build_specs_from_selected(
+                            chosen_ol,
+                            hreal,
+                            hgray,
+                            source_layers,
+                            "peak",
+                        )
+                        out_ol = generate_with_specs(
+                            model,
+                            processor,
+                            decoder_layers,
+                            rb,
+                            specs_ol,
+                            1.0,
+                            a.max_new_tokens,
+                        )
+                        sid_rows.append(
                             {
                                 "sid": sid,
-                                "axis": "layer",
-                                "method": rule,
-                                **e,
+                                "gt": gt,
+                                "baseline_prediction": baseline_by_sid[sid][
+                                    "baseline_prediction"
+                                ],
+                                "baseline_correct": baseline_by_sid[sid][
+                                    "baseline_correct"
+                                ],
+                                "mode": "oracle_layer",
+                                "selector": a.selector,
+                                "K": K,
+                                "alpha": 1.0,
+                                "prediction": out_ol["prediction"],
+                                "correct": out_ol["prediction"] == gt,
+                                "n_edit_pairs": out_ol["n_edit_pairs"],
+                                **overlap,
+                            }
+                        )
+
+                    if "self_soft_all" in modes:
+                        specs_sa, exp_sa = build_soft_all_specs_for_self_positions(
+                            chosen,
+                            f_sid,
+                            hreal,
+                            hgray,
+                            source_layers,
+                        )
+                        out_sa = generate_with_specs(
+                            model,
+                            processor,
+                            decoder_layers,
+                            rb,
+                            specs_sa,
+                            1.0,
+                            a.max_new_tokens,
+                        )
+                        sid_rows.append(
+                            {
+                                "sid": sid,
+                                "gt": gt,
+                                "baseline_prediction": baseline_by_sid[sid][
+                                    "baseline_prediction"
+                                ],
+                                "baseline_correct": baseline_by_sid[sid][
+                                    "baseline_correct"
+                                ],
+                                "mode": "self_soft_all",
+                                "selector": a.selector,
+                                "K": K,
+                                "alpha": 1.0,
+                                "prediction": out_sa["prediction"],
+                                "correct": out_sa["prediction"] == gt,
+                                "n_edit_pairs": out_sa["n_edit_pairs"],
+                                **overlap,
                             }
                         )
 
                 pd.to_pickle(
-                    {"rows": sid_rows, "selected": sid_selected},
+                    {
+                        "rows": sid_rows,
+                        "reference": sid_reference,
+                        "selected": sid_selected,
+                    },
                     cache,
                     compression="gzip",
                 )
                 all_rows.extend(sid_rows)
+                reference_rows.extend(sid_reference)
                 selected_rows.extend(sid_selected)
 
             finally:
@@ -2338,37 +2259,38 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    summary = summarize(all_rows)
-    by_relation = summarize_by_relation(all_rows)
+    summary = summarize_k_sweep(all_rows)
+    reference = summarize_reference(reference_rows)
 
     write_csv(outdir / "behavior_per_sample.csv", all_rows)
+    write_csv(outdir / "oracle_reference_per_sample.csv", reference_rows)
+    write_csv(outdir / "selected_positions.csv", selected_rows)
     summary.to_csv(outdir / "behavior_summary.csv", index=False)
-    by_relation.to_csv(outdir / "behavior_by_relation.csv", index=False)
-    write_csv(outdir / "selected_details.csv", selected_rows)
     core_sizes.to_csv(outdir / "core_sizes.csv", index=False)
 
-    text = render_summary(summary, core_sizes, fixed_k, a)
+    text = render_k_summary(summary, reference, a, target, ks)
     (outdir / "analysis_summary.txt").write_text(text, encoding="utf-8")
 
-    meta = {
+    metadata = {
         "alpha": 1.0,
         "core_mass": a.core_mass,
         "target": target,
+        "selector": a.selector,
+        "ks": ks,
+        "modes": modes,
         "N": len(valid_sids),
-        "fixed_self_position_k": fixed_k,
         "source_layers": source_layers,
-        "position_methods": position_methods,
-        "layer_methods": layer_methods,
         "run_dir": a.run_dir,
         "feature_dir": a.feature_dir,
-        "note": (
-            "Position-axis experiments use oracle layer; layer-axis experiments "
-            "use oracle core positions. Only oracle_core_exact uses both oracle "
-            "position and oracle layer. This script is diagnostic, not deployable."
-        ),
+        "notes": [
+            "Selection is relation-free.",
+            "Core50 overlap and oracle-layer mode use GT-derived causal information only as diagnostics.",
+            "self_soft_all is fully relation-free in position/layer selection.",
+            "For self_soft_all, per-position weights across source layers sum to 1, with alpha fixed at 1.",
+        ],
     }
     (outdir / "metadata.json").write_text(
-        json.dumps(meta, indent=2),
+        json.dumps(metadata, indent=2),
         encoding="utf-8",
     )
 
