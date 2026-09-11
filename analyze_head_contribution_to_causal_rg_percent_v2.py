@@ -124,15 +124,367 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import torch
+import transformers
+from transformers import AutoProcessor
 from tqdm import tqdm
 
 import analyze_coco_centroid_generation_step1_v4 as base
 import eval_coco_multilayer_relation_trajectory_repair_v1 as traj
 import eval_qwen_dynamic_k24_all440_v1 as dyn
-import scan_head_suppliers_to_causal_text_states_v1 as supp
+import scan_qwen_spatial_heads_vs_causal_core_v1 as spatialscan
 
 
 EPS = 1e-12
+
+
+DEFAULT_DIRECTION_HEADS = ",".join([
+    "26:3", "23:1", "23:5", "26:2", "22:9",
+    "23:0", "22:13", "22:2", "21:14", "23:10",
+    "21:5", "22:12", "21:1", "26:1", "27:2",
+    "27:1", "21:11", "22:14", "21:3", "22:10",
+])
+
+DEFAULT_DIRECTION_ACCURACY = {
+    (26,3): 0.815909, (23,1): 0.793182, (23,5): 0.786364,
+    (26,2): 0.779545, (22,9): 0.775000, (23,0): 0.770455,
+    (22,13): 0.770455, (22,2): 0.759091, (21,14): 0.752273,
+    (23,10): 0.752273, (21,5): 0.747727, (22,12): 0.747727,
+    (21,1): 0.747727, (26,1): 0.743182, (27,2): 0.734091,
+    (27,1): 0.729545, (21,11): 0.725000, (22,14): 0.725000,
+    (21,3): 0.722727, (22,10): 0.713636,
+}
+
+
+def parse_layers(text: str) -> List[int]:
+    out = set()
+    for part in str(text).split(","):
+        part = part.strip().upper().replace("L", "")
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            a, b = int(a), int(b)
+            out.update(range(min(a, b), max(a, b) + 1))
+        else:
+            out.add(int(part))
+    return sorted(out)
+
+
+def parse_heads(text: str) -> List[Tuple[int, int]]:
+    out = []
+    seen = set()
+    for part in str(text).split(","):
+        part = part.strip().upper().replace("L", "").replace("H", ":")
+        if not part:
+            continue
+        if ":" not in part:
+            raise ValueError(f"Bad head specification {part!r}")
+        a, b = part.split(":", 1)
+        pair = (int(a), int(b))
+        if pair not in seen:
+            out.append(pair)
+            seen.add(pair)
+    return out
+
+
+def parse_categories(text: str) -> Optional[set]:
+    xs = {x.strip() for x in str(text).split(",") if x.strip()}
+    return xs if xs else None
+
+
+def write_json(path: Path, obj: Any) -> None:
+    path.write_text(
+        json.dumps(obj, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def load_coco_meta(args):
+    two = base.import_two_object_module()
+    prompts = base.load_standard_prompts(Path(args.prompt_jsonl))
+    records, _audit = two.load_records("coco_two", Path(args.data_root), None)
+    rec_by_sid = {int(r.sid): r for r in records}
+
+    meta = []
+    for rec in records:
+        sid = int(rec.sid)
+        if sid not in prompts:
+            continue
+        p = prompts[sid]
+        gt = traj.normalize_relation(base, p["answer_raw"])
+        if gt not in ("left", "right", "above", "below"):
+            continue
+        meta.append({
+            "sid": sid,
+            "gt": gt,
+            "subject": str(p["subject"]),
+            "reference": str(p["reference"]),
+            "question_text": str(p["question_text"]),
+        })
+
+    meta = traj.stratified_cap(meta, args.max_samples, args.seed)
+    train, heldout = traj.stratified_split(meta, 0.30, args.seed)
+    return two, meta, train, heldout, rec_by_sid
+
+
+def load_causal_selection(
+    path: Path,
+    causal_layers: Sequence[int],
+    top_k: int,
+    categories: Optional[set],
+    allowed_sids: set,
+) -> pd.DataFrame:
+    d = pd.read_csv(path)
+    need = {
+        "sid", "rank", "source_layer", "position",
+        "token", "category", "broad_category", "mediation",
+    }
+    missing = need - set(d.columns)
+    if missing:
+        raise RuntimeError(f"{path} missing columns: {sorted(missing)}")
+
+    for c in ("sid", "rank", "source_layer", "position"):
+        d[c] = pd.to_numeric(d[c], errors="raise").astype(int)
+    d["mediation"] = pd.to_numeric(d["mediation"], errors="coerce")
+
+    d = d[d["sid"].isin(allowed_sids)].copy()
+    d = d[d["source_layer"].isin(set(map(int, causal_layers)))].copy()
+    d = d[d["broad_category"].astype(str) != "visual"].copy()
+    d = d[d["broad_category"].astype(str) != "last"].copy()
+
+    if categories is not None:
+        d = d[d["broad_category"].astype(str).isin(categories)].copy()
+
+    rows = []
+    for sid, g in d.groupby("sid"):
+        g = g.sort_values("rank").head(int(top_k)).copy()
+        g["causal_text_rank"] = np.arange(1, len(g) + 1)
+        rows.append(g)
+
+    if not rows:
+        return d.iloc[:0].copy()
+    return pd.concat(rows, ignore_index=True)
+
+
+def load_model(args, two):
+    specs = base.merged_model_specs(two)
+    spec = specs[args.model]
+    cls = getattr(transformers, spec.model_class)
+
+    kw = dict(
+        dtype=base.resolve_dtype(spec.dtype_name),
+        low_cpu_mem_usage=True,
+        trust_remote_code=spec.trust_remote_code,
+        device_map={"": args.device},
+    )
+    if args.attn_impl != "none":
+        kw["attn_implementation"] = args.attn_impl
+
+    print(f"Loading {spec.repo_id}", flush=True)
+    try:
+        model = cls.from_pretrained(spec.repo_id, **kw)
+    except TypeError:
+        kw["torch_dtype"] = kw.pop("dtype")
+        model = cls.from_pretrained(spec.repo_id, **kw)
+
+    model.eval()
+    processor = AutoProcessor.from_pretrained(
+        spec.repo_id,
+        trust_remote_code=spec.trust_remote_code,
+    )
+    base.configure_processor(model, processor)
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    decoder_layers, decoder_path = base.resolve_decoder_layers(model)
+    return model, processor, decoder_layers, decoder_path, spec
+
+
+def infer_head_geometry(model, decoder_layers, head_layers):
+    cfg = spatialscan.get_text_config(model)
+    fallback_nh = int(cfg.num_attention_heads)
+    out = {}
+
+    for L in head_layers:
+        attn = spatialscan.resolve_attn(decoder_layers[L])
+        op = spatialscan.resolve_o_proj(attn)
+
+        nh = getattr(attn, "num_heads", None)
+        if nh is None:
+            nh = getattr(
+                getattr(attn, "config", None),
+                "num_attention_heads",
+                None,
+            )
+        if nh is None:
+            nh = fallback_nh
+        nh = int(nh)
+
+        hidden = int(op.in_features)
+        if hidden % nh != 0:
+            raise RuntimeError(
+                f"L{L}: o_proj input={hidden} not divisible by heads={nh}"
+            )
+
+        out[L] = {
+            "n_heads": nh,
+            "head_dim": hidden // nh,
+            "hidden": hidden,
+        }
+    return out
+
+
+class GrayStateHeadCapture:
+    def __init__(self, decoder_layers, state_layers, head_layers):
+        self.states = {}
+        self.pre_o = {}
+        self.handles = []
+
+        for L in sorted(set(map(int, state_layers))):
+            def make_state_hook(layer):
+                def hook(_m, _inp, out):
+                    x = traj.first_tensor(out)
+                    self.states[layer] = (
+                        x.detach().float().cpu().numpy().astype(np.float32)
+                    )
+                    return None
+                return hook
+            self.handles.append(
+                decoder_layers[L].register_forward_hook(make_state_hook(L))
+            )
+
+        for L in sorted(set(map(int, head_layers))):
+            attn = spatialscan.resolve_attn(decoder_layers[L])
+            op = spatialscan.resolve_o_proj(attn)
+
+            def make_pre_hook(layer):
+                def hook(_m, inputs):
+                    self.pre_o[layer] = (
+                        inputs[0].detach().float().cpu().numpy().astype(np.float32)
+                    )
+                return hook
+            self.handles.append(
+                op.register_forward_pre_hook(make_pre_hook(L))
+            )
+
+    def close(self):
+        for h in reversed(self.handles):
+            with contextlib.suppress(Exception):
+                h.remove()
+        self.handles = []
+
+
+@torch.inference_mode()
+def run_gray_capture(
+    model,
+    decoder_layers,
+    batch,
+    state_layers,
+    head_layers,
+):
+    cap = GrayStateHeadCapture(decoder_layers, state_layers, head_layers)
+    try:
+        kw = dict(batch)
+        kw["use_cache"] = False
+        _ = model(**kw)
+
+        ms = [L for L in state_layers if L not in cap.states]
+        mh = [L for L in head_layers if L not in cap.pre_o]
+        if ms or mh:
+            raise RuntimeError(
+                f"Gray capture missing states={ms}, head_layers={mh}"
+            )
+        return cap.states, cap.pre_o
+    finally:
+        cap.close()
+
+
+class RealGraphHeadCapture:
+    def __init__(
+        self,
+        decoder_layers,
+        state_layers,
+        head_layers,
+        cut_layer=0,
+    ):
+        self.states = {}
+        self.pre_o = {}
+        self.handles = []
+        self.cut_layer = int(cut_layer)
+
+        def cut_hook(_m, _inp, out):
+            x = traj.first_tensor(out)
+            y = x.detach().clone().requires_grad_(True)
+            self.states[self.cut_layer] = y
+            return traj.replace_first_tensor(out, y)
+
+        self.handles.append(
+            decoder_layers[self.cut_layer].register_forward_hook(cut_hook)
+        )
+
+        for L in sorted(set(map(int, state_layers))):
+            if L == self.cut_layer:
+                continue
+
+            def make_state_hook(layer):
+                def hook(_m, _inp, out):
+                    x = traj.first_tensor(out)
+                    self.states[layer] = x
+                    return None
+                return hook
+            self.handles.append(
+                decoder_layers[L].register_forward_hook(make_state_hook(L))
+            )
+
+        for L in sorted(set(map(int, head_layers))):
+            if L <= self.cut_layer:
+                raise ValueError(
+                    f"Supplier head L{L} must be after graph cut L{self.cut_layer}"
+                )
+            attn = spatialscan.resolve_attn(decoder_layers[L])
+            op = spatialscan.resolve_o_proj(attn)
+
+            def make_pre_hook(layer):
+                def hook(_m, inputs):
+                    self.pre_o[layer] = inputs[0]
+                return hook
+            self.handles.append(
+                op.register_forward_pre_hook(make_pre_hook(L))
+            )
+
+    def close(self):
+        for h in reversed(self.handles):
+            with contextlib.suppress(Exception):
+                h.remove()
+        self.handles = []
+
+
+def run_real_graph(
+    model,
+    decoder_layers,
+    batch,
+    state_layers,
+    head_layers,
+):
+    cap = RealGraphHeadCapture(
+        decoder_layers,
+        state_layers=state_layers,
+        head_layers=head_layers,
+        cut_layer=0,
+    )
+    kw = dict(batch)
+    kw["use_cache"] = False
+    _ = model(**kw)
+
+    ms = [L for L in state_layers if L not in cap.states]
+    mh = [L for L in head_layers if L not in cap.pre_o]
+    if ms or mh:
+        cap.close()
+        raise RuntimeError(
+            f"Real graph missing states={ms}, head_layers={mh}"
+        )
+    return cap
+
 
 
 # =============================================================================
@@ -168,7 +520,7 @@ def parse_args():
     )
     p.add_argument(
         "--direction-heads",
-        default=supp.DEFAULT_DIRECTION_HEADS,
+        default=DEFAULT_DIRECTION_HEADS,
         help="Known Direction heads, used only as post-hoc labels.",
     )
 
@@ -366,7 +718,7 @@ def decompose_one_causal_state(
                 "head": int(h),
                 "head_name": hname(L, h),
                 "is_direction_head": (int(L), int(h)) in direction_set,
-                "direction_coco_accuracy": supp.DEFAULT_DIRECTION_ACCURACY.get(
+                "direction_coco_accuracy": DEFAULT_DIRECTION_ACCURACY.get(
                     (int(L), int(h)), np.nan
                 ),
 
@@ -538,11 +890,11 @@ def main():
     np.random.seed(a.seed)
     torch.manual_seed(a.seed)
 
-    causal_layers = supp.parse_layers(a.causal_layers)
-    supplier_layers = supp.parse_layers(a.supplier_layers)
-    direction_heads = supp.parse_heads(a.direction_heads)
+    causal_layers = parse_layers(a.causal_layers)
+    supplier_layers = parse_layers(a.supplier_layers)
+    direction_heads = parse_heads(a.direction_heads)
     direction_set = set(direction_heads)
-    categories = supp.parse_categories(a.causal_categories)
+    categories = parse_categories(a.causal_categories)
 
     if any(L <= 0 for L in supplier_layers):
         raise ValueError(
@@ -558,7 +910,7 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
     error_path = outdir / "errors.jsonl"
 
-    two, meta, _train, _test_unused, rec_by_sid = supp.load_coco_meta(a)
+    two, meta, _train, _test_unused, rec_by_sid = load_coco_meta(a)
     meta_by_sid = {int(x["sid"]): x for x in meta}
 
     ranking_sids = set(
@@ -582,7 +934,7 @@ def main():
 
     eval_sids = {int(x["sid"]) for x in eval_meta}
 
-    selected = supp.load_causal_selection(
+    selected = load_causal_selection(
         Path(a.ranked_causal),
         causal_layers=causal_layers,
         top_k=a.causal_top_k,
@@ -603,7 +955,7 @@ def main():
 
     model = processor = None
     try:
-        model, processor, decoder_layers, decoder_path, spec = supp.load_model(
+        model, processor, decoder_layers, decoder_path, spec = load_model(
             a, two
         )
         device = torch.device(a.device)
@@ -614,7 +966,7 @@ def main():
             if 0 < L < n_layers
         ]
 
-        geom = supp.infer_head_geometry(
+        geom = infer_head_geometry(
             model,
             decoder_layers,
             supplier_layers,
@@ -694,7 +1046,7 @@ def main():
                 ]
 
                 # Gray values, no graph needed.
-                gray_states, gray_pre_o = supp.run_gray_capture(
+                gray_states, gray_pre_o = run_gray_capture(
                     model=model,
                     decoder_layers=decoder_layers,
                     batch=gb,
@@ -704,7 +1056,7 @@ def main():
 
                 # One real graph; reuse it for each causal state.
                 with torch.enable_grad():
-                    cap = supp.run_real_graph(
+                    cap = run_real_graph(
                         model=model,
                         decoder_layers=decoder_layers,
                         batch=rb,
@@ -922,7 +1274,7 @@ def main():
             encoding="utf-8",
         )
 
-        supp.write_json(
+        write_json(
             outdir / "metadata.json",
             {
                 "script": "analyze_head_contribution_to_causal_rg_percent_v1.py",
