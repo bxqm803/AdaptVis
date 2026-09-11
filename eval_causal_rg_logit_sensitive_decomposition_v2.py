@@ -473,10 +473,10 @@ def main():
                         linear_margin_orthogonal3=float(np.dot(cp["orthogonal3"],gm)),
                     )
                     for i,s in enumerate(cp["S"][:3],1): gr[f"sv{i}"]=float(s)
-                    for wr,gc in zip(cp["wrong"],cp["contrasts"]):
-                        gr[f"full_margin_vs_{wr}"]=float(np.dot(delta,gc))
-                        gr[f"decision3_margin_vs_{wr}"]=float(np.dot(cp["decision3"],gc))
-                        gr[f"orthogonal3_margin_vs_{wr}"]=float(np.dot(cp["orthogonal3"],gc))
+                    for wr,gcontrast in zip(cp["wrong"],cp["contrasts"]):
+                        gr[f"full_margin_vs_{wr}"]=float(np.dot(delta,gcontrast))
+                        gr[f"decision3_margin_vs_{wr}"]=float(np.dot(cp["decision3"],gcontrast))
+                        gr[f"orthogonal3_margin_vs_{wr}"]=float(np.dot(cp["orthogonal3"],gcontrast))
                     geom_rows.append(gr)
 
                     for cond in conds:
