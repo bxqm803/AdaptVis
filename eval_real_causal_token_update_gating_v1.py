@@ -2,119 +2,122 @@
 # -*- coding: utf-8 -*-
 
 """
-eval_decision_aware_rn_update_gating_v1.py
+eval_real_causal_token_update_gating_v1.py
 
-Purpose
-=======
-Previous layerwise RN analysis used the FINAL RN state itself as the target:
+Question
+========
+For a selected causal-token position p, what does EACH REAL decoder layer
+actually add to that token, and is that real update helpful or harmful to the
+correct decision?
 
-    d_L = h_real[L,p] - h_noimage[L,q]
-    u_L = d_L - d_{L-1}
-    old_score = <u_L, d_C>
+Primary update definition
+=========================
+This script does NOT define the layer update with Real-NoImage.
 
-That only asks whether an update helps construct the sample's eventual RN state.
-If d_C contains both GT-helpful and GT-harmful image-conditioned components,
-old_score can label BOTH as "positive".
+For REAL only:
 
-This script changes the target from "final RN similarity" to "decision effect".
+    a_L(p) = h_real[L,p] - h_real[L-1,p]
 
-For each unique causal-token trajectory position p and update layer L:
+where h_real[L,p] is the decoder BLOCK OUTPUT at layer L.
 
-    u_L(p) = [hR_L,p - hN_L,q] - [hR_{L-1,p} - hN_{L-1,q}]
+Thus a_L is the actual residual-stream update received by causal token p from
+decoder block L.
 
-We define a sequence-level four-way answer margin
+Decision-aware sign
+===================
+Use a four-way teacher-forced sequence margin:
 
-    M(x) = S_GT(x) - S_competitor(x)
+    M = S_GT - S_competitor
 
-where S_r is the teacher-forced log-probability of a candidate relation answer
-(left/right/above/below by default), and competitor is the strongest non-GT
-candidate on the clean REAL prompt.
+where S_r is the sequence log-probability of answer r and competitor is the
+strongest non-GT answer on the clean REAL prompt.
 
-At layer L we compute
+At each layer/token:
 
-    g_L,p = d M / d h_L,p
+    B_L,p = < a_L(p), dM / d h_real[L,p] >
 
-and the DECISION-AWARE RN update score
+Interpretation:
 
-    B_L,p = <u_L(p), g_L,p>
+    B > 0 : the actual REAL block update locally supports GT.
+    B < 0 : the actual REAL block update locally supports the competing decision.
 
-Interpretation
-==============
-    B > 0 : amplifying this RN update locally helps the GT decision.
-    B < 0 : amplifying this RN update locally hurts the GT decision.
-
-This is deliberately different from alignment with d_C.
-
-Then run actual greedy generation under cached clean-trajectory interventions:
-
-decision_positive:
+Generation interventions
+========================
+real_positive:
     if B > tau:
-        h[L,p] += alpha * u_L
+        h_real[L,p] <- h_real[L,p] + alpha * a_L(p)
 
-decision_negative_cancel:
+real_negative_cancel:
     if B < -tau:
-        h[L,p] -= alpha * u_L
+        h_real[L,p] <- h_real[L,p] - alpha * a_L(p)
 
-decision_signed:
-    positive -> +alpha*u_L
-    negative -> -alpha*u_L
+real_signed:
+    positive -> +alpha*a_L
+    negative -> -alpha*a_L
 
-all_amplify control:
-    h[L,p] += alpha*u_L regardless of B
+real_all_amplify:
+    h_real[L,p] <- h_real[L,p] + alpha*a_L
+    regardless of sign
 
-direct_rn reference:
-    h[C,p] += beta * (hR_C,p - hN_C,q)
-    at the selected final causal states.
+direct_rn:
+    reference only. At selected final causal states:
+        h_real[C,p] <- h_real[C,p] + beta*(h_real[C,p]-h_noimage[C,q])
 
-Why this experiment matters
-===========================
-If wrong samples have substantially more negative B mass than correct samples,
-and cancelling those negative updates improves real model.generate() accuracy,
-that supports a "competing / harmful image-conditioned component" explanation.
+The sign/gating of the main experiment uses ONLY the REAL update a_L and the
+GT decision gradient. NoImage is not used to define the update or its sign.
 
-If negative B mass is small and cancelling it does not help, then the failure is
-more likely a missing/weak useful component rather than persistent interference.
+Secondary decomposition
+=======================
+NoImage is retained only as a diagnostic. For aligned q:
 
-Important caveats
-=================
-1) Causal token positions still come from the prior oracle causal ranking.
-2) The sign B uses GT, so this is an ORACLE mechanism diagnostic.
-3) Sequence-level candidate margin is still a behavioral proxy. Therefore the
-   final criterion is actual greedy generation W2C/C2W, not the margin alone.
-4) u_L is cached from the clean REAL/NoImage trajectory. Multi-layer steering
-   reuses those clean updates after earlier interventions; this is a controlled
-   replay, not an exact counterfactual re-computation of u_L.
+    a_N,L = h_noimage[L,q] - h_noimage[L-1,q]
+    a_RN,L = a_R,L - a_N,L
+
+and therefore:
+
+    B_REAL = B_NOIMAGE + B_RN
+
+up to floating-point error.
+
+This lets us ask AFTER finding a helpful/harmful REAL update whether its
+decision effect is mainly shared/text-like or image-conditioned.
+
+Oracle status
+=============
+This is an oracle MECHANISM experiment:
+  1) causal-token positions come from the prior oracle causal ranking;
+  2) GT defines the decision margin and therefore the positive/negative sign.
 
 Recommended first run
 =====================
-CUDA_VISIBLE_DEVICES=0 python -u eval_decision_aware_rn_update_gating_v1.py \
+CUDA_VISIBLE_DEVICES=0 python -u eval_real_causal_token_update_gating_v1.py \
   --model qwen-3b \
   --ranked-causal \
     output/qwen3b_oracle_causal_scan_L1_L26_all440/ranked_k36_tokens.csv \
   --causal-layers 20-26 \
   --causal-top-k 7 \
   --update-layers 8-26 \
-  --scales 0.25,0.5 \
+  --scales 0.1,0.25,0.5 \
   --decision-threshold 0 \
   --answer-surface above_below \
   --sequence-score-reduction mean \
   --eval-max-samples 40 \
-  --output-dir output/qwen3b_decision_aware_rn_updates_n40_v1 \
+  --output-dir output/qwen3b_real_causal_token_updates_n40_v1 \
   --overwrite
 
-Optional finite-difference validation of the strongest update scores:
-    --finite-probe-k 4 --finite-probe-scale 0.10
+Optional local sign validation:
+  --finite-probe-k 4 --finite-probe-scale 0.05
 
 Outputs
 =======
 selected_causal_states.csv
 alignment_summary.csv
 sequence_score_summary.csv
-per_update_decision_score.csv
-sample_update_summary.csv
-update_summary_by_generation_correctness.csv
-layer_update_summary.csv
-layer_update_by_generation_correctness.csv
+per_real_update_decision_score.csv
+sample_real_update_summary.csv
+real_update_summary_by_generation_correctness.csv
+layer_real_update_summary.csv
+layer_real_update_by_generation_correctness.csv
 finite_probe_validation.csv
 generation_per_sample.csv
 generation_summary.csv
@@ -135,7 +138,7 @@ import random
 import shutil
 import traceback
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence
 
 import numpy as np
 import pandas as pd
@@ -177,28 +180,28 @@ def parse_args():
     p.add_argument(
         "--update-layers",
         default="8-26",
-        help="Layers L for u_L=d_L-d_{L-1}; must be >=1.",
+        help="REAL block updates a_L=hR_L-hR_{L-1}; every L must be >=1.",
     )
     p.add_argument(
         "--exclude-target-layer",
         action="store_true",
-        help="Only score/intervene at L < target causal layer C.",
+        help="For each causal token position, only use L before its latest selected causal layer.",
     )
 
     p.add_argument(
         "--scales",
-        default="0.25,0.5",
-        help="alpha for decision-aware / all-amplify interventions.",
+        default="0.1,0.25,0.5",
+        help="alpha values for actual-REAL-update interventions.",
     )
     p.add_argument(
         "--decision-threshold",
         type=float,
         default=0.0,
-        help="Gate only when |B_L,p| exceeds this raw decision score threshold.",
+        help="Gate only if |B_REAL| is greater than this raw score.",
     )
     p.add_argument(
         "--conditions",
-        default="decision_positive,decision_negative_cancel,decision_signed,all_amplify,direct_rn",
+        default="real_positive,real_negative_cancel,real_signed,real_all_amplify,direct_rn",
     )
     p.add_argument("--direct-beta", type=float, default=1.0)
 
@@ -206,18 +209,9 @@ def parse_args():
         "--answer-surface",
         default="above_below",
         choices=["above_below", "on_under"],
-        help="Canonical answer strings used for teacher-forced sequence scores.",
     )
-    p.add_argument(
-        "--answer-prefix",
-        default="",
-        help="Optional prefix placed before every candidate answer, e.g. 'The answer is '.",
-    )
-    p.add_argument(
-        "--answer-suffix",
-        default="",
-        help="Optional suffix after every candidate answer.",
-    )
+    p.add_argument("--answer-prefix", default="")
+    p.add_argument("--answer-suffix", default="")
     p.add_argument(
         "--sequence-score-reduction",
         default="mean",
@@ -228,13 +222,9 @@ def parse_args():
         "--finite-probe-k",
         type=int,
         default=0,
-        help="Validate top-|B| updates per sample by finite +eps*u_L sequence-margin probes.",
+        help="Validate top-|B_REAL| updates per sample with +eps*a_L sequence-margin probes.",
     )
-    p.add_argument(
-        "--finite-probe-scale",
-        type=float,
-        default=0.10,
-    )
+    p.add_argument("--finite-probe-scale", type=float, default=0.05)
 
     p.add_argument("--max-new-tokens", type=int, default=6)
     p.add_argument("--seed", type=int, default=17)
@@ -372,6 +362,7 @@ def load_model(a, two):
         kw["attn_implementation"] = a.attn_impl
 
     print(f"[model] loading {spec.repo_id}", flush=True)
+
     try:
         model = cls.from_pretrained(spec.repo_id, **kw)
     except TypeError:
@@ -379,6 +370,7 @@ def load_model(a, two):
         model = cls.from_pretrained(spec.repo_id, **kw)
 
     model.eval()
+
     processor = AutoProcessor.from_pretrained(
         spec.repo_id,
         trust_remote_code=spec.trust_remote_code,
@@ -394,6 +386,7 @@ def load_model(a, two):
 
 def load_causal_selection(path, allowed_sids, causal_layers, top_k, categories):
     d = pd.read_csv(path)
+
     required = {
         "sid",
         "rank",
@@ -429,7 +422,7 @@ def load_causal_selection(path, allowed_sids, causal_layers, top_k, categories):
 
 
 # =============================================================================
-# NoImage / alignment
+# NoImage / LCS -- secondary decomposition and direct-RN reference only
 # =============================================================================
 
 def move_batch(batch, device):
@@ -484,7 +477,9 @@ def lcs_token_map(real_ids: List[int], no_ids: List[int]) -> Dict[int, int]:
             if ai == b[j]:
                 row[j] = 1 + below[j + 1]
             else:
-                row[j] = max(below[j], row[j + 1])
+                x = below[j]
+                y = row[j + 1]
+                row[j] = x if x >= y else y
 
     out = {}
     i = j = 0
@@ -502,7 +497,7 @@ def lcs_token_map(real_ids: List[int], no_ids: List[int]) -> Dict[int, int]:
 
 
 # =============================================================================
-# Block output helpers
+# Block output capture / patch
 # =============================================================================
 
 def first_tensor(output):
@@ -560,7 +555,7 @@ def capture_prompt_blocks(model, decoder_layers, batch, layers):
 
         missing = [L for L in layers if L not in cap.states]
         if missing:
-            raise RuntimeError(f"Missing prompt block captures {missing}")
+            raise RuntimeError(f"Missing block captures: {missing}")
 
         return dict(cap.states)
     finally:
@@ -569,8 +564,7 @@ def capture_prompt_blocks(model, decoder_layers, batch, layers):
 
 class GraphBlockCapture:
     """
-    Detach at earliest requested layer to avoid backpropagating through vision and
-    early decoder blocks. Capture block OUTPUT tensors for requested layers.
+    Capture block OUTPUTS and cut autograd at the earliest requested block output.
     """
     def __init__(self, decoder_layers, layers):
         layers = sorted(set(map(int, layers)))
@@ -613,8 +607,8 @@ class MultiLayerResidualAdd:
     patch_map:
         layer -> {prompt_position -> vector}
 
-    Patch prompt-prefill calls only. Decode-token calls (seq_len != prompt_len)
-    are left untouched.
+    prompt_len is the full sequence length of the current prefill / teacher-forced
+    forward. Decode-token steps are not patched.
     """
     def __init__(self, decoder_layers, patch_map, prompt_len):
         self.handles = []
@@ -659,7 +653,7 @@ class MultiLayerResidualAdd:
 
 
 # =============================================================================
-# Candidate sequence scoring
+# Candidate sequence score
 # =============================================================================
 
 def tokenizer_of(processor):
@@ -692,30 +686,23 @@ def candidate_texts(a):
 
 def encode_candidate_ids(processor, texts):
     tok = tokenizer_of(processor)
-    ids = {}
+    result = {}
+
     print("\nCandidate answer tokenizations:")
     for r in REL:
-        x = tok.encode(texts[r], add_special_tokens=False)
-        if not x:
+        ids = tok.encode(texts[r], add_special_tokens=False)
+        if not ids:
             raise RuntimeError(f"Empty candidate tokenization for {r}: {texts[r]!r}")
-        ids[r] = list(map(int, x))
+        result[r] = list(map(int, ids))
         print(
-            f"  {r:>5s}: text={texts[r]!r} ids={ids[r]} "
-            f"decoded={tok.decode(ids[r])!r}"
+            f"  {r:>5s}: text={texts[r]!r} ids={result[r]} "
+            f"decoded={tok.decode(result[r])!r}"
         )
-    return ids
+
+    return result
 
 
 def extend_batch_with_candidate(batch, answer_ids):
-    """
-    Append answer ids to the existing multimodal prompt input_ids.
-
-    The processor batch for Qwen2.5-VL normally contains input_ids,
-    attention_mask, pixel_values, and image_grid_thw. Pixel tensors stay
-    unchanged. If token_type_ids exists, extend using the last type id.
-    Explicit position_ids/cache_position are removed so the model can rebuild
-    them consistently for the extended sequence.
-    """
     out = {}
     T = int(batch["input_ids"].shape[1])
     dev = batch["input_ids"].device
@@ -750,10 +737,6 @@ def extend_batch_with_candidate(batch, answer_ids):
 
 
 def sequence_score_from_logits(logits, prompt_len, answer_ids, reduction):
-    """
-    logits[:, t] predicts input_ids[:, t+1].
-    First appended token is predicted by logits[:, prompt_len-1].
-    """
     terms = []
     for j, tid in enumerate(answer_ids):
         idx = prompt_len - 1 + j
@@ -767,7 +750,8 @@ def sequence_score_from_logits(logits, prompt_len, answer_ids, reduction):
 
 
 @torch.inference_mode()
-def clean_sequence_score(
+def sequence_score(
+    *,
     model,
     batch,
     answer_ids,
@@ -776,47 +760,46 @@ def clean_sequence_score(
     patch_map=None,
 ):
     ext, T = extend_batch_with_candidate(batch, answer_ids)
+    full_len = T + len(answer_ids)
 
     ctx = (
         MultiLayerResidualAdd(
             decoder_layers=decoder_layers,
             patch_map=patch_map,
-            prompt_len=T + len(answer_ids),  # whole teacher-forced call length
+            prompt_len=full_len,
         )
         if patch_map
         else contextlib.nullcontext()
     )
 
-    # In a teacher-forced call, causal-token positions are in the extended
-    # sequence and should be patched once. Hence hook expects full ext length.
     with ctx:
         kw = dict(ext)
         kw["use_cache"] = False
         kw["return_dict"] = True
         out = model(**kw)
-        score = sequence_score_from_logits(
+        s = sequence_score_from_logits(
             out.logits,
             T,
             answer_ids,
             reduction,
         )
 
-    return float(score.item())
+    return float(s.item())
 
 
-def all_clean_sequence_scores(model, batch, candidate_ids, reduction):
+def all_sequence_scores(model, batch, candidate_ids, reduction):
     return {
-        r: clean_sequence_score(
-            model,
-            batch,
-            candidate_ids[r],
-            reduction,
+        r: sequence_score(
+            model=model,
+            batch=batch,
+            answer_ids=candidate_ids[r],
+            reduction=reduction,
         )
         for r in REL
     }
 
 
-def run_sequence_score_and_grads(
+def sequence_score_and_grads(
     *,
     model,
     decoder_layers,
@@ -846,10 +829,10 @@ def run_sequence_score_and_grads(
                 reduction,
             )
 
-            states = [cap.states[L] for L in grad_layers]
+            tensors = [cap.states[L] for L in grad_layers]
             grads = torch.autograd.grad(
                 score,
-                states,
+                tensors,
                 retain_graph=False,
                 create_graph=False,
                 allow_unused=True,
@@ -857,12 +840,11 @@ def run_sequence_score_and_grads(
 
             grad_by_layer = {}
             for L, g in zip(grad_layers, grads):
-                if g is None:
-                    grad_by_layer[L] = None
-                else:
-                    grad_by_layer[L] = (
-                        g.detach().float().cpu().numpy().astype(np.float32)
-                    )
+                grad_by_layer[L] = (
+                    None
+                    if g is None
+                    else g.detach().float().cpu().numpy().astype(np.float32)
+                )
 
             return float(score.detach().item()), grad_by_layer
 
@@ -870,20 +852,17 @@ def run_sequence_score_and_grads(
         cap.close()
 
 
-def fixed_sequence_margin(scores, gt, competitor):
-    return float(scores[gt] - scores[competitor])
-
-
 # =============================================================================
-# Build RN updates on unique causal-token trajectories
+# Causal-token trajectory + ACTUAL REAL block update
 # =============================================================================
 
 def causal_position_specs(causal_rows):
     """
-    Unique prompt positions. If the same token position appears in multiple
-    selected causal states, scan it up to its latest selected target layer.
+    Unique causal token positions. A token can be selected at more than one
+    target layer; scan its trajectory up to the latest selected causal layer.
     """
     specs = {}
+
     for r in causal_rows.itertuples():
         p = int(r.position)
         C = int(r.source_layer)
@@ -901,6 +880,7 @@ def causal_position_specs(causal_rows):
         else:
             specs[p]["max_target_layer"] = max(specs[p]["max_target_layer"], C)
             specs[p]["min_target_layer"] = min(specs[p]["min_target_layer"], C)
+
             if int(r.rank) < specs[p]["best_rank"]:
                 specs[p]["best_rank"] = int(r.rank)
                 specs[p]["token"] = str(r.token)
@@ -910,7 +890,7 @@ def causal_position_specs(causal_rows):
     return list(specs.values())
 
 
-def build_clean_updates(
+def build_real_updates(
     *,
     sid,
     gt,
@@ -922,20 +902,27 @@ def build_clean_updates(
     update_layers,
     exclude_target_layer,
 ):
+    """
+    PRIMARY:
+        a_R,L = hR_L - hR_{L-1}
+
+    SECONDARY only:
+        a_N,L  = hN_L - hN_{L-1}
+        a_RN,L = a_R,L - a_N,L
+    """
     entries = []
 
     for s in specs:
         p = int(s["real_position"])
         q = r2n.get(p, None)
-        if q is None:
-            continue
-
         Cmax = int(s["max_target_layer"])
 
         for L in update_layers:
             L = int(L)
+
             if L < 1:
                 continue
+
             if exclude_target_layer:
                 if L >= Cmax:
                     continue
@@ -943,27 +930,35 @@ def build_clean_updates(
                 if L > Cmax:
                     continue
 
-            needed = (L - 1, L)
-            if any(x not in real_states or x not in no_states for x in needed):
+            if L not in real_states or L - 1 not in real_states:
                 continue
 
             if not (
-                0 <= p < real_states[L - 1].shape[1]
-                and 0 <= p < real_states[L].shape[1]
-                and 0 <= q < no_states[L - 1].shape[1]
-                and 0 <= q < no_states[L].shape[1]
+                0 <= p < real_states[L].shape[1]
+                and 0 <= p < real_states[L - 1].shape[1]
             ):
                 continue
 
-            d_prev = (
-                real_states[L - 1][0, p].astype(np.float32)
-                - no_states[L - 1][0, q].astype(np.float32)
-            )
-            d_cur = (
+            a_real = (
                 real_states[L][0, p].astype(np.float32)
-                - no_states[L][0, q].astype(np.float32)
+                - real_states[L - 1][0, p].astype(np.float32)
             )
-            u = (d_cur - d_prev).astype(np.float32)
+
+            # Secondary NoImage decomposition if this position is alignable.
+            a_no = None
+            a_rn = None
+            if (
+                q is not None
+                and L in no_states
+                and L - 1 in no_states
+                and 0 <= q < no_states[L].shape[1]
+                and 0 <= q < no_states[L - 1].shape[1]
+            ):
+                a_no = (
+                    no_states[L][0, q].astype(np.float32)
+                    - no_states[L - 1][0, q].astype(np.float32)
+                )
+                a_rn = (a_real - a_no).astype(np.float32)
 
             entries.append(
                 {
@@ -972,16 +967,36 @@ def build_clean_updates(
                     "baseline_correct": bool(baseline_correct),
                     "update_layer": L,
                     "real_position": p,
-                    "noimage_position": int(q),
+                    "noimage_position": int(q) if q is not None else -1,
                     "token": str(s["token"]),
                     "category": str(s["category"]),
                     "broad_category": str(s["broad_category"]),
                     "max_target_layer": Cmax,
                     "distance_to_latest_target": Cmax - L,
-                    "rn_prev_norm": float(np.linalg.norm(d_prev)),
-                    "rn_cur_norm": float(np.linalg.norm(d_cur)),
-                    "update_norm": float(np.linalg.norm(u)),
-                    "_update_vector": u,
+                    "real_update_norm": float(np.linalg.norm(a_real)),
+                    "noimage_update_norm": (
+                        float(np.linalg.norm(a_no))
+                        if a_no is not None
+                        else float("nan")
+                    ),
+                    "rn_update_norm": (
+                        float(np.linalg.norm(a_rn))
+                        if a_rn is not None
+                        else float("nan")
+                    ),
+                    "rn_update_fraction_of_real": (
+                        float(np.linalg.norm(a_rn)) / max(float(np.linalg.norm(a_real)), EPS)
+                        if a_rn is not None
+                        else float("nan")
+                    ),
+                    "real_rn_update_cosine": (
+                        cosine_np(a_real, a_rn)
+                        if a_rn is not None
+                        else float("nan")
+                    ),
+                    "_real_update": a_real,
+                    "_noimage_update": a_no,
+                    "_rn_update": a_rn,
                 }
             )
 
@@ -989,39 +1004,58 @@ def build_clean_updates(
 
 
 def attach_decision_scores(entries, grad_gt, grad_comp):
-    out = []
+    scored = []
 
     for e in entries:
         L = int(e["update_layer"])
         p = int(e["real_position"])
-        u = np.asarray(e["_update_vector"], np.float32)
 
         gg = grad_gt.get(L, None)
         gc = grad_comp.get(L, None)
+
         if gg is None or gc is None:
             continue
         if not (0 <= p < gg.shape[1] and 0 <= p < gc.shape[1]):
             continue
 
-        g = (gg[0, p] - gc[0, p]).astype(np.float32)
-        gn = float(np.linalg.norm(g))
-        un = float(np.linalg.norm(u))
-        dot = float(np.dot(u, g))
+        grad = (gg[0, p] - gc[0, p]).astype(np.float32)
+        a_real = np.asarray(e["_real_update"], np.float32)
+
+        B_real = float(np.dot(a_real, grad))
+        grad_norm = float(np.linalg.norm(grad))
+        real_norm = float(np.linalg.norm(a_real))
+
+        a_no = e["_noimage_update"]
+        a_rn = e["_rn_update"]
+
+        if a_no is not None and a_rn is not None:
+            B_no = float(np.dot(np.asarray(a_no, np.float32), grad))
+            B_rn = float(np.dot(np.asarray(a_rn, np.float32), grad))
+            decomp_error = abs(B_real - (B_no + B_rn))
+        else:
+            B_no = float("nan")
+            B_rn = float("nan")
+            decomp_error = float("nan")
 
         z = dict(e)
         z.update(
             {
-                "decision_grad_norm": gn,
-                "decision_score": dot,
-                "decision_score_per_update_norm": dot / max(un, EPS),
-                "decision_score_per_grad_norm": dot / max(gn, EPS),
-                "decision_cosine": cosine_np(u, g),
-                "_decision_grad": g,
+                "decision_grad_norm": grad_norm,
+                "real_update_decision_score": B_real,
+                "real_update_decision_score_per_update_norm": B_real / max(real_norm, EPS),
+                "real_update_decision_score_per_grad_norm": B_real / max(grad_norm, EPS),
+                "real_update_decision_cosine": cosine_np(a_real, grad),
+
+                # Secondary decomposition only.
+                "noimage_update_decision_score": B_no,
+                "rn_update_decision_score": B_rn,
+                "decision_score_decomposition_error": decomp_error,
+                "_decision_grad": grad,
             }
         )
-        out.append(z)
+        scored.append(z)
 
-    return out
+    return scored
 
 
 # =============================================================================
@@ -1040,13 +1074,18 @@ def add_patch(patch_map, layer, position, vec):
         patch_map[L][p] = v.copy()
 
 
-def build_decision_patch_map(entries, condition, scale, threshold):
+def build_real_update_patch_map(entries, condition, scale, threshold):
     patch_map = {}
-    counts = {"positive": 0, "negative": 0, "neutral": 0, "patched": 0}
+    counts = {
+        "positive": 0,
+        "negative": 0,
+        "neutral": 0,
+        "patched": 0,
+    }
 
     for e in entries:
-        s = float(e["decision_score"])
-        u = np.asarray(e["_update_vector"], np.float32)
+        s = float(e["real_update_decision_score"])
+        u = np.asarray(e["_real_update"], np.float32)
         vec = None
 
         if s > threshold:
@@ -1056,19 +1095,23 @@ def build_decision_patch_map(entries, condition, scale, threshold):
         else:
             counts["neutral"] += 1
 
-        if condition == "decision_positive":
+        if condition == "real_positive":
             if s > threshold:
                 vec = float(scale) * u
-        elif condition == "decision_negative_cancel":
+
+        elif condition == "real_negative_cancel":
             if s < -threshold:
                 vec = -float(scale) * u
-        elif condition == "decision_signed":
+
+        elif condition == "real_signed":
             if s > threshold:
                 vec = float(scale) * u
             elif s < -threshold:
                 vec = -float(scale) * u
-        elif condition == "all_amplify":
+
+        elif condition == "real_all_amplify":
             vec = float(scale) * u
+
         else:
             raise ValueError(condition)
 
@@ -1108,6 +1151,7 @@ def build_direct_rn_patch_map(causal_rows, r2n, real_states, no_states, beta):
             real_states[C][0, p].astype(np.float32)
             - no_states[C][0, q].astype(np.float32)
         )
+
         add_patch(patch_map, C, p, float(beta) * t)
         seen.add(key)
 
@@ -1149,7 +1193,7 @@ def generate_with_patch(
 
 
 # =============================================================================
-# Finite sequence-margin validation
+# Finite local validation
 # =============================================================================
 
 def sequence_margin_with_patch(
@@ -1163,19 +1207,19 @@ def sequence_margin_with_patch(
     competitor,
     patch_map,
 ):
-    s_gt = clean_sequence_score(
-        model,
-        batch,
-        candidate_ids[gt],
-        reduction,
+    s_gt = sequence_score(
+        model=model,
+        batch=batch,
+        answer_ids=candidate_ids[gt],
+        reduction=reduction,
         decoder_layers=decoder_layers,
         patch_map=patch_map,
     )
-    s_comp = clean_sequence_score(
-        model,
-        batch,
-        candidate_ids[competitor],
-        reduction,
+    s_comp = sequence_score(
+        model=model,
+        batch=batch,
+        answer_ids=candidate_ids[competitor],
+        reduction=reduction,
         decoder_layers=decoder_layers,
         patch_map=patch_map,
     )
@@ -1191,6 +1235,7 @@ def summarize_samples(sample_df):
         return pd.DataFrame()
 
     rows = []
+
     for correct, g in sample_df.groupby("baseline_correct", dropna=False):
         rows.append(
             {
@@ -1200,15 +1245,24 @@ def summarize_samples(sample_df):
                 "mean_negative_fraction": safe_mean(g["negative_fraction"]),
                 "mean_positive_mass": safe_mean(g["positive_mass"]),
                 "mean_negative_mass": safe_mean(g["negative_mass"]),
-                "mean_net_decision_mass": safe_mean(g["net_decision_mass"]),
+                "mean_net_real_update_decision_mass": safe_mean(
+                    g["net_real_update_decision_mass"]
+                ),
                 "mean_decision_efficiency": safe_mean(g["decision_efficiency"]),
                 "median_decision_efficiency": safe_median(g["decision_efficiency"]),
                 "mean_sequence_margin": safe_mean(g["sequence_margin"]),
                 "sequence_margin_correct_fraction": float(
                     np.mean(g["sequence_margin_correct"].astype(bool))
                 ),
+                "mean_rn_share_of_positive_mass": safe_mean(
+                    g["rn_share_of_positive_mass"]
+                ),
+                "mean_rn_share_of_negative_mass": safe_mean(
+                    g["rn_share_of_negative_mass"]
+                ),
             }
         )
+
     return pd.DataFrame(rows)
 
 
@@ -1222,25 +1276,44 @@ def summarize_layers(update_df, extra_keys=None):
     for key, g in update_df.groupby(keys, dropna=False):
         if not isinstance(key, tuple):
             key = (key,)
+
         row = {k: v for k, v in zip(keys, key)}
-        s = g["decision_score"].astype(float).to_numpy()
+
+        s = g["real_update_decision_score"].astype(float).to_numpy()
 
         row.update(
             {
                 "N_samples": g["sid"].nunique(),
                 "N_updates": len(g),
-                "mean_decision_score": float(np.mean(s)),
-                "median_decision_score": float(np.median(s)),
+                "mean_real_update_decision_score": float(np.mean(s)),
+                "median_real_update_decision_score": float(np.median(s)),
                 "positive_fraction": float(np.mean(s > 0)),
                 "negative_fraction": float(np.mean(s < 0)),
                 "mean_positive_score": safe_mean(x for x in s if x > 0),
                 "mean_negative_score": safe_mean(x for x in s if x < 0),
                 "mean_abs_score": float(np.mean(np.abs(s))),
-                "mean_decision_cosine": safe_mean(g["decision_cosine"]),
-                "mean_update_norm": safe_mean(g["update_norm"]),
+                "mean_real_update_decision_cosine": safe_mean(
+                    g["real_update_decision_cosine"]
+                ),
+                "mean_real_update_norm": safe_mean(g["real_update_norm"]),
                 "mean_grad_norm": safe_mean(g["decision_grad_norm"]),
+
+                # Secondary source diagnostics.
+                "mean_noimage_update_decision_score": safe_mean(
+                    g["noimage_update_decision_score"]
+                ),
+                "mean_rn_update_decision_score": safe_mean(
+                    g["rn_update_decision_score"]
+                ),
+                "mean_rn_update_fraction_of_real": safe_mean(
+                    g["rn_update_fraction_of_real"]
+                ),
+                "mean_real_rn_update_cosine": safe_mean(
+                    g["real_rn_update_cosine"]
+                ),
             }
         )
+
         rows.append(row)
 
     return pd.DataFrame(rows).sort_values(keys).reset_index(drop=True)
@@ -1257,6 +1330,7 @@ def summarize_generation(gen_df):
     )
 
     rows = []
+
     for (cond, scale), g in gen_df[gen_df["condition"] != "baseline"].groupby(
         ["condition", "scale"],
         dropna=False,
@@ -1309,6 +1383,7 @@ def summarize_generation_by_relation(gen_df):
         return pd.DataFrame()
 
     rows = []
+
     for (cond, scale, gt), g in gen_df.groupby(
         ["condition", "scale", "gt"],
         dropna=False,
@@ -1323,9 +1398,11 @@ def summarize_generation_by_relation(gen_df):
             }
         )
 
-    return pd.DataFrame(rows).sort_values(
-        ["condition", "scale", "relation"]
-    ).reset_index(drop=True)
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["condition", "scale", "relation"])
+        .reset_index(drop=True)
+    )
 
 
 # =============================================================================
@@ -1346,10 +1423,10 @@ def main():
     conditions = parse_set(a.conditions)
 
     valid_conditions = {
-        "decision_positive",
-        "decision_negative_cancel",
-        "decision_signed",
-        "all_amplify",
+        "real_positive",
+        "real_negative_cancel",
+        "real_signed",
+        "real_all_amplify",
         "direct_rn",
     }
     unknown = set(conditions) - valid_conditions
@@ -1357,15 +1434,17 @@ def main():
         raise ValueError(f"Unknown conditions: {sorted(unknown)}")
 
     if any(L < 1 for L in update_layers):
-        raise ValueError("--update-layers must be >=1 because u_L uses L-1")
+        raise ValueError("--update-layers must be >=1 because a_L uses L-1")
 
     outdir = Path(a.output_dir)
+
     if a.overwrite and outdir.exists():
         shutil.rmtree(outdir)
+
     if outdir.exists() and any(outdir.iterdir()):
         raise RuntimeError(f"Non-empty output dir: {outdir}")
-    outdir.mkdir(parents=True, exist_ok=True)
 
+    outdir.mkdir(parents=True, exist_ok=True)
     error_path = outdir / "errors.jsonl"
 
     two, meta, rec_by_sid = load_data(a)
@@ -1416,9 +1495,9 @@ def main():
         texts = candidate_texts(a)
         candidate_ids = encode_candidate_ids(processor, texts)
 
-        print("=" * 196)
-        print("DECISION-AWARE RN UPDATE GATING")
-        print("=" * 196)
+        print("=" * 202)
+        print("ACTUAL REAL CAUSAL-TOKEN LAYER UPDATE -> DECISION")
+        print("=" * 202)
         print(f"model={a.model} repo={spec.repo_id}")
         print(f"N={len(meta)}")
         print(f"causal_layers={causal_layers} topK={a.causal_top_k}")
@@ -1432,7 +1511,7 @@ def main():
         )
         print()
 
-        for m in tqdm(meta, desc="DECISION-AWARE RN UPDATES"):
+        for m in tqdm(meta, desc="REAL CAUSAL-TOKEN UPDATES"):
             sid = int(m["sid"])
             if sid not in causal_by_sid:
                 continue
@@ -1450,6 +1529,9 @@ def main():
                     question_text=m["question_text"],
                     device=device,
                 )
+
+                # NoImage is not part of the primary update/sign. It is used only
+                # for secondary decomposition and direct-RN control.
                 nb = build_noimage_batch(
                     processor,
                     m["question_text"],
@@ -1460,9 +1542,6 @@ def main():
                 nid = nb["input_ids"][0].detach().cpu().tolist()
                 r2n = lcs_token_map(rid, nid)
 
-                # ---------------------------------------------------------
-                # Clean hidden states
-                # ---------------------------------------------------------
                 real_states = capture_prompt_blocks(
                     model,
                     decoder_layers,
@@ -1477,7 +1556,7 @@ def main():
                 )
 
                 # ---------------------------------------------------------
-                # Actual baseline generation
+                # Baseline free generation
                 # ---------------------------------------------------------
                 base_text = base.generate_text(
                     model,
@@ -1504,25 +1583,20 @@ def main():
                 )
 
                 # ---------------------------------------------------------
-                # Clean sequence-level candidate scores
+                # Sequence-level decision proxy
                 # ---------------------------------------------------------
-                clean_scores = all_clean_sequence_scores(
+                clean_scores = all_sequence_scores(
                     model,
                     rb,
                     candidate_ids,
                     a.sequence_score_reduction,
                 )
-
                 seq_pred = max(REL, key=lambda r: clean_scores[r])
                 competitor = max(
                     (r for r in REL if r != m["gt"]),
                     key=lambda r: clean_scores[r],
                 )
-                seq_margin = fixed_sequence_margin(
-                    clean_scores,
-                    m["gt"],
-                    competitor,
-                )
+                seq_margin = float(clean_scores[m["gt"]] - clean_scores[competitor])
                 seq_correct = seq_pred == m["gt"]
 
                 sequence_rows.append(
@@ -1541,11 +1615,11 @@ def main():
                 )
 
                 # ---------------------------------------------------------
-                # Build unique RN updates
+                # ACTUAL REAL updates at selected causal-token trajectories
                 # ---------------------------------------------------------
                 specs = causal_position_specs(causal_by_sid[sid])
 
-                entries = build_clean_updates(
+                entries = build_real_updates(
                     sid=sid,
                     gt=m["gt"],
                     baseline_correct=base_correct,
@@ -1558,16 +1632,13 @@ def main():
                 )
 
                 if not entries:
-                    raise RuntimeError("No aligned RN update entries")
+                    raise RuntimeError("No REAL causal-token layer updates")
 
                 grad_layers = sorted(
                     set(int(e["update_layer"]) for e in entries)
                 )
 
-                # ---------------------------------------------------------
-                # Sequence-level GT and competitor gradients
-                # ---------------------------------------------------------
-                gt_score_graph, grad_gt = run_sequence_score_and_grads(
+                gt_score_graph, grad_gt = sequence_score_and_grads(
                     model=model,
                     decoder_layers=decoder_layers,
                     batch=rb,
@@ -1575,7 +1646,8 @@ def main():
                     reduction=a.sequence_score_reduction,
                     grad_layers=grad_layers,
                 )
-                comp_score_graph, grad_comp = run_sequence_score_and_grads(
+
+                comp_score_graph, grad_comp = sequence_score_and_grads(
                     model=model,
                     decoder_layers=decoder_layers,
                     batch=rb,
@@ -1585,10 +1657,11 @@ def main():
                 )
 
                 graph_margin = gt_score_graph - comp_score_graph
+
                 if abs(graph_margin - seq_margin) > 5e-3:
                     raise RuntimeError(
-                        f"Sequence margin replay mismatch: clean={seq_margin:.6f} "
-                        f"graph={graph_margin:.6f}"
+                        f"Sequence margin replay mismatch: "
+                        f"clean={seq_margin:.6f} graph={graph_margin:.6f}"
                     )
 
                 scored = attach_decision_scores(
@@ -1596,17 +1669,36 @@ def main():
                     grad_gt,
                     grad_comp,
                 )
-                if not scored:
-                    raise RuntimeError("No RN update received a decision gradient")
 
-                scores_np = np.asarray(
-                    [float(e["decision_score"]) for e in scored],
+                if not scored:
+                    raise RuntimeError("No REAL update received a decision gradient")
+
+                B = np.asarray(
+                    [float(e["real_update_decision_score"]) for e in scored],
                     dtype=np.float64,
                 )
-                pos_mass = float(np.maximum(scores_np, 0).sum())
-                neg_mass = float(np.maximum(-scores_np, 0).sum())
+
+                pos_mass = float(np.maximum(B, 0).sum())
+                neg_mass = float(np.maximum(-B, 0).sum())
                 abs_mass = pos_mass + neg_mass
-                net_mass = float(scores_np.sum())
+                net_mass = float(B.sum())
+
+                # Secondary decomposition: what fraction of positive/negative
+                # REAL decision mass is carried by the RN differential component?
+                pos_rn = 0.0
+                neg_rn = 0.0
+                for e in scored:
+                    br = float(e["real_update_decision_score"])
+                    brn = float(e["rn_update_decision_score"])
+                    if not math.isfinite(brn):
+                        continue
+                    if br > 0:
+                        pos_rn += brn
+                    elif br < 0:
+                        # Report same signed-axis contribution magnitude relative
+                        # to harmful REAL mass; positive brn here means RN opposes
+                        # the harmful real update.
+                        neg_rn += -brn
 
                 sample_rows.append(
                     {
@@ -1620,15 +1712,21 @@ def main():
                         "sequence_generation_agree": seq_pred == base_pred,
                         "competitor": competitor,
                         "N_updates": len(scored),
-                        "positive_fraction": float(np.mean(scores_np > 0)),
-                        "negative_fraction": float(np.mean(scores_np < 0)),
+                        "positive_fraction": float(np.mean(B > 0)),
+                        "negative_fraction": float(np.mean(B < 0)),
                         "positive_mass": pos_mass,
                         "negative_mass": neg_mass,
-                        "net_decision_mass": net_mass,
+                        "net_real_update_decision_mass": net_mass,
                         "decision_efficiency": (
                             net_mass / abs_mass if abs_mass > EPS else float("nan")
                         ),
-                        "mean_abs_decision_score": float(np.mean(np.abs(scores_np))),
+                        "mean_abs_real_update_score": float(np.mean(np.abs(B))),
+                        "rn_share_of_positive_mass": (
+                            pos_rn / pos_mass if pos_mass > EPS else float("nan")
+                        ),
+                        "rn_share_of_negative_mass": (
+                            neg_rn / neg_mass if neg_mass > EPS else float("nan")
+                        ),
                     }
                 )
 
@@ -1641,17 +1739,17 @@ def main():
                         "lcs_matches": len(r2n),
                         "selected_causal_states": len(causal_by_sid[sid]),
                         "unique_causal_positions": len(specs),
-                        "decision_scored_updates": len(scored),
+                        "decision_scored_real_updates": len(scored),
                     }
                 )
 
                 # ---------------------------------------------------------
-                # Optional finite-difference validation
+                # Optional finite local sign validation
                 # ---------------------------------------------------------
                 if a.finite_probe_k > 0:
                     chosen = sorted(
                         scored,
-                        key=lambda e: abs(float(e["decision_score"])),
+                        key=lambda e: abs(float(e["real_update_decision_score"])),
                         reverse=True,
                     )[: int(a.finite_probe_k)]
 
@@ -1662,9 +1760,10 @@ def main():
                             e["update_layer"],
                             e["real_position"],
                             float(a.finite_probe_scale)
-                            * np.asarray(e["_update_vector"], np.float32),
+                            * np.asarray(e["_real_update"], np.float32),
                         )
-                        pmargin = sequence_margin_with_patch(
+
+                        patched_margin = sequence_margin_with_patch(
                             model=model,
                             decoder_layers=decoder_layers,
                             batch=rb,
@@ -1674,10 +1773,11 @@ def main():
                             competitor=competitor,
                             patch_map=pmap,
                         )
-                        actual_gain = pmargin - seq_margin
+
+                        actual_gain = patched_margin - seq_margin
                         predicted_gain = (
                             float(a.finite_probe_scale)
-                            * float(e["decision_score"])
+                            * float(e["real_update_decision_score"])
                         )
 
                         finite_rows.append(
@@ -1688,7 +1788,9 @@ def main():
                                 "update_layer": int(e["update_layer"]),
                                 "real_position": int(e["real_position"]),
                                 "token": str(e["token"]),
-                                "decision_score": float(e["decision_score"]),
+                                "real_update_decision_score": float(
+                                    e["real_update_decision_score"]
+                                ),
                                 "probe_scale": float(a.finite_probe_scale),
                                 "predicted_margin_gain": predicted_gain,
                                 "actual_margin_gain": actual_gain,
@@ -1703,20 +1805,24 @@ def main():
                             }
                         )
 
-                # ---------------------------------------------------------
-                # Save per-update rows (without arrays)
-                # ---------------------------------------------------------
+                # Save score rows without arrays.
                 for e in scored:
                     update_rows_all.append(
                         {
                             k: v
                             for k, v in e.items()
-                            if k not in ("_update_vector", "_decision_grad")
+                            if k
+                            not in (
+                                "_real_update",
+                                "_noimage_update",
+                                "_rn_update",
+                                "_decision_grad",
+                            )
                         }
                     )
 
                 # ---------------------------------------------------------
-                # Actual generation under decision-aware gating
+                # Actual generation under REAL-update gating
                 # ---------------------------------------------------------
                 for cond in conditions:
                     if cond == "direct_rn":
@@ -1727,6 +1833,7 @@ def main():
                             no_states,
                             a.direct_beta,
                         )
+
                         pred, text = generate_with_patch(
                             model=model,
                             processor=processor,
@@ -1744,7 +1851,9 @@ def main():
                                 "scale": float(a.direct_beta),
                                 "prediction": pred,
                                 "correct": pred == m["gt"],
-                                "n_patched_updates": sum(len(v) for v in pmap.values()),
+                                "n_patched_updates": sum(
+                                    len(v) for v in pmap.values()
+                                ),
                                 "n_positive_updates": np.nan,
                                 "n_negative_updates": np.nan,
                                 "text": text,
@@ -1753,12 +1862,13 @@ def main():
                         continue
 
                     for scale in scales:
-                        pmap, counts = build_decision_patch_map(
+                        pmap, counts = build_real_update_patch_map(
                             scored,
                             cond,
                             scale,
                             a.decision_threshold,
                         )
+
                         pred, text = generate_with_patch(
                             model=model,
                             processor=processor,
@@ -1807,7 +1917,7 @@ def main():
                     torch.cuda.empty_cache()
 
         # =================================================================
-        # Save tables
+        # Save raw tables
         # =================================================================
         align_df = pd.DataFrame(alignment_rows)
         seq_df = pd.DataFrame(sequence_rows)
@@ -1818,44 +1928,56 @@ def main():
 
         align_df.to_csv(outdir / "alignment_summary.csv", index=False)
         seq_df.to_csv(outdir / "sequence_score_summary.csv", index=False)
-        upd_df.to_csv(outdir / "per_update_decision_score.csv", index=False)
-        sample_df.to_csv(outdir / "sample_update_summary.csv", index=False)
+        upd_df.to_csv(outdir / "per_real_update_decision_score.csv", index=False)
+        sample_df.to_csv(outdir / "sample_real_update_summary.csv", index=False)
         finite_df.to_csv(outdir / "finite_probe_validation.csv", index=False)
         gen_df.to_csv(outdir / "generation_per_sample.csv", index=False)
 
+        # =================================================================
+        # Summaries
+        # =================================================================
         by_correct = summarize_samples(sample_df)
         by_correct.to_csv(
-            outdir / "update_summary_by_generation_correctness.csv",
+            outdir / "real_update_summary_by_generation_correctness.csv",
             index=False,
         )
 
         layer_summary = summarize_layers(upd_df)
-        layer_summary.to_csv(outdir / "layer_update_summary.csv", index=False)
+        layer_summary.to_csv(
+            outdir / "layer_real_update_summary.csv",
+            index=False,
+        )
 
         layer_by_correct = summarize_layers(
             upd_df,
             extra_keys=["baseline_correct"],
         )
         layer_by_correct.to_csv(
-            outdir / "layer_update_by_generation_correctness.csv",
+            outdir / "layer_real_update_by_generation_correctness.csv",
             index=False,
         )
 
         gen_summary = summarize_generation(gen_df)
-        gen_summary.to_csv(outdir / "generation_summary.csv", index=False)
+        gen_summary.to_csv(
+            outdir / "generation_summary.csv",
+            index=False,
+        )
 
         gen_rel = summarize_generation_by_relation(gen_df)
-        gen_rel.to_csv(outdir / "generation_by_relation.csv", index=False)
+        gen_rel.to_csv(
+            outdir / "generation_by_relation.csv",
+            index=False,
+        )
 
-        # sequence proxy quality
+        # Proxy checks
         if len(seq_df):
-            seq_acc = float(seq_df["sequence_correct"].astype(bool).mean())
             gen_acc = float(seq_df["generation_correct"].astype(bool).mean())
+            seq_acc = float(seq_df["sequence_correct"].astype(bool).mean())
             seq_gen_agree = float(
                 seq_df["sequence_generation_agree"].astype(bool).mean()
             )
         else:
-            seq_acc = gen_acc = seq_gen_agree = float("nan")
+            gen_acc = seq_acc = seq_gen_agree = float("nan")
 
         if len(finite_df):
             finite_sign_agree = float(
@@ -1865,9 +1987,9 @@ def main():
             finite_sign_agree = float("nan")
 
         report = [
-            "=" * 200,
-            "DECISION-AWARE RN UPDATE GATING",
-            "=" * 200,
+            "=" * 202,
+            "ACTUAL REAL CAUSAL-TOKEN LAYER UPDATE -> DECISION",
+            "=" * 202,
             f"model={a.model} repo={spec.repo_id}",
             f"N requested={len(meta)}",
             f"causal layers={causal_layers} topK={a.causal_top_k}",
@@ -1877,58 +1999,68 @@ def main():
             f"decision threshold={a.decision_threshold}",
             "",
             "SEQUENCE-SCORE PROXY CHECK",
-            "-" * 200,
+            "-" * 202,
             f"generation accuracy              : {gen_acc:.4f}",
             f"sequence-score accuracy          : {seq_acc:.4f}",
             f"sequence vs generation agreement : {seq_gen_agree:.4f}",
             f"finite-probe sign agreement      : {finite_sign_agree:.4f}",
             "",
-            "DECISION-AWARE UPDATE MASS BY BASELINE GENERATION CORRECTNESS",
-            "-" * 200,
+            "ACTUAL REAL UPDATE MASS BY BASELINE GENERATION CORRECTNESS",
+            "-" * 202,
             by_correct.to_string(
                 index=False,
                 float_format=lambda x: f"{x:.4f}",
-            ) if len(by_correct) else "EMPTY",
+            )
+            if len(by_correct)
+            else "EMPTY",
             "",
-            "LAYERWISE DECISION-AWARE RN UPDATE SCORE",
-            "-" * 200,
+            "LAYERWISE ACTUAL REAL UPDATE SCORE",
+            "-" * 202,
             layer_summary.to_string(
                 index=False,
                 float_format=lambda x: f"{x:.4f}",
-            ) if len(layer_summary) else "EMPTY",
+            )
+            if len(layer_summary)
+            else "EMPTY",
             "",
             "GENERATION",
-            "-" * 200,
+            "-" * 202,
             gen_summary.to_string(
                 index=False,
                 float_format=lambda x: f"{x:.4f}",
-            ) if len(gen_summary) else "EMPTY",
+            )
+            if len(gen_summary)
+            else "EMPTY",
             "",
-            "Definition:",
-            "  d_L = h_real[L,p] - h_noimage[L,q]",
-            "  u_L = d_L - d_{L-1}",
-            "  M_seq = score(GT answer sequence) - score(best non-GT answer sequence)",
-            "  B_L,p = <u_L, dM_seq/dh_L,p>",
+            "PRIMARY definition:",
+            "  a_REAL[L,p] = h_REAL[L,p] - h_REAL[L-1,p]",
+            "  M_seq       = score(GT) - score(best non-GT competitor)",
+            "  B_REAL[L,p] = <a_REAL[L,p], dM_seq/dh_REAL[L,p]>",
             "",
-            "Read B as behavioral sign, NOT RN-formation sign:",
-            "  B > 0 : locally amplifying this image-conditioned update helps GT",
-            "  B < 0 : locally amplifying this image-conditioned update hurts GT",
+            "B_REAL is about what the REAL decoder block actually did to the causal token.",
+            "It is NOT defined with Real-NoImage.",
             "",
-            "Evidence for persistent competing / harmful RN information would be:",
-            "  1) wrong samples show higher negative_fraction / negative_mass than correct;",
-            "  2) decision_negative_cancel improves actual greedy generation;",
-            "  3) decision_signed > all_amplify at matched scale.",
+            "Secondary decomposition only:",
+            "  a_NOIMAGE = h_N[L,q] - h_N[L-1,q]",
+            "  a_RN      = a_REAL - a_NOIMAGE",
+            "  B_REAL ~= B_NOIMAGE + B_RN",
             "",
-            "Evidence instead for missing/weak useful information would be:",
-            "  negative mass is not selectively larger in wrong samples, and",
-            "  cancelling negative updates does not improve generation.",
+            "Evidence for harmful layer computation would be:",
+            "  1) wrong samples show larger negative REAL-update mass/fraction;",
+            "  2) real_negative_cancel repairs actual generation;",
+            "  3) real_signed > real_all_amplify at matched scale.",
             "",
-            "Use generation W2C/C2W as the final criterion because sequence margin is",
-            "still a proxy for free-form generation.",
+            "Evidence for insufficient positive computation would be:",
+            "  wrong samples have weaker positive REAL-update mass, while cancelling",
+            "  negative REAL updates gives little benefit.",
+            "",
+            "NoImage diagnostics can then tell whether helpful/harmful REAL updates are",
+            "predominantly image-conditioned or also present in the text-only trajectory.",
         ]
 
         report_text = "\n".join(report) + "\n"
         print(report_text)
+
         (outdir / "analysis_summary.txt").write_text(
             report_text,
             encoding="utf-8",
@@ -1937,7 +2069,7 @@ def main():
         write_json(
             outdir / "metadata.json",
             {
-                "script": "eval_decision_aware_rn_update_gating_v1.py",
+                "script": "eval_real_causal_token_update_gating_v1.py",
                 "model": a.model,
                 "repo_id": spec.repo_id,
                 "decoder_path": decoder_path,
@@ -1957,13 +2089,14 @@ def main():
                 "sequence_score_reduction": a.sequence_score_reduction,
                 "finite_probe_k": a.finite_probe_k,
                 "finite_probe_scale": a.finite_probe_scale,
-                "rn_state": "d_L = h_real[L,p]-h_noimage[L,q]",
-                "rn_update": "u_L = d_L-d_{L-1}",
-                "decision_score": "dot(u_L, grad_h [S_GT - S_competitor])",
-                "alignment": "exact token-ID LCS",
+                "primary_update": "a_REAL[L,p] = h_REAL[L,p] - h_REAL[L-1,p]",
+                "decision_score": "dot(a_REAL[L,p], grad_h [S_GT-S_competitor])",
+                "secondary_noimage_decomposition": (
+                    "a_RN = a_REAL-a_NOIMAGE; not used for primary sign/gating"
+                ),
                 "oracle_note": (
-                    "Causal positions come from prior oracle ranking; GT is used "
-                    "to define the decision margin. This is a mechanism diagnostic."
+                    "Causal positions originate from prior oracle ranking; GT defines "
+                    "the sequence margin and therefore the update sign."
                 ),
             },
         )
