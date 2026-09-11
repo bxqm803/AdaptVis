@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-eval_nonoracle_how_policy_sweep_v1.py
+eval_nonoracle_how_policy_sweep_v1_1.py
 
 Purpose
 =======
@@ -138,7 +138,7 @@ Run from AdaptVis/llava16 root and keep these helper scripts available:
 
 Recommended broad N80 sweep
 ===========================
-CUDA_VISIBLE_DEVICES=0 python -u eval_nonoracle_how_policy_sweep_v1.py \
+CUDA_VISIBLE_DEVICES=0 python -u eval_nonoracle_how_policy_sweep_v1_1.py \
   --model qwen-3b \
   --global-template-dir output/qwen3b_global_fixed_l26_top10_traj_n80_v1 \
   --prior-real-update-dir output/qwen3b_real_causal_token_updates_all440_v1 \
@@ -189,13 +189,212 @@ import analyze_coco_centroid_generation_step1_v4 as base
 import eval_real_causal_token_update_gating_v1 as gate
 import eval_l26_horizontal_top7_real_update_trajectory_v1 as l26
 import eval_global_fixed_l26_top10_trajectory_gating_v1 as gfix
-import eval_direction_head_selector_synthetic400_to_coco440_v2 as dsel
 
 
 REL = ("left", "right", "above", "below")
 RID = {r: i for i, r in enumerate(REL)}
 DISPLAY = {"left": "left", "right": "right", "above": "on", "below": "under"}
 EPS = 1e-12
+
+
+# =============================================================================
+# Standalone Direction-Head selector helpers
+# =============================================================================
+#
+# These functions are copied/reimplemented from
+# eval_direction_head_selector_synthetic400_to_coco440_v2.py so this sweep
+# does NOT require that Python file to exist in the repository.  It only needs
+# the selector OUTPUT files:
+#
+#   synthetic_fitted_direction_codebook.npz
+#   source_oof_head_reliability.csv
+#
+# plus the target Direction-Head cache relation_vectors.npz.
+
+
+def _dh_resolve_npz(path_or_dir):
+    p = Path(path_or_dir)
+    if p.is_file():
+        return p
+
+    candidates = [
+        p / "relation_vectors.npz",
+        p / "direction_vectors.npz",
+    ]
+    for q in candidates:
+        if q.exists():
+            return q
+
+    npzs = sorted(p.glob("*.npz")) if p.exists() else []
+    if len(npzs) == 1:
+        return npzs[0]
+
+    raise FileNotFoundError(
+        f"Could not resolve target Direction-Head NPZ from: {p}. "
+        f"Tried {[str(x) for x in candidates]}"
+    )
+
+
+def _dh_load_target_cache(path_or_dir):
+    p = _dh_resolve_npz(path_or_dir)
+    z = np.load(p, allow_pickle=True)
+
+    required = {"relation", "residual"}
+    missing = required - set(z.files)
+    if missing:
+        raise RuntimeError(
+            f"{p} missing arrays: {sorted(missing)}; keys={list(z.files)}"
+        )
+
+    X = np.asarray(z["residual"], dtype=np.float32)
+    y = np.asarray(
+        [canon_rel(x) for x in z["relation"]],
+        dtype=object,
+    )
+
+    if "sample_index" in z.files:
+        sid = np.asarray(z["sample_index"]).astype(int)
+    else:
+        sid = np.arange(len(y), dtype=int)
+
+    valid = np.isin(y, np.asarray(REL, dtype=object))
+    return p, sid[valid], y[valid], X[valid]
+
+
+def _dh_normalize(x, axis=-1):
+    x = np.asarray(x, dtype=np.float32)
+    n = np.linalg.norm(x, axis=axis, keepdims=True)
+    return x / np.maximum(n, EPS)
+
+
+def _dh_softmax(x, axis=-1, temperature=1.0):
+    x = np.asarray(x, dtype=np.float64)
+    x = x / max(float(temperature), 1e-8)
+    x = x - np.max(x, axis=axis, keepdims=True)
+    e = np.exp(x)
+    return e / np.maximum(
+        e.sum(axis=axis, keepdims=True),
+        EPS,
+    )
+
+
+def _dh_score_all_heads(X, center, dirs):
+    """
+    X      : [N,L,H,D]
+    center : [L,H,D]
+    dirs   : [L,H,R,D]
+    return : [N,L,H,R]
+    """
+    Xc = X - center[None, :, :, :]
+    Xn = _dh_normalize(Xc, axis=-1)
+    return np.einsum(
+        "nlhd,lhrd->nlhr",
+        Xn,
+        dirs,
+        optimize=True,
+    )
+
+
+def _dh_ensemble_probs(
+    scores,
+    heads,
+    reliability,
+    temperature,
+    weighted,
+    layer_balanced,
+):
+    """
+    Reimplementation of the selector's ensemble_probs().
+
+    scores: [N,L,H,R], per-head cosine relation scores.
+
+    First convert each head to a relation probability via softmax.
+    Non-layer-balanced:
+        weighted/equal average directly over selected heads.
+    Layer-balanced:
+        average selected heads inside each layer first, then average layers
+        equally so a layer with more selected heads cannot dominate.
+    """
+    probs = _dh_softmax(
+        scores,
+        axis=-1,
+        temperature=temperature,
+    )
+    N = scores.shape[0]
+
+    if not layer_balanced:
+        out = np.zeros((N, len(REL)), dtype=np.float64)
+        denom = 0.0
+
+        for l, h in heads:
+            w = (
+                max(float(reliability[l, h]) - 0.25, 0.0)
+                if weighted
+                else 1.0
+            )
+            if w <= 0:
+                continue
+
+            out += w * probs[:, l, h, :]
+            denom += w
+
+        if denom <= EPS:
+            return np.mean(
+                np.stack(
+                    [probs[:, l, h, :] for l, h in heads],
+                    axis=0,
+                ),
+                axis=0,
+            )
+
+        return out / denom
+
+    # Layer-balanced branch.
+    by_layer = {}
+    for l, h in heads:
+        by_layer.setdefault(int(l), []).append(int(h))
+
+    layer_outputs = []
+
+    for l, hs in sorted(by_layer.items()):
+        layer_out = np.zeros(
+            (N, len(REL)),
+            dtype=np.float64,
+        )
+        denom = 0.0
+
+        for h in hs:
+            w = (
+                max(float(reliability[l, h]) - 0.25, 0.0)
+                if weighted
+                else 1.0
+            )
+            if w <= 0:
+                continue
+
+            layer_out += w * probs[:, l, h, :]
+            denom += w
+
+        if denom <= EPS:
+            layer_out = np.mean(
+                np.stack(
+                    [probs[:, l, h, :] for h in hs],
+                    axis=0,
+                ),
+                axis=0,
+            )
+        else:
+            layer_out /= denom
+
+        layer_outputs.append(layer_out)
+
+    if not layer_outputs:
+        raise RuntimeError("No selected Direction Heads for ensemble.")
+
+    return np.mean(
+        np.stack(layer_outputs, axis=0),
+        axis=0,
+    )
 
 
 # =============================================================================
@@ -631,7 +830,7 @@ def load_direction_posterior(
     center = np.asarray(z["center"], dtype=np.float32)
     directions = np.asarray(z["directions"], dtype=np.float32)
 
-    target_path, target_sid, target_y, target_X = dsel.load_target_cache(
+    target_path, target_sid, target_y, target_X = _dh_load_target_cache(
         target_direction_dir
     )
 
@@ -641,7 +840,7 @@ def load_direction_posterior(
             f"source center shape {center.shape}"
         )
 
-    target_scores = dsel.score_all_heads(
+    target_scores = _dh_score_all_heads(
         target_X,
         center,
         directions,
@@ -676,7 +875,7 @@ def load_direction_posterior(
         if 0 <= l < reliability.shape[0] and 0 <= h < reliability.shape[1]:
             reliability[l, h] = float(r.source_oof_accuracy)
 
-    probs = dsel.ensemble_probs(
+    probs = _dh_ensemble_probs(
         scores=target_scores,
         heads=heads,
         reliability=reliability,
@@ -1905,7 +2104,7 @@ def main():
         )
 
         metadata = {
-            "script": "eval_nonoracle_how_policy_sweep_v1.py",
+            "script": "eval_nonoracle_how_policy_sweep_v1_1.py",
             "model": a.model,
             "repo_id": spec.repo_id,
             "decoder_path": decoder_path,
