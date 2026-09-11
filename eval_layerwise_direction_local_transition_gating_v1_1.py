@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-eval_layerwise_direction_local_transition_gating_v1.py
+eval_layerwise_direction_local_transition_gating_v1_1.py
 
 Purpose
 =======
@@ -171,7 +171,7 @@ against oracle sign.
 Recommended first run: N=80
 ===========================
 CUDA_VISIBLE_DEVICES=0 python -u \
-  eval_layerwise_direction_local_transition_gating_v1.py \
+  eval_layerwise_direction_local_transition_gating_v1_1.py \
   --model qwen-3b \
   --global-template-dir output/qwen3b_global_fixed_l26_top10_traj_n80_v1 \
   --prior-real-update-dir output/qwen3b_real_causal_token_updates_all440_v1 \
@@ -553,7 +553,11 @@ class JointGraphCapture:
       * block OUTPUT tensors for requested block layers;
       * pre-W_O attention outputs for requested Direction-head layers.
 
-    Nothing is detached; this is the graph used for local Jacobians.
+    A grad-enabled cut is inserted at the earliest update-layer block output,
+    exactly as in gate.GraphBlockCapture.  This is necessary because the loaded
+    model can be fully frozen (parameters require_grad=False).  Numerically the
+    trajectory is unchanged; downstream activations become differentiable with
+    respect to that cut state.
     """
 
     def __init__(
@@ -561,15 +565,42 @@ class JointGraphCapture:
         decoder_layers,
         block_layers: Sequence[int],
         prewo_layers: Sequence[int],
+        cut_layer: int,
     ):
         self.decoder_layers = decoder_layers
         self.block_layers = sorted(set(map(int, block_layers)))
         self.prewo_layers = sorted(set(map(int, prewo_layers)))
+        self.cut_layer = int(cut_layer)
         self.block: Dict[int, torch.Tensor] = {}
         self.prewo: Dict[int, torch.Tensor] = {}
         self.handles = []
 
     def __enter__(self):
+        # IMPORTANT:
+        # The loaded VLM is used as a frozen model in this project, so merely
+        # capturing intermediate activations does NOT guarantee that they carry
+        # an autograd graph.  Mirror gate.GraphBlockCapture: cut the graph at
+        # the earliest update layer and re-introduce a leaf that requires grad.
+        #
+        # Numerically y == x, so the REAL trajectory is unchanged.  The only
+        # purpose is to make all downstream L->L+1 Direction readouts
+        # differentiable w.r.t. the causal block outputs.
+        if self.cut_layer not in self.block_layers:
+            raise ValueError(
+                f"cut_layer={self.cut_layer} must be included in block_layers"
+            )
+
+        def cut_hook(_module, _inp, out):
+            x = gate.first_tensor(out)
+            y = x.detach().clone().requires_grad_(True)
+            return gate.replace_first_tensor(out, y)
+
+        # Register this FIRST.  The later capture hook at the same layer will
+        # therefore see the replaced grad-enabled output.
+        self.handles.append(
+            self.decoder_layers[self.cut_layer].register_forward_hook(cut_hook)
+        )
+
         for L in self.block_layers:
             def make_block(li):
                 def hook(_module, _inp, out):
@@ -833,6 +864,9 @@ def generate_condition(
 # =============================================================================
 
 def summarize_generation(df):
+    if df is None or df.empty or "condition" not in df.columns:
+        return pd.DataFrame()
+
     base_df = (
         df[df["condition"] == "baseline"]
         .drop_duplicates("sid")
@@ -897,6 +931,8 @@ def summarize_generation(df):
 
 def summarize_by_relation(df):
     rows = []
+    if df is None or df.empty or "gt" not in df.columns:
+        return pd.DataFrame()
     for gt, g in df.groupby("gt"):
         s = summarize_generation(g)
         if len(s):
@@ -907,6 +943,26 @@ def summarize_by_relation(df):
 
 def summarize_signs(df):
     rows = []
+
+    required = {
+        "baseline_correct",
+        "B_layer_final",
+        "B_local_transition",
+        "B_oracle",
+        "sid",
+    }
+    if df is None or df.empty or not required.issubset(set(df.columns)):
+        return pd.DataFrame(
+            columns=[
+                "method",
+                "cohort",
+                "N_updates",
+                "N_samples",
+                "sign_accuracy",
+                "weighted_sign_accuracy",
+                "coverage",
+            ]
+        )
 
     methods = [
         ("layer_final", "B_layer_final"),
@@ -977,6 +1033,9 @@ def summarize_signs(df):
 
 def summarize_signs_by_layer(df):
     rows = []
+
+    if df is None or df.empty or "update_layer" not in df.columns:
+        return pd.DataFrame()
 
     for L, g in df.groupby("update_layer"):
         s = summarize_signs(g)
@@ -1249,6 +1308,7 @@ def main():
                     decoder_layers,
                     block_capture_layers,
                     all_direction_layers,
+                    cut_layer=min(update_layers),
                 ) as cap:
                     kw = dict(rb)
                     kw["use_cache"] = False
@@ -1424,6 +1484,21 @@ def main():
                         local_margin_value[L] = float(
                             margin.detach().item()
                         )
+
+                        if not margin.requires_grad:
+                            raise RuntimeError(
+                                f"Local margin L{L}->L{L+1} does not require grad. "
+                                f"pnext.requires_grad={pnext.requires_grad}; "
+                                f"block_L.requires_grad={cap.block[L].requires_grad}. "
+                                "This means the local Direction readout was detached "
+                                "from the REAL causal trajectory."
+                            )
+
+                        if not cap.block[L].requires_grad:
+                            raise RuntimeError(
+                                f"Captured block output L{L} does not require grad. "
+                                f"cut_layer={min(update_layers)}."
+                            )
 
                         grad = torch.autograd.grad(
                             margin,
@@ -1991,7 +2066,7 @@ def main():
         )
 
         metadata = {
-            "script": "eval_layerwise_direction_local_transition_gating_v1.py",
+            "script": "eval_layerwise_direction_local_transition_gating_v1_1.py",
             "model": a.model,
             "repo_id": spec.repo_id,
             "decoder_path": decoder_path,
