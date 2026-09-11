@@ -1351,7 +1351,8 @@ def main():
                 score_df=pd.DataFrame(scores)
                 if len(score_df)==0:
                     continue
-                score_df.insert(0,"sid",sid)
+                # `scores` contains the same dict objects already updated above
+                # with sid/gt, so do not insert sid a second time.
 
                 state_layers=sorted(set(map(int,causal_rows.source_layer)))
 
@@ -1589,7 +1590,7 @@ def main():
         )
 
         write_json(outdir/"metadata.json",{
-            "script":"eval_head_token_to_causal_rg_reconstruction_v1.py",
+            "script":"eval_head_token_to_causal_rg_reconstruction_v2.py",
             "model":a.model,
             "repo_id":spec.repo_id,
             "decoder_path":decoder_path,
