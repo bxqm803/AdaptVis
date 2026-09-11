@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-validate_four_k7_vs_direction_head_sources_v1.py
+validate_four_k7_vs_direction_head_sources_v3.py
 
 Purpose
 -------
@@ -81,7 +81,7 @@ Repo helpers
 
 Typical run
 -----------
-CUDA_VISIBLE_DEVICES=0 python -u validate_four_k7_vs_direction_head_sources_v1.py \
+CUDA_VISIBLE_DEVICES=0 python -u validate_four_k7_vs_direction_head_sources_v3.py \
   --fourway-dir output/qwen3b_four_writer_k7_N80 \
   --direction-dir output/qwen3b_head_object_residual_direction \
   --model qwen-3b \
@@ -638,7 +638,7 @@ def select_heads(head_results, head_layer, n, rel=None):
 
 def head_accuracy(head_results, L, H):
     g = head_results[
-        (head_results.layer == int(L)) & (head_results["head"] == int(H))
+        (head_results["layer"] == int(L)) & (head_results["head"] == int(H))
     ]
     if not len(g):
         return np.nan
@@ -929,7 +929,7 @@ def summarize_oracle_states(state_df, ks):
                 "baseline_group": "correct" if bc else "wrong",
                 "N_samples": int(g.sid.nunique()),
                 "N_states": int(len(g)),
-                "direction_accuracy": safe_mean(g.direction_accuracy),
+                "direction_accuracy": safe_mean(g["direction_accuracy"]),
                 "mean_spatial_percentile": safe_mean(g.spatial_percentile),
                 "top10_rate": float(g.top10_hit.mean()),
                 "top05_rate": float(g.top05_hit.mean()),
@@ -945,7 +945,7 @@ def summarize_oracle_states(state_df, ks):
                 "baseline_group": "all",
                 "N_samples": int(g.sid.nunique()),
                 "N_states": int(len(g)),
-                "direction_accuracy": safe_mean(g.direction_accuracy),
+                "direction_accuracy": safe_mean(g["direction_accuracy"]),
                 "mean_spatial_percentile": safe_mean(g.spatial_percentile),
                 "top10_rate": float(g.top10_hit.mean()),
                 "top05_rate": float(g.top05_hit.mean()),
@@ -960,13 +960,13 @@ def summarize_overlap(overlap_df):
         return pd.DataFrame()
     for (K, HL, h, group), g in overlap_df.assign(
         baseline_group=np.where(
-            overlap_df.baseline_correct, "correct", "wrong"
+            overlap_df["baseline_correct"], "correct", "wrong"
         )
     ).groupby(["K", "head_layer", "head", "baseline_group"]):
-        denom = g.budget_m.sum()
-        micro = safe_div(g.intersection.sum(), denom)
+        denom = g["budget_m"].sum()
+        micro = safe_div(g["intersection"].sum(), denom)
         expected = safe_div(
-            np.sum(g.random_expected_recall * g.budget_m), denom
+            np.sum(g["random_expected_recall"] * g["budget_m"]), denom
         )
         rows.append({
             "K": int(K),
@@ -979,14 +979,14 @@ def summarize_overlap(overlap_df):
             "micro_recall": micro,
             "random_expected_recall": expected,
             "enrichment_ratio": safe_div(micro, expected),
-            "direction_accuracy": safe_mean(g.direction_accuracy),
+            "direction_accuracy": safe_mean(g["direction_accuracy"]),
         })
 
     for (K, HL, h), g in overlap_df.groupby(["K", "head_layer", "head"]):
-        denom = g.budget_m.sum()
-        micro = safe_div(g.intersection.sum(), denom)
+        denom = g["budget_m"].sum()
+        micro = safe_div(g["intersection"].sum(), denom)
         expected = safe_div(
-            np.sum(g.random_expected_recall * g.budget_m), denom
+            np.sum(g["random_expected_recall"] * g["budget_m"]), denom
         )
         rows.append({
             "K": int(K),
@@ -999,27 +999,27 @@ def summarize_overlap(overlap_df):
             "micro_recall": micro,
             "random_expected_recall": expected,
             "enrichment_ratio": safe_div(micro, expected),
-            "direction_accuracy": safe_mean(g.direction_accuracy),
+            "direction_accuracy": safe_mean(g["direction_accuracy"]),
         })
     return pd.DataFrame(rows)
 
 
 def head_accuracy_alignment_correlations(state_summary):
     rows = []
-    allg = state_summary[state_summary.baseline_group == "all"].copy()
+    allg = state_summary[state_summary["baseline_group"] == "all"].copy()
     for (K, HL), g in allg.groupby(["K", "head_layer"]):
         rows.append({
             "K": int(K),
             "head_layer": int(HL),
             "n_heads": int(len(g)),
             "rho_directionAcc_vs_percentile": spearman(
-                g.direction_accuracy, g.mean_spatial_percentile
+                g["direction_accuracy"], g["mean_spatial_percentile"]
             ),
             "rho_directionAcc_vs_top10": spearman(
-                g.direction_accuracy, g.top10_rate
+                g["direction_accuracy"], g["top10_rate"]
             ),
             "rho_directionAcc_vs_top01": spearman(
-                g.direction_accuracy, g.top01_rate
+                g["direction_accuracy"], g["top01_rate"]
             ),
         })
 
@@ -1041,6 +1041,16 @@ def head_accuracy_alignment_correlations(state_summary):
 
 
 def selector_summary(candidate_df):
+    required = {
+        "sid", "K", "candidate_relation", "gt", "baseline_prediction",
+        "baseline_correct",
+    }
+    missing = required - set(candidate_df.columns)
+    if missing:
+        raise RuntimeError(
+            "candidate_df missing required columns: " + ", ".join(sorted(missing))
+        )
+
     score_cols = [
         "overall_heads_mean_percentile",
         "overall_heads_rankweighted_percentile",
@@ -1052,18 +1062,18 @@ def selector_summary(candidate_df):
     rows = []
     details = []
     for (K, sid), g in candidate_df.groupby(["K", "sid"]):
-        if set(g.candidate_relation) != set(REL):
+        if set(g["candidate_relation"]) != set(REL):
             continue
-        gt = str(g.gt.iloc[0])
-        bp = str(g.baseline_prediction.iloc[0])
-        bc = bool(g.baseline_correct.iloc[0])
+        gt = str(g["gt"].iloc[0])
+        bp = str(g["baseline_prediction"].iloc[0])
+        bc = bool(g["baseline_correct"].iloc[0])
 
         for score_col in score_cols:
             gg = g[["candidate_relation", score_col]].dropna()
             if len(gg) < 4:
                 continue
             winner = gg.loc[gg[score_col].idxmax()]
-            pred = str(winner.candidate_relation)
+            pred = str(winner["candidate_relation"])
             vals = gg.sort_values(score_col, ascending=False)[score_col].to_numpy(float)
             detail = {
                 "sid": int(sid),
@@ -1078,7 +1088,7 @@ def selector_summary(candidate_df):
                 "winner_margin": float(vals[0] - vals[1]),
             }
             for r in REL:
-                hit = gg[gg.candidate_relation == r]
+                hit = gg[gg["candidate_relation"] == r]
                 detail[f"score_{r}"] = (
                     float(hit[score_col].iloc[0]) if len(hit) else np.nan
                 )
@@ -1089,16 +1099,16 @@ def selector_summary(candidate_df):
         return pd.DataFrame(), d
 
     for (K, score), g in d.groupby(["K", "score"]):
-        c = g.baseline_correct
+        c = g["baseline_correct"]
         w = ~c
         rows.append({
             "K": int(K),
             "score": score,
             "N": len(g),
-            "GTacc_all": float(g.pred_is_gt.mean()),
+            "GTacc_all": float(g["pred_is_gt"].mean()),
             "GTacc_correct": float(g.loc[c, "pred_is_gt"].mean()) if c.any() else np.nan,
             "GTacc_wrong": float(g.loc[w, "pred_is_gt"].mean()) if w.any() else np.nan,
-            "matchBaseline_all": float(g.pred_matches_baseline.mean()),
+            "matchBaseline_all": float(g["pred_matches_baseline"].mean()),
             "matchBaseline_wrong": (
                 float(g.loc[w, "pred_matches_baseline"].mean()) if w.any() else np.nan
             ),
@@ -1116,16 +1126,16 @@ def focus_head_report(state_summary, overlap_summary, focus_heads, ks):
         hn = head_name(L, H)
         for K in ks:
             s = state_summary[
-                (state_summary.head_layer == L)
+                (state_summary["head_layer"] == L)
                 & (state_summary["head"] == H)
-                & (state_summary.K == K)
-                & (state_summary.baseline_group == "all")
+                & (state_summary["K"] == K)
+                & (state_summary["baseline_group"] == "all")
             ]
             o = overlap_summary[
-                (overlap_summary.head_layer == L)
+                (overlap_summary["head_layer"] == L)
                 & (overlap_summary["head"] == H)
-                & (overlap_summary.K == K)
-                & (overlap_summary.baseline_group == "all")
+                & (overlap_summary["K"] == K)
+                & (overlap_summary["baseline_group"] == "all")
             ] if len(overlap_summary) else pd.DataFrame()
 
             if not len(s) and not len(o):
@@ -1164,7 +1174,7 @@ def render_summary(
     lines.append("CAUSAL TOKEN RANKING vs DIRECTION-HEAD SPATIAL-SOURCE RANKING")
     lines.append("=" * 166)
     lines.append(
-        f"N={state_df.sid.nunique() if len(state_df) else 0} | "
+        f"N={state_df["sid"].nunique() if len(state_df) else 0} | "
         f"source={args.source_layers} | Ks={args.ks} | "
         f"direction_fit={args.direction_fit} (N={direction_meta['fit_n']})"
     )
@@ -1181,7 +1191,7 @@ def render_summary(
     lines.append("-" * 166)
     if len(focus_df):
         for hn in [head_name(*parse_head_name(x)) for x in args.focus_heads.split(",") if x.strip()]:
-            g = focus_df[focus_df.head_name == hn].sort_values("K")
+            g = focus_df[focus_df["head_name"] == hn].sort_values("K")
             if not len(g):
                 continue
             lines.append(f"{hn}:")
@@ -1200,7 +1210,7 @@ def render_summary(
     lines.append("2) DOES HIGHER DIRECTION-HEAD ACCURACY PREDICT STRONGER CAUSAL/SPATIAL CONVERGENCE?")
     lines.append("-" * 166)
     if len(corr_df):
-        z = corr_df[corr_df.K.isin([1, 3, 5, 7, 36])].copy()
+        z = corr_df[corr_df["K"].isin([1, 3, 5, 7, 36])].copy()
         for r in z.itertuples():
             layer = "POOLED-within-layer" if int(r.head_layer) == -1 else f"L{int(r.head_layer):02d}"
             lines.append(
@@ -1214,7 +1224,7 @@ def render_summary(
     lines.append("-" * 166)
     if len(selector_df):
         z = selector_df[
-            selector_df.K.isin(sorted(set([args.selector_k, 3, 5, 7])))
+            selector_df["K"].isin(sorted(set([args.selector_k, 3, 5, 7])))
         ].sort_values(["GTacc_wrong", "GTacc_all"], ascending=False)
         for r in z.head(30).itertuples():
             lines.append(
@@ -1300,14 +1310,14 @@ def main():
     med["gt"] = med["gt"].map(canon_rel)
     med["baseline_prediction"] = med["baseline_prediction"].map(canon_rel)
     med["baseline_correct"] = med["baseline_correct"].map(boolify)
-    med = med[med.source_layer.isin(source_layers)].copy()
+    med = med[med["source_layer"].isin(source_layers)].copy()
 
     ps["sid"] = pd.to_numeric(ps["sid"], errors="raise").astype(int)
     ps["gt"] = ps["gt"].map(canon_rel)
     ps["baseline_prediction"] = ps["baseline_prediction"].map(canon_rel)
     ps["baseline_correct"] = ps["baseline_correct"].map(boolify)
 
-    eval_sids = sorted(set(ps.sid) & set(med.sid))
+    eval_sids = sorted(set(ps["sid"]) & set(med["sid"]))
     if args.max_eval_samples and args.max_eval_samples > 0:
         # Keep same deterministic N80 subset if the fourway run itself has N80.
         # If more are present, sample deterministically.
@@ -1321,8 +1331,8 @@ def main():
                 ).tolist()
             )
 
-    med = med[med.sid.isin(eval_sids)].copy()
-    ps = ps[ps.sid.isin(eval_sids)].copy()
+    med = med[med["sid"].isin(eval_sids)].copy()
+    ps = ps[ps["sid"].isin(eval_sids)].copy()
 
     ranked = build_all_causal_ranks(med, max_k=max_k)
     if not len(ranked):
@@ -1450,7 +1460,7 @@ def main():
                     real_caps, gray_caps, dirs, target_head_layers
                 )
 
-                rsid = ranked[ranked.sid == sid].copy()
+                rsid = ranked[ranked["sid"] == sid].copy()
                 if not len(rsid):
                     raise RuntimeError("No causal ranking rows for SID")
 
@@ -1533,7 +1543,7 @@ def main():
 
     metadata = {
         "N_requested": len(eval_sids),
-        "N_success": int(state_df.sid.nunique()),
+        "N_success": int(state_df["sid"].nunique()),
         "source_layers": source_layers,
         "aligned_head_layers": target_head_layers,
         "ks": ks,
