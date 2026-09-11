@@ -739,9 +739,13 @@ def scan_one_sample(
         kw["use_cache"] = False
         _ = model(**kw)
 
+        writers_for_relation = {
+            T: writers[T][gt] for T in target_layers
+        }
+
         J = build_writer_objective(
             cap.states,
-            writers[gt],
+            writers_for_relation,
             target_layers,
         )
 
@@ -1787,9 +1791,13 @@ def main():
                     head_layers=head_layers,
                 )
 
+                writers_for_relation = {
+                    T: writers[T][m["gt"]] for T in target_layers
+                }
+
                 baseline_J = writer_value_np(
                     real_states,
-                    writers[m["gt"]],
+                    writers_for_relation,
                     target_layers,
                 )
 
@@ -1840,7 +1848,7 @@ def main():
                     decoder_layers=decoder_layers,
                     batch=rb,
                     target_layers=target_layers,
-                    writers_for_relation=writers[m["gt"]],
+                    writers_for_relation=writers_for_relation,
                     max_new_tokens=a.max_new_tokens,
                     block_patch_map=causal_patch,
                     scale=a.causal_scale,
@@ -1889,7 +1897,7 @@ def main():
                             decoder_layers=decoder_layers,
                             batch=rb,
                             target_layers=target_layers,
-                            writers_for_relation=writers[m["gt"]],
+                            writers_for_relation=writers_for_relation,
                             max_new_tokens=a.max_new_tokens,
                             attention_patch_map=patch_map,
                             scale=alpha,
@@ -2036,7 +2044,7 @@ def main():
         write_json(
             outdir / "metadata.json",
             {
-                "script": "scan_directJ_heads_and_reproduce_causalRG_v1.py",
+                "script": "scan_directJ_heads_and_reproduce_causalRG_v2.py",
                 "model": a.model,
                 "repo_id": spec.repo_id,
                 "decoder_path": decoder_path,
