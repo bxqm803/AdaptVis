@@ -954,17 +954,17 @@ def summarize_router(df):
             "top_k":int(K),
             "N":len(g),
             "router_accuracy":float(
-                np.mean(g.route_prediction.astype(str)==g.gt.astype(str))
+                np.mean(g["route_prediction"].astype(str)==g["gt"].astype(str))
             ),
             "prefill_logit_accuracy":float(
-                np.mean(g.prefill_prediction.astype(str)==g.gt.astype(str))
+                np.mean(g["prefill_prediction"].astype(str)==g["gt"].astype(str))
             ),
             "mean_route_gap":safe_mean(g.route_gap),
             "median_route_gap":float(np.median(g.route_gap.astype(float))),
             "route_vs_prefill_agreement":float(
                 np.mean(
-                    g.route_prediction.astype(str)
-                    ==g.prefill_prediction.astype(str)
+                    g["route_prediction"].astype(str)
+                    ==g["prefill_prediction"].astype(str)
                 )
             ),
         })
@@ -1344,16 +1344,16 @@ def main():
         if len(router_df):
             for K,g in router_df.groupby("top_k"):
                 for gt in REL:
-                    q=g[g.gt==gt]
+                    q=g[g["gt"]==gt]
                     for pred in REL:
                         confusion_rows.append({
                             "top_k":int(K),
                             "gt":gt,
                             "prediction":pred,
-                            "count":int(np.sum(q.route_prediction==pred)),
+                            "count":int(np.sum(q["route_prediction"]==pred)),
                             "N_gt":len(q),
                             "fraction":(
-                                float(np.mean(q.route_prediction==pred))
+                                float(np.mean(q["route_prediction"]==pred))
                                 if len(q) else float("nan")
                             ),
                         })
