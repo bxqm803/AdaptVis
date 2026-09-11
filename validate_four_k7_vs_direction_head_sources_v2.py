@@ -152,7 +152,7 @@ def parse_args():
         "--attn-impl",
         default="eager",
         choices=["eager", "sdpa", "flash_attention_2", "none"],
-        help="Use eager for exact manual attention reconstruction.",
+        help="Use eager so the model returns exact attention probabilities.",
     )
     p.add_argument("--seed", type=int, default=17)
     p.add_argument("--max-eval-samples", type=int, default=80)
@@ -356,31 +356,18 @@ def load_direction_probe(direction_dir, eval_sids, mode):
 # Exact attention/value source contribution capture
 # =============================================================================
 
-def rotate_half_np(x):
-    d = x.shape[-1]
-    if d % 2:
-        raise RuntimeError(f"Odd head_dim={d}; cannot rotate_half")
-    x1 = x[..., : d // 2]
-    x2 = x[..., d // 2 :]
-    return np.concatenate([-x2, x1], axis=-1)
-
-
-def softmax_np(x, axis=-1):
-    x = np.asarray(x, dtype=np.float32)
-    m = np.max(x, axis=axis, keepdims=True)
-    e = np.exp(x - m)
-    return e / np.maximum(e.sum(axis=axis, keepdims=True), EPS)
-
-
-class LayerQKVRecorder:
+class LayerAttentionValueRecorder:
     """
-    Capture just enough to reconstruct attention rows for subject/reference
-    queries at selected decoder layers.
+    Capture the model's ACTUAL eager-attention probabilities plus V projections.
 
-    q_proj: keep only query positions
-    k_proj/v_proj: keep all source positions, KV heads only
-    position_embeddings: keep cos/sin
-    attention_mask: keep only query rows
+    This is preferable to manually reconstructing Q/K attention for Qwen2/2.5-VL,
+    because those models use multimodal RoPE (mRoPE).  Using the attention
+    probabilities returned by the model automatically preserves the exact
+    positional-encoding logic used in the real forward pass.
+
+    We keep only subject/reference query rows from attention:
+        A[:, subject/reference queries, :]
+    and keep V for all source positions.
     """
 
     def __init__(self, layer, query_positions):
@@ -388,65 +375,65 @@ class LayerQKVRecorder:
         self.attn = hprobe.resolve_self_attention(layer)
         self.query_positions = [int(x) for x in query_positions]
         self.handles = []
-        self.q = None
-        self.k = None
         self.v = None
-        self.cos = None
-        self.sin = None
-        self.mask = None
-        self.mask_is_bool = False
+        self.attn_rows = None
 
-        for name in ("q_proj", "k_proj", "v_proj"):
-            if not hasattr(self.attn, name):
-                raise RuntimeError(
-                    f"{type(self.attn).__name__} lacks {name}; this script targets Qwen2/2.5-style attention."
-                )
+        if not hasattr(self.attn, "v_proj"):
+            raise RuntimeError(
+                f"{type(self.attn).__name__} lacks v_proj; expected Qwen2/2.5-style attention."
+            )
 
         self.handles.append(
-            self.attn.register_forward_pre_hook(self._pre, with_kwargs=True)
+            self.attn.v_proj.register_forward_hook(self._v_hook)
         )
-        self.handles.append(self.attn.q_proj.register_forward_hook(self._q_hook))
-        self.handles.append(self.attn.k_proj.register_forward_hook(self._k_hook))
-        self.handles.append(self.attn.v_proj.register_forward_hook(self._v_hook))
-
-    def _pre(self, module, args, kwargs):
-        pe = kwargs.get("position_embeddings", None)
-        if pe is None or len(pe) != 2:
-            raise RuntimeError("Attention position_embeddings not available in forward kwargs")
-        cos, sin = pe
-        # [B,S,D]
-        self.cos = cos[0].detach().float().cpu().numpy()
-        self.sin = sin[0].detach().float().cpu().numpy()
-
-        am = kwargs.get("attention_mask", None)
-        self.mask = None
-        self.mask_is_bool = False
-        if torch.is_tensor(am):
-            self.mask_is_bool = (am.dtype == torch.bool)
-            # Common Qwen eager mask: [B,1,Q,K] or [B,H,Q,K]
-            if am.ndim == 4:
-                self.mask = (
-                    am[0, :, self.query_positions, :]
-                    .detach().float().cpu().numpy()
-                )  # [M,Q,S]
-            elif am.ndim == 3:
-                self.mask = (
-                    am[0, self.query_positions, :]
-                    .detach().float().cpu().numpy()
-                )  # [Q,S]
-            elif am.ndim == 2:
-                # Usually padding mask, not full causal mask.
-                self.mask = am[0].detach().float().cpu().numpy()[None, :]
-
-    def _q_hook(self, module, inp, out):
-        # [B,S,H*D] -> only subject/ref queries
-        self.q = out[0, self.query_positions].detach().float().cpu().numpy()
-
-    def _k_hook(self, module, inp, out):
-        self.k = out[0].detach().float().cpu().numpy()
+        self.handles.append(
+            self.attn.register_forward_hook(self._attn_hook)
+        )
 
     def _v_hook(self, module, inp, out):
+        # [B,S,Hkv*D]
         self.v = out[0].detach().float().cpu().numpy()
+
+    def _attn_hook(self, module, inp, out):
+        """
+        Find returned attention probabilities [B,H,Q,K].
+        Qwen eager attention returns them when output_attentions=True.
+        """
+        tensors = []
+        if torch.is_tensor(out):
+            tensors = [out]
+        elif isinstance(out, (tuple, list)):
+            tensors = [x for x in out if torch.is_tensor(x)]
+
+        candidates = [
+            x for x in tensors
+            if x.ndim == 4
+            and x.shape[0] >= 1
+            and x.shape[-2] > max(self.query_positions)
+        ]
+
+        if not candidates:
+            return
+
+        # Attention probabilities should have [B,H,Q,K].  Prefer a tensor
+        # whose last dimension is at least Q; this excludes unusual caches.
+        candidates.sort(
+            key=lambda x: (
+                int(x.shape[-1] >= x.shape[-2]),
+                int(x.shape[1] > 1),
+            ),
+            reverse=True,
+        )
+        a = candidates[0]
+
+        # Save only required query rows immediately.
+        self.attn_rows = (
+            a[0, :, self.query_positions, :]
+            .detach()
+            .float()
+            .cpu()
+            .numpy()
+        )  # [H, nq, S]
 
     def close(self):
         for h in reversed(self.handles):
@@ -463,120 +450,109 @@ def capture_condition_contributions(
     subject_positions,
     reference_positions,
 ):
+    """
+    Exact Direction-Head source decomposition using the model's own attention:
+
+        contribution_{h,p}
+          = (A_{sub,p}^h - A_{ref,p}^h) * V_p^h
+
+    No manual Q/K or RoPE reconstruction is performed.
+    """
     qpos = sorted(set(map(int, subject_positions + reference_positions)))
     qlocal = {p: i for i, p in enumerate(qpos)}
     sub_local = [qlocal[p] for p in subject_positions if p in qlocal]
     ref_local = [qlocal[p] for p in reference_positions if p in qlocal]
+
     if not sub_local or not ref_local:
-        raise RuntimeError("Could not map subject/reference query positions")
+        raise RuntimeError(
+            f"Could not map subject/reference query positions: "
+            f"subject={subject_positions}, reference={reference_positions}"
+        )
 
     recs = {}
     try:
         for HL in target_head_layers:
-            recs[HL] = LayerQKVRecorder(decoder_layers[HL], qpos)
+            recs[HL] = LayerAttentionValueRecorder(
+                decoder_layers[HL], qpos
+            )
 
         with torch.inference_mode():
             kw = dict(batch)
             kw["use_cache"] = False
-            kw["output_attentions"] = False
+            kw["output_attentions"] = True
             kw["output_hidden_states"] = False
-            _ = model(**kw)
+            outputs = model(**kw)
 
         out = {}
         for HL, rec in recs.items():
+            if rec.v is None:
+                raise RuntimeError(f"L{HL}: missing v_proj capture")
+            if rec.attn_rows is None:
+                raise RuntimeError(
+                    f"L{HL}: attention probabilities were not returned. "
+                    f"Run with --attn-impl eager; Qwen SDPA/Flash may not return attentions."
+                )
+
             attn = rec.attn
-            if rec.q is None or rec.k is None or rec.v is None:
-                raise RuntimeError(f"L{HL}: missing q/k/v capture")
-            if rec.cos is None or rec.sin is None:
-                raise RuntimeError(f"L{HL}: missing position embeddings")
+            A = rec.attn_rows  # [H, nq, Sattn]
+            H = int(A.shape[0])
+            Sattn = int(A.shape[-1])
 
-            H = int(getattr(attn, "num_heads", getattr(attn, "num_attention_heads", 0)))
             Hkv = int(getattr(attn, "num_key_value_heads", H))
-            if H <= 0:
-                raise RuntimeError(f"L{HL}: cannot infer num_heads")
+            if Hkv <= 0:
+                Hkv = H
 
-            D = int(getattr(attn, "head_dim", rec.q.shape[-1] // H))
-            if rec.q.shape[-1] != H * D:
+            vraw = rec.v  # [S, Hkv*D]
+            if vraw.shape[-1] % Hkv != 0:
                 raise RuntimeError(
-                    f"L{HL}: q width {rec.q.shape[-1]} != H*D={H*D}"
+                    f"L{HL}: v width {vraw.shape[-1]} not divisible by Hkv={Hkv}"
                 )
-            if rec.k.shape[-1] != Hkv * D or rec.v.shape[-1] != Hkv * D:
+            D = int(vraw.shape[-1] // Hkv)
+            Sv = int(vraw.shape[0])
+
+            if H % Hkv != 0:
                 raise RuntimeError(
-                    f"L{HL}: k/v widths incompatible with Hkv={Hkv}, D={D}"
+                    f"L{HL}: attention heads H={H} not divisible by KV heads Hkv={Hkv}"
                 )
 
-            S = min(rec.k.shape[0], rec.v.shape[0], rec.cos.shape[0], rec.sin.shape[0])
-            Q = len(qpos)
+            S = min(Sattn, Sv)
+            v = vraw[:S].reshape(S, Hkv, D)
 
-            q = rec.q.reshape(Q, H, D)
-            k = rec.k[:S].reshape(S, Hkv, D)
-            v = rec.v[:S].reshape(S, Hkv, D)
-
-            cos_q = rec.cos[np.asarray(qpos), :D]
-            sin_q = rec.sin[np.asarray(qpos), :D]
-            cos_k = rec.cos[:S, :D]
-            sin_k = rec.sin[:S, :D]
-
-            qrot = q * cos_q[:, None, :] + rotate_half_np(q) * sin_q[:, None, :]
-            krot = k * cos_k[:, None, :] + rotate_half_np(k) * sin_k[:, None, :]
-
+            # Qwen GQA repeats each KV head for a contiguous group of query heads.
             groups = H // Hkv
-            if H % Hkv:
-                raise RuntimeError(f"L{HL}: H={H} not divisible by Hkv={Hkv}")
-            krep = np.repeat(krot, groups, axis=1)  # [S,H,D]
-            vrep = np.repeat(v, groups, axis=1)     # [S,H,D]
+            vrep = np.repeat(v, groups, axis=1)  # [S,H,D]
 
-            # [H,Q,S]
-            scores = np.einsum("qhd,shd->hqs", qrot, krep, optimize=True)
-            scores *= float(D) ** -0.5
-
-            if rec.mask is not None:
-                m = rec.mask
-                if m.ndim == 3:
-                    # [M,Q,S]
-                    m = m[:, :, :S]
-                    if m.shape[0] == 1:
-                        scores += m[0][None, :, :]
-                    elif m.shape[0] == H:
-                        scores += m
-                    else:
-                        # Conservative fallback to first mask head.
-                        scores += m[0][None, :, :]
-                elif m.ndim == 2 and m.shape[0] == Q:
-                    scores += m[:, :S][None, :, :]
-                elif m.ndim == 2 and m.shape[0] == 1:
-                    # Padding-like mask. If values are binary, convert 0 to -inf.
-                    mm = m[:, :S]
-                    if np.all(np.isin(np.unique(mm), [0.0, 1.0])):
-                        bad = (mm <= 0)
-                        scores[:, :, bad[0]] = -1e30
-            else:
-                # Exact causal fallback.
-                for qi, abs_q in enumerate(qpos):
-                    if abs_q + 1 < S:
-                        scores[:, qi, abs_q + 1:] = -1e30
-
-            A = softmax_np(scores, axis=-1)  # [H,Q,S]
+            A = A[:, :, :S]
             A_sub = A[:, sub_local, :].mean(axis=1)  # [H,S]
             A_ref = A[:, ref_local, :].mean(axis=1)  # [H,S]
             deltaA = A_sub - A_ref
 
-            # [H,S,D]: exact additive source contribution to z_sub-z_ref pre-W_O.
-            contrib = deltaA[:, :, None] * np.transpose(vrep, (1, 0, 2))
+            # Exact additive source contribution to pre-W_O head output:
+            # [H,S,D]
+            contrib = (
+                deltaA[:, :, None]
+                * np.transpose(vrep, (1, 0, 2))
+            ).astype(np.float32)
 
-            # Visible source universe: any token causally available to at least one
-            # subject/reference query. Tokens after max query cannot contribute.
+            # Only source positions causally visible to at least one selected
+            # subject/reference query can contribute.  Attention returned by
+            # the model is already causally masked, but trimming keeps the
+            # ranking universe consistent with the original analysis.
             universe_end = min(S, max(qpos) + 1)
 
             out[HL] = {
-                "contrib": contrib[:, :universe_end].astype(np.float32),
+                "contrib": contrib[:, :universe_end],
                 "deltaA": deltaA[:, :universe_end].astype(np.float32),
                 "seq_len": int(S),
                 "universe_end": int(universe_end),
                 "num_heads": int(H),
                 "head_dim": int(D),
             }
+
+        # Drop the large model output as soon as target-layer rows are copied.
+        del outputs
         return out
+
     finally:
         for rec in recs.values():
             rec.close()
@@ -1277,7 +1253,7 @@ def main():
     args = parse_args()
     if args.attn_impl != "eager":
         print(
-            "[WARN] Exact reconstruction is validated against Qwen eager attention. "
+            "[WARN] This experiment requires returned attention probabilities from Qwen eager attention. "
             "For this experiment, --attn-impl eager is strongly recommended."
         )
 
