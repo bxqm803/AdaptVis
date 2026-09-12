@@ -102,8 +102,12 @@ def classify_updates(m, thr):
     x["mlp_same_sign_mass"] = m_same
     x["attn_opposing_mass"] = a_opp
     x["mlp_opposing_mass"] = m_opp
-    x["attn_same_sign_share"] = np.where(den>EPS,a_same/den,np.nan)
-    x["mlp_same_sign_share"] = np.where(den>EPS,m_same/den,np.nan)
+    attn_share = np.full_like(den, np.nan, dtype=float)
+    mlp_share = np.full_like(den, np.nan, dtype=float)
+    np.divide(a_same, den, out=attn_share, where=den > EPS)
+    np.divide(m_same, den, out=mlp_share, where=den > EPS)
+    x["attn_same_sign_share"] = attn_share
+    x["mlp_same_sign_share"] = mlp_share
     dom = np.full(len(x),"none",object)
     dom[(den>EPS)&(a_same>m_same+EPS)] = "attention"
     dom[(den>EPS)&(m_same>a_same+EPS)] = "mlp"
@@ -169,8 +173,8 @@ def summarize_heads(z):
         total_same=max(float(g.head_same_sign_mass.sum()),EPS)
         for name,q in g.groupby("head_name"):
             f=q.iloc[0]; same=float(q.head_same_sign_mass.sum())
-            rows.append({"update_polarity":pol,"head_name":name,"update_layer":int(f.update_layer),"head":int(f.head),
-                         "is_direction_head":bool(f.is_direction_head),"is_centroid_head":bool(f.is_centroid_head),
+            rows.append({"update_polarity":pol,"head_name":name,"update_layer":int(f["update_layer"]),"head":int(f["head"]),
+                         "is_direction_head":bool(f["is_direction_head"]),"is_centroid_head":bool(f["is_centroid_head"]),
                          "N_messages":len(q),"N_samples":q.sid.nunique(),
                          "mean_B_head":safe_mean(q.head_decision_score),
                          "mean_abs_B_head":safe_mean(abs(q.head_decision_score)),
