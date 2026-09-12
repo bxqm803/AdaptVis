@@ -1,4 +1,4 @@
-
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 diagnose_centroid_to_residual_causal_transport_v1.py
@@ -755,7 +755,11 @@ def clean_trace(
 
     attention = resolve_self_attention(layers[int(intervention_layer)])
     with CaptureAttentionInput(attention) as capture:
-        with torch.inference_mode():
+        # Use no_grad rather than inference_mode.  We reuse captured tensors
+        # (notably the L24 attention input) in a later v_proj call; inference
+        # tensors cannot safely be fed to ordinary modules outside
+        # inference_mode on recent PyTorch versions.
+        with torch.no_grad():
             outputs = model(
                 **batch,
                 use_cache=False,
@@ -774,7 +778,12 @@ def clean_trace(
         expected_query_length=input_length,
     )
     n_heads = get_num_heads(attention, prompt_attention)
-    values = project_value_states(attention, capture.hidden, n_heads)
+    # Defensive clone ensures this is an ordinary tensor even if an upstream
+    # backend happens to return an inference tensor.  Keep this reconstruction
+    # gradient-free: this experiment never uses autograd.
+    attention_hidden = capture.hidden.detach().clone()
+    with torch.no_grad():
+        values = project_value_states(attention, attention_hidden, n_heads)
 
     clean_pairs = {
         int(L): pair_state(
@@ -814,7 +823,7 @@ def run_intervention(
 ) -> Dict[int, torch.Tensor]:
     attention = clean["attention"]
     with PatchHeadPreWO(attention, head, deltas, clean["n_heads"]) as patch:
-        with torch.inference_mode():
+        with torch.no_grad():
             outputs = model(
                 **clean["batch"],
                 use_cache=False,
