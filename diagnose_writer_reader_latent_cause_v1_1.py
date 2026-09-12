@@ -455,18 +455,18 @@ def collect_sample_rows(
                         continue
 
                 gg = grad_gt.get(L, None)
-                gc = grad_comp.get(L, None)
-                if gg is None or gc is None:
+                gcomp = grad_comp.get(L, None)
+                if gg is None or gcomp is None:
                     continue
                 if not (
                     0 <= p < gg.shape[1]
-                    and 0 <= p < gc.shape[1]
+                    and 0 <= p < gcomp.shape[1]
                 ):
                     continue
 
                 g = (
                     gg[0, p].astype(np.float32)
-                    - gc[0, p].astype(np.float32)
+                    - gcomp[0, p].astype(np.float32)
                 )
 
                 x_in = caps["block_in"][L][pi].astype(np.float32)
