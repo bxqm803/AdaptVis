@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""Can middle-layer object states correct final free generation?
+"""Same-question generation -> fixed-layer conflict confidence diagnostic.
 
-Run from AdaptVis/llava16. Uses the exact Synthetic-only centered cosine
-codebook of analyze_hsub_href_spatial_update_sign_v1.py, NOT an LM-head lens.
-No causal-state selection, gradients, update intervention, or target fitting.
-Layer numbers are zero-based decoder BLOCK OUTPUT indices.
+Independent entry point; does NOT import diagnose_midlayer_vs_final_v1.py.
+Uses existing repository extraction/generation utilities for GPU inference.
+Default: fixed residual L25 (zero-based block output), plus REAL/NoImage controls.
+Reuses legacy hsub/href caches and generates clean answers with exactly the
+readout question. Synthetic labels construct the centered cosine codebook.
+No COCO labels select layers, confidence thresholds, or policies.
 
-Default: reuse old hsub/href caches when present, extract missing caches,
-and read baseline rows from --prior-real-update-dir/generation_per_sample.csv.
-Add --generate-baseline to instead run model.generate on the SAME readout
-question. This changes the baseline protocol and need not reproduce 71.14%.
-With existing caches and a baseline CSV, only numpy/pandas are required.
+Step 1: same-question free generation and middle/final paired outcomes.
+Step 2: conflict confidence distributions, AUC, fixed bins, and source-OOF
+        quantile thresholds for answer replacement. Every policy is reported;
+        no target-optimal threshold is selected.
+Step 3 prerequisite: per-sample four-way cosine scores are exported for a
+        later soft-evidence intervention experiment. No update is patched here.
+        A positive diagnostic is NOT evidence of successful HOW prediction.
 
-Source labels construct the readout and select the primary layer by source
-OOF accuracy (ties -> lower layer). Target labels are evaluation-only. This is
-a supervised source-codebook diagnostic, NOT a selector-free HOW solution.
+--baseline-csv can reuse a previously generated same-question CSV, provided
+its sibling metadata.json verifies the CSV hash, model, question and settings.
+Otherwise clean generation is mandatory. Default full COCO; --target-max-samples
+uses the old first-N cache convention, not a stratified cap.
 """
 from __future__ import annotations
 
@@ -61,13 +66,10 @@ def parse_args():
     p.add_argument("--cache-dir", default="output/qwen3b_hsub_href_spatial_cache")
     p.add_argument("--source-cache", default="", help="Explicit existing trusted NPZ path")
     p.add_argument("--target-cache", default="", help="Explicit existing trusted NPZ path")
-    p.add_argument("--prior-real-update-dir", default="output/qwen3b_real_causal_token_updates_all440_v1")
-    p.add_argument("--baseline-csv", default="", help="Overrides prior directory")
-    p.add_argument("--generate-baseline", action="store_true",
-                   help="Generate clean answers with the same question as the readout; ignores prior baseline")
+    p.add_argument("--baseline-csv", default="", help="Reuse a verified SAME-question baseline; sibling metadata.json required")
     p.add_argument("--max-new-tokens", type=int, default=6)
-    p.add_argument("--analysis-layers", default="20-26")
-    p.add_argument("--primary-layer", default="source_oof",
+    p.add_argument("--analysis-layers", default="25")
+    p.add_argument("--primary-layer", default="25",
                    help="source_oof or a predeclared integer; never selected on target labels")
     p.add_argument("--cv-folds", type=int, default=5)
     p.add_argument("--seed", type=int, default=17)
@@ -78,8 +80,7 @@ def parse_args():
         p.error("sample limits must be nonnegative and cv-folds >= 2")
     if a.max_new_tokens < 1:
         p.error("max-new-tokens must be positive")
-    if a.generate_baseline and a.baseline_csv:
-        p.error("choose --generate-baseline OR --baseline-csv")
+    a.generate_baseline = not bool(a.baseline_csv)
     return a
 
 
@@ -141,7 +142,9 @@ def obtain_inputs(a, out):
     ttag = f"N{a.target_max_samples}" if a.target_max_samples else "all"
     sp = Path(a.source_cache) if a.source_cache else cache / f"{a.model}_synthetic_hsub_href_{stag}.npz"
     tp = Path(a.target_cache) if a.target_cache else cache / f"{a.model}_{a.dataset}_hsub_href_{ttag}.npz"
-    bp = Path(a.baseline_csv) if a.baseline_csv else Path(a.prior_real_update_dir) / "generation_per_sample.csv"
+    bp = Path(a.baseline_csv) if a.baseline_csv else out / "baseline_generated.csv"
+    if a.baseline_csv:
+        verify_same_question_baseline(bp, a)
     if not a.generate_baseline and not bp.exists():
         raise FileNotFoundError(f"{bp}; supply --baseline-csv or use --generate-baseline")
     for explicit, path in [(a.source_cache, sp), (a.target_cache, tp)]:
@@ -260,7 +263,7 @@ def score(X, center, directions):
     return np.einsum("nld,lrd->nlr", normalize(X - center[None]), directions, optimize=True)
 
 
-def source_oof(X, y, folds, seed):
+def source_oof(X, y, folds, seed, return_scores=False):
     counts = {r: int(np.sum(y == r)) for r in REL}
     if min(counts.values()) < folds:
         raise ValueError(f"Need >= cv-folds examples per source class: {counts}")
@@ -272,13 +275,16 @@ def source_oof(X, y, folds, seed):
         for f, part in enumerate(np.array_split(indices, folds)):
             buckets[f].extend(part.tolist())
     predictions = np.empty((len(y), X.shape[1]), dtype=int)
+    oof_scores = np.empty((len(y), X.shape[1], 4), dtype=np.float32)
     for bucket in buckets:
         te = np.asarray(sorted(bucket))
         train = np.ones(len(y), dtype=bool)
         train[te] = False
-        predictions[te] = score(X[te], *fit(X[train], y[train])).argmax(axis=-1)
+        oof_scores[te] = score(X[te], *fit(X[train], y[train]))
+        predictions[te] = oof_scores[te].argmax(axis=-1)
     yi = np.asarray([REL.index(r) for r in y])
-    return (predictions == yi[:, None]).mean(axis=0)
+    accuracy = (predictions == yi[:, None]).mean(axis=0)
+    return (accuracy, oof_scores) if return_scores else accuracy
 
 
 def ratio(k, n):
@@ -325,12 +331,147 @@ def summarize(df):
         paired_exact_p=p)
 
 
+def verify_same_question_baseline(path, a):
+    """Reject legacy/external baselines with unknown prompt provenance."""
+    meta_path = path.parent / "metadata.json"
+    if not path.exists() or not meta_path.exists():
+        raise FileNotFoundError(f"Need {path} and its sibling metadata.json")
+    meta = json.loads(meta_path.read_text())
+    if meta.get("baseline_protocol") != "same_readout_question_free_generation":
+        raise ValueError("Baseline is not verified same-question generation. Omit --baseline-csv to regenerate.")
+    settings = meta.get("args", {})
+    for key in ("model", "dataset", "prompt_template", "pool", "max_new_tokens", "attn_impl"):
+        if settings.get(key) != getattr(a, key):
+            raise ValueError(f"Baseline metadata mismatch: {key}")
+    recorded = [h for p, h in meta.get("inputs", {}).items() if Path(p).name == path.name]
+    if len(recorded) != 1 or recorded[0] != sha256(path):
+        raise ValueError("Baseline CSV hash is missing, ambiguous, or changed")
+    header = pd.read_csv(path, nrows=1)
+    if "question" not in header:
+        raise ValueError("Verified baseline must retain each generation question")
+
+
+def binary_auc(labels, values):
+    """Mann-Whitney AUC, higher confidence predicts label=True; ties count half."""
+    labels, values = np.asarray(labels, dtype=bool), np.asarray(values, dtype=float)
+    npos, nneg = int(labels.sum()), int((~labels).sum())
+    if not npos or not nneg:
+        return float("nan")
+    ranks = pd.Series(values).rank(method="average").to_numpy()
+    return float((ranks[labels].sum() - npos * (npos + 1) / 2) / (npos * nneg))
+
+
+def confidence_analysis(df, source_scores):
+    """All source-derived thresholds frozen before target outcome evaluation."""
+    ident = dict(representation=str(df.representation.iloc[0]), layer=int(df.layer.iloc[0]))
+    conflicts = df[df.conflict].copy()
+    outcomes = np.where(conflicts.mid_correct, "mid_wins",
+                        np.where(conflicts.baseline_correct, "baseline_wins", "both_wrong"))
+    conflicts["outcome"] = outcomes
+    gap = conflicts.mid_top2_cosine_gap.to_numpy(float)
+    decisive = outcomes != "both_wrong"
+    auc_rows = []
+    for name, mask in [("mid_wins_vs_baseline_wins", decisive),
+                       ("mid_correct_vs_all_other_conflicts", np.ones(len(gap), dtype=bool))]:
+        positive = outcomes[mask] == "mid_wins"
+        auc_rows.append(dict(**ident, comparison=name, N=int(mask.sum()),
+            positive_N=int(positive.sum()), negative_N=int((~positive).sum()),
+            auc=binary_auc(positive, gap[mask])))
+    distributions = []
+    for name in ("mid_wins", "baseline_wins", "both_wrong"):
+        v = gap[outcomes == name]
+        row = dict(**ident, outcome=name, N=len(v), mean=float(v.mean()) if len(v) else float("nan"))
+        for q in (0, .1, .25, .5, .75, .9, 1):
+            row[f"q{int(q*100):02d}"] = float(np.quantile(v, q)) if len(v) else float("nan")
+        distributions.append(row)
+    # Fixed intervals do not depend on COCO scores or labels. Last bin includes 2.
+    edges = [0, .05, .1, .2, .3, .5, 1, float("inf")]
+    bins = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        mask = (gap >= lo) & (gap < hi)
+        subset = conflicts.loc[mask]
+        k, n = int(subset.mid_correct.sum()), len(subset)
+        ci = wilson(k, n)
+        bins.append(dict(**ident, gap_lo=lo, gap_hi=hi, N=n,
+            mid_wins=k, baseline_wins=int(subset.baseline_correct.sum()),
+            both_wrong=int(np.sum((~subset.mid_correct) & (~subset.baseline_correct))),
+            mid_accuracy=ratio(k, n), ci95_low=ci[0], ci95_high=ci[1]))
+    sorted_source = np.sort(source_scores, axis=-1)
+    source_gap = sorted_source[:, -1] - sorted_source[:, -2]
+    # Zero is an all-conflicts reference. Repeated thresholds are intentionally kept.
+    thresholds = [("all_conflicts_reference", -1.0, 0.0)] + [
+        (f"source_oof_q{int(q*100):02d}", q, float(np.quantile(source_gap, q)))
+        for q in (0, .25, .5, .75, .9, .95)]
+    policies = []
+    base_ok = df.baseline_correct.to_numpy(bool)
+    mid_ok = df.mid_correct.to_numpy(bool)
+    is_conflict = df.conflict.to_numpy(bool)
+    for name, q, threshold in thresholds:
+        trigger = is_conflict & (df.mid_top2_cosine_gap.to_numpy(float) >= threshold)
+        final_ok = np.where(trigger, mid_ok, base_ok)
+        w2c = int(np.sum(trigger & ~base_ok & mid_ok))
+        c2w = int(np.sum(trigger & base_ok & ~mid_ok))
+        n = int(trigger.sum())
+        ci = wilson(w2c, n)
+        policies.append(dict(**ident, policy=name, source_quantile=q, threshold=threshold,
+            N=len(df), conflict_N=int(is_conflict.sum()), triggered_N=n,
+            target_coverage=ratio(n, len(df)), conflict_coverage=ratio(n, is_conflict.sum()),
+            baseline_accuracy=float(base_ok.mean()), final_accuracy=float(final_ok.mean()),
+            gain=float(final_ok.mean() - base_ok.mean()), W2C=w2c, C2W=c2w, net=w2c-c2w,
+            triggered_both_wrong=int(np.sum(trigger & ~base_ok & ~mid_ok)),
+            triggered_mid_accuracy=ratio(w2c, n), triggered_mid_ci95_low=ci[0],
+            triggered_mid_ci95_high=ci[1],
+            untriggered_repairable_N=int(np.sum(~trigger & ~base_ok & mid_ok))))
+    return dict(auc=auc_rows, distributions=distributions, bins=bins, policies=policies)
+
+
+def save_confidence(parts, samples, out, primary):
+    names = {"auc": "confidence_auc.csv", "distributions": "confidence_distributions.csv",
+             "bins": "confidence_bins.csv", "policies": "source_threshold_policies.csv"}
+    frames = {}
+    for key, filename in names.items():
+        frames[key] = pd.DataFrame([row for part in parts for row in part[key]])
+        frames[key].to_csv(out / filename, index=False)
+    conflicts = samples[samples.conflict].copy()
+    conflicts["outcome"] = np.where(conflicts.mid_correct, "mid_wins",
+                                  np.where(conflicts.baseline_correct, "baseline_wins", "both_wrong"))
+    conflicts.to_csv(out / "conflicts.csv", index=False)
+    lines = ["STEP 2: CONFLICT CONFIDENCE", "",
+        "Confidence = top1 minus top2 cosine; NOT a calibrated probability.",
+        "AUC > .5 means higher gap ranks middle-wins above the comparison group.",
+        "The win-vs-win AUC excludes both-wrong; the second AUC includes them.",
+        "Thresholds come from Synthetic OOF gaps only; every threshold is reported.",
+        "These policies replace answers, NOT actual updates. Do not report them as HOW steering.", ""]
+    for row in primary:
+        r, L = row["representation"], row["layer"]
+        lines.append(f"{r} PRIMARY L{L}")
+        for key, cols in [
+            ("auc", ["comparison", "N", "positive_N", "negative_N", "auc"]),
+            ("distributions", ["outcome", "N", "mean", "q25", "q50", "q75"]),
+            ("policies", ["policy", "threshold", "triggered_N", "W2C", "C2W", "net", "final_accuracy"])]:
+            table = frames[key]
+            selected = table[(table.representation == r) & (table.layer == L)]
+            lines.append(selected[cols].to_string(index=False))
+        lines.append("")
+    lines += ["STEP 3: FOLLOW-UP DECISION (no automatic target-tuned gate)",
+        "First check that the same-question middle readout still repairs baseline errors.",
+        "Then inspect win/loss confidence distributions, both AUCs, and all source-threshold policies.",
+        "A favorable result motivates a separate soft-evidence-to-update experiment; it does not prove polarity.",
+        "per_sample_layer.csv retains four continuous cosine scores for that follow-up.",
+        "No threshold, layer, softmax temperature or update policy is optimized on these target labels."]
+    report = "\n".join(lines) + "\n"
+    (out / "confidence_summary.txt").write_text(report, encoding="utf-8")
+    return report
+
+
 def main():
     a = parse_args()
     out = Path(a.output_dir)
     output_names = ["baseline_generated.csv", "baseline_aligned.csv", "per_sample_layer.csv",
         "summary_by_layer.csv", "summary_by_relation.csv", "source_oof_layer_accuracy.csv",
-        "primary_summary.csv", "analysis_summary.txt", "metadata.json"]
+        "primary_summary.csv", "analysis_summary.txt", "metadata.json",
+        "confidence_auc.csv", "confidence_distributions.csv", "confidence_bins.csv",
+        "source_threshold_policies.csv", "conflicts.csv", "confidence_summary.txt"]
     if not a.overwrite and any((out / n).exists() for n in output_names):
         raise FileExistsError(f"Existing diagnostic outputs in {out}; use --overwrite")
     out.mkdir(parents=True, exist_ok=True)
@@ -342,6 +483,7 @@ def main():
     pd.DataFrame(dict(sid=ts, gt=ty, baseline_prediction=bp_pred,
                      baseline_correct=bp_ok)).to_csv(out / "baseline_aligned.csv", index=False)
     summary, by_rel, oof_rows, sample_parts, primary = [], [], [], [], []
+    confidence_parts = []
     for representation in ("residual", "img", "no_image"):
         if representation == "residual":
             X = si[:, layers].astype(np.float32) - sn[:, layers].astype(np.float32)
@@ -349,7 +491,7 @@ def main():
         else:
             X = (si if representation == "img" else sn)[:, layers].astype(np.float32)
             Y = (ti if representation == "img" else tn)[:, layers].astype(np.float32)
-        acc = source_oof(X, sy, a.cv_folds, a.seed)
+        acc, oof_scores = source_oof(X, sy, a.cv_folds, a.seed, return_scores=True)
         chosen = layers[int(np.argmax(acc))] if a.primary_layer == "source_oof" else int(a.primary_layer)
         if chosen not in layers:
             raise ValueError("primary-layer must be in analysis-layers")
@@ -363,6 +505,7 @@ def main():
                 mid_top2_cosine_gap=sorted_scores[:, -1] - sorted_scores[:, -2]))
             for k, r in enumerate(REL):
                 df[f"mid_score_{r}"] = scores[:, j, k]
+            confidence_parts.append(confidence_analysis(df, oof_scores[:, j]))
             row = dict(representation=representation, layer=L,
                        source_oof_accuracy=float(acc[j]), **summarize(df))
             summary.append(row)
@@ -380,8 +523,8 @@ def main():
     pd.DataFrame(by_rel).to_csv(out / "summary_by_relation.csv", index=False)
     pd.DataFrame(oof_rows).to_csv(out / "source_oof_layer_accuracy.csv", index=False)
     pd.DataFrame(primary).to_csv(out / "primary_summary.csv", index=False)
-    protocol = ("same_readout_question_free_generation" if a.generate_baseline else
-                "external_baseline_question_not_verified")
+    protocol = "same_readout_question_free_generation"
+    confidence_report = save_confidence(confidence_parts, all_samples, out, primary)
     lines = ["MIDDLE OBJECT STATE vs FINAL FREE GENERATION", "",
         f"Source N={len(ss)}; target N={len(ts)}; zero-based block outputs={layers}",
         f"Baseline protocol: {protocol}",
@@ -390,9 +533,6 @@ def main():
         "No intervention: W2C/C2W describe replacing the answer with the readout.",
         "oracle_union_accuracy is an unavailable GT-dependent ceiling, not a policy.",
         "Conflicts include BOTH-WRONG cases; invalid generations count as baseline wrong.", ""]
-    if not a.generate_baseline:
-        lines += ["CAUTION: legacy readout template differs from the standard COCO generation prompt.",
-                  "Use --generate-baseline in a separate output-dir for a same-question comparison.", ""]
     for r in primary:
         lines += [f"{r['representation']} PRIMARY L{r['layer']} (source OOF={r['source_oof_accuracy']:.4f})",
             f"  baseline={r['baseline_accuracy']:.4f}; middle={r['mid_accuracy']:.4f}",
@@ -404,17 +544,20 @@ def main():
     lines += ["ALL LAYERS (do not select the target peak as a validated method)",
               pd.DataFrame(summary)[["representation", "layer", "mid_accuracy", "mid_accuracy_on_baseline_wrong",
                   "conflict_N", "mid_wins", "baseline_wins", "conflict_both_wrong", "net"]].to_string(index=False)]
-    report = "\n".join(lines) + "\n"
+    report = "\n".join(lines) + "\n\n" + confidence_report
     (out / "analysis_summary.txt").write_text(report, encoding="utf-8")
     metadata = dict(args=vars(a), join_audit=join_audit, baseline_protocol=protocol,
         layer_indexing="zero-based decoder block output", source_N=len(ss), target_N=len(ts),
         source_class_counts={r: int(np.sum(sy == r)) for r in REL},
         target_class_counts={r: int(np.sum(ty == r)) for r in REL},
         inputs={str(p.resolve()): sha256(p) for p in [sp, tp, bp]},
-        notes=["No WHERE/HOW oracle used; historical baseline rows only.",
+        notes=["No WHERE/HOW oracle used; same-question baseline only.",
                "No target label used for codebook fitting or automatic primary layer choice.",
                "Source OOF used for layer selection is not an unbiased selected-layer source estimate.",
-               "Paired p-values for layer scans are unadjusted and exploratory."])
+               "Paired p-values for layer scans are unadjusted and exploratory.",
+               "Confidence policies use only source OOF gap quantiles, never target GT.",
+               "Report all policies; selecting the best on these targets needs new held-out validation.",
+               "Cosine gap is a ranking signal, not calibrated probability."])
     (out / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
     print(report, flush=True)
     print(f"Saved: {out.resolve()}", flush=True)
