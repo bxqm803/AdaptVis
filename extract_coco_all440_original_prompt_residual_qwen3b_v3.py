@@ -751,7 +751,7 @@ def main() -> None:
     )
     print(
         f"[{args.dataset}] n={len(records)} | "
-        f"prompt_counts={dict(Counter(norm_relation(prompt_rows[int(r.sid)]["answer_raw"]) for r in records))}"
+        f"prompt_counts={dict(Counter(norm_relation(prompt_rows[int(r.sid)]['answer_raw']) for r in records))}"
     )
 
     wrong_map = None
