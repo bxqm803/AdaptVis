@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-eval_oracle_multilayer_spatial_logit_optimization_v1.py
+eval_oracle_multilayer_spatial_logit_optimization_v2_multicomp.py
 
 Oracle upper bound for spatial -> decision control.
 
@@ -32,19 +32,26 @@ For a layer group G (e.g. 20-26), the optimization variables are ONLY these
 spatial coordinates, 2*|G| scalars in free2d mode.  At each step:
 
   1) measure current four-way sequence scores;
-  2) choose the strongest non-GT competitor j;
-  3) compute the exact local gradient
+  2) build one smooth multi-competitor objective
 
-         grad_x [ S_GT(x) - S_j(x) ]
+         J_tau(x) = S_GT(x) - tau * logsumexp({S_j(x)/tau : j != GT})
 
-     by backpropagating through the current patched model;
+     which smoothly approximates S_GT - max_{j!=GT} S_j;
+  3) compute its exact local gradient in the spatial control coordinates;
   4) take a normalized step inside the spatial subspace;
-  5) backtracking-line-search the step using the REAL four-way scores;
+  5) backtracking-line-search using THE SAME J_tau objective;
   6) replan from the new state;
   7) stop when GT is highest by the requested margin, generation is repaired,
      or the optimization budget is exhausted.
 
 No model parameter is trained or changed.
+
+The exact stopping criterion is still the true worst-case GT margin
+
+    S_GT - max_{j!=GT} S_j >= required_margin,
+
+so the smooth objective is used only to obtain a stable local ascent direction
+across competitor switches.
 
 Control modes
 =============
@@ -72,7 +79,7 @@ errors.jsonl
 
 Recommended first upper-bound run
 =================================
-CUDA_VISIBLE_DEVICES=0 python -u eval_oracle_multilayer_spatial_logit_optimization_v1.py \
+CUDA_VISIBLE_DEVICES=0 python -u eval_oracle_multilayer_spatial_logit_optimization_v2_multicomp.py \
   --model qwen-3b \
   --spatial-states-npz output/qwen3b_coco_spatial_real_noimage_v1/states/raw__correct_minus_noimage.npz \
   --layer-groups "20-26" \
@@ -91,7 +98,7 @@ CUDA_VISIBLE_DEVICES=0 python -u eval_oracle_multilayer_spatial_logit_optimizati
   --answer-surface above_below \
   --sequence-score-reduction mean \
   --max-new-tokens 6 \
-  --output-dir output/qwen3b_oracle_multilayer_spatial_logit_L20_26_n80_v1 \
+  --output-dir output/qwen3b_oracle_multilayer_spatial_logit_multicomp_L20_26_n80_v2 \
   --overwrite
 
 Layerwise + window scan example
@@ -216,6 +223,25 @@ def strongest_competitor(scores: Dict[str, float], target: str) -> str:
 
 def min_gt_margin(scores: Dict[str, float], target: str) -> float:
     return min(float(scores[target]) - float(scores[r]) for r in REL if r != target)
+
+
+def smooth_competitor_weights(scores: Dict[str, float], target: str, tau: float):
+    """Softmax weights over the three non-target competitors."""
+    comps = [r for r in REL if r != target]
+    vals = np.asarray([float(scores[r]) for r in comps], dtype=np.float64) / float(tau)
+    vals = vals - float(np.max(vals))
+    w = np.exp(vals)
+    w = w / max(float(np.sum(w)), EPS)
+    return comps, w
+
+
+def smooth_gt_objective(scores: Dict[str, float], target: str, tau: float) -> float:
+    """S_GT - tau*logsumexp(S_comp/tau), a smooth worst-competitor margin."""
+    comps = [r for r in REL if r != target]
+    vals = np.asarray([float(scores[r]) for r in comps], dtype=np.float64) / float(tau)
+    vmax = float(np.max(vals))
+    lse = vmax + math.log(float(np.sum(np.exp(vals - vmax))))
+    return float(scores[target]) - float(tau) * lse
 
 
 def stratified_cap(rows: Sequence[dict], n: int, seed: int) -> List[dict]:
@@ -604,10 +630,14 @@ def parse_args():
         help="Optional per-layer natural-coordinate L2 cap; <=0 disables.",
     )
     p.add_argument("--line-search-shrink", type=float, default=0.5)
-    p.add_argument("--line-search-tries", type=int, default=5)
+    p.add_argument("--line-search-tries", type=int, default=8)
     p.add_argument(
-        "--min-margin-improvement", type=float, default=1e-4,
-        help="Required improvement in REAL min GT margin for accepting a step.",
+        "--min-objective-improvement", type=float, default=1e-6,
+        help="Required improvement in the SAME smooth multi-competitor objective for accepting a step.",
+    )
+    p.add_argument(
+        "--competitor-temperature", type=float, default=0.25,
+        help="Temperature tau for smooth max over the three non-GT competitors; smaller approaches hard max.",
     )
     p.add_argument(
         "--stop-on", default="generation", choices=["generation", "teacher_forced", "either"],
@@ -652,6 +682,10 @@ def parse_args():
         p.error("--line-search-tries must be >0")
     if a.generation_margin_escalation < 0:
         p.error("--generation-margin-escalation must be >=0")
+    if a.competitor_temperature <= 0:
+        p.error("--competitor-temperature must be >0")
+    if a.min_objective_improvement < 0:
+        p.error("--min-objective-improvement must be >=0")
     if a.generation_check_every <= 0:
         p.error("--generation-check-every must be >0")
     return a
@@ -815,7 +849,10 @@ def main():
             f"required_margin={a.required_margin} step={a.step_natural} "
             f"max_steps={a.max_steps} max_total={a.max_total_natural}"
         )
-        print("No frozen A. Each step backpropagates the REAL GT-vs-strongest-competitor score margin.")
+        print(
+            "No frozen A. Each step backpropagates one smooth GT-vs-ALL-competitors objective "
+            f"(tau={a.competitor_temperature})."
+        )
         print("Baseline-correct generations are preserved and never edited.")
         print("=" * 190, flush=True)
 
@@ -939,33 +976,40 @@ def main():
                                 )
 
                             competitor = strongest_competitor(current_scores, gt)
+                            current_objective = smooth_gt_objective(
+                                current_scores, gt, a.competitor_temperature
+                            )
 
-                            # Exact local decision-margin gradient at CURRENT patched state.
-                            s_gt, g_gt = sequence_score_and_spatial_grad(
-                                model=model,
-                                decoder_layers=decoder_layers,
-                                batch=batch,
-                                answer_ids=candidate_ids[gt],
-                                reduction=a.sequence_score_reduction,
-                                layers=layers,
-                                geom=geom,
-                                sub_pos=sub_pos,
-                                ref_pos=ref_pos,
-                                base_coords=coords,
+                            # Exact local gradient of ONE CONSISTENT multi-competitor objective:
+                            #   J = S_GT - tau*logsumexp(S_comp/tau).
+                            # This avoids the old top-1-gradient / worst-margin-line-search mismatch.
+                            score_grad = {}
+                            for r in REL:
+                                sr, gr = sequence_score_and_spatial_grad(
+                                    model=model,
+                                    decoder_layers=decoder_layers,
+                                    batch=batch,
+                                    answer_ids=candidate_ids[r],
+                                    reduction=a.sequence_score_reduction,
+                                    layers=layers,
+                                    geom=geom,
+                                    sub_pos=sub_pos,
+                                    ref_pos=ref_pos,
+                                    base_coords=coords,
+                                )
+                                score_grad[r] = (float(sr), gr)
+
+                            grad_scores = {r: score_grad[r][0] for r in REL}
+                            comp_names, comp_weights = smooth_competitor_weights(
+                                grad_scores, gt, a.competitor_temperature
                             )
-                            s_comp, g_comp = sequence_score_and_spatial_grad(
-                                model=model,
-                                decoder_layers=decoder_layers,
-                                batch=batch,
-                                answer_ids=candidate_ids[competitor],
-                                reduction=a.sequence_score_reduction,
-                                layers=layers,
-                                geom=geom,
-                                sub_pos=sub_pos,
-                                ref_pos=ref_pos,
-                                base_coords=coords,
-                            )
-                            grad2d = g_gt - g_comp
+                            s_gt, g_gt = score_grad[gt]
+                            weighted_comp_grad = np.zeros_like(g_gt, dtype=np.float64)
+                            weighted_comp_score = 0.0
+                            for r, w in zip(comp_names, comp_weights):
+                                weighted_comp_grad += float(w) * score_grad[r][1]
+                                weighted_comp_score += float(w) * score_grad[r][0]
+                            grad2d = g_gt - weighted_comp_grad
                             projected_g, current_param, semantic_dir = projected_gradient_and_coords(
                                 grad2d, coords, mode, gt
                             )
@@ -995,7 +1039,15 @@ def main():
                                 actual_delta_coords = cand_coords - coords
                                 actual_step_norm = float(np.linalg.norm(actual_delta_coords.reshape(-1)))
                                 if actual_step_norm < 1e-10:
-                                    trial_logs.append((ls, step_size, np.nan, actual_step_norm, False))
+                                    trial_logs.append({
+                                        "ls": int(ls),
+                                        "step_size": float(step_size),
+                                        "min_gt_margin": None,
+                                        "smooth_objective": None,
+                                        "objective_gain": None,
+                                        "step_norm": float(actual_step_norm),
+                                        "accepted": False,
+                                    })
                                     continue
 
                                 cand_patch = natural_coords_to_patch(
@@ -1006,10 +1058,20 @@ def main():
                                     decoder_layers, cand_patch,
                                 )
                                 cand_margin = min_gt_margin(cand_scores, gt)
-                                improved = (
-                                    cand_margin >= current_margin + a.min_margin_improvement
+                                cand_objective = smooth_gt_objective(
+                                    cand_scores, gt, a.competitor_temperature
                                 )
-                                trial_logs.append((ls, step_size, cand_margin, actual_step_norm, improved))
+                                objective_gain = float(cand_objective - current_objective)
+                                improved = objective_gain >= a.min_objective_improvement
+                                trial_logs.append({
+                                    "ls": int(ls),
+                                    "step_size": float(step_size),
+                                    "min_gt_margin": float(cand_margin),
+                                    "smooth_objective": float(cand_objective),
+                                    "objective_gain": float(objective_gain),
+                                    "step_norm": float(actual_step_norm),
+                                    "accepted": bool(improved),
+                                })
                                 if improved:
                                     accepted = True
                                     accepted_scores = cand_scores
@@ -1028,8 +1090,14 @@ def main():
                                     "competitor": competitor,
                                     "gt_margin_before": float(current_margin),
                                     "gt_margin_after": float(current_margin),
+                                    "smooth_objective_before": float(current_objective),
+                                    "smooth_objective_after": float(current_objective),
+                                    "actual_objective_gain": 0.0,
                                     "actual_margin_gain": 0.0,
                                     "raw_spatial_margin_grad_norm": float(raw_grad_norm),
+                                    "competitor_weights": json.dumps(
+                                        {r: float(w) for r, w in zip(comp_names, comp_weights)}
+                                    ),
                                     "accepted_step_natural": 0.0,
                                     "total_natural_norm": float(np.linalg.norm(coords.reshape(-1))),
                                     "line_search_trials": json.dumps(trial_logs),
@@ -1048,7 +1116,7 @@ def main():
                             hit_total_cap = bool(hit_total_cap or accepted_total_cap)
                             steps_taken = step_idx
 
-                            # First-order predicted gain from the true local gradient.
+                            # First-order predicted gain for the smooth multi-competitor objective.
                             dc = coords - prev_coords
                             predicted_gain = float(np.sum(grad2d * dc))
                             actual_gain = float(new_margin - prev_margin)
@@ -1078,10 +1146,22 @@ def main():
                                 "accepted": True,
                                 "competitor": competitor,
                                 "gt_score_at_grad": float(s_gt),
-                                "competitor_score_at_grad": float(s_comp),
+                                "strongest_competitor_at_grad": competitor,
+                                "weighted_competitor_score_at_grad": float(weighted_comp_score),
+                                "competitor_weights": json.dumps(
+                                    {r: float(w) for r, w in zip(comp_names, comp_weights)}
+                                ),
                                 "gt_margin_before": prev_margin,
                                 "gt_margin_after": float(new_margin),
-                                "predicted_local_margin_gain": predicted_gain,
+                                "smooth_objective_before": float(current_objective),
+                                "smooth_objective_after": float(
+                                    smooth_gt_objective(current_scores, gt, a.competitor_temperature)
+                                ),
+                                "predicted_local_objective_gain": predicted_gain,
+                                "actual_objective_gain": float(
+                                    smooth_gt_objective(current_scores, gt, a.competitor_temperature)
+                                    - current_objective
+                                ),
                                 "actual_margin_gain": actual_gain,
                                 "raw_spatial_margin_grad_norm": float(raw_grad_norm),
                                 "accepted_line_search_index": int(accepted_step[0]),
@@ -1214,6 +1294,8 @@ def main():
             "eval_scope": a.eval_scope,
             "eval_N_successful_baseline": int(len(baseline_df)),
             "required_margin": a.required_margin,
+            "competitor_temperature": a.competitor_temperature,
+            "min_objective_improvement": a.min_objective_improvement,
             "step_natural": a.step_natural,
             "max_steps": a.max_steps,
             "max_total_natural": a.max_total_natural,
@@ -1243,7 +1325,7 @@ def main():
             "",
             "GT is used only as the target relation.",
             "All edits are constrained to fitted per-layer spatial H/V subspaces.",
-            "No frozen transport A is used; each step backpropagates the current real decision margin.",
+            "No frozen transport A is used; each step backpropagates a smooth GT-vs-all-competitors objective.",
             "Baseline-correct generations are not edited.",
             "",
             summary_df.to_string(index=False),
