@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-diagnose_centroid_mediation_same_centroid_v1.py
+diagnose_centroid_mediation_same_centroid_v1_standalone.py
 
 Question
 ========
@@ -81,13 +81,12 @@ higher-order attention/value mixture matters.
 
 Dependency
 ==========
-Place this script in the AdaptVis repo root next to the already-fixed script:
-
-    diagnose_centroid_to_residual_causal_transport_v1_fixed.py
+Standalone with respect to the previous causal-transport script. Place this file
+in the AdaptVis repo root; it only imports existing repository helper scripts.
 
 Recommended pilot
 =================
-CUDA_VISIBLE_DEVICES=0 python -u diagnose_centroid_mediation_same_centroid_v1.py \
+CUDA_VISIBLE_DEVICES=0 python -u diagnose_centroid_mediation_same_centroid_v1_standalone.py \
   --source-spatial-npz \
     output/qwen3b_hsub_href_spatial_cache/qwen-3b_synthetic_hsub_href_all.npz \
   --target-spatial-npz \
@@ -106,6 +105,7 @@ CUDA_VISIBLE_DEVICES=0 python -u diagnose_centroid_mediation_same_centroid_v1.py
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import random
@@ -121,14 +121,734 @@ import torch
 from tqdm import tqdm
 
 try:
-    import diagnose_centroid_to_residual_causal_transport_v1_fixed as base
+    import eval_coco_centroid_select_late_direction_qwen25_v1 as centexp
+    import analyze_coco_centroid_generation_step1_v4 as cent
 except Exception as exc:
     raise SystemExit(
-        "Could not import diagnose_centroid_to_residual_causal_transport_v1_fixed.py. "
-        "Put this script next to that fixed script in the AdaptVis repo root.\n"
+        "Run this script from the AdaptVis llava16 repository root next to "
+        "eval_coco_centroid_select_late_direction_qwen25_v1.py and "
+        "analyze_coco_centroid_generation_step1_v4.py.\n"
         f"{type(exc).__name__}: {exc}"
     )
 
+REL = ("left", "right", "above", "below")
+EPS = 1e-12
+
+
+# =============================================================================
+# CLI / utilities
+# =============================================================================
+
+def parse_layers(text: str) -> List[int]:
+    out: List[int] = []
+    for piece in str(text).split(","):
+        piece = piece.strip().lower().replace("l", "")
+        if not piece:
+            continue
+        if "-" in piece:
+            a, b = map(int, piece.split("-", 1))
+            step = 1 if b >= a else -1
+            out.extend(range(a, b + step, step))
+        else:
+            out.append(int(piece))
+    result: List[int] = []
+    for x in out:
+        if x not in result:
+            result.append(x)
+    if not result:
+        raise ValueError("empty layer list")
+    return result
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--model", default="qwen-3b", choices=["qwen-3b"])
+    p.add_argument("--data-root", default="data")
+    p.add_argument(
+        "--prompt-jsonl",
+        default="prompts/COCO_QA_two_obj_with_answer_four_options.jsonl",
+    )
+    p.add_argument("--source-spatial-npz", required=True)
+    p.add_argument("--target-spatial-npz", required=True)
+    p.add_argument("--intervention-layer", type=int, default=24)
+    p.add_argument("--target-head", type=int, default=5)
+    p.add_argument(
+        "--control-head",
+        type=int,
+        default=15,
+        help="Same-layer control head; must differ from --target-head.",
+    )
+    p.add_argument("--readout-layers", default="23,24,25,26")
+    p.add_argument(
+        "--beta",
+        type=float,
+        default=2.0,
+        help="Exponential spatial tilt strength in normalized visual coordinates.",
+    )
+    p.add_argument(
+        "--object-pool",
+        default="mean",
+        choices=["mean", "last"],
+        help="Pooling used for h_sub/h_ref downstream residual readout.",
+    )
+    p.add_argument("--max-samples", type=int, default=80, help="0 = all 440")
+    p.add_argument("--seed", type=int, default=17)
+    p.add_argument("--device", default="cuda:0")
+    p.add_argument(
+        "--dtype",
+        default="auto",
+        choices=["auto", "bfloat16", "float16", "float32"],
+    )
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--overwrite", action="store_true")
+    args = p.parse_args()
+    args.readout_layers_parsed = parse_layers(args.readout_layers)
+    if args.beta <= 0:
+        p.error("--beta must be > 0")
+    if args.target_head == args.control_head:
+        p.error("--control-head must differ from --target-head")
+    return args
+
+
+def cleanup() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def unit(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    n = float(np.linalg.norm(x))
+    return x / max(n, EPS)
+
+
+def safe_mean(values: Iterable[float]) -> float:
+    vals = [float(x) for x in values if math.isfinite(float(x))]
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def safe_std(values: Iterable[float]) -> float:
+    vals = [float(x) for x in values if math.isfinite(float(x))]
+    return float(np.std(vals)) if vals else float("nan")
+
+
+def safe_corr(x: Sequence[float], y: Sequence[float]) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    good = np.isfinite(x) & np.isfinite(y)
+    x, y = x[good], y[good]
+    if len(x) < 3 or np.std(x) < EPS or np.std(y) < EPS:
+        return float("nan")
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def norm_rel(x: Any) -> str:
+    s = str(x).strip().lower()
+    mapping = {
+        "on": "above",
+        "over": "above",
+        "under": "below",
+        "underneath": "below",
+        "beneath": "below",
+    }
+    return mapping.get(s, s)
+
+
+# =============================================================================
+# Existing residual H/V geometry
+# =============================================================================
+
+def load_state_npz(path: Path, require_labels: bool):
+    if not path.exists():
+        raise FileNotFoundError(path)
+    with np.load(path, allow_pickle=True) as z:
+        keys = set(z.files)
+        if "relation_vectors" in keys:
+            X = np.asarray(z["relation_vectors"], dtype=np.float32)
+            definition = (
+                str(z["vector_definition"].item())
+                if "vector_definition" in keys
+                else "relation_vectors"
+            )
+        elif {"img", "no_image"}.issubset(keys):
+            X = np.asarray(z["img"], dtype=np.float32) - np.asarray(
+                z["no_image"], dtype=np.float32
+            )
+            definition = "img_minus_no_image"
+        else:
+            raise RuntimeError(f"Bad NPZ keys in {path}: {sorted(keys)}")
+        if "decoder_block_index" not in keys:
+            raise RuntimeError(f"{path} missing decoder_block_index")
+        layers = [int(v) for v in np.asarray(z["decoder_block_index"]).tolist()]
+        sids = (
+            np.asarray(z["sample_index"], dtype=np.int64)
+            if "sample_index" in keys
+            else np.arange(len(X), dtype=np.int64)
+        )
+        labels = None
+        if "relation" in keys:
+            labels = np.asarray([norm_rel(v) for v in z["relation"].tolist()], dtype=object)
+        elif require_labels:
+            raise RuntimeError(f"{path} requires relation labels")
+    if X.ndim != 3:
+        raise RuntimeError(f"Expected [N,L,D], got {X.shape}")
+    return X, labels, layers, sids, definition
+
+
+def fit_hv_geometry(
+    X: np.ndarray,
+    y: np.ndarray,
+    source_layers: Sequence[int],
+    wanted_layers: Sequence[int],
+):
+    lmap = {int(L): i for i, L in enumerate(source_layers)}
+    geom: Dict[int, Dict[str, Any]] = {}
+    rows = []
+    for L in wanted_layers:
+        if L not in lmap:
+            raise RuntimeError(f"Source cache missing L{L}")
+        Xf = X[:, lmap[L]].astype(np.float64)
+        center = Xf.mean(axis=0)
+        mus = {r: Xf[y == r].mean(axis=0) for r in REL}
+        dirs = {r: unit(mus[r] - center) for r in REL}
+        dH = unit(dirs["right"] - dirs["left"])
+        dV = unit(dirs["above"] - dirs["below"])
+        gapH = float(np.dot(mus["right"] - mus["left"], dH))
+        gapV = float(np.dot(mus["above"] - mus["below"], dV))
+        if gapH < 0:
+            dH, gapH = -dH, -gapH
+        if gapV < 0:
+            dV, gapV = -dV, -gapV
+        B = np.stack([dH, dV], axis=1)
+        gram = B.T @ B
+        dual = B @ np.linalg.inv(gram)
+        geom[int(L)] = {
+            "center": center,
+            "dual": dual,
+            "halfH": max(gapH / 2.0, EPS),
+            "halfV": max(gapV / 2.0, EPS),
+        }
+        rows.append(
+            {
+                "layer": int(L),
+                "axis_H_dot_axis_V": float(np.dot(dH, dV)),
+                "full_gap_H": gapH,
+                "full_gap_V": gapV,
+            }
+        )
+    return geom, pd.DataFrame(rows)
+
+
+def read_coord(x: np.ndarray, g: Mapping[str, Any]) -> np.ndarray:
+    res = np.asarray(x, dtype=np.float64) - np.asarray(g["center"], dtype=np.float64)
+    c = np.asarray(g["dual"], dtype=np.float64).T @ res
+    return np.asarray(
+        [c[0] / float(g["halfH"]), c[1] / float(g["halfV"])],
+        dtype=np.float64,
+    )
+
+
+# =============================================================================
+# Attention helpers
+# =============================================================================
+
+def resolve_self_attention(layer: Any) -> Any:
+    for name in ("self_attn", "attention", "attn"):
+        module = getattr(layer, name, None)
+        if module is not None:
+            return module
+    raise RuntimeError(f"Cannot locate self-attention in {type(layer).__name__}")
+
+
+def resolve_hidden_tuple(outputs: Any) -> Sequence[torch.Tensor]:
+    candidates = [
+        getattr(outputs, "hidden_states", None),
+        getattr(getattr(outputs, "language_model_output", None), "hidden_states", None),
+        getattr(getattr(outputs, "language_model_outputs", None), "hidden_states", None),
+    ]
+    for value in candidates:
+        if isinstance(value, (tuple, list)) and len(value) > 0:
+            return value
+    raise RuntimeError("Forward did not return decoder hidden_states")
+
+
+def locate_attention_hidden(args: Sequence[Any], kwargs: Mapping[str, Any]) -> torch.Tensor:
+    value = kwargs.get("hidden_states")
+    if torch.is_tensor(value) and value.ndim == 3:
+        return value
+    for item in args:
+        if torch.is_tensor(item) and item.ndim == 3:
+            return item
+    raise RuntimeError("Could not locate attention hidden_states")
+
+
+class CaptureAttentionInput:
+    def __init__(self, attention: Any):
+        self.attention = attention
+        self.handle = None
+        self.hidden: Optional[torch.Tensor] = None
+        self.events = 0
+
+    def __enter__(self):
+        def hook(_module, args, kwargs):
+            hidden = locate_attention_hidden(args, kwargs)
+            self.hidden = hidden.detach()
+            self.events += 1
+
+        self.handle = self.attention.register_forward_pre_hook(hook, with_kwargs=True)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.handle is not None:
+            self.handle.remove()
+            self.handle = None
+
+
+def get_num_heads(attention: Any, attention_tensor: torch.Tensor) -> int:
+    # prompt attention tensor is already [H,Q,K]
+    return int(attention_tensor.shape[0])
+
+
+def project_value_states(
+    attention: Any,
+    hidden_states: torch.Tensor,
+    n_heads: int,
+) -> torch.Tensor:
+    """Return V after GQA repetition as [B,H,S,Dh]."""
+    v_proj = getattr(attention, "v_proj", None)
+    if v_proj is None:
+        raise RuntimeError(f"{type(attention).__name__} has no v_proj")
+    values = v_proj(hidden_states)
+    if values.ndim != 3:
+        raise RuntimeError(f"v_proj shape={tuple(values.shape)}, expected [B,S,D]")
+    n_kv = getattr(attention, "num_key_value_heads", None)
+    if n_kv is None:
+        n_kv = getattr(getattr(attention, "config", None), "num_key_value_heads", None)
+    if n_kv is None:
+        n_kv = n_heads
+    n_kv = int(n_kv)
+    if values.shape[-1] % n_kv != 0:
+        raise RuntimeError(
+            f"v_proj dim={values.shape[-1]} not divisible by num_key_value_heads={n_kv}"
+        )
+    dh = int(values.shape[-1] // n_kv)
+    values = values.view(values.shape[0], values.shape[1], n_kv, dh).transpose(1, 2)
+    if n_kv != n_heads:
+        if n_heads % n_kv != 0:
+            raise RuntimeError(f"Cannot repeat KV heads {n_kv} -> query heads {n_heads}")
+        values = values.repeat_interleave(n_heads // n_kv, dim=1)
+    return values.contiguous()
+
+
+class PatchHeadPreWO:
+    """Add precomputed deltas to one head slice at selected token positions."""
+
+    def __init__(
+        self,
+        attention: Any,
+        head: int,
+        deltas_by_position: Mapping[int, torch.Tensor],
+        n_heads: int,
+    ):
+        self.attention = attention
+        self.head = int(head)
+        self.deltas = {int(k): v.detach() for k, v in deltas_by_position.items()}
+        self.n_heads = int(n_heads)
+        self.handle = None
+        self.events = 0
+
+    def __enter__(self):
+        o_proj = getattr(self.attention, "o_proj", None)
+        if o_proj is None:
+            raise RuntimeError(f"{type(self.attention).__name__} has no o_proj")
+
+        def hook(_module, inputs):
+            if not inputs or not torch.is_tensor(inputs[0]):
+                raise RuntimeError("o_proj pre-hook received no tensor input")
+            x = inputs[0]
+            if x.ndim != 3:
+                raise RuntimeError(f"o_proj input shape={tuple(x.shape)}, expected [B,S,D]")
+            if x.shape[-1] % self.n_heads != 0:
+                raise RuntimeError(
+                    f"o_proj input dim={x.shape[-1]} not divisible by n_heads={self.n_heads}"
+                )
+            dh = int(x.shape[-1] // self.n_heads)
+            if not (0 <= self.head < self.n_heads):
+                raise RuntimeError(f"head {self.head} outside 0..{self.n_heads-1}")
+            start, end = self.head * dh, (self.head + 1) * dh
+            y = x.clone()
+            for position, delta in self.deltas.items():
+                if not (0 <= position < y.shape[1]):
+                    raise RuntimeError(
+                        f"patch position {position} outside seq len {y.shape[1]}"
+                    )
+                d = delta.to(device=y.device, dtype=y.dtype)
+                if d.numel() != dh:
+                    raise RuntimeError(f"delta dim={d.numel()} != head_dim={dh}")
+                y[0, position, start:end] = y[0, position, start:end] + d
+            self.events += 1
+            return (y,) + tuple(inputs[1:])
+
+        self.handle = o_proj.register_forward_pre_hook(hook)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.handle is not None:
+            self.handle.remove()
+            self.handle = None
+
+
+# =============================================================================
+# Counterfactual centroid construction
+# =============================================================================
+
+@dataclass
+class ConditionSpec:
+    name: str
+    head_kind: str       # target / control
+    axis: str            # H / V
+    mode: str            # antisym / common
+    direction: int       # +1 / -1 in aligned c_H/c_V convention
+
+
+def conditions() -> List[ConditionSpec]:
+    out = []
+    for axis in ("H", "V"):
+        for direction in (+1, -1):
+            out.append(
+                ConditionSpec(
+                    name=f"target_{axis}{'+' if direction > 0 else '-'}",
+                    head_kind="target",
+                    axis=axis,
+                    mode="antisym",
+                    direction=direction,
+                )
+            )
+    out.extend(
+        [
+            ConditionSpec("common_H+", "target", "H", "common", +1),
+            ConditionSpec("common_V+", "target", "V", "common", +1),
+        ]
+    )
+    for axis in ("H", "V"):
+        for direction in (+1, -1):
+            out.append(
+                ConditionSpec(
+                    name=f"control_{axis}{'+' if direction > 0 else '-'}",
+                    head_kind="control",
+                    axis=axis,
+                    mode="antisym",
+                    direction=direction,
+                )
+            )
+    return out
+
+
+def normalized_visual_map(full_row: torch.Tensor, visual_idx: torch.Tensor):
+    a = full_row.index_select(0, visual_idx).float()
+    mass = a.sum()
+    if not torch.isfinite(mass) or float(mass.item()) <= EPS:
+        raise RuntimeError("visual attention mass is zero/non-finite")
+    p = a / mass
+    return a, p, mass
+
+
+def tilted_distribution(
+    p: torch.Tensor,
+    coord: torch.Tensor,
+    signed_beta: float,
+) -> torch.Tensor:
+    # p is already normalized over visual tokens; multiplication keeps exact zeros zero.
+    c = coord.float()
+    c = c - c.mean()
+    scale = torch.exp(torch.clamp(float(signed_beta) * c, min=-40.0, max=40.0))
+    q = p.float() * scale
+    denom = q.sum()
+    if float(denom.item()) <= EPS or not torch.isfinite(denom):
+        raise RuntimeError("tilted visual distribution degenerated")
+    return q / denom
+
+
+def condition_query_signs(spec: ConditionSpec) -> Tuple[int, int, int]:
+    """Return coordinate index and subject/ref tilt signs in raw image coords."""
+    d = int(spec.direction)
+    if spec.axis == "H":
+        coord_idx = 0
+        if spec.mode == "antisym":
+            return coord_idx, +d, -d
+        return coord_idx, +d, +d
+    if spec.axis == "V":
+        coord_idx = 1
+        # c_V = -(y_sub-y_ref): +V(above) requires sub y down-sign negative.
+        if spec.mode == "antisym":
+            return coord_idx, -d, +d
+        return coord_idx, -d, -d
+    raise ValueError(spec.axis)
+
+
+def build_condition_patch(
+    *,
+    spec: ConditionSpec,
+    beta: float,
+    head: int,
+    prompt_attention: torch.Tensor,   # [H,Q,K]
+    values: torch.Tensor,             # [B,H,S,Dh]
+    visual_indices: Sequence[int],
+    coords: torch.Tensor,              # [V,2]
+    subject_index: int,
+    reference_index: int,
+) -> Tuple[Dict[int, torch.Tensor], Dict[str, float]]:
+    device = prompt_attention.device
+    vidx = torch.as_tensor(visual_indices, device=device, dtype=torch.long)
+    coords = coords.to(device=device, dtype=torch.float32)
+    if len(visual_indices) != coords.shape[0]:
+        raise RuntimeError("visual index / coordinate length mismatch")
+    if head >= prompt_attention.shape[0]:
+        raise RuntimeError(f"head={head} >= n_heads={prompt_attention.shape[0]}")
+
+    coord_idx, s_sign, r_sign = condition_query_signs(spec)
+    query_data = []
+    deltas: Dict[int, torch.Tensor] = {}
+
+    for role, q_index, sign in (
+        ("subject", subject_index, s_sign),
+        ("reference", reference_index, r_sign),
+    ):
+        full_row = prompt_attention[head, q_index, :]
+        a, p, mass = normalized_visual_map(full_row, vidx)
+        p_new = tilted_distribution(p, coords[:, coord_idx], float(beta) * float(sign))
+        a_new = mass * p_new
+        delta_a = a_new - a
+
+        # Values are from the clean input to this attention layer; L24 input is
+        # unchanged in every L24 intervention, so this is the exact A'V-AV delta.
+        v = values[0, head].index_select(0, vidx.to(values.device)).float()
+        delta_vec = torch.matmul(delta_a.to(v.device).unsqueeze(0), v).squeeze(0)
+        deltas[int(q_index)] = delta_vec.detach()
+
+        c_old = torch.sum(p.unsqueeze(1) * coords, dim=0)
+        c_new = torch.sum(p_new.unsqueeze(1) * coords, dim=0)
+        query_data.append((role, c_old, c_new, float(mass.item())))
+
+    old = {role: c for role, c, _, _ in query_data}
+    new = {role: c for role, _, c, _ in query_data}
+    masses = {role: m for role, _, _, m in query_data}
+
+    old_dx = float((old["subject"][0] - old["reference"][0]).item())
+    old_dy = float((old["subject"][1] - old["reference"][1]).item())
+    new_dx = float((new["subject"][0] - new["reference"][0]).item())
+    new_dy = float((new["subject"][1] - new["reference"][1]).item())
+
+    old_cH = old_dx
+    old_cV = -old_dy
+    new_cH = new_dx
+    new_cV = -new_dy
+
+    obj_shift_sub = float(torch.linalg.vector_norm(new["subject"] - old["subject"]).item())
+    obj_shift_ref = float(torch.linalg.vector_norm(new["reference"] - old["reference"]).item())
+
+    metrics = {
+        "clean_cH": old_cH,
+        "clean_cV": old_cV,
+        "cf_cH": new_cH,
+        "cf_cV": new_cV,
+        "delta_cH": new_cH - old_cH,
+        "delta_cV": new_cV - old_cV,
+        "subject_centroid_shift": obj_shift_sub,
+        "reference_centroid_shift": obj_shift_ref,
+        "mean_object_centroid_shift": 0.5 * (obj_shift_sub + obj_shift_ref),
+        "subject_visual_mass": masses["subject"],
+        "reference_visual_mass": masses["reference"],
+        "delta_head_norm_subject": float(torch.linalg.vector_norm(deltas[subject_index].float()).item()),
+        "delta_head_norm_reference": float(torch.linalg.vector_norm(deltas[reference_index].float()).item()),
+    }
+    return deltas, metrics
+
+
+# =============================================================================
+# Object pair states
+# =============================================================================
+
+def span_positions(span: Sequence[int]) -> List[int]:
+    if len(span) < 2:
+        raise RuntimeError(f"bad span={span}")
+    a, b = int(span[0]), int(span[1])
+    if b < a:
+        a, b = b, a
+    # Existing centroid code uses span[1] as the final object token, so spans are
+    # treated as inclusive endpoints here.
+    return list(range(a, b + 1))
+
+
+def pooled_state(hidden: torch.Tensor, positions: Sequence[int], mode: str) -> torch.Tensor:
+    idx = torch.as_tensor(positions, device=hidden.device, dtype=torch.long)
+    selected = hidden[0].index_select(0, idx)
+    if mode == "last":
+        return selected[-1]
+    return selected.mean(dim=0)
+
+
+def pair_state(
+    hidden_tuple: Sequence[torch.Tensor],
+    layer: int,
+    subject_positions: Sequence[int],
+    reference_positions: Sequence[int],
+    pool: str,
+) -> torch.Tensor:
+    # HF hidden_states[0] is embedding output; block L output is hidden_states[L+1].
+    index = int(layer) + 1
+    if index >= len(hidden_tuple):
+        raise RuntimeError(
+            f"Requested block L{layer}, but hidden_states has {len(hidden_tuple)} entries"
+        )
+    h = hidden_tuple[index]
+    sub = pooled_state(h, subject_positions, pool)
+    ref = pooled_state(h, reference_positions, pool)
+    return (sub - ref).detach().float().cpu()
+
+
+# =============================================================================
+# Per-sample clean trace and intervention
+# =============================================================================
+
+def clean_trace(
+    *,
+    model: Any,
+    processor: Any,
+    layers: Sequence[Any],
+    image: Any,
+    record: Mapping[str, Any],
+    intervention_layer: int,
+    args: argparse.Namespace,
+):
+    device = torch.device(args.device)
+    batch = centexp.make_batch(processor, image, record, device)
+    input_ids = batch["input_ids"][0].detach().cpu().tolist()
+    input_length = len(input_ids)
+    sub_span, ref_span = cent.locate_object_spans(
+        processor.tokenizer,
+        input_ids,
+        record["subject"],
+        record["reference"],
+    )
+    subject_index = int(sub_span[1])
+    reference_index = int(ref_span[1])
+    subject_positions = span_positions(sub_span)
+    reference_positions = span_positions(ref_span)
+
+    visual_indices = cent.resolve_visual_indices(model, processor, batch, input_ids)
+    coords = cent.visual_coordinates(
+        model,
+        batch,
+        len(visual_indices),
+        batch["input_ids"].device,
+    )
+    if coords is None:
+        raise RuntimeError("Could not construct visual coordinates")
+
+    attention = resolve_self_attention(layers[int(intervention_layer)])
+    with CaptureAttentionInput(attention) as capture:
+        # Use no_grad rather than inference_mode.  We reuse captured tensors
+        # (notably the L24 attention input) in a later v_proj call; inference
+        # tensors cannot safely be fed to ordinary modules outside
+        # inference_mode on recent PyTorch versions.
+        with torch.no_grad():
+            outputs = model(
+                **batch,
+                use_cache=False,
+                output_attentions=True,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+    if capture.events != 1 or capture.hidden is None:
+        raise RuntimeError(
+            f"L{intervention_layer} attention input capture events={capture.events}"
+        )
+    attentions = centexp.resolve_attention_tuple(outputs)
+    hidden_tuple = resolve_hidden_tuple(outputs)
+    prompt_attention = cent.normalize_attention_tensor(
+        attentions[int(intervention_layer)],
+        expected_query_length=input_length,
+    )
+    n_heads = get_num_heads(attention, prompt_attention)
+    # Defensive clone ensures this is an ordinary tensor even if an upstream
+    # backend happens to return an inference tensor.  Keep this reconstruction
+    # gradient-free: this experiment never uses autograd.
+    attention_hidden = capture.hidden.detach().clone()
+    with torch.no_grad():
+        values = project_value_states(attention, attention_hidden, n_heads)
+
+    clean_pairs = {
+        int(L): pair_state(
+            hidden_tuple,
+            int(L),
+            subject_positions,
+            reference_positions,
+            args.object_pool,
+        )
+        for L in args.readout_layers_parsed
+    }
+
+    return {
+        "batch": batch,
+        "subject_index": subject_index,
+        "reference_index": reference_index,
+        "subject_positions": subject_positions,
+        "reference_positions": reference_positions,
+        "visual_indices": visual_indices,
+        "coords": coords.detach(),
+        "attention": attention,
+        "prompt_attention": prompt_attention.detach(),
+        "values": values.detach(),
+        "n_heads": n_heads,
+        "clean_pairs": clean_pairs,
+        "input_length": input_length,
+    }
+
+
+def run_intervention(
+    *,
+    model: Any,
+    clean: Mapping[str, Any],
+    head: int,
+    deltas: Mapping[int, torch.Tensor],
+    args: argparse.Namespace,
+) -> Dict[int, torch.Tensor]:
+    attention = clean["attention"]
+    with PatchHeadPreWO(attention, head, deltas, clean["n_heads"]) as patch:
+        with torch.no_grad():
+            outputs = model(
+                **clean["batch"],
+                use_cache=False,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+    if patch.events != 1:
+        raise RuntimeError(f"o_proj patch fired {patch.events} times, expected 1")
+    hidden_tuple = resolve_hidden_tuple(outputs)
+    result = {
+        int(L): pair_state(
+            hidden_tuple,
+            int(L),
+            clean["subject_positions"],
+            clean["reference_positions"],
+            args.object_pool,
+        )
+        for L in args.readout_layers_parsed
+    }
+    del outputs
+    return result
+
+
+
+
+# =============================================================================
+# SAME-CENTROID MEDIATION EXPERIMENT
+# =============================================================================
 
 EPS = 1e-12
 METHODS = ("min_kl", "radial_null", "checker_null")
@@ -215,7 +935,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
 
-    args.readout_layers_parsed = base.parse_layers(args.readout_layers)
+    args.readout_layers_parsed = parse_layers(args.readout_layers)
     methods = [x.strip() for x in str(args.methods).split(",") if x.strip()]
     bad = [x for x in methods if x not in METHODS]
     if bad:
@@ -431,7 +1151,7 @@ def extract_query_visual_distribution(
     device = prompt_attention.device
     vidx = torch.as_tensor(visual_indices, device=device, dtype=torch.long)
     full_row = prompt_attention[int(head), int(query_index), :]
-    a, p_t, mass_t = base.normalized_visual_map(full_row, vidx)
+    a, p_t, mass_t = normalized_visual_map(full_row, vidx)
     p = p_t.detach().float().cpu().numpy().astype(np.float64)
     p = normalize_prob(p)
     C = coords.detach().float().cpu().numpy().astype(np.float64)
@@ -821,8 +1541,8 @@ def pairwise_method_agreement(df: pd.DataFrame) -> pd.DataFrame:
                 "method_a": a,
                 "method_b": b,
                 "N": int(len(ids)),
-                "corr_dzH": base.safe_corr(za[:,0], zb[:,0]),
-                "corr_dzV": base.safe_corr(za[:,1], zb[:,1]),
+                "corr_dzH": safe_corr(za[:,0], zb[:,0]),
+                "corr_dzV": safe_corr(za[:,1], zb[:,1]),
                 "target_axis_sign_agreement": float(sign_agree),
                 "mean_delta_z_distance": float(diff.mean()),
                 "mean_relative_delta_z_distance": float(np.mean(diff/np.maximum(denom, EPS))),
@@ -919,13 +1639,13 @@ def main() -> None:
         shutil.rmtree(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    Xs, ys, Ls, sids_s, source_def = base.load_state_npz(
+    Xs, ys, Ls, sids_s, source_def = load_state_npz(
         Path(args.source_spatial_npz), require_labels=True
     )
-    Xt, yt, Lt, sids_t, target_def = base.load_state_npz(
+    Xt, yt, Lt, sids_t, target_def = load_state_npz(
         Path(args.target_spatial_npz), require_labels=False
     )
-    geom, geom_df = base.fit_hv_geometry(Xs, ys, Ls, args.readout_layers_parsed)
+    geom, geom_df = fit_hv_geometry(Xs, ys, Ls, args.readout_layers_parsed)
     geom_df.to_csv(outdir / "hv_geometry.csv", index=False)
     target_lmap = {int(L): i for i, L in enumerate(Lt)}
     target_sid_to_i = {int(sid): i for i, sid in enumerate(sids_t)}
@@ -933,13 +1653,13 @@ def main() -> None:
         if L not in target_lmap:
             raise RuntimeError(f"Target cache missing readout L{L}")
 
-    # Compatibility with centexp helper APIs imported inside base.
+    # Compatibility with centexp helper APIs imported inside 
     args.max_samples = None if int(args.max_samples) == 0 else int(args.max_samples)
-    records, audit = base.centexp.load_coco_records(args)
+    records, audit = centexp.load_coco_records(args)
     if args.max_samples is not None:
         records = records[: int(args.max_samples)]
 
-    model, processor, layers, decoder_path, spec = base.centexp.load_model_and_processor(args)
+    model, processor, layers, decoder_path, spec = centexp.load_model_and_processor(args)
     if not (0 <= args.intervention_layer < len(layers)):
         raise RuntimeError(
             f"intervention L{args.intervention_layer} outside 0..{len(layers)-1}"
@@ -969,8 +1689,8 @@ def main() -> None:
             if sid not in target_sid_to_i:
                 raise RuntimeError(f"sid={sid} missing from target spatial cache")
             ti = target_sid_to_i[sid]
-            image = base.centexp.open_record_image(record)
-            clean = base.clean_trace(
+            image = centexp.open_record_image(record)
+            clean = clean_trace(
                 model=model,
                 processor=processor,
                 layers=layers,
@@ -989,7 +1709,7 @@ def main() -> None:
             for L in args.readout_layers_parsed:
                 r = Xt[ti, target_lmap[L]].astype(np.float64)
                 clean_residual[int(L)] = r
-                clean_z[int(L)] = base.read_coord(r, geom[int(L)])
+                clean_z[int(L)] = read_coord(r, geom[int(L)])
 
             interventions: List[BuiltIntervention] = []
             for direction in DIRECTIONS:
@@ -1022,7 +1742,7 @@ def main() -> None:
                 raise RuntimeError("No feasible interventions for sample")
 
             for intervention in interventions:
-                int_pairs = base.run_intervention(
+                int_pairs = run_intervention(
                     model=model,
                     clean=clean,
                     head=args.target_head,
@@ -1034,7 +1754,7 @@ def main() -> None:
                         int_pairs[int(L)] - clean["clean_pairs"][int(L)]
                     ).numpy().astype(np.float64)
                     r_int = clean_residual[int(L)] + pair_delta
-                    z_int = base.read_coord(r_int, geom[int(L)])
+                    z_int = read_coord(r_int, geom[int(L)])
                     z0 = clean_z[int(L)]
                     detail_rows.append({
                         "sid": sid,
@@ -1077,7 +1797,7 @@ def main() -> None:
                     del clean
                 except Exception:
                     pass
-            base.cleanup()
+            cleanup()
 
     if not detail_rows:
         raise RuntimeError("No successful intervention rows")
@@ -1147,7 +1867,7 @@ def main() -> None:
         print(shape_diff.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
 
     config = {
-        "script": "diagnose_centroid_mediation_same_centroid_v1.py",
+        "script": "diagnose_centroid_mediation_same_centroid_v1_standalone.py",
         "model": args.model,
         "repo_id": getattr(spec, "repo_id", ""),
         "decoder_path": decoder_path,
