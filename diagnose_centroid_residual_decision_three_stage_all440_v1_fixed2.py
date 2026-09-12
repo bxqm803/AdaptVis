@@ -859,11 +859,17 @@ def main():
     df["R_correct"] = df["residual_correct"]
     df["D_pred"] = df["decision_pred"]
     df["D_correct"] = df["decision_correct"]
-    df["three_stage_pattern"] = (
-        np.where(df.C_correct, "C+", "C-") + "/" +
-        np.where(df.R_correct, "R+", "R-") + "/" +
-        np.where(df.D_correct, "D+", "D-")
-    )
+    # Build the categorical C/R/D pattern in pure Python.
+    # Do NOT concatenate NumPy unicode arrays with `+`: NumPy 2.x raises
+    # UFuncNoLoopError for that operation.
+    df["three_stage_pattern"] = [
+        f"{'C+' if bool(c) else 'C-'}/{'R+' if bool(r) else 'R-'}/{'D+' if bool(d) else 'D-'}"
+        for c, r, d in zip(
+            df["C_correct"].tolist(),
+            df["R_correct"].tolist(),
+            df["D_correct"].tolist(),
+        )
+    ]
     df.to_csv(outdir / "per_sample_three_stage.csv", index=False)
     residual_layer.to_csv(outdir / "per_sample_residual_layer.csv", index=False)
 
