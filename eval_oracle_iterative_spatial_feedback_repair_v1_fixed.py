@@ -611,7 +611,7 @@ def summarize_generation(repair_df: pd.DataFrame) -> pd.DataFrame:
             "mean_final_total_natural_wrong": float(gw.final_total_natural_norm.mean()) if len(gw) else np.nan,
             "fraction_hit_total_cap_wrong": float(gw.hit_total_cap.mean()) if len(gw) else np.nan,
             "fraction_ever_tf_target_wrong": float(gw.ever_tf_target.mean()) if len(gw) else np.nan,
-            "final_tf_target_rate_wrong": float((gw.final_tf_prediction == gw.gt).mean()) if len(gw) else np.nan,
+            "final_tf_target_rate_wrong": float((gw["final_tf_prediction"] == gw["gt"]).mean()) if len(gw) else np.nan,
             "mean_final_gt_margin_wrong": float(gw.final_gt_min_margin.mean()) if len(gw) else np.nan,
         })
     return pd.DataFrame(rows).sort_values(["source_layer", "required_margin"]).reset_index(drop=True)
@@ -1037,7 +1037,7 @@ def main():
         rel_df.to_csv(outdir / "repair_by_relation.csv", index=False)
         step_summary_df.to_csv(outdir / "step_summary.csv", index=False)
 
-        below_df = step_df[(step_df.gt == "below")].copy() if len(step_df) else pd.DataFrame()
+        below_df = step_df[step_df["gt"] == "below"].copy() if len(step_df) else pd.DataFrame()
         below_df.to_csv(outdir / "below_trajectories.csv", index=False)
 
         lines = [
