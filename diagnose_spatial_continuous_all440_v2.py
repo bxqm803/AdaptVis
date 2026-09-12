@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-diagnose_spatial_continuous_all440_v1.py
+diagnose_spatial_continuous_all440_v2.py
 
 Threshold-free continuous decomposition of the model's middle-layer spatial
 state on ALL target samples.
@@ -57,7 +57,7 @@ used only for post-hoc diagnosis/evaluation.
 
 Recommended ALL-440 run
 =======================
-python -u diagnose_spatial_continuous_all440_v1.py \
+python -u diagnose_spatial_continuous_all440_v2.py \
   --source-spatial-npz \
     output/qwen3b_hsub_href_spatial_cache/qwen-3b_synthetic_hsub_href_all.npz \
   --target-spatial-npz \
@@ -66,7 +66,7 @@ python -u diagnose_spatial_continuous_all440_v1.py \
     output/qwen3b_synthetic400_to_coco440_originalprompt_mean_v2/per_sample_candidate_repair.csv \
   --layers 20-26 \
   --expected-n 440 \
-  --output-dir output/qwen3b_spatial_continuous_all440_v1 \
+  --output-dir output/qwen3b_spatial_continuous_all440_v2 \
   --overwrite
 
 Main outputs
@@ -77,6 +77,12 @@ per_sample_layer_continuous_spatial.csv
     All sample x layer rows.
 cohort_summary.csv
     all / baseline_wrong / baseline_correct continuous summaries.
+correctness_x_spatial_leading.csv
+    Main 2x3 decomposition: baseline correct/wrong x GT-leading/wrong-leading/tie.
+spatial_leading_by_correctness.csv
+    Compact counts/rates of GT-leading and wrong-leading inside correct and wrong samples.
+by_gt_x_correctness_x_spatial_leading.csv
+    Relation-wise decomposition of the same quadrants.
 gt_rank_distribution.csv
     GT spatial rank 1/2/3/4 by cohort.
 margin_quantiles.csv
@@ -108,7 +114,7 @@ import pandas as pd
 
 REL = ("left", "right", "above", "below")
 EPS = 1e-10
-SCRIPT_VERSION = "v1_threshold_free_continuous_all_samples"
+SCRIPT_VERSION = "v2_correct_wrong_x_spatial_leading_all_samples"
 
 
 def norm_rel(x) -> str:
@@ -445,6 +451,79 @@ def grouped_summary(df: pd.DataFrame, col: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def correctness_leading_tables(samples: pd.DataFrame):
+    """Build explicit correct/wrong x GT-leading/wrong-leading/tie tables."""
+    rows = []
+    compact = []
+    status_order = ("gt_leading", "wrong_leading", "tie")
+    correctness_order = ((True, "baseline_correct"), (False, "baseline_wrong"))
+    N_all = len(samples)
+
+    for bc, cname in correctness_order:
+        cg = samples.loc[samples["baseline_correct"].eq(bc)].copy()
+        Nc = len(cg)
+        crow = {
+            "baseline_cohort": cname,
+            "N": Nc,
+            "fraction_of_all": float(Nc / N_all) if N_all else np.nan,
+        }
+        for status in status_order:
+            g = cg.loc[cg["spatial_leading_status"].eq(status)].copy()
+            n = len(g)
+            rows.append({
+                "baseline_cohort": cname,
+                "baseline_correct": bool(bc),
+                "spatial_leading_status": status,
+                "N": n,
+                "fraction_of_all": float(n / N_all) if N_all else np.nan,
+                "fraction_within_baseline_cohort": float(n / Nc) if Nc else np.nan,
+                "mean_gt_evidence": float(g["mean_gt_direction_evidence"].mean()) if n else np.nan,
+                "mean_best_wrong_evidence": float(g["mean_best_wrong_direction_evidence"].mean()) if n else np.nan,
+                "mean_gt_minus_bestwrong": float(g["gt_minus_bestwrong_mean_evidence"].mean()) if n else np.nan,
+                "median_gt_minus_bestwrong": float(g["gt_minus_bestwrong_mean_evidence"].median()) if n else np.nan,
+                "mean_gt_source_percentile": float(g["mean_gt_evidence_source_percentile"].mean()) if n else np.nan,
+                "mean_bestwrong_source_percentile": float(g["mean_bestwrong_evidence_source_percentile"].mean()) if n else np.nan,
+                "mean_spatial_norm_source_percentile": float(g["mean_spatial_norm_source_percentile"].mean()) if n else np.nan,
+                "gt_top1_rate": float(g["gt_rank_by_mean_evidence"].eq(1).mean()) if n else np.nan,
+                "gt_top2_rate": float(g["gt_rank_by_mean_evidence"].le(2).mean()) if n else np.nan,
+                "mean_gt_layer_win_fraction": float(g["gt_top1_layer_fraction"].mean()) if n else np.nan,
+                "cross_layer_unstable_rate": float(g["cross_layer_unstable"].mean()) if n else np.nan,
+                "baseline_equals_top1_direction_rate": float(g["baseline_equals_top1_direction"].mean()) if n else np.nan,
+                "baseline_equals_bestwrong_rate": float(g["baseline_equals_bestwrong_mean_evidence"].mean()) if n else np.nan,
+            })
+            crow[f"N_{status}"] = n
+            crow[f"frac_{status}"] = float(n / Nc) if Nc else np.nan
+        compact.append(crow)
+    return pd.DataFrame(rows), pd.DataFrame(compact)
+
+
+def by_gt_correctness_leading(samples: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for gt in REL:
+        gg = samples.loc[samples["gt"].eq(gt)]
+        for bc, cname in ((True, "baseline_correct"), (False, "baseline_wrong")):
+            cg = gg.loc[gg["baseline_correct"].eq(bc)]
+            Nc = len(cg)
+            for status in ("gt_leading", "wrong_leading", "tie"):
+                g = cg.loc[cg["spatial_leading_status"].eq(status)]
+                n = len(g)
+                rows.append({
+                    "gt": gt,
+                    "baseline_cohort": cname,
+                    "spatial_leading_status": status,
+                    "N": n,
+                    "cohort_N": Nc,
+                    "fraction_within_gt_and_correctness": float(n / Nc) if Nc else np.nan,
+                    "mean_gt_minus_bestwrong": float(g["gt_minus_bestwrong_mean_evidence"].mean()) if n else np.nan,
+                    "mean_gt_evidence": float(g["mean_gt_direction_evidence"].mean()) if n else np.nan,
+                    "mean_best_wrong_evidence": float(g["mean_best_wrong_direction_evidence"].mean()) if n else np.nan,
+                    "mean_gt_source_percentile": float(g["mean_gt_evidence_source_percentile"].mean()) if n else np.nan,
+                    "mean_bestwrong_source_percentile": float(g["mean_bestwrong_evidence_source_percentile"].mean()) if n else np.nan,
+                    "baseline_equals_bestwrong_rate": float(g["baseline_equals_bestwrong_mean_evidence"].mean()) if n else np.nan,
+                })
+    return pd.DataFrame(rows)
+
+
 def main():
     a = parse_args()
     out = Path(a.output_dir)
@@ -565,6 +644,11 @@ def main():
         denom = abs(gt_ev) + abs(wrong_ev) + EPS
         normalized_margin = float(margin / denom)
         gt_rank = rank_desc(mean_ev, gt)
+        spatial_leading_status = (
+            "gt_leading" if margin > 0 else
+            "wrong_leading" if margin < 0 else
+            "tie"
+        )
 
         cnt = Counter(layer_winners)
         mode, mode_n = cnt.most_common(1)[0]
@@ -591,6 +675,7 @@ def main():
             "best_wrong_direction_by_source_percentile": best_wrong_pct,
             "mean_bestwrong_relation_percentile": mean_pct[best_wrong_pct],
             "gt_minus_bestwrong_mean_evidence": margin,
+            "spatial_leading_status": spatial_leading_status,
             "normalized_gt_vs_bestwrong_margin": normalized_margin,
             "abs_gt_vs_bestwrong_margin": abs(margin),
             "gt_rank_by_mean_evidence": gt_rank,
@@ -627,7 +712,34 @@ def main():
     samples.to_csv(out / "per_sample_continuous_spatial.csv", index=False)
     layers_df.to_csv(out / "per_sample_layer_continuous_spatial.csv", index=False)
 
-    # Threshold-free error views.
+    # Explicit all-sample correct/wrong x spatial-leading decomposition.
+    quad_df, compact_leading_df = correctness_leading_tables(samples)
+    quad_df.to_csv(out / "correctness_x_spatial_leading.csv", index=False)
+    compact_leading_df.to_csv(out / "spatial_leading_by_correctness.csv", index=False)
+
+    by_gt_quad_df = by_gt_correctness_leading(samples)
+    by_gt_quad_df.to_csv(out / "by_gt_x_correctness_x_spatial_leading.csv", index=False)
+
+    # Save each main quadrant as a sample-level CSV for inspection.
+    for bc, cname in ((True, "baseline_correct"), (False, "baseline_wrong")):
+        for status in ("gt_leading", "wrong_leading", "tie"):
+            q = samples.loc[
+                samples["baseline_correct"].eq(bc)
+                & samples["spatial_leading_status"].eq(status)
+            ].copy()
+            if status == "gt_leading":
+                q = q.sort_values(
+                    ["gt_minus_bestwrong_mean_evidence", "mean_gt_evidence_source_percentile"],
+                    ascending=[False, False],
+                )
+            elif status == "wrong_leading":
+                q = q.sort_values(
+                    ["gt_minus_bestwrong_mean_evidence", "mean_bestwrong_evidence_source_percentile"],
+                    ascending=[True, False],
+                )
+            q.to_csv(out / f"{cname}_{status}.csv", index=False)
+
+    # Threshold-free error views retained for compatibility.
     gt_leading = errors.loc[errors["gt_minus_bestwrong_mean_evidence"] > 0].copy()
     gt_leading = gt_leading.sort_values(
         ["gt_minus_bestwrong_mean_evidence", "mean_gt_evidence_source_percentile"],
@@ -696,6 +808,10 @@ def main():
     wrong_wrong_lead_n = int((errors["gt_minus_bestwrong_mean_evidence"] < 0).sum())
     wrong_tie_n = int((errors["gt_minus_bestwrong_mean_evidence"] == 0).sum())
     wrong_bp_best_n = int(errors["baseline_equals_bestwrong_mean_evidence"].sum())
+    Nc = len(correct)
+    correct_gt_lead_n = int(correct["spatial_leading_status"].eq("gt_leading").sum())
+    correct_wrong_lead_n = int(correct["spatial_leading_status"].eq("wrong_leading").sum())
+    correct_tie_n = int(correct["spatial_leading_status"].eq("tie").sum())
 
     report = [
         "=" * 200,
@@ -719,12 +835,19 @@ def main():
         "-" * 200,
         cohort_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"),
         "",
-        "BASELINE-WRONG THRESHOLD-FREE SPLIT",
+        "SPATIAL LEADING STATUS BY BASELINE CORRECTNESS",
         "-" * 200,
-        f"GT strongest (M>0)                         : {wrong_gt_lead_n}/{Nw} = {wrong_gt_lead_n/max(Nw,1):.4f}",
-        f"wrong direction stronger (M<0)             : {wrong_wrong_lead_n}/{Nw} = {wrong_wrong_lead_n/max(Nw,1):.4f}",
-        f"exact tie (M=0)                             : {wrong_tie_n}/{Nw} = {wrong_tie_n/max(Nw,1):.4f}",
-        f"baseline wrong answer == strongest wrong dir: {wrong_bp_best_n}/{Nw} = {wrong_bp_best_n/max(Nw,1):.4f}",
+        f"baseline_correct: GT-leading={correct_gt_lead_n}/{Nc}={correct_gt_lead_n/max(Nc,1):.4f} | wrong-leading={correct_wrong_lead_n}/{Nc}={correct_wrong_lead_n/max(Nc,1):.4f} | tie={correct_tie_n}/{Nc}={correct_tie_n/max(Nc,1):.4f}",
+        f"baseline_wrong  : GT-leading={wrong_gt_lead_n}/{Nw}={wrong_gt_lead_n/max(Nw,1):.4f} | wrong-leading={wrong_wrong_lead_n}/{Nw}={wrong_wrong_lead_n/max(Nw,1):.4f} | tie={wrong_tie_n}/{Nw}={wrong_tie_n/max(Nw,1):.4f}",
+        f"wrong samples: baseline wrong answer == strongest wrong dir: {wrong_bp_best_n}/{Nw} = {wrong_bp_best_n/max(Nw,1):.4f}",
+        "",
+        "CORRECT/WRONG x GT-LEADING/WRONG-LEADING QUADRANTS",
+        "-" * 200,
+        quad_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"),
+        "",
+        "BY GT x BASELINE CORRECTNESS x SPATIAL LEADING STATUS",
+        "-" * 200,
+        by_gt_quad_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"),
         "",
         "GT RANK DISTRIBUTION",
         "-" * 200,
@@ -755,6 +878,11 @@ def main():
         "source_N": int(len(Xs)),
         "eval_N": int(N),
         "baseline_wrong_N": int(Nw),
+        "baseline_correct_N": int(Nc),
+        "baseline_correct_gt_leading_N": int(correct_gt_lead_n),
+        "baseline_correct_wrong_leading_N": int(correct_wrong_lead_n),
+        "baseline_wrong_gt_leading_N": int(wrong_gt_lead_n),
+        "baseline_wrong_wrong_leading_N": int(wrong_wrong_lead_n),
         "baseline_accuracy": acc,
         "expected_N": int(a.expected_n),
         "source_labels_used_for_HV_geometry_and_reference_percentiles": True,
