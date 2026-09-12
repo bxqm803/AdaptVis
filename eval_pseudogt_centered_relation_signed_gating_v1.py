@@ -2,83 +2,94 @@
 # -*- coding: utf-8 -*-
 
 """
-eval_pseudogt_relation_signed_gating_v1.py
+eval_pseudogt_centered_relation_signed_gating_v1.py
 
-Goal
-====
-Take samples whose TRUE GT is e.g. LEFT, keep the original image/question and
-the original clean decoder trajectory unchanged, but COUNTERFACTUALLY treat
-another spatial relation (e.g. RIGHT) as the desired pseudo-GT.
-
-Crucially, the primary polarity definition DOES NOT compare RIGHT against LEFT.
-
-For every realized clean block update
-
-    a_{i,L,p} = h_out - h_in
-
-and every candidate spatial relation r, compute
+Purpose
+=======
+Previous pseudo-GT experiment used
 
     q_r(i,L,p) = a_{i,L,p}^T grad_h S_r
 
-where S_r is the teacher-forced sequence score of candidate r.
+and found that, on GT=LEFT / baseline=LEFT samples, RIGHT / ABOVE / BELOW
+effects were strongly correlated.  That suggests q_r may contain a large
+candidate-common decision component rather than a relation-specific component.
 
-Primary pseudo-GT polarity
-==========================
-If pseudo-GT is RIGHT:
+This script removes that common mode before assigning positive/negative signs.
 
-    B_RIGHT(i,L,p) := q_RIGHT(i,L,p)
+For every realized CLEAN block update
 
-Then:
+    a_{i,L,p} = h_out - h_in
 
-    B_RIGHT > 0  -> this realized update locally INCREASES RIGHT score
-    B_RIGHT < 0  -> this realized update locally DECREASES RIGHT score
+compute the four candidate effects
 
-No LEFT vector / LEFT score is used in this primary sign definition.
+    q_left, q_right, q_above, q_below
 
-The intervention reuses the same signed-gating logic that was effective in the
-previous oracle repair experiment:
+with
+
+    q_r = a^T grad S_r.
+
+Then compute the per-update common mode
+
+    q_common = (q_left + q_right + q_above + q_below) / 4
+
+and the centered relation-specific effect
+
+    q_centered_r = q_r - q_common.
+
+Because dot products are linear, this is EXACTLY
+
+    q_centered_r
+      = a^T [ grad S_r - mean_k grad S_k ].
+
+No LEFT-vs-RIGHT opposition is assumed.
+
+For pseudo target RIGHT:
+
+    B_RIGHT := q_centered_right.
+
+Positive / negative signed gating is the same mild intervention used in the
+previous oracle repair:
 
     B_target > 0 : add +alpha * a
     B_target < 0 : add -alpha * a
 
-So with alpha=0.5:
+So alpha=0.5 gives approximately
 
-    positive clean update: effective a -> 1.5 a
-    negative clean update: effective a -> 0.5 a
+    positive effective update:  a -> 1.5 a
+    negative effective update:  a -> 0.5 a
 
-We do NOT reverse the whole update vector.
+and NEVER reverses the entire update.
 
-Why this experiment matters
-===========================
-If the SAME clean updates can be re-labeled by different pseudo spatial goals,
-and pseudo-target-specific signed gating selectively drives generation toward
-the chosen target, that supports the interpretation that "positive/negative"
-is relation-conditioned utilization polarity rather than an intrinsic
-good/bad property of an update.
+Controls
+========
+1) RAW control:
+       uses q_target without common-mode removal on the exact same cohort.
 
-This script also computes, for every update:
+2) CENTERED sign-shuffle control:
+       within each layer, preserve the number of + / - / 0 assignments but
+       randomly permute which update gets which sign.
 
-    q_left, q_right, q_above, q_below
+3) Single-layer CENTERED gating:
+       localizes where centered relation-conditioned utilization has leverage.
 
-so we can directly test whether LEFT and RIGHT effects are actually opposite.
-They are NOT assumed to be.
+Important caution
+=================
+Centering forces
 
-Optional margin control
-=======================
-For comparison only, the script also computes
+    q_centered_left + q_centered_right
+      + q_centered_above + q_centered_below = 0
 
-    B_margin(r) = q_r - q_best_other
+for every update.  Therefore a reduction in pairwise same-sign rates after
+centering is partly mathematical and is NOT evidence by itself.
 
-where best_other is the strongest clean candidate other than r.
+The meaningful evidence is CAUSAL TARGET SPECIFICITY:
+does centered pseudo-RIGHT gating selectively increase RIGHT generation more
+than RAW gating and sign-shuffle, and do different pseudo targets selectively
+drive different relations?
 
-Use:
-    --polarity-mode target_score   (DEFAULT; exactly the user's proposal)
-or
-    --polarity-mode target_margin  (control)
-
-Recommended first run: LEFT samples, pseudo-GT RIGHT
-====================================================
-CUDA_VISIBLE_DEVICES=0 python -u eval_pseudogt_relation_signed_gating_v1.py \
+Recommended LEFT -> pseudo RIGHT run
+====================================
+CUDA_VISIBLE_DEVICES=0 python -u eval_pseudogt_centered_relation_signed_gating_v1.py \
   --model qwen-3b \
   --real-update-dir output/qwen3b_real_causal_token_updates_all440_v1 \
   --source-rel left \
@@ -86,13 +97,12 @@ CUDA_VISIBLE_DEVICES=0 python -u eval_pseudogt_relation_signed_gating_v1.py \
   --update-layers 20-26 \
   --scales 0.5 \
   --max-samples 40 \
-  --polarity-mode target_score \
-  --output-dir output/qwen3b_left_pseudogt_right_signed_n40_v1 \
+  --output-dir output/qwen3b_left_pseudogt_right_centered_n40_v1 \
   --overwrite
 
-Stronger controllability test: same LEFT cohort, all four pseudo targets
-=======================================================================
-CUDA_VISIBLE_DEVICES=0 python -u eval_pseudogt_relation_signed_gating_v1.py \
+Stronger all-four pseudo-target test
+===================================
+CUDA_VISIBLE_DEVICES=0 python -u eval_pseudogt_centered_relation_signed_gating_v1.py \
   --model qwen-3b \
   --real-update-dir output/qwen3b_real_causal_token_updates_all440_v1 \
   --source-rel left \
@@ -100,18 +110,21 @@ CUDA_VISIBLE_DEVICES=0 python -u eval_pseudogt_relation_signed_gating_v1.py \
   --update-layers 20-26 \
   --scales 0.5 \
   --max-samples 40 \
-  --polarity-mode target_score \
-  --output-dir output/qwen3b_left_pseudogt_all4_signed_n40_v1 \
+  --output-dir output/qwen3b_left_pseudogt_all4_centered_n40_v1 \
   --overwrite
 
-Outputs
-=======
+Main outputs
+============
 per_update_relation_effects.csv
-relation_effect_pair_summary.csv
+common_mode_by_layer.csv
+relation_pair_summary_raw.csv
+relation_pair_summary_centered.csv
+pseudo_polarity_by_layer.csv
 generation_per_sample.csv
 generation_summary.csv
-controllability_matrix.csv
-single_layer_summary.csv
+all_layer_comparison.csv
+controllability_matrix_centered.csv
+single_layer_centered_summary.csv
 analysis_summary.txt
 metadata.json
 errors.jsonl
@@ -128,7 +141,7 @@ import random
 import shutil
 import traceback
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -172,24 +185,14 @@ def parse_args():
     p.add_argument(
         "--pseudo-targets",
         default="right",
-        help="'all' or comma-separated relations, e.g. right or left,right,above,below",
+        help="'all' or comma-separated relations.",
     )
 
     p.add_argument("--update-layers", default="20-26")
     p.add_argument(
         "--exclude-target-layer",
         action="store_true",
-        help="Use only L < latest selected causal target layer for each token.",
-    )
-
-    p.add_argument(
-        "--polarity-mode",
-        default="target_score",
-        choices=["target_score", "target_margin"],
-        help=(
-            "target_score: B_r = a dot grad S_r (does not use source relation). "
-            "target_margin: B_r = a dot grad(S_r-S_best_other), control only."
-        ),
+        help="Analyze only L < latest selected causal target layer for a token.",
     )
     p.add_argument(
         "--decision-threshold",
@@ -203,31 +206,32 @@ def parse_args():
     )
 
     p.add_argument(
+        "--run-raw-control",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run raw q_target signed gating on the exact same cohort.",
+    )
+    p.add_argument(
         "--single-layer",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Also run pseudo-target signed gating one layer at a time.",
+        help="Run centered signed gating one layer at a time.",
     )
     p.add_argument(
         "--all-layers",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Run signed gating across all requested available layers.",
     )
     p.add_argument(
         "--shuffle-control",
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Randomly permute +/-/0 signs WITHIN each layer while preserving the "
-            "number of positive/negative/neutral updates."
+            "Within each layer, preserve centered +/-/0 counts but randomly "
+            "permute sign assignments across updates."
         ),
     )
-    p.add_argument(
-        "--shuffle-repeats",
-        type=int,
-        default=1,
-    )
+    p.add_argument("--shuffle-repeats", type=int, default=1)
 
     p.add_argument(
         "--max-samples",
@@ -239,8 +243,8 @@ def parse_args():
         "--include-nonsource-baseline",
         action="store_true",
         help=(
-            "Default cohort requires GT=source-rel AND baseline generation=source-rel. "
-            "Set this to include all GT=source-rel samples."
+            "Default: GT=source-rel AND baseline generation=source-rel. "
+            "Enable to include all GT=source-rel samples."
         ),
     )
     p.add_argument("--seed", type=int, default=17)
@@ -257,8 +261,8 @@ def parse_args():
         "--score-margins",
         action="store_true",
         help=(
-            "Also teacher-force pseudo-target minus best-other score after each "
-            "intervention. Adds substantial forward cost."
+            "Teacher-force pseudo-target minus strongest clean other candidate "
+            "after each intervention. Adds forward cost."
         ),
     )
 
@@ -281,14 +285,14 @@ def append_jsonl(path: Path, row):
 
 
 def parse_scales(text: str) -> List[float]:
-    vals = []
+    out = []
     for x in str(text).split(","):
         x = x.strip()
         if x:
-            vals.append(float(x))
-    if not vals:
+            out.append(float(x))
+    if not out:
         raise ValueError("--scales is empty")
-    return vals
+    return out
 
 
 def parse_targets(text: str) -> List[str]:
@@ -299,10 +303,8 @@ def parse_targets(text: str) -> List[str]:
     out = []
     for x in s.split(","):
         r = src.normalize_rel(x.strip())
-        if not r:
-            continue
         if r not in REL:
-            raise ValueError(f"Unknown pseudo target {x!r}")
+            raise ValueError(f"Unknown pseudo target: {x!r}")
         if r not in out:
             out.append(r)
 
@@ -311,10 +313,10 @@ def parse_targets(text: str) -> List[str]:
     return out
 
 
-def safe_mean(x):
-    a = pd.to_numeric(pd.Series(list(x)), errors="coerce").to_numpy(float)
-    a = a[np.isfinite(a)]
-    return float(a.mean()) if len(a) else float("nan")
+def safe_mean(xs):
+    x = pd.to_numeric(pd.Series(list(xs)), errors="coerce").to_numpy(float)
+    x = x[np.isfinite(x)]
+    return float(x.mean()) if len(x) else float("nan")
 
 
 # =============================================================================
@@ -323,8 +325,8 @@ def safe_mean(x):
 
 def select_meta(a, meta_all):
     source = src.normalize_rel(a.source_rel)
-
     rows = []
+
     for m in meta_all:
         gt = src.normalize_rel(m["gt"])
         pred = src.normalize_rel(m["baseline_prediction"])
@@ -345,23 +347,24 @@ def select_meta(a, meta_all):
             f"include_nonsource_baseline={a.include_nonsource_baseline}"
         )
 
+    rows = sorted(rows, key=lambda z: int(z["sid"]))
+
     if a.max_samples > 0 and len(rows) > a.max_samples:
         rng = np.random.default_rng(a.seed)
-        keep_idx = sorted(
+        keep = sorted(
             rng.choice(
                 np.arange(len(rows)),
                 size=int(a.max_samples),
                 replace=False,
             ).tolist()
         )
-        rows = [rows[i] for i in keep_idx]
+        rows = [rows[i] for i in keep]
 
-    rows = sorted(rows, key=lambda z: int(z["sid"]))
     return rows
 
 
 # =============================================================================
-# Clean actual updates
+# Clean realized updates
 # =============================================================================
 
 def build_clean_updates(
@@ -371,7 +374,7 @@ def build_clean_updates(
     update_layers,
     exclude_target_layer,
 ):
-    rows = []
+    out = []
 
     for s in specs:
         p = int(s["real_position"])
@@ -402,7 +405,7 @@ def build_clean_updates(
                 - real_states[L - 1][0, p].astype(np.float32)
             )
 
-            rows.append(
+            out.append(
                 {
                     "update_layer": L,
                     "real_position": p,
@@ -414,11 +417,11 @@ def build_clean_updates(
                 }
             )
 
-    return rows
+    return out
 
 
 # =============================================================================
-# Candidate score gradients and per-relation effects
+# Four candidate gradients -> raw and centered relation effects
 # =============================================================================
 
 def compute_candidate_scores_and_grads(
@@ -434,7 +437,7 @@ def compute_candidate_scores_and_grads(
     grads = {}
 
     for r in REL:
-        s, g = upd.sequence_score_and_grads(
+        score, grad = upd.sequence_score_and_grads(
             model=model,
             decoder_layers=decoder_layers,
             batch=batch,
@@ -442,8 +445,8 @@ def compute_candidate_scores_and_grads(
             reduction=reduction,
             grad_layers=grad_layers,
         )
-        scores[r] = float(s)
-        grads[r] = g
+        scores[r] = float(score)
+        grads[r] = grad
 
     return scores, grads
 
@@ -456,19 +459,20 @@ def attach_relation_effects(
     threshold,
 ):
     """
-    For every actual clean update a, compute:
+    For each clean update a:
 
-        q_r = a dot grad S_r             for all r
+        q_r = a . grad S_r
 
-    Also compute the optional margin-control quantity:
+        q_common = mean_r q_r
 
-        m_r = q_r - q_best_other(r)
+        centered_q_r = q_r - q_common
+                     = a . (grad S_r - mean_k grad S_k)
 
-    No source/GT relation is used in q_r.
+    The second equality is exact by linearity.
     """
     out = []
 
-    competitors = {
+    best_other = {
         r: max(
             (rr for rr in REL if rr != r),
             key=lambda rr: scores[rr],
@@ -489,49 +493,83 @@ def attach_relation_effects(
             if gr is None or not (0 <= p < gr.shape[1]):
                 valid = False
                 break
-
-            v = gr[0, p].astype(np.float32)
-            q[r] = float(np.dot(a_real, v))
+            q[r] = float(
+                np.dot(
+                    a_real,
+                    gr[0, p].astype(np.float32),
+                )
+            )
 
         if not valid:
             continue
 
+        q_values = np.asarray([q[r] for r in REL], dtype=np.float64)
+        q_common = float(q_values.mean())
+        centered = {
+            r: float(q[r] - q_common)
+            for r in REL
+        }
+
+        raw_abs_mean = float(np.mean(np.abs(q_values)))
+        centered_abs_mean = float(
+            np.mean(np.abs([centered[r] for r in REL]))
+        )
+
         z = dict(e)
+        z["q_common"] = q_common
+        z["raw_abs_mean_across_relations"] = raw_abs_mean
+        z["centered_abs_mean_across_relations"] = centered_abs_mean
+        z["common_abs_over_raw_abs_mean"] = (
+            abs(q_common) / max(raw_abs_mean, EPS)
+        )
+        z["common_abs_over_centered_abs_mean"] = (
+            abs(q_common) / max(centered_abs_mean, EPS)
+        )
+        z["raw_relation_std"] = float(np.std(q_values))
+        z["raw_relation_range"] = float(np.max(q_values) - np.min(q_values))
 
         for r in REL:
-            comp = competitors[r]
-            margin_b = float(q[r] - q[comp])
+            qr = float(q[r])
+            cr = float(centered[r])
+            comp = best_other[r]
 
-            z[f"q_{r}"] = float(q[r])
-            z[f"sign_{r}"] = int(
-                1 if q[r] > threshold
-                else -1 if q[r] < -threshold
+            z[f"q_{r}"] = qr
+            z[f"raw_sign_{r}"] = int(
+                1 if qr > threshold
+                else -1 if qr < -threshold
                 else 0
             )
+
+            z[f"centered_q_{r}"] = cr
+            z[f"centered_sign_{r}"] = int(
+                1 if cr > threshold
+                else -1 if cr < -threshold
+                else 0
+            )
+
             z[f"best_other_{r}"] = comp
-            z[f"margin_B_{r}"] = margin_b
-            z[f"margin_sign_{r}"] = int(
-                1 if margin_b > threshold
-                else -1 if margin_b < -threshold
-                else 0
-            )
+            z[f"margin_B_{r}"] = float(qr - q[comp])
 
+        # Numerical check: centered effects must sum to ~0.
+        z["centered_sum_check"] = float(
+            sum(centered[r] for r in REL)
+        )
         z["real_update_norm"] = float(np.linalg.norm(a_real))
         out.append(z)
 
     return out
 
 
-def polarity_value(e, target: str, mode: str) -> float:
-    if mode == "target_score":
+def effect_value(e, target: str, mode: str) -> float:
+    if mode == "centered":
+        return float(e[f"centered_q_{target}"])
+    if mode == "raw":
         return float(e[f"q_{target}"])
-    if mode == "target_margin":
-        return float(e[f"margin_B_{target}"])
     raise ValueError(mode)
 
 
 # =============================================================================
-# Patch construction
+# Signed-gating patch maps
 # =============================================================================
 
 def build_signed_patch(
@@ -543,9 +581,8 @@ def build_signed_patch(
     scale,
     threshold,
 ):
-    pmap = {}
     allowed = set(map(int, layers))
-
+    pmap = {}
     counts = {
         "n_positive": 0,
         "n_negative": 0,
@@ -558,7 +595,7 @@ def build_signed_patch(
         if L not in allowed:
             continue
 
-        b = polarity_value(e, target, mode)
+        b = effect_value(e, target, mode)
         a_real = np.asarray(e["_real_update"], np.float32)
 
         vec = None
@@ -583,24 +620,27 @@ def build_signed_patch(
     return pmap, counts
 
 
-def build_shuffled_sign_patch(
+def build_shuffled_centered_patch(
     entries,
     *,
     target,
-    mode,
     layers,
     scale,
     threshold,
     rng,
 ):
     """
-    Preserve the exact number of + / - / 0 signs in each layer, but randomly
-    assign those signs to update vectors in that layer.
+    Preserve + / - / 0 centered-sign counts independently in each layer,
+    but randomly reassign the signs to updates in that layer.
     """
-    pmap = {}
     allowed = set(map(int, layers))
-
-    total_pos = total_neg = total_neu = total_patched = 0
+    pmap = {}
+    counts = {
+        "n_positive": 0,
+        "n_negative": 0,
+        "n_neutral": 0,
+        "n_patched": 0,
+    }
 
     for L in sorted(allowed):
         rows = [
@@ -612,30 +652,29 @@ def build_shuffled_sign_patch(
 
         signs = []
         for e in rows:
-            b = polarity_value(e, target, mode)
-            if b > threshold:
-                signs.append(1)
-            elif b < -threshold:
-                signs.append(-1)
-            else:
-                signs.append(0)
+            b = float(e[f"centered_q_{target}"])
+            signs.append(
+                1 if b > threshold
+                else -1 if b < -threshold
+                else 0
+            )
 
         signs = np.asarray(signs, dtype=np.int8)
         rng.shuffle(signs)
 
         for e, sgn in zip(rows, signs.tolist()):
             if sgn > 0:
-                total_pos += 1
+                counts["n_positive"] += 1
                 vec = float(scale) * np.asarray(
                     e["_real_update"], np.float32
                 )
             elif sgn < 0:
-                total_neg += 1
+                counts["n_negative"] += 1
                 vec = -float(scale) * np.asarray(
                     e["_real_update"], np.float32
                 )
             else:
-                total_neu += 1
+                counts["n_neutral"] += 1
                 vec = None
 
             if vec is not None:
@@ -645,42 +684,14 @@ def build_shuffled_sign_patch(
                     int(e["real_position"]),
                     vec,
                 )
-                total_patched += 1
+                counts["n_patched"] += 1
 
-    return pmap, {
-        "n_positive": total_pos,
-        "n_negative": total_neg,
-        "n_neutral": total_neu,
-        "n_patched": total_patched,
-    }
+    return pmap, counts
 
 
 # =============================================================================
-# Generation / score evaluation
+# Evaluate an intervention
 # =============================================================================
-
-def relation_margin_with_patch(
-    *,
-    model,
-    decoder_layers,
-    batch,
-    candidate_ids,
-    reduction,
-    target,
-    competitor,
-    patch_map,
-):
-    return upd.sequence_margin_with_patch(
-        model=model,
-        decoder_layers=decoder_layers,
-        batch=batch,
-        candidate_ids=candidate_ids,
-        reduction=reduction,
-        gt=target,
-        competitor=competitor,
-        patch_map=patch_map,
-    )
-
 
 def evaluate_patch(
     *,
@@ -708,13 +719,13 @@ def evaluate_patch(
 
     margin = float("nan")
     if score_margin:
-        margin = relation_margin_with_patch(
+        margin = upd.sequence_margin_with_patch(
             model=model,
             decoder_layers=decoder_layers,
             batch=batch,
             candidate_ids=candidate_ids,
             reduction=reduction,
-            target=target,
+            gt=target,
             competitor=competitor,
             patch_map=patch_map,
         )
@@ -728,19 +739,26 @@ def evaluate_patch(
 
 
 # =============================================================================
-# Diagnostics: are relation effects actually opposites?
+# Diagnostics / summaries
 # =============================================================================
 
-def relation_pair_summary(update_df: pd.DataFrame) -> pd.DataFrame:
+def relation_pair_summary(
+    update_df: pd.DataFrame,
+    *,
+    prefix: str,
+    label: str,
+) -> pd.DataFrame:
     rows = []
 
     for i, r1 in enumerate(REL):
         for r2 in REL[i + 1:]:
             x = pd.to_numeric(
-                update_df[f"q_{r1}"], errors="coerce"
+                update_df[f"{prefix}{r1}"],
+                errors="coerce",
             ).to_numpy(float)
             y = pd.to_numeric(
-                update_df[f"q_{r2}"], errors="coerce"
+                update_df[f"{prefix}{r2}"],
+                errors="coerce",
             ).to_numpy(float)
 
             good = np.isfinite(x) & np.isfinite(y)
@@ -762,12 +780,17 @@ def relation_pair_summary(update_df: pd.DataFrame) -> pd.DataFrame:
 
             rows.append(
                 {
+                    "effect_space": label,
                     "relation_1": r1,
                     "relation_2": r2,
                     "N_updates": int(len(x)),
-                    "pearson_q": pearson,
-                    "same_sign_fraction": float(np.mean(sx == sy)),
-                    "opposite_sign_fraction": float(np.mean(sx == -sy)),
+                    "pearson": pearson,
+                    "same_sign_fraction": float(
+                        np.mean(sx == sy)
+                    ),
+                    "opposite_sign_fraction": float(
+                        np.mean(sx == -sy)
+                    ),
                     "both_positive_fraction": float(
                         np.mean((sx > 0) & (sy > 0))
                     ),
@@ -786,13 +809,111 @@ def relation_pair_summary(update_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# =============================================================================
-# Summaries
-# =============================================================================
+def common_mode_by_layer(update_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+
+    for L, g in update_df.groupby(
+        "update_layer",
+        sort=True,
+    ):
+        q = g[[f"q_{r}" for r in REL]].to_numpy(float)
+        c = g[[f"centered_q_{r}" for r in REL]].to_numpy(float)
+
+        raw_sign = np.sign(q)
+        all_same_nonzero = (
+            (np.all(raw_sign > 0, axis=1))
+            | (np.all(raw_sign < 0, axis=1))
+        )
+
+        rows.append(
+            {
+                "update_layer": int(L),
+                "N_updates": int(len(g)),
+                "mean_abs_q_common": float(
+                    np.mean(np.abs(g["q_common"].to_numpy(float)))
+                ),
+                "mean_raw_abs_across_relations": float(
+                    np.mean(np.abs(q))
+                ),
+                "mean_centered_abs_across_relations": float(
+                    np.mean(np.abs(c))
+                ),
+                "mean_common_abs_over_raw_abs_mean": safe_mean(
+                    g["common_abs_over_raw_abs_mean"]
+                ),
+                "mean_common_abs_over_centered_abs_mean": safe_mean(
+                    g["common_abs_over_centered_abs_mean"]
+                ),
+                "raw_all4_same_sign_fraction": float(
+                    np.mean(all_same_nonzero)
+                ),
+                "mean_relation_std_raw": float(
+                    np.mean(np.std(q, axis=1))
+                ),
+                "mean_relation_range_raw": float(
+                    np.mean(np.max(q, axis=1) - np.min(q, axis=1))
+                ),
+                "max_abs_centered_sum_check": float(
+                    np.max(
+                        np.abs(
+                            g["centered_sum_check"].to_numpy(float)
+                        )
+                    )
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def polarity_by_layer(
+    update_df: pd.DataFrame,
+    targets,
+    threshold,
+) -> pd.DataFrame:
+    rows = []
+
+    for target in targets:
+        for mode, col in (
+            ("raw", f"q_{target}"),
+            ("centered", f"centered_q_{target}"),
+        ):
+            for L, g in update_df.groupby(
+                "update_layer",
+                sort=True,
+            ):
+                x = pd.to_numeric(
+                    g[col],
+                    errors="coerce",
+                ).to_numpy(float)
+                x = x[np.isfinite(x)]
+                if len(x) == 0:
+                    continue
+
+                rows.append(
+                    {
+                        "pseudo_target": target,
+                        "mode": mode,
+                        "update_layer": int(L),
+                        "N_updates": int(len(x)),
+                        "positive_fraction": float(
+                            np.mean(x > threshold)
+                        ),
+                        "negative_fraction": float(
+                            np.mean(x < -threshold)
+                        ),
+                        "mean_effect": float(np.mean(x)),
+                        "mean_abs_effect": float(
+                            np.mean(np.abs(x))
+                        ),
+                    }
+                )
+
+    return pd.DataFrame(rows)
+
 
 def generation_summary(gdf: pd.DataFrame) -> pd.DataFrame:
     rows = []
-
     group_cols = [
         "condition",
         "pseudo_target",
@@ -819,11 +940,20 @@ def generation_summary(gdf: pd.DataFrame) -> pd.DataFrame:
                 g["pseudo_target_hit"].mean()
             ),
             "changed_from_baseline_rate": float(
-                (g["prediction"] != g["baseline_prediction"]).mean()
+                (
+                    g["prediction"]
+                    != g["baseline_prediction"]
+                ).mean()
             ),
-            "mean_n_positive": safe_mean(g["n_positive"]),
-            "mean_n_negative": safe_mean(g["n_negative"]),
-            "mean_n_patched": safe_mean(g["n_patched"]),
+            "mean_n_positive": safe_mean(
+                g["n_positive"]
+            ),
+            "mean_n_negative": safe_mean(
+                g["n_negative"]
+            ),
+            "mean_n_patched": safe_mean(
+                g["n_patched"]
+            ),
             "mean_pseudo_target_margin": safe_mean(
                 g["pseudo_target_margin"]
             ),
@@ -837,26 +967,6 @@ def generation_summary(gdf: pd.DataFrame) -> pd.DataFrame:
         rows.append(row)
 
     return pd.DataFrame(rows)
-
-
-def controllability_matrix(gsum: pd.DataFrame) -> pd.DataFrame:
-    """
-    Wide relation-distribution matrix for all-layer signed gating.
-    """
-    x = gsum[
-        gsum["condition"] == "pseudo_signed_all"
-    ].copy()
-
-    keep = [
-        "pseudo_target",
-        "scale",
-        "N",
-        "pseudo_target_hit_rate",
-        *[f"pred_{r}_fraction" for r in REL],
-    ]
-    return x[keep].sort_values(
-        ["scale", "pseudo_target"]
-    ).reset_index(drop=True)
 
 
 # =============================================================================
@@ -874,6 +984,9 @@ def main():
     targets = parse_targets(a.pseudo_targets)
     update_layers = src.parse_layers(a.update_layers)
     scales = parse_scales(a.scales)
+
+    if not update_layers:
+        raise ValueError("No update layers.")
 
     outdir = Path(a.output_dir)
     ensure_outdir(outdir, a.overwrite)
@@ -898,9 +1011,10 @@ def main():
     )
     meta = select_meta(a, meta_all)
 
-    model = processor = None
     generation_rows = []
     update_rows = []
+
+    model = processor = None
 
     try:
         (
@@ -941,36 +1055,29 @@ def main():
         if reduction not in ("mean", "sum"):
             reduction = "mean"
 
+        device = torch.device(a.device)
+
         print("=" * 190)
-        print("PSEUDO-GT RELATION-CONDITIONED SIGNED GATING")
+        print("PSEUDO-GT CENTERED RELATION SIGNED GATING")
         print("=" * 190)
         print(f"model={a.model} repo={spec.repo_id}")
-        print(f"source cohort GT={source}")
+        print(f"true source cohort={source}")
         print(f"pseudo targets={targets}")
         print(f"N samples={len(meta)}")
         print(f"update_layers={update_layers}")
-        print(f"polarity_mode={a.polarity_mode}")
         print(f"scales={scales}")
+        print(f"run_raw_control={a.run_raw_control}")
         print(
-            "cohort filter="
-            + (
-                "GT=source AND baseline_generation=source"
-                if not a.include_nonsource_baseline
-                else "GT=source only"
-            )
+            "CENTERED definition: centered_q_r = q_r - mean(q_left,q_right,q_above,q_below)"
+        )
+        print(
+            "                    = a dot [grad S_r - mean_k grad S_k]"
         )
         print()
-        print(
-            "PRIMARY target_score definition: "
-            "B_r = a_real dot grad(S_r); no source/LEFT score enters the sign."
-        )
-        print()
-
-        device = torch.device(a.device)
 
         for m in tqdm(
             meta,
-            desc=f"GT={source} PSEUDO={','.join(targets)}",
+            desc=f"GT={source} CENTERED PSEUDO={','.join(targets)}",
         ):
             sid = int(m["sid"])
             if sid not in selected_by_sid:
@@ -992,7 +1099,6 @@ def main():
                     device=device,
                 )
 
-                # Self-contained baseline generation.
                 base_text = src.base.generate_text(
                     model,
                     processor,
@@ -1006,7 +1112,6 @@ def main():
                     )
                 )
 
-                # Clean realized block updates.
                 real_states = upd.capture_prompt_blocks(
                     model,
                     decoder_layers,
@@ -1037,8 +1142,6 @@ def main():
                     )
                 )
 
-                # Four candidate gradients once. This lets us ask whether
-                # LEFT/RIGHT are actually opposite without assuming it.
                 scores, grads = compute_candidate_scores_and_grads(
                     model=model,
                     decoder_layers=decoder_layers,
@@ -1058,10 +1161,9 @@ def main():
                 )
                 if not scored:
                     raise RuntimeError(
-                        "No update received relation effects."
+                        "No update received candidate gradients."
                     )
 
-                # Save one WIDE row per update with q for all four relations.
                 for e in scored:
                     row = {
                         "sid": sid,
@@ -1084,6 +1186,30 @@ def main():
                         "real_update_norm": float(
                             e["real_update_norm"]
                         ),
+                        "q_common": float(
+                            e["q_common"]
+                        ),
+                        "raw_abs_mean_across_relations": float(
+                            e["raw_abs_mean_across_relations"]
+                        ),
+                        "centered_abs_mean_across_relations": float(
+                            e["centered_abs_mean_across_relations"]
+                        ),
+                        "common_abs_over_raw_abs_mean": float(
+                            e["common_abs_over_raw_abs_mean"]
+                        ),
+                        "common_abs_over_centered_abs_mean": float(
+                            e["common_abs_over_centered_abs_mean"]
+                        ),
+                        "raw_relation_std": float(
+                            e["raw_relation_std"]
+                        ),
+                        "raw_relation_range": float(
+                            e["raw_relation_range"]
+                        ),
+                        "centered_sum_check": float(
+                            e["centered_sum_check"]
+                        ),
                     }
 
                     for r in REL:
@@ -1093,17 +1219,20 @@ def main():
                         row[f"q_{r}"] = float(
                             e[f"q_{r}"]
                         )
-                        row[f"sign_{r}"] = int(
-                            e[f"sign_{r}"]
+                        row[f"raw_sign_{r}"] = int(
+                            e[f"raw_sign_{r}"]
+                        )
+                        row[f"centered_q_{r}"] = float(
+                            e[f"centered_q_{r}"]
+                        )
+                        row[f"centered_sign_{r}"] = int(
+                            e[f"centered_sign_{r}"]
                         )
                         row[f"best_other_{r}"] = str(
                             e[f"best_other_{r}"]
                         )
                         row[f"margin_B_{r}"] = float(
                             e[f"margin_B_{r}"]
-                        )
-                        row[f"margin_sign_{r}"] = int(
-                            e[f"margin_sign_{r}"]
                         )
 
                     update_rows.append(row)
@@ -1115,17 +1244,14 @@ def main():
                     )
                 )
 
-                # -------------------------------------------------------------
-                # Baseline rows for each pseudo target.
-                # -------------------------------------------------------------
+                # Baseline rows.
                 for target in targets:
-                    comp = str(
+                    competitor = str(
                         scored[0][f"best_other_{target}"]
                     )
                     clean_margin = float(
-                        scores[target] - scores[comp]
+                        scores[target] - scores[competitor]
                     )
-
                     generation_rows.append(
                         {
                             "sid": sid,
@@ -1133,7 +1259,6 @@ def main():
                             "baseline_prediction": base_pred,
                             "condition": "baseline",
                             "pseudo_target": target,
-                            "polarity_mode": a.polarity_mode,
                             "scale": 0.0,
                             "intervention_layer": np.nan,
                             "shuffle_repeat": np.nan,
@@ -1150,28 +1275,25 @@ def main():
                         }
                     )
 
-                # -------------------------------------------------------------
-                # Pseudo-target-conditioned interventions.
-                # -------------------------------------------------------------
+                # Target-conditioned interventions.
                 for target in targets:
                     competitor = str(
                         scored[0][f"best_other_{target}"]
                     )
 
                     for scale in scales:
-                        # All-layer signed gating.
                         if a.all_layers:
+                            # CENTERED primary.
                             pmap, counts = build_signed_patch(
                                 scored,
                                 target=target,
-                                mode=a.polarity_mode,
+                                mode="centered",
                                 layers=available_layers,
                                 scale=float(scale),
                                 threshold=float(
                                     a.decision_threshold
                                 ),
                             )
-
                             res = evaluate_patch(
                                 model=model,
                                 processor=processor,
@@ -1189,15 +1311,13 @@ def main():
                                     a.score_margins
                                 ),
                             )
-
                             generation_rows.append(
                                 {
                                     "sid": sid,
                                     "true_gt": source,
                                     "baseline_prediction": base_pred,
-                                    "condition": "pseudo_signed_all",
+                                    "condition": "centered_signed_all",
                                     "pseudo_target": target,
-                                    "polarity_mode": a.polarity_mode,
                                     "scale": float(scale),
                                     "intervention_layer": np.nan,
                                     "shuffle_repeat": np.nan,
@@ -1206,8 +1326,51 @@ def main():
                                 }
                             )
 
-                            # Sign-shuffle control, preserving sign counts
-                            # independently within each layer.
+                            # RAW same-cohort control.
+                            if a.run_raw_control:
+                                rpmap, rcounts = build_signed_patch(
+                                    scored,
+                                    target=target,
+                                    mode="raw",
+                                    layers=available_layers,
+                                    scale=float(scale),
+                                    threshold=float(
+                                        a.decision_threshold
+                                    ),
+                                )
+                                rres = evaluate_patch(
+                                    model=model,
+                                    processor=processor,
+                                    decoder_layers=decoder_layers,
+                                    batch=rb,
+                                    patch_map=rpmap,
+                                    candidate_ids=candidate_ids,
+                                    reduction=reduction,
+                                    target=target,
+                                    competitor=competitor,
+                                    max_new_tokens=int(
+                                        a.max_new_tokens
+                                    ),
+                                    score_margin=bool(
+                                        a.score_margins
+                                    ),
+                                )
+                                generation_rows.append(
+                                    {
+                                        "sid": sid,
+                                        "true_gt": source,
+                                        "baseline_prediction": base_pred,
+                                        "condition": "raw_signed_all",
+                                        "pseudo_target": target,
+                                        "scale": float(scale),
+                                        "intervention_layer": np.nan,
+                                        "shuffle_repeat": np.nan,
+                                        **rres,
+                                        **rcounts,
+                                    }
+                                )
+
+                            # CENTERED sign-shuffle control.
                             if a.shuffle_control:
                                 for rr in range(
                                     int(a.shuffle_repeats)
@@ -1218,11 +1381,10 @@ def main():
                                         + 101 * REL.index(target)
                                         + 17 * rr
                                     )
-                                    rpmap, rcounts = (
-                                        build_shuffled_sign_patch(
+                                    spmap, scounts = (
+                                        build_shuffled_centered_patch(
                                             scored,
                                             target=target,
-                                            mode=a.polarity_mode,
                                             layers=available_layers,
                                             scale=float(scale),
                                             threshold=float(
@@ -1231,13 +1393,12 @@ def main():
                                             rng=rng,
                                         )
                                     )
-
-                                    rres = evaluate_patch(
+                                    sres = evaluate_patch(
                                         model=model,
                                         processor=processor,
                                         decoder_layers=decoder_layers,
                                         batch=rb,
-                                        patch_map=rpmap,
+                                        patch_map=spmap,
                                         candidate_ids=candidate_ids,
                                         reduction=reduction,
                                         target=target,
@@ -1249,37 +1410,34 @@ def main():
                                             a.score_margins
                                         ),
                                     )
-
                                     generation_rows.append(
                                         {
                                             "sid": sid,
                                             "true_gt": source,
                                             "baseline_prediction": base_pred,
-                                            "condition": "sign_shuffle_all",
+                                            "condition": "centered_sign_shuffle_all",
                                             "pseudo_target": target,
-                                            "polarity_mode": a.polarity_mode,
                                             "scale": float(scale),
                                             "intervention_layer": np.nan,
                                             "shuffle_repeat": int(rr),
-                                            **rres,
-                                            **rcounts,
+                                            **sres,
+                                            **scounts,
                                         }
                                     )
 
-                        # One layer at a time.
+                        # CENTERED one layer at a time.
                         if a.single_layer:
                             for L in available_layers:
                                 pmap, counts = build_signed_patch(
                                     scored,
                                     target=target,
-                                    mode=a.polarity_mode,
+                                    mode="centered",
                                     layers=[L],
                                     scale=float(scale),
                                     threshold=float(
                                         a.decision_threshold
                                     ),
                                 )
-
                                 res = evaluate_patch(
                                     model=model,
                                     processor=processor,
@@ -1297,15 +1455,13 @@ def main():
                                         a.score_margins
                                     ),
                                 )
-
                                 generation_rows.append(
                                     {
                                         "sid": sid,
                                         "true_gt": source,
                                         "baseline_prediction": base_pred,
-                                        "condition": "pseudo_signed_single",
+                                        "condition": "centered_signed_single",
                                         "pseudo_target": target,
-                                        "polarity_mode": a.polarity_mode,
                                         "scale": float(scale),
                                         "intervention_layer": int(L),
                                         "shuffle_repeat": np.nan,
@@ -1352,11 +1508,11 @@ def main():
 
     if not update_rows:
         raise RuntimeError(
-            "No per-update relation effects were produced."
+            "No per-update relation effects produced."
         )
     if not generation_rows:
         raise RuntimeError(
-            "No generation results were produced."
+            "No generation results produced."
         )
 
     udf = pd.DataFrame(update_rows)
@@ -1371,9 +1527,38 @@ def main():
         index=False,
     )
 
-    pair_df = relation_pair_summary(udf)
-    pair_df.to_csv(
-        outdir / "relation_effect_pair_summary.csv",
+    common_df = common_mode_by_layer(udf)
+    common_df.to_csv(
+        outdir / "common_mode_by_layer.csv",
+        index=False,
+    )
+
+    raw_pairs = relation_pair_summary(
+        udf,
+        prefix="q_",
+        label="raw",
+    )
+    centered_pairs = relation_pair_summary(
+        udf,
+        prefix="centered_q_",
+        label="centered",
+    )
+    raw_pairs.to_csv(
+        outdir / "relation_pair_summary_raw.csv",
+        index=False,
+    )
+    centered_pairs.to_csv(
+        outdir / "relation_pair_summary_centered.csv",
+        index=False,
+    )
+
+    pol_df = polarity_by_layer(
+        udf,
+        targets,
+        float(a.decision_threshold),
+    )
+    pol_df.to_csv(
+        outdir / "pseudo_polarity_by_layer.csv",
         index=False,
     )
 
@@ -1383,124 +1568,97 @@ def main():
         index=False,
     )
 
-    cm = controllability_matrix(gsum)
-    cm.to_csv(
-        outdir / "controllability_matrix.csv",
+    all_compare = gsum[
+        gsum["condition"].isin(
+            [
+                "baseline",
+                "raw_signed_all",
+                "centered_signed_all",
+                "centered_sign_shuffle_all",
+            ]
+        )
+    ].copy()
+    all_compare.to_csv(
+        outdir / "all_layer_comparison.csv",
+        index=False,
+    )
+
+    centered_matrix = gsum[
+        gsum["condition"] == "centered_signed_all"
+    ][
+        [
+            "pseudo_target",
+            "scale",
+            "N",
+            "pseudo_target_hit_rate",
+            "pred_left_fraction",
+            "pred_right_fraction",
+            "pred_above_fraction",
+            "pred_below_fraction",
+        ]
+    ].copy()
+    centered_matrix.to_csv(
+        outdir / "controllability_matrix_centered.csv",
         index=False,
     )
 
     single = gsum[
-        gsum["condition"] == "pseudo_signed_single"
+        gsum["condition"] == "centered_signed_single"
     ].copy()
     single.to_csv(
-        outdir / "single_layer_summary.csv",
+        outdir / "single_layer_centered_summary.csv",
         index=False,
     )
 
-    # Per-layer polarity composition for every pseudo target.
-    layer_rows = []
-    for target in targets:
-        col = (
-            f"q_{target}"
-            if a.polarity_mode == "target_score"
-            else f"margin_B_{target}"
-        )
-
-        for L, g in udf.groupby(
-            "update_layer",
-            sort=True,
-        ):
-            x = pd.to_numeric(
-                g[col],
-                errors="coerce",
-            ).to_numpy(float)
-            x = x[np.isfinite(x)]
-            if len(x) == 0:
-                continue
-
-            layer_rows.append(
-                {
-                    "pseudo_target": target,
-                    "polarity_mode": a.polarity_mode,
-                    "update_layer": int(L),
-                    "N_updates": int(len(x)),
-                    "positive_fraction": float(
-                        np.mean(
-                            x > a.decision_threshold
-                        )
-                    ),
-                    "negative_fraction": float(
-                        np.mean(
-                            x < -a.decision_threshold
-                        )
-                    ),
-                    "mean_effect": float(
-                        np.mean(x)
-                    ),
-                    "mean_abs_effect": float(
-                        np.mean(np.abs(x))
-                    ),
-                }
-            )
-
-    layer_polarity = pd.DataFrame(layer_rows)
-    layer_polarity.to_csv(
-        outdir / "pseudo_polarity_by_layer.csv",
-        index=False,
-    )
-
-    # Report.
     report = [
         "=" * 190,
-        "PSEUDO-GT RELATION-CONDITIONED SIGNED GATING",
+        "PSEUDO-GT CENTERED RELATION SIGNED GATING",
         "=" * 190,
         f"true source cohort={source}",
         f"pseudo targets={targets}",
         f"N samples={gdf['sid'].nunique()}",
         f"update_layers={update_layers}",
-        f"polarity_mode={a.polarity_mode}",
         f"scales={scales}",
         "",
-        "A. RELATION EFFECT PAIRS ON THE SAME CLEAN UPDATES",
+        "A. COMMON-MODE MAGNITUDE BY LAYER",
         "-" * 190,
-        (
-            pair_df.to_string(
-                index=False,
-                float_format=lambda x: f"{x:.4f}",
-            )
-            if len(pair_df)
-            else "EMPTY"
+        common_df.to_string(
+            index=False,
+            float_format=lambda x: f"{x:.4f}",
         ),
         "",
-        "Interpretation of A:",
-        "  q_r = a_real dot grad(S_r).",
-        "  same_sign and both_positive can be nonzero: relation effects are NOT",
-        "  assumed to be mutually opposite. LEFT/RIGHT opposition is an empirical",
-        "  question here, not a construction.",
-        "",
-        "B. PSEUDO-TARGET POLARITY BY LAYER",
+        "B. RAW RELATION EFFECT PAIRS",
         "-" * 190,
-        (
-            layer_polarity.to_string(
-                index=False,
-                float_format=lambda x: f"{x:.4f}",
-            )
-            if len(layer_polarity)
-            else "EMPTY"
+        raw_pairs.to_string(
+            index=False,
+            float_format=lambda x: f"{x:.4f}",
         ),
         "",
-        "C. ALL-LAYER CONTROLLABILITY MATRIX",
+        "C. CENTERED RELATION EFFECT PAIRS",
         "-" * 190,
-        (
-            cm.to_string(
-                index=False,
-                float_format=lambda x: f"{x:.4f}",
-            )
-            if len(cm)
-            else "EMPTY"
+        centered_pairs.to_string(
+            index=False,
+            float_format=lambda x: f"{x:.4f}",
         ),
         "",
-        "D. SINGLE-LAYER PSEUDO-TARGET SIGNED GATING",
+        "NOTE: centered effects sum to zero by construction; pairwise sign",
+        "differences after centering are NOT causal evidence by themselves.",
+        "",
+        "D. RAW vs CENTERED vs SHUFFLE — ALL LAYERS",
+        "-" * 190,
+        all_compare.to_string(
+            index=False,
+            float_format=lambda x: f"{x:.4f}",
+        ),
+        "",
+        "E. CENTERED CONTROLLABILITY MATRIX",
+        "-" * 190,
+        centered_matrix.to_string(
+            index=False,
+            float_format=lambda x: f"{x:.4f}",
+        ),
+        "",
+        "F. CENTERED SINGLE-LAYER GATING",
         "-" * 190,
         (
             single.to_string(
@@ -1511,22 +1669,20 @@ def main():
             else "DISABLED / EMPTY"
         ),
         "",
-        "What would be strong evidence:",
-        "  1) On the SAME original cohort and SAME clean updates, changing only the",
-        "     pseudo target changes the +/- assignment substantially.",
-        "  2) Signed gating using pseudo target RIGHT increases RIGHT generation;",
-        "     pseudo target ABOVE increases ABOVE generation; etc.",
-        "  3) Target-specific gating is much stronger than sign_shuffle_all, which",
-        "     preserves how many + and - updates exist but destroys which update",
-        "     receives which sign.",
-        "  4) A layer-specific target effect localizes where relation-conditioned",
-        "     utilization has causal leverage.",
+        "What would support a relation-specific utilization interpretation:",
+        "  1) centered_signed_all drives the chosen pseudo target substantially",
+        "     more than raw_signed_all and centered_sign_shuffle_all;",
+        "  2) with pseudo-targets=all, RIGHT gating preferentially raises RIGHT,",
+        "     ABOVE gating preferentially raises ABOVE, etc.;",
+        "  3) the effect localizes to specific layers under centered_signed_single.",
+        "",
+        "What would weaken the hypothesis:",
+        "  centered gating mainly destroys the original answer, produces arbitrary",
+        "  other relations, or is no better than sign shuffle.",
         "",
         "Caveat:",
-        "  grad(S_r) is still an oracle-chosen candidate score direction used for",
-        "  mechanism diagnosis. This experiment tests whether update polarity is",
-        "  relation-conditioned and causally steerable; it does not yet provide a",
-        "  training-free non-oracle selector.",
+        "  Candidate identity is still chosen externally and the prior causal-token",
+        "  scaffold is oracle-derived. This is a mechanism test, not non-oracle repair.",
     ]
 
     report_text = "\n".join(report) + "\n"
@@ -1537,41 +1693,37 @@ def main():
     )
 
     metadata = {
-        "script": "eval_pseudogt_relation_signed_gating_v1.py",
+        "script": "eval_pseudogt_centered_relation_signed_gating_v1.py",
         "model": a.model,
         "real_update_dir": str(run_dir),
         "true_source_relation": source,
         "pseudo_targets": targets,
         "N_samples": int(gdf["sid"].nunique()),
         "update_layers": update_layers,
-        "polarity_mode": a.polarity_mode,
         "scales": scales,
         "decision_threshold": float(
             a.decision_threshold
         ),
-        "primary_definition": (
-            "q_r = a_real dot grad(S_r); target_score mode uses sign(q_r) "
-            "without subtracting source/GT relation score"
+        "raw_effect": "q_r = a_real dot grad(S_r)",
+        "common_mode": "q_common = mean_r q_r",
+        "centered_effect": (
+            "centered_q_r = q_r - q_common = "
+            "a_real dot (grad S_r - mean_k grad S_k)"
         ),
-        "margin_control_definition": (
-            "margin_B_r = q_r - q_best_other(r)"
+        "signed_gating": (
+            "positive -> +alpha*a_real; negative -> -alpha*a_real"
         ),
-        "signed_gating_definition": (
-            "positive -> add +alpha*a_real; "
-            "negative -> add -alpha*a_real"
-        ),
-        "require_baseline_source": (
-            not bool(a.include_nonsource_baseline)
-        ),
+        "run_raw_control": bool(a.run_raw_control),
+        "shuffle_control": bool(a.shuffle_control),
         "single_layer": bool(a.single_layer),
-        "all_layers": bool(a.all_layers),
-        "shuffle_control": bool(
-            a.shuffle_control
-        ),
-        "uses_pseudo_target_candidate_identity": True,
-        "uses_true_gt_in_polarity": False,
+        "uses_true_gt_in_centered_sign": False,
         "uses_true_gt_for_cohort_selection": True,
         "prior_causal_position_selection_is_oracle": True,
+        "important_centering_caveat": (
+            "sum_r centered_q_r = 0 by construction, so pairwise sign "
+            "separation after centering is partly mathematical; causal "
+            "generation target specificity is the primary evidence."
+        ),
     }
 
     (outdir / "metadata.json").write_text(
