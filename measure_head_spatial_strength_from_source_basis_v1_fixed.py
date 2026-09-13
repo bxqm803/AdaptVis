@@ -1,4 +1,4 @@
-
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
@@ -1207,3 +1207,17 @@ def main():
 
     finally:
         if model is not None:
+            try:
+                del model
+            except Exception:
+                pass
+        if processor is not None:
+            try:
+                del processor
+            except Exception:
+                pass
+        cleanup()
+
+
+if __name__ == "__main__":
+    main()
