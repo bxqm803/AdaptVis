@@ -1,98 +1,49 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-eval_qwen3b_synthetic_head_guided_spatial_control_v1.py
+eval_qwen3b_targetselected_head_spatial_control_all440_v2.py
 
-Qwen2.5-VL-3B / COCO_two: use a Synthetic-400 selected spatial attention head
-as the NON-ORACLE target for the old multi-layer residual spatial controller.
+Qwen2.5-VL-3B / COCO_two: learn the relation directions ONLY on
+Synthetic-400, transfer those frozen directions to every COCO attention head,
+select the COCO head with the highest transferred direction accuracy, and then
+use that head prediction to drive the mid-layer residual H/V spatial controller.
 
-Main question
-=============
-The previous oracle controller showed that editing ONLY the mid-layer
-subject/reference spatial H/V subspace (L20-26) can drive actual generation
-from ~66% to ~95% on an N=80 diagnostic subset.  That experiment used the
-COCO ground-truth relation as the optimization target.
-
-This script changes only the target selection:
+This is the exact diagnostic requested here:
 
     Synthetic-400
-        -> choose the best direction head using SOURCE accuracy only
-        -> refit that head's four frozen relation directions on all Synthetic-400
+        -> fit a frozen L/R/A/B direction code for EVERY head
 
-    COCO image
-        -> selected head predicts r_hat in {left,right,above,below}
-        -> replace oracle GT target by r_hat
-        -> optimize ONLY the L20-26 residual spatial H/V coordinates
-        -> continue the original network and call model.generate()
+    COCO (all target samples)
+        -> apply those frozen Synthetic directions to EVERY head
+        -> use COCO GT only to choose the best transferred head
+        -> selected head predicts r_hat for each sample
 
-So the main condition is:
+    Synthetic-400 residual states
+        -> define the L20-26 residual H/V control geometry
 
-    spatial head (READ) -> residual spatial controller (WRITE) -> generation
+    COCO generation
+        -> use r_hat as the target of the H/V controller
+        -> edit ONLY subject/reference residual spatial coordinates
+        -> continue the original model and call model.generate()
 
-No COCO GT is used to select the head or choose the intervention target.
-COCO GT is used only for evaluation metrics.  For a strict source-only method,
-use --geometry-mode synthetic_source.  The default --geometry-mode coco_calib
-reuses the old controller's COCO-calibrated H/V geometry, which is useful for
-an apples-to-apples mechanistic diagnostic but is not fully target-label-free.
+Thus the spatial DIRECTIONS and residual H/V GEOMETRY are source-only, but the
+HEAD ID is target-supervised.  This is intentionally a diagnostic / oracle head
+selection experiment, not a fully label-free method.  Per-sample intervention
+routing in `head` mode does NOT use COCO GT after the head has been selected.
 
-Head selection
-==============
-Default is source_cv: stratified K-fold CV entirely within Synthetic-400.
-The head with the highest Synthetic CV accuracy is chosen, then its codebook is
-refit on all 400 synthetic samples before COCO inference.
+Default run is the requested all-440 experiment:
 
-Use --head-select-mode source_self to reproduce the simpler "highest Synthetic
-self-accuracy" rule.  That rule uses the same source points to fit and rank the
-prototype code, so source_cv is cleaner for a paper.
-
-Controller profiles
-===================
-old:
-    step=0.75, max_steps=20, max_total_natural=12
-    approximately the previous bounded controller.
-
-wide:
-    step=1.50, max_steps=60, max_total_natural=0 (NO global cap)
-    no per-layer cap; backtracking still requires real objective improvement.
-
-verywide:
-    step=3.00, max_steps=80, max_total_natural=0
-    stronger diagnostic upper bound.
-
-The optimizer uses the v2 smooth multi-competitor objective inside the 14D
-spatial coordinate system; it never edits arbitrary hidden dimensions.
-
-Recommended first diagnostic
-============================
-CUDA_VISIBLE_DEVICES=0 python -u eval_qwen3b_synthetic_head_guided_spatial_control_v1.py \
-  --geometry-mode coco_calib \
-  --spatial-states-npz output/qwen3b_coco_spatial_real_noimage_v1/states/raw__correct_minus_noimage.npz \
-  --head-select-mode source_cv \
-  --modes head,oracle \
-  --profiles old,wide \
-  --eval-max-samples 80 \
-  --output-dir output/qwen3b_synhead_spatial_control_n80_v1 \
-  --overwrite
-
-Strict source-only spatial geometry
-===================================
-CUDA_VISIBLE_DEVICES=0 python -u eval_qwen3b_synthetic_head_guided_spatial_control_v1.py \
-  --geometry-mode synthetic_source \
+CUDA_VISIBLE_DEVICES=0 python -u eval_qwen3b_targetselected_head_spatial_control_all440_v2.py \
+  --head-source-cache output/qwen3b_synhead_spatial_control_syngeom_n80_v1/head_source_synthetic_vectors.npz \
+  --head-target-cache output/qwen3b_synhead_spatial_control_syngeom_n80_v1/head_target_coco_vectors.npz \
   --source-spatial-npz output/qwen3b_hsub_href_spatial_cache/qwen-3b_synthetic_hsub_href_all.npz \
-  --head-select-mode source_cv \
-  --modes head,oracle \
-  --profiles wide \
-  --eval-max-samples 80 \
-  --output-dir output/qwen3b_synhead_spatial_control_syngeom_n80_v1 \
+  --output-dir output/qwen3b_targetselected_head_spatial_control_all440_v2 \
   --overwrite
 
-Notes
-=====
-* "oracle" is diagnostic only: it uses the COCO GT relation as the controller
-  target and asks whether the wider spatial budget can push 95% closer to 100%.
-* "head" is the actual non-oracle target-routing experiment.
-* Selecting the best profile after inspecting COCO GT would be target tuning.
-  Treat old/wide/verywide comparisons as diagnostics until a profile is frozen.
+Expected head-selection protocol matches the earlier multi-model table:
+Synthetic-frozen relation code + full-target supervised head selection.
+For Qwen3B/COCO this should recover the same best head as that scan if the same
+cache/control/pooling conventions are used.
 """
 
 from __future__ import annotations
@@ -130,7 +81,7 @@ except Exception as exc:
 
 REL = ("left", "right", "above", "below")
 EPS = 1e-12
-SCRIPT_VERSION = "qwen3b-synthetic-head-guided-spatial-control-v1.1"
+SCRIPT_VERSION = "qwen3b-targetselected-head-spatial-control-all440-v2"
 
 
 def _norm_rel_local(x) -> str:
@@ -337,9 +288,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--keep-fp32", action="store_true")
     p.add_argument(
         "--head-select-mode",
-        default="source_cv",
-        choices=["source_cv", "source_self"],
-        help="Select the head using Synthetic-400 only; source_cv is recommended.",
+        default="target_full",
+        choices=["target_full", "source_cv", "source_self"],
+        help=("target_full: fit directions on Synthetic-400, then use full COCO GT only to choose "
+              "the best transferred head; source_cv/source_self keep the older source-only selection."),
     )
     p.add_argument("--source-cv-folds", type=int, default=5)
     p.add_argument("--head-source-cache", default=None)
@@ -354,7 +306,7 @@ def parse_args() -> argparse.Namespace:
     # Residual spatial geometry.
     p.add_argument(
         "--geometry-mode",
-        default="coco_calib",
+        default="synthetic_source",
         choices=["coco_calib", "synthetic_source"],
         help=(
             "coco_calib exactly mirrors the old controller geometry (uses a COCO calibration split); "
@@ -381,7 +333,7 @@ def parse_args() -> argparse.Namespace:
 
     # Conditions and controller strength.
     p.add_argument("--modes", default="head,oracle", help="Comma-separated: head,oracle")
-    p.add_argument("--profiles", default="old,wide", help="Comma-separated: old,wide,verywide")
+    p.add_argument("--profiles", default="wide", help="Comma-separated: old,wide,verywide")
     p.add_argument("--competitor-temperature", type=float, default=0.25)
     p.add_argument("--line-search-shrink", type=float, default=0.5)
     p.add_argument("--min-objective-improvement", type=float, default=1e-6)
@@ -402,7 +354,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Evaluation / model generation.
-    p.add_argument("--eval-max-samples", type=int, default=80, help="0 = all eligible COCO samples")
+    p.add_argument("--eval-max-samples", type=int, default=0, help="0 = all eligible COCO samples")
     p.add_argument("--seed", type=int, default=17)
     p.add_argument("--answer-surface", default="above_below", choices=["above_below", "on_under"])
     p.add_argument("--answer-prefix", default="")
@@ -498,7 +450,6 @@ def load_or_extract_head_pack(
     if (
         args.reuse_head_cache_any_version
         and cache_path.exists()
-        and not args.overwrite
     ):
         try:
             pack = load_head_cache_any(cache_path)
@@ -1007,7 +958,7 @@ def main() -> None:
         )
 
         # ---------------------------------------------------------------
-        # SOURCE-ONLY spatial-head selection.
+        # Synthetic-frozen direction code; head ID may be selected on COCO GT.
         # ---------------------------------------------------------------
         syn_records = headscan.load_synthetic(a)
         coco_records = headscan.load_coco(a)
@@ -1052,19 +1003,61 @@ def main() -> None:
         yt = np.asarray(target_pack["relation"], dtype=object)
         target_sids = np.asarray(target_pack["sid"], dtype=np.int64)
 
-        ranking_df, (best_layer, best_head), center_all, dirs_all = rank_heads_source_only(
-            Xs=Xs,
-            ys=ys,
-            mode=a.head_select_mode,
-            folds=a.source_cv_folds,
-            seed=a.seed,
-        )
-        ranking_df.to_csv(outdir / "synthetic_only_head_ranking.csv", index=False)
-        best_row = ranking_df.iloc[0].to_dict()
+        if a.head_select_mode == "target_full":
+            # Fit relation directions ONLY on Synthetic-400.  Then apply those
+            # frozen directions to every COCO head and use COCO GT only to pick
+            # the best transferred head.  This exactly matches the broad-sweep
+            # diagnostic used for the current Generation-vs-Spatial-Head table.
+            center_all, dirs_all = headscan.fit_source_codebooks(Xs, ys)
+            all_idx = np.arange(len(yt), dtype=np.int64)
+            ranking_rows, pred_map = headscan.rank_heads(
+                X_source=Xs,
+                y_source=ys,
+                X_target=Xt,
+                y_target=yt,
+                center=center_all,
+                dirs=dirs_all,
+                selection_idx=all_idx,
+                test_idx=all_idx,
+            )
+            ranking_df = pd.DataFrame(ranking_rows)
+            ranking_df.to_csv(outdir / "synthetic_frozen_coco_head_ranking.csv", index=False)
+            best_row = ranking_rows[0]
+            best_layer = int(best_row["layer"])
+            best_head = int(best_row["head"])
+            head_pred, head_margin = pred_map[(best_layer, best_head)]
 
-        head_pred, head_margin = headscan.predict_one_head(
-            Xt, center_all, dirs_all, best_layer, best_head
-        )
+            print("\n" + "=" * 180)
+            print("SYNTHETIC-FROZEN DIRECTIONS -> FULL-COCO HEAD SELECTION")
+            print("=" * 180)
+            cols = [
+                "rank", "head_name", "syn_self_acc", "selection_acc",
+                "all_target_acc", "left_acc", "right_acc", "above_acc",
+                "below_acc", "mean_margin",
+            ]
+            print(ranking_df[cols].head(20).to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+            print(
+                f"\nSELECTED HEAD = {headscan.head_name(best_layer, best_head)} | "
+                f"COCO transferred-direction acc={float(best_row['all_target_acc']):.4f} | "
+                f"Synthetic self acc={float(best_row['syn_self_acc']):.4f}"
+            )
+            print(
+                "[NOTE] COCO GT is used ONLY to choose the head ID. "
+                "The four relation directions remain frozen from Synthetic-400."
+            )
+        else:
+            ranking_df, (best_layer, best_head), center_all, dirs_all = rank_heads_source_only(
+                Xs=Xs,
+                ys=ys,
+                mode=a.head_select_mode,
+                folds=a.source_cv_folds,
+                seed=a.seed,
+            )
+            ranking_df.to_csv(outdir / "synthetic_only_head_ranking.csv", index=False)
+            best_row = ranking_df.iloc[0].to_dict()
+            head_pred, head_margin = headscan.predict_one_head(
+                Xt, center_all, dirs_all, best_layer, best_head
+            )
         head_by_sid: Dict[int, Dict[str, Any]] = {}
         for i, sid in enumerate(target_sids.tolist()):
             head_by_sid[int(sid)] = {
@@ -1086,19 +1079,20 @@ def main() -> None:
         ])
         head_pred_df.to_csv(outdir / "selected_head_coco_predictions.csv", index=False)
 
-        print("\n" + "=" * 180)
-        print("SYNTHETIC-ONLY HEAD SELECTION")
-        print("=" * 180)
-        print(ranking_df.head(20).to_string(index=False, float_format=lambda x: f"{x:.4f}"))
-        print(
-            f"\nSELECTED HEAD = {headscan.head_name(best_layer, best_head)} | "
-            f"source_select_acc={float(best_row['source_select_acc']):.4f} | "
-            f"source_self_acc={float(best_row['source_self_acc']):.4f}"
-        )
-        print(
-            f"COCO head accuracy (EVAL ONLY; not used for selection) = "
-            f"{safe_acc(head_pred, yt):.4f}"
-        )
+        if a.head_select_mode != "target_full":
+            print("\n" + "=" * 180)
+            print("SYNTHETIC-ONLY HEAD SELECTION")
+            print("=" * 180)
+            print(ranking_df.head(20).to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+            print(
+                f"\nSELECTED HEAD = {headscan.head_name(best_layer, best_head)} | "
+                f"source_select_acc={float(best_row['source_select_acc']):.4f} | "
+                f"source_self_acc={float(best_row['source_self_acc']):.4f}"
+            )
+            print(
+                f"COCO head accuracy (EVAL ONLY; not used for selection) = "
+                f"{safe_acc(head_pred, yt):.4f}"
+            )
 
         # ---------------------------------------------------------------
         # Select evaluation rows. For coco_calib geometry, use heldout only
@@ -1127,7 +1121,7 @@ def main() -> None:
         print(f"modes={a.modes_parsed} profiles={a.profiles_parsed}")
         print(f"selected_head={headscan.head_name(best_layer, best_head)}")
         print(f"min_head_margin={a.min_head_margin}")
-        print("HEAD mode never uses COCO GT to choose target relation.")
+        print("HEAD mode uses the selected head prediction as the per-sample target; it does not use per-sample COCO GT for routing.")
         print("ORACLE mode is diagnostic only.")
         print("=" * 180, flush=True)
 
@@ -1347,11 +1341,18 @@ def main() -> None:
             "selected_head_layer": int(best_layer),
             "selected_head_index": int(best_head),
             "head_select_mode": a.head_select_mode,
-            "head_selection_uses_coco_gt": False,
+            "direction_fit_uses_coco_gt": False,
+            "head_selection_uses_coco_gt": bool(a.head_select_mode == "target_full"),
+            "head_selection_target_fraction": 1.0 if a.head_select_mode == "target_full" else 0.0,
             "source_cv_folds": int(a.source_cv_folds),
-            "source_select_acc": float(best_row["source_select_acc"]),
-            "source_self_acc": float(best_row["source_self_acc"]),
-            "coco_head_acc_eval_only_all_extracted": float(safe_acc(head_pred, yt)),
+            "source_select_acc": (
+                float(best_row["source_select_acc"])
+                if "source_select_acc" in best_row else None
+            ),
+            "source_self_acc": float(
+                best_row.get("source_self_acc", best_row.get("syn_self_acc", float("nan")))
+            ),
+            "selected_head_coco_transfer_acc": float(safe_acc(head_pred, yt)),
             "head_control": a.control,
             "geometry": geometry_meta,
             "layer_groups": [{"label": label, "layers": layers} for label, layers in groups],
