@@ -1,4 +1,4 @@
-
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 eval_qwen3b_synthetic_head_guided_spatial_control_v1.py
@@ -117,14 +117,12 @@ from tqdm import tqdm
 try:
     import eval_real_causal_token_update_gating_v1 as gate
     import eval_oracle_multilayer_spatial_logit_optimization_v2_multicomp as ora
-    import eval_nonoracle_direct_self_spatial_amplification_v1 as selfamp
     import scan_synthetic_frozen_direction_heads_multimodel_v1 as headscan
 except Exception as exc:
     raise SystemExit(
         "Could not import AdaptVis dependencies. Run from the llava16 repo root and keep:\n"
         "  eval_real_causal_token_update_gating_v1.py\n"
         "  eval_oracle_multilayer_spatial_logit_optimization_v2_multicomp.py\n"
-        "  eval_nonoracle_direct_self_spatial_amplification_v1.py\n"
         "  scan_synthetic_frozen_direction_heads_multimodel_v1.py\n"
         f"available.\n{type(exc).__name__}: {exc}"
     )
@@ -132,7 +130,128 @@ except Exception as exc:
 
 REL = ("left", "right", "above", "below")
 EPS = 1e-12
-SCRIPT_VERSION = "qwen3b-synthetic-head-guided-spatial-control-v1"
+SCRIPT_VERSION = "qwen3b-synthetic-head-guided-spatial-control-v1.1"
+
+
+def _norm_rel_local(x) -> str:
+    s = str(x).strip().lower().replace("-", "_")
+    table = {
+        "left": "left", "left of": "left", "l": "left",
+        "right": "right", "right of": "right", "r": "right",
+        "above": "above", "on": "above", "over": "above", "top": "above",
+        "below": "below", "under": "below", "beneath": "below", "bottom": "below",
+    }
+    return table.get(s, s)
+
+
+def _unit_local(v: np.ndarray) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float64)
+    n = float(np.linalg.norm(v))
+    if n < EPS:
+        raise RuntimeError("Cannot normalize near-zero vector")
+    return v / n
+
+
+def load_state_npz_local(path: Path, *, require_labels: bool):
+    """Load relation_vectors or old img/no_image cache as a relation state."""
+    if not path.exists():
+        raise FileNotFoundError(path)
+    with np.load(path, allow_pickle=True) as z:
+        keys = set(z.files)
+        if "relation_vectors" in keys:
+            X = np.asarray(z["relation_vectors"], dtype=np.float32)
+            vector_definition = (
+                str(z["vector_definition"].item())
+                if "vector_definition" in keys else "relation_vectors"
+            )
+        elif {"img", "no_image"}.issubset(keys):
+            X = np.asarray(z["img"], dtype=np.float32) - np.asarray(z["no_image"], dtype=np.float32)
+            vector_definition = "img_minus_no_image"
+        else:
+            raise RuntimeError(
+                f"{path} must contain relation_vectors OR both img and no_image; keys={sorted(keys)}"
+            )
+
+        if "decoder_block_index" not in keys:
+            raise RuntimeError(f"{path} missing decoder_block_index")
+        layers = [int(v) for v in np.asarray(z["decoder_block_index"]).tolist()]
+        sids = (
+            np.asarray(z["sample_index"], dtype=np.int64)
+            if "sample_index" in keys else np.arange(X.shape[0], dtype=np.int64)
+        )
+        labels = None
+        if "relation" in keys:
+            labels = np.asarray([_norm_rel_local(v) for v in z["relation"].tolist()], dtype=object)
+        elif require_labels:
+            raise RuntimeError(f"{path} requires relation labels for source geometry")
+
+    if X.ndim != 3:
+        raise RuntimeError(f"Bad state shape {X.shape}; expected [N,L,D]")
+    if X.shape[0] != len(sids):
+        raise RuntimeError("X/sample_index length mismatch")
+    if labels is not None and len(labels) != X.shape[0]:
+        raise RuntimeError("X/relation length mismatch")
+    return X, labels, layers, sids, vector_definition
+
+
+def fit_source_geometry_local(X, y, layers, fit_layers: Sequence[int]):
+    """Fit source-only H/V natural-coordinate geometry without external helpers."""
+    if y is None:
+        raise RuntimeError("Source labels required")
+    layer_to_i = {int(L): i for i, L in enumerate(layers)}
+    missing = [int(L) for L in fit_layers if int(L) not in layer_to_i]
+    if missing:
+        raise RuntimeError(f"Source NPZ missing layers {missing}; has {layers}")
+
+    geom = {}
+    rows = []
+    for L in fit_layers:
+        li = layer_to_i[int(L)]
+        Xf = X[:, li].astype(np.float64)
+        center = Xf.mean(axis=0)
+        means = {}
+        for r in REL:
+            mask = y == r
+            if not np.any(mask):
+                raise RuntimeError(f"Source has no samples for relation={r}")
+            means[r] = Xf[mask].mean(axis=0)
+
+        class_dirs = {r: _unit_local(means[r] - center) for r in REL}
+        dH = _unit_local(class_dirs["right"] - class_dirs["left"])
+        dV = _unit_local(class_dirs["above"] - class_dirs["below"])
+        gapH = float(np.dot(means["right"] - means["left"], dH))
+        gapV = float(np.dot(means["above"] - means["below"], dV))
+        if gapH < 0:
+            dH, gapH = -dH, -gapH
+        if gapV < 0:
+            dV, gapV = -dV, -gapV
+
+        B = np.stack([dH, dV], axis=1)
+        dual = B @ np.linalg.inv(B.T @ B)
+        halfH = max(gapH / 2.0, EPS)
+        halfV = max(gapV / 2.0, EPS)
+        natural_M = dual @ np.diag([halfH, halfV])
+
+        geom[int(L)] = {
+            "layer_index": int(li),
+            "center": center.astype(np.float32),
+            "B": B.astype(np.float32),
+            "dual": dual.astype(np.float32),
+            "natural_M": natural_M.astype(np.float32),
+            "natural_half_H": float(halfH),
+            "natural_half_V": float(halfV),
+        }
+        rows.append({
+            "source_layer": int(L),
+            "fit_N": int(X.shape[0]),
+            "axis_H_dot_axis_V": float(np.dot(dH, dV)),
+            "natural_full_gap_H": float(gapH),
+            "natural_half_gap_H": float(halfH),
+            "natural_full_gap_V": float(gapV),
+            "natural_half_gap_V": float(halfV),
+            "dual_check_max_abs": float(np.max(np.abs(B.T @ dual - np.eye(2)))),
+        })
+    return geom, pd.DataFrame(rows)
 
 
 @dataclass(frozen=True)
@@ -532,10 +651,10 @@ def fit_controller_geometry(
         }
         return geom, held_sids, meta
 
-    Xs, ys, source_layers, source_sids, source_def = selfamp.load_state_npz(
+    Xs, ys, source_layers, source_sids, source_def = load_state_npz_local(
         Path(args.source_spatial_npz), require_labels=True
     )
-    geom, axis_df = selfamp.fit_source_geometry(Xs, ys, source_layers, needed_layers)
+    geom, axis_df = fit_source_geometry_local(Xs, ys, source_layers, needed_layers)
     axis_df.to_csv(outdir / "controller_spatial_geometry.csv", index=False)
     meta = {
         "geometry_mode": "synthetic_source",
