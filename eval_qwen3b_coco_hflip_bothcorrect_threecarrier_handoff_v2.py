@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Layer-wise counterfactual handoff patching for COCO-two spatial reasoning.
+Left/right horizontal-flip counterfactual handoff patching for COCO-two spatial reasoning.
 
 Purpose
 -------
@@ -13,13 +13,13 @@ Test whether the causal carrier of spatial information shifts with depth:
 The SAME counterfactual experiment and the SAME decision-recovery metric are
 used for all three carriers.
 
-For each COCO-two example:
+For each LEFT/RIGHT COCO-two example:
   1) Keep the prompt fixed.
-  2) Create a counterfactual image by horizontal/vertical flipping so the
-     spatial relation becomes its opposite.
+  2) Create a counterfactual image by HORIZONTAL reflection so
+     left <-> right while object identity and prompt stay fixed.
   3) Use a fixed random relation -> A/B/C/D mapping for BOTH images.
-  4) Keep only clean pairs for which both original and flipped baselines choose
-     their corresponding A/B/C/D option.
+  4) Keep only clean pairs for which BOTH original and horizontally flipped
+     inputs are correctly answered by actual greedy model.generate().
   5) At every decoder layer, patch the donor block-output residual into the
      counterfactual recipient at exactly one carrier:
          - all visual-token positions
@@ -70,23 +70,23 @@ reimplementing the decoder hooks.
 Example quick run
 -----------------
 CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 \
-python -u eval_qwen3b_coco_threecarrier_handoff_patch_v1.py \
+python -u eval_qwen3b_coco_hflip_bothcorrect_threecarrier_handoff_v2.py \
   --model qwen-3b \
   --layers all \
   --max-samples 160 \
   --max-clean-pairs 40 \
-  --output-dir output/qwen3b_coco_threecarrier_handoff_quick \
+  --output-dir output/qwen3b_coco_hflip_bothcorrect_threecarrier_quick \
   --overwrite
 
 Full run
 --------
 CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 \
-python -u eval_qwen3b_coco_threecarrier_handoff_patch_v1.py \
+python -u eval_qwen3b_coco_hflip_bothcorrect_threecarrier_handoff_v2.py \
   --model qwen-3b \
   --layers all \
   --max-samples 0 \
   --max-clean-pairs 0 \
-  --output-dir output/qwen3b_coco_threecarrier_handoff_v1 \
+  --output-dir output/qwen3b_coco_hflip_bothcorrect_threecarrier_v2 \
   --overwrite
 """
 
@@ -100,6 +100,7 @@ import importlib.util
 import json
 import math
 import random
+import re
 import shutil
 import time
 import traceback
@@ -117,7 +118,7 @@ from transformers import AutoProcessor
 import eval_coco_flip_residual_patching_v1 as oldpatch
 
 
-VERSION = "qwen3b-coco-threecarrier-handoff-patch-v1"
+VERSION = "qwen3b-coco-hflip-bothcorrect-threecarrier-handoff-v2"
 
 RELATIONS = ("left", "right", "above", "below")
 LETTERS = ("A", "B", "C", "D")
@@ -161,6 +162,7 @@ def parse_args() -> argparse.Namespace:
         default="prompts/COCO_QA_two_obj_with_answer_four_options.jsonl",
     )
     p.add_argument("--model", default="qwen-3b")
+    p.add_argument("--max-new-tokens", type=int, default=4, help="Greedy-generation length used only for the both-correct clean-pair filter.")
     p.add_argument("--device", default="cuda:0")
     p.add_argument(
         "--attn-impl",
@@ -554,6 +556,54 @@ def run_option_forward(
     return results, captured
 
 
+
+def generate_option(
+    *,
+    model: Any,
+    processor: Any,
+    batch: Mapping[str, Any],
+    max_new_tokens: int,
+) -> Tuple[Optional[str], str]:
+    """
+    Actual greedy generation used ONLY for selecting clean counterfactual pairs.
+
+    The intervention metric below remains the continuous donor-vs-recipient
+    A/B/C/D next-token margin, but a sample enters the causal analysis only if
+    BOTH the original and horizontally flipped inputs are actually generated
+    correctly by model.generate().
+    """
+    input_len = int(batch["input_ids"].shape[1])
+
+    with torch.inference_mode():
+        sequences = model.generate(
+            **batch,
+            max_new_tokens=max(1, int(max_new_tokens)),
+            do_sample=False,
+            use_cache=True,
+        )
+
+    if hasattr(sequences, "sequences"):
+        sequences = sequences.sequences
+
+    new_ids = sequences[0, input_len:].detach().cpu().tolist()
+    text = processor.tokenizer.decode(
+        new_ids,
+        skip_special_tokens=True,
+    ).strip()
+
+    # Prompt explicitly asks for only A/B/C/D.  Prefer a standalone option
+    # letter, but keep parsing tolerant of strings such as "A." or "Answer: A".
+    match = re.search(r"(?<![A-Za-z])([ABCD])(?![A-Za-z])", text.upper())
+    pred = match.group(1) if match else None
+
+    if pred is None and text:
+        first = text.lstrip()[:1].upper()
+        if first in LETTERS:
+            pred = first
+
+    return pred, text
+
+
 # -----------------------------------------------------------------------------
 # Counterfactual image + carrier positions
 # -----------------------------------------------------------------------------
@@ -563,15 +613,14 @@ def flip_image(
     image: Image.Image,
     relation: str,
 ) -> Image.Image:
-    if relation in ("left", "right"):
-        return image.transpose(
-            Image.Transpose.FLIP_LEFT_RIGHT
+    """Horizontal reflection only; valid only for left/right examples."""
+    if relation not in ("left", "right"):
+        raise ValueError(
+            f"This experiment is left/right only, got relation={relation!r}"
         )
-    if relation in ("above", "below"):
-        return image.transpose(
-            Image.Transpose.FLIP_TOP_BOTTOM
-        )
-    raise ValueError(relation)
+    return image.transpose(
+        Image.Transpose.FLIP_LEFT_RIGHT
+    )
 
 
 def span_positions(
@@ -1050,11 +1099,11 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    relations = parse_subset(
-        args.relations,
-        RELATIONS,
-        "relation",
-    )
+    # Main causal-localization protocol:
+    # use only left/right examples so the counterfactual is a natural
+    # horizontal reflection.  Above/below + vertical reflection is
+    # intentionally excluded to avoid the stronger distribution shift.
+    relations = ["left", "right"]
     directions = parse_subset(
         args.directions,
         DIRECTIONS,
@@ -1236,14 +1285,15 @@ def main() -> None:
         "layers": layers,
         "carriers": list(CARRIERS),
         "directions": directions,
-        "relations": relations,
+        "relations": ["left", "right"],
+        "counterfactual": "horizontal reflection only",
         "max_samples": max_samples,
         "max_clean_pairs": max_clean_pairs,
         "seed": args.seed,
         "audit": audit,
         "decision_space": "randomized A/B/C/D",
         "pair_filter": (
-            "both original and flipped restricted A/B/C/D baseline decisions correct"
+            "both original and horizontally flipped ACTUAL greedy generations correct"
         ),
         "patch_location": (
             "decoder block output residual"
@@ -1306,7 +1356,7 @@ def main() -> None:
     try:
         for record in tqdm(
             records,
-            desc=f"threecarrier:{args.model}",
+            desc=f"hflip-bothcorrect-threecarrier:{args.model}",
         ):
             if (
                 max_clean_pairs is not None
@@ -1350,12 +1400,7 @@ def main() -> None:
                     ]
                 )
 
-                axis = (
-                    "horizontal"
-                    if original_relation
-                    in ("left", "right")
-                    else "vertical"
-                )
+                axis = "horizontal"
 
                 mapping = (
                     relation_option_mapping(
@@ -1446,6 +1491,21 @@ def main() -> None:
                     .detach()
                     .cpu()
                     .tolist()
+                )
+
+                # Actual generation is the clean-pair gate.
+                # We deliberately do this before any activation patching.
+                original_gen_pred, original_gen_text = generate_option(
+                    model=model,
+                    processor=processor,
+                    batch=original_batch,
+                    max_new_tokens=args.max_new_tokens,
+                )
+                flipped_gen_pred, flipped_gen_text = generate_option(
+                    model=model,
+                    processor=processor,
+                    batch=flipped_batch,
+                    max_new_tokens=args.max_new_tokens,
                 )
 
                 if (
@@ -1568,12 +1628,15 @@ def main() -> None:
                     ]
                 )
 
+                # Restricted first-step predictions are retained for auditing and
+                # for the continuous recovery metric.  Clean-pair eligibility,
+                # however, is based on actual greedy generation.
                 original_correct = (
-                    original_pred
+                    original_gen_pred
                     == original_option
                 )
                 flipped_correct = (
-                    flipped_pred
+                    flipped_gen_pred
                     == flipped_option
                 )
 
@@ -1626,10 +1689,22 @@ def main() -> None:
                         "flipped_option": (
                             flipped_option
                         ),
-                        "original_prediction": (
+                        "original_generation_prediction": (
+                            original_gen_pred
+                        ),
+                        "flipped_generation_prediction": (
+                            flipped_gen_pred
+                        ),
+                        "original_generation_text": (
+                            original_gen_text
+                        ),
+                        "flipped_generation_text": (
+                            flipped_gen_text
+                        ),
+                        "original_restricted_firststep_prediction": (
                             original_pred
                         ),
-                        "flipped_prediction": (
+                        "flipped_restricted_firststep_prediction": (
                             flipped_pred
                         ),
                         "original_correct": (
