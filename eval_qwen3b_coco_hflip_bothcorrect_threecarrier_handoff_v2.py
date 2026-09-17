@@ -8,7 +8,7 @@ Purpose
 -------
 Test whether the causal carrier of spatial information shifts with depth:
 
-    Visual tokens  ->  Object text tokens  ->  Prompt-last token
+    Visual tokens  ->  Text tokens (excluding prompt-last)  ->  Prompt-last token
 
 The SAME counterfactual experiment and the SAME decision-recovery metric are
 used for all three carriers.
@@ -23,7 +23,7 @@ For each LEFT/RIGHT COCO-two example:
   5) At every decoder layer, patch the donor block-output residual into the
      counterfactual recipient at exactly one carrier:
          - all visual-token positions
-         - subject + reference text-token positions
+         - all non-visual, non-special text-token positions except prompt-last
          - prompt-last position
   6) Let all later layers recompute naturally.
   7) Measure normalized donor-decision recovery:
@@ -39,7 +39,7 @@ R ~ 0 : patch carries little donor decision information at that layer/site.
 R ~ 1 : patch approximately restores the full donor-vs-recipient decision gap.
 
 If a three-stage causal handoff exists, the strongest recovery should move from
-Visual -> Object Text -> Prompt Last as layer depth increases.
+Visual -> Text -> Prompt Last as layer depth increases.
 
 Outputs
 -------
@@ -118,7 +118,7 @@ from transformers import AutoProcessor
 import eval_coco_flip_residual_patching_v1 as oldpatch
 
 
-VERSION = "qwen3b-coco-hflip-bothcorrect-threecarrier-handoff-v2"
+VERSION = "qwen3b-coco-hflip-bothcorrect-threecarrier-handoff-v2-text-excl-last"
 
 RELATIONS = ("left", "right", "above", "below")
 LETTERS = ("A", "B", "C", "D")
@@ -128,10 +128,10 @@ OPPOSITE = {
     "above": "below",
     "below": "above",
 }
-CARRIERS = ("visual", "object_text", "prompt_last")
+CARRIERS = ("visual", "text", "prompt_last")
 CARRIER_LABELS = {
     "visual": "Visual",
-    "object_text": "Object Text",
+    "text": "Text",
     "prompt_last": "Prompt Last",
 }
 DIRECTIONS = ("orig_to_flip", "flip_to_orig")
@@ -623,50 +623,73 @@ def flip_image(
     )
 
 
-def span_positions(
-    span: Tuple[int, int],
-) -> List[int]:
-    return list(
-        range(
-            int(span[0]),
-            int(span[1]) + 1,
-        )
-    )
-
-
 def build_carrier_positions(
     *,
     visual_positions: Sequence[int],
-    subject_positions: Sequence[int],
-    reference_positions: Sequence[int],
+    input_ids: Sequence[int],
     prompt_last: int,
+    special_token_ids: Sequence[int] = (),
 ) -> Tuple[List[str], List[List[int]]]:
-    visual = sorted(
-        set(map(int, visual_positions))
-    )
-    objects = sorted(
-        set(
-            map(
-                int,
-                list(subject_positions)
-                + list(reference_positions),
-            )
+    """Build three disjoint carriers over decoder residual positions.
+
+    The middle carrier is ALL ordinary text-token positions, not only the
+    subject/reference mentions.  The prompt-final position is explicitly
+    excluded so that the Text and Prompt Last carriers do not overlap.
+    Visual positions and tokenizer special/control tokens are also excluded
+    from the Text carrier.
+    """
+    seq_len = len(input_ids)
+    last_pos = int(prompt_last)
+
+    if not (0 <= last_pos < seq_len):
+        raise RuntimeError(
+            f"prompt_last={last_pos} outside sequence length {seq_len}"
         )
-    )
-    last = [int(prompt_last)]
+
+    visual = sorted(set(map(int, visual_positions)))
+    visual_set = set(visual)
+    special_ids = set(map(int, special_token_ids))
 
     if not visual:
         raise RuntimeError(
             "Visual position set is empty"
         )
-    if not objects:
+    if any(p < 0 or p >= seq_len for p in visual):
         raise RuntimeError(
-            "Object-text position set is empty"
+            "Visual position outside input sequence"
+        )
+    if last_pos in visual_set:
+        raise RuntimeError(
+            "Prompt-last position overlaps a visual position"
+        )
+
+    text = [
+        i
+        for i, token_id in enumerate(input_ids)
+        if i not in visual_set
+        and i != last_pos
+        and int(token_id) not in special_ids
+    ]
+    last = [last_pos]
+
+    if not text:
+        raise RuntimeError(
+            "Text position set is empty after excluding visual/special/last positions"
+        )
+
+    # The three carrier sets must be pairwise disjoint.
+    if (
+        set(visual) & set(text)
+        or set(visual) & set(last)
+        or set(text) & set(last)
+    ):
+        raise RuntimeError(
+            "Carrier position sets unexpectedly overlap"
         )
 
     return (
-        ["visual", "object_text", "prompt_last"],
-        [visual, objects, last],
+        ["visual", "text", "prompt_last"],
+        [visual, text, last],
     )
 
 
@@ -1305,8 +1328,8 @@ def main() -> None:
         "visual_patch": (
             "all visual-token residual positions"
         ),
-        "object_text_patch": (
-            "subject + reference text-token residual positions"
+        "text_patch": (
+            "all non-visual, non-special text-token residual positions except prompt-final"
         ),
         "prompt_last_patch": (
             "single prompt-final residual position"
@@ -1516,29 +1539,6 @@ def main() -> None:
                         "Original/flip tokenization differs"
                     )
 
-                (
-                    subject_span,
-                    reference_span,
-                ) = (
-                    base.locate_object_spans(
-                        processor.tokenizer,
-                        original_ids,
-                        subject,
-                        reference,
-                    )
-                )
-
-                subject_positions = (
-                    span_positions(
-                        subject_span
-                    )
-                )
-                reference_positions = (
-                    span_positions(
-                        reference_span
-                    )
-                )
-
                 prompt_last = (
                     len(original_ids)
                     - 1
@@ -1569,14 +1569,18 @@ def main() -> None:
                     visual_positions=(
                         visual_positions
                     ),
-                    subject_positions=(
-                        subject_positions
-                    ),
-                    reference_positions=(
-                        reference_positions
+                    input_ids=(
+                        original_ids
                     ),
                     prompt_last=(
                         prompt_last
+                    ),
+                    special_token_ids=(
+                        getattr(
+                            processor.tokenizer,
+                            "all_special_ids",
+                            [],
+                        )
                     ),
                 )
 
@@ -1724,27 +1728,16 @@ def main() -> None:
                                 "scores"
                             ]
                         ),
-                        "subject_span": (
-                            list(
-                                subject_span
-                            )
-                        ),
-                        "reference_span": (
-                            list(
-                                reference_span
-                            )
-                        ),
                         "n_visual_positions": (
                             len(
                                 visual_positions
                             )
                         ),
-                        "n_object_positions": (
+                        "n_text_positions": (
                             len(
-                                set(
-                                    subject_positions
-                                    + reference_positions
-                                )
+                                position_sets[
+                                    carriers.index("text")
+                                ]
                             )
                         ),
                         "prompt_last": (
@@ -2022,7 +2015,7 @@ def main() -> None:
                         f"{original_relation}->{flipped_relation} "
                         f"{original_option}->{flipped_option} "
                         f"| visual={len(visual_positions)} "
-                        f"object={len(set(subject_positions + reference_positions))}"
+                        f"text={len(position_sets[carriers.index('text')])}"
                     )
 
                 del (
