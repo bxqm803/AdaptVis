@@ -45,8 +45,8 @@ Main outputs (5 figures)
       All four targets aligned together.
 2) figureB_target_left.png
 3) figureB_target_right.png
-4) figureB_target_above.png
-5) figureB_target_below.png
+4) figureB_target_on.png
+5) figureB_target_under.png
 
 Each plot shows:
   x-axis = spatial edit strength alpha
@@ -68,12 +68,12 @@ Recommended run
 Run Figure A first to identify a promising intervention layer, then:
 
 CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 \
-python -u figureB_qwen3b_dataset_average_mapped_option_v1.py \
+python -u figureB_qwen3b_dataset_average_mapped_option_v2.py \
   --model qwen-3b \
   --layer 22 \
-  --alphas -1.5,-1.0,-0.5,0.0,0.5,1.0,1.5 \
+  --alphas -1.5 -1.0 -0.5 0.0 0.5 1.0 1.5 \
   --max-samples 0 \
-  --output-dir output/figureB_qwen3b_mapped_option_L22_v1 \
+  --output-dir output/figureB_qwen3b_mapped_option_L22_v2 \
   --overwrite
 """
 
@@ -110,7 +110,17 @@ OPP = {
     "above": "below",
     "below": "above",
 }
-SCRIPT_VERSION = "figureB-qwen3b-dataset-average-mapped-option-v1"
+SCRIPT_VERSION = "figureB-qwen3b-dataset-average-mapped-option-v2"
+
+DISPLAY_REL = {
+    "left": "left",
+    "right": "right",
+    "above": "on",
+    "below": "under",
+}
+
+def disp_rel(r: str) -> str:
+    return DISPLAY_REL.get(str(r), str(r))
 
 
 # =============================================================================
@@ -131,8 +141,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--layer", type=int, default=22)
     p.add_argument(
         "--alphas",
-        default="-1.5,-1.0,-0.5,0.0,0.5,1.0,1.5",
-        help="Comma-separated steering strengths. Positive = toward target relation; negative = toward opposite.",
+        nargs="+",
+        type=float,
+        default=[-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5],
+        help=(
+            "Steering strengths as space-separated numbers, e.g. "
+            "--alphas -1.5 -1.0 -0.5 0 0.5 1.0 1.5. "
+            "Positive = toward target relation; negative = toward opposite."
+        ),
     )
     p.add_argument("--train-ratio", type=float, default=0.30)
     p.add_argument("--seed", type=int, default=17)
@@ -173,16 +189,10 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def parse_alphas(spec: str) -> List[float]:
-    vals: List[float] = []
-    for part in str(spec).split(","):
-        part = part.strip()
-        if not part:
-            continue
-        vals.append(float(part))
+def parse_alphas(spec: Sequence[float]) -> List[float]:
+    vals = sorted(float(x) for x in spec)
     if not vals:
         raise ValueError("No alpha values provided")
-    vals = sorted(vals)
     return vals
 
 
@@ -444,24 +454,44 @@ def summarize_rows(rows: Sequence[Mapping[str, Any]], target_filter: Optional[st
     return out
 
 
-def plot_one(path: Path, summary_rows: Sequence[Mapping[str, Any]], title: str) -> None:
+def plot_one(
+    path: Path,
+    summary_rows: Sequence[Mapping[str, Any]],
+    *,
+    target_relation: Optional[str] = None,
+) -> None:
+    """Paper-friendly half-column plot: no title, large text, semantic labels."""
     x = np.asarray([float(r["alpha"]) for r in summary_rows], np.float64)
     y1 = np.asarray([float(r["target_mean"]) for r in summary_rows], np.float64)
     e1 = np.asarray([float(r["target_sem"]) for r in summary_rows], np.float64)
     y2 = np.asarray([float(r["other_mean"]) for r in summary_rows], np.float64)
     e2 = np.asarray([float(r["other_sem"]) for r in summary_rows], np.float64)
 
-    fig, ax = plt.subplots(figsize=(6.0, 4.2), dpi=170)
-    ax.axhline(0.0, linestyle="--", linewidth=1.0)
-    ax.plot(x, y1, marker="o", linewidth=2.2, label="Mapped target option")
-    ax.fill_between(x, y1 - e1, y1 + e1, alpha=0.20)
-    ax.plot(x, y2, marker="o", linewidth=2.2, label="Other options (mean)")
-    ax.fill_between(x, y2 - e2, y2 + e2, alpha=0.20)
-    ax.set_xlabel("Spatial edit strength")
-    ax.set_ylabel("Average Δ option logit")
-    ax.set_title(title)
-    ax.legend(frameon=False)
-    fig.tight_layout()
+    fig, ax = plt.subplots(figsize=(5.25, 4.25), dpi=220)
+    ax.axhline(0.0, linestyle="--", linewidth=1.4, color="0.35")
+
+    if target_relation is None:
+        target_label = "Target relation"
+    else:
+        target_label = f"Target: {disp_rel(target_relation)}"
+
+    ax.plot(
+        x, y1, marker="o", markersize=6.0, linewidth=2.6,
+        label=target_label,
+    )
+    ax.fill_between(x, y1 - e1, y1 + e1, alpha=0.18)
+    ax.plot(
+        x, y2, marker="o", markersize=6.0, linewidth=2.6,
+        label="Other relations (mean)",
+    )
+    ax.fill_between(x, y2 - e2, y2 + e2, alpha=0.18)
+
+    ax.set_xlabel("Spatial edit strength $\\alpha$", fontsize=16)
+    ax.set_ylabel("Mean $\\Delta$ answer logit", fontsize=16)
+    ax.tick_params(axis="both", labelsize=14)
+    ax.grid(True, alpha=0.22)
+    ax.legend(frameon=False, fontsize=13, loc="best")
+    fig.tight_layout(pad=0.7)
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
 
@@ -716,17 +746,19 @@ def main() -> None:
             summary_rows.extend(per_target[r])
         write_csv(out / "figureB_summary.csv", summary_rows)
 
-        # exactly five images
+        # exactly five paper-friendly images.
+        # Layer information belongs in the caption / filename, not a large plot title.
         plot_one(
             out / "figureB_all_targets_aligned.png",
             all_summary,
-            title=f"All targets aligned — layer {a.layer}",
+            target_relation=None,
         )
+        file_label = {"left": "left", "right": "right", "above": "on", "below": "under"}
         for r in REL:
             plot_one(
-                out / f"figureB_target_{r}.png",
+                out / f"figureB_target_{file_label[r]}.png",
                 per_target[r],
-                title=f"Target {r.upper()} — layer {a.layer}",
+                target_relation=r,
             )
 
         meta_out = {
@@ -761,7 +793,7 @@ def main() -> None:
         print("Generated figures:")
         print(f"  - {out / 'figureB_all_targets_aligned.png'}")
         for r in REL:
-            print(f"  - {out / f'figureB_target_{r}.png'}")
+            print(f"  - {out / f'figureB_target_{file_label[r]}.png'}")
     finally:
         del model, processor
         gc.collect()
