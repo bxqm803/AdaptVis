@@ -3,111 +3,34 @@
 """
 Find a stronger illustrative sample for Figure A.
 
-This script uses the SAME protocol as:
-    figureA_qwen3b_single_sample_spatial_steering_layers_v1.py
-
-It does NOT create new evidence for the paper. It only pre-specifies a ranking
-rule to choose a visually clear illustrative example after the dataset-level
-experiment is defined separately.
-
-Preferred illustrative pattern
-==============================
-For a held-out sample i with GT relation g and semantic opposite o:
-
-  1) Original first-step prediction is wrong.
-  2) Preferably, the wrong prediction is exactly pi_i(o).
-  3) At the SAME middle layer L, steering toward g:
-       - increases log P(pi_i(g))
-       - decreases log P(pi_i(o))
-  4) Steering toward o does the reverse:
-       - decreases log P(pi_i(g))
-       - increases log P(pi_i(o))
-  5) The two intervention directions create a large decision-margin "opening".
-
-For each layer:
-
-    margin_orig = logP(GT option) - logP(opposite option)
-    margin_gt   = same margin after steer -> GT
-    margin_opp  = same margin after steer -> opposite
-
-    opening(L) = margin_gt - margin_opp
-
-This equals:
-
-    [margin_gt - margin_orig] + [margin_orig - margin_opp]
-
-so it rewards BOTH directions at the same layer. The ranking also records the
-four directional component tests separately and whether steer->GT flips the
-first-step decision to the GT-mapped option.
-
-To avoid selecting a one-layer spike, final rank_score mixes the best-layer
-opening with local neighbor support:
-
-    rank_score = 0.70 * best_opening
-               + 0.30 * local_opening_mean
-               + 0.25 * gt_flip_at_best
-               + 0.10 * opp_prediction_at_best
-               + 0.20 * four_way_consistent_at_best
-
-where local_opening_mean averages the best layer and adjacent scanned layers.
-
-Outputs
-=======
-  sample_ranking.csv
-      One row per scanned candidate, sorted best first.
-
-  layer_details.csv
-      Per sample x layer causal steering details.
-
-  top_samples.json
-      Compact metadata for the top-ranked samples.
-
-  previews/rank01_sidXXXX.png ...
-      Figure-A-format previews for the top-K samples.
-
-Recommended run
-===============
-Put this script next to:
-  figureA_qwen3b_single_sample_spatial_steering_layers_v1.py
-
-Then run:
-
-CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 \
-python -u find_figureA_best_sample_v1.py \
-  --model qwen-3b \
-  --scan-layers 18-26 \
-  --alpha 1.0 \
-  --candidate-mode opposite \
-  --top-k 10 \
-  --preview-k 5 \
-  --output-dir output/figureA_best_sample_scan_v1 \
-  --overwrite
-
-After choosing a fixed SID, regenerate the final Figure A with:
-
-CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 \
-python -u figureA_qwen3b_single_sample_spatial_steering_layers_v1.py \
-  --sid <SID> --layers all --alpha 1.0 \
-  --output-dir output/figureA_sid<SID> --overwrite
+Version v2:
+- same ranking logic as v1
+- paper-friendly preview rendering
+- removes the big top title (caption will carry it in the paper)
+- uses larger fonts / thicker lines for half-column readability
+- uses relation-semantic display labels (left/right/on/under) in the preview
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
-import csv
 import gc
 import json
-import math
 import random
 import shutil
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Sequence
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import torch
 import transformers
+from PIL import Image
 from tqdm import tqdm
 from transformers import AutoProcessor
 
@@ -127,7 +50,19 @@ REL = tuple(figA.REL)
 LETTERS = tuple(figA.LETTERS)
 OPP = dict(figA.OPP)
 EPS = float(figA.EPS)
-SCRIPT_VERSION = "find-figureA-best-sample-v1"
+SCRIPT_VERSION = "find-figureA-best-sample-v2"
+
+DISPLAY_REL = {
+    "left": "left",
+    "right": "right",
+    "above": "on",
+    "below": "under",
+}
+DISPLAY_ORDER = ["left", "right", "below", "above"]
+
+
+def disp_rel(r: str) -> str:
+    return DISPLAY_REL.get(str(r), str(r))
 
 
 def parse_args() -> argparse.Namespace:
@@ -202,6 +137,114 @@ def local_mean(opening_by_layer: Mapping[int, float], best_layer: int) -> float:
         if L in opening_by_layer
     ]
     return float(np.mean(vals)) if vals else float("nan")
+
+
+def plot_figure_paper(
+    *,
+    output_path: Path,
+    image: Image.Image,
+    subject: str,
+    reference: str,
+    gt: str,
+    opp: str,
+    mapping: Mapping[str, str],
+    sid: int,
+    rows: Sequence[Mapping[str, Any]],
+    alpha: float,
+) -> None:
+    """Paper-friendly preview with larger fonts and no global title."""
+    layers = sorted({int(r["layer"]) for r in rows})
+    by = {(str(r["condition"]), int(r["layer"])): r for r in rows}
+    gt_letter = mapping[gt]
+    opp_letter = mapping[opp]
+
+    gt_disp = disp_rel(gt)
+    opp_disp = disp_rel(opp)
+
+    # Slightly taller / larger text, suitable to shrink into a half-column figure.
+    fig = plt.figure(figsize=(10.2, 4.9))
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.85], wspace=0.24)
+
+    ax0 = fig.add_subplot(gs[0, 0])
+    ax0.imshow(image)
+    ax0.set_xticks([])
+    ax0.set_yticks([])
+    ax0.set_title(f"COCO sid={sid}", fontsize=16, pad=8)
+
+    query = f"Q: Where is the {subject} relative to the {reference}?"
+    options_txt = "Options: left / right / under / on"
+    gt_txt = f"GT: {gt_disp}"
+    ax0.text(
+        0.0, -0.11,
+        query + "\n" + options_txt + "\n" + gt_txt,
+        transform=ax0.transAxes,
+        va="top",
+        fontsize=14,
+        wrap=True,
+    )
+
+    ax = fig.add_subplot(gs[0, 1])
+    condition_labels = {
+        "orig": "orig",
+        "toward_gt": f"steer  {gt_disp}".replace("\x1a", "→"),
+        "toward_opp": f"steer  {opp_disp}".replace("\x1a", "→"),
+    }
+
+    condition_handles = []
+    for cond in ("orig", "toward_gt", "toward_opp"):
+        y_gt = [float(by[(cond, L)][f"logp_{gt_letter}"]) for L in layers]
+        y_opp = [float(by[(cond, L)][f"logp_{opp_letter}"]) for L in layers]
+        line_gt, = ax.plot(
+            layers, y_gt,
+            linestyle="-",
+            linewidth=2.6,
+            marker="o",
+            markersize=5.8,
+            label=condition_labels[cond],
+        )
+        ax.plot(
+            layers, y_opp,
+            linestyle="--",
+            linewidth=2.2,
+            marker="o",
+            markersize=5.2,
+            color=line_gt.get_color(),
+        )
+        condition_handles.append(line_gt)
+
+    ax.set_xlabel("Intervention Layer", fontsize=16)
+    ax.set_ylabel("Log Probability", fontsize=16)
+    ax.set_title(f"Spatial steering across layers (alpha={alpha:g})", fontsize=17, pad=10)
+    ax.grid(True, alpha=0.25)
+    ax.tick_params(axis="both", labelsize=14)
+
+    leg1 = ax.legend(
+        handles=condition_handles,
+        loc="lower left",
+        fontsize=14,
+        title="Condition",
+        title_fontsize=15,
+        framealpha=0.92,
+    )
+    ax.add_artist(leg1)
+    style_handles = [
+        Line2D([0], [0], linestyle="-", linewidth=2.4, color="black", marker="o", markersize=5.8,
+               label=f"P({gt_disp})"),
+        Line2D([0], [0], linestyle="--", linewidth=2.2, color="black", marker="o", markersize=5.2,
+               label=f"P({opp_disp})"),
+    ]
+    ax.legend(
+        handles=style_handles,
+        loc="lower right",
+        fontsize=14,
+        title="Answer belief",
+        title_fontsize=15,
+        framealpha=0.92,
+    )
+
+    fig.subplots_adjust(left=0.055, right=0.99, top=0.90, bottom=0.28)
+    fig.savefig(output_path, dpi=240, bbox_inches="tight")
+    plt.close(fig)
 
 
 def main() -> None:
@@ -292,9 +335,7 @@ def main() -> None:
         print(f"TRAIN={len(train)} TEST={len(test)}")
         print()
 
-        # ------------------------------------------------------------------
         # 1) Fit TRAIN spatial centroids on exactly the scan layers.
-        # ------------------------------------------------------------------
         train_q: Dict[int, Dict[int, np.ndarray]] = {}
         for m in tqdm(train, desc="TRAIN Real-Gray spatial states"):
             sid = int(m["sid"])
@@ -335,9 +376,7 @@ def main() -> None:
             **{f"L{L}_{r}": cent[L][r] for L in scan_layers for r in REL},
         )
 
-        # ------------------------------------------------------------------
         # 2) Cheap baseline pass: keep only requested candidate type.
-        # ------------------------------------------------------------------
         candidates: List[Dict[str, Any]] = []
         for m in tqdm(test, desc="baseline candidate filter"):
             sid = int(m["sid"])
@@ -394,9 +433,7 @@ def main() -> None:
 
         print(f"[CANDIDATES] {len(candidates)} samples after baseline filter")
 
-        # ------------------------------------------------------------------
         # 3) Causal scan and deterministic ranking.
-        # ------------------------------------------------------------------
         layer_details: List[Dict[str, Any]] = []
         sample_rows: List[Dict[str, Any]] = []
         rows_by_sid: Dict[int, List[Dict[str, Any]]] = {}
@@ -507,7 +544,6 @@ def main() -> None:
                     layer_details.append(det)
                     opening_by_layer[int(L)] = opening
 
-                    # rows compatible with Figure-A plot helper
                     for cond, sc in (
                         ("orig", {"prediction": c["orig_prediction"], "logprob": orig_lp}),
                         ("toward_gt", sc_gt),
@@ -597,16 +633,11 @@ def main() -> None:
         write_csv(out / "layer_details.csv", layer_details)
 
         top = sample_rows[: max(1, int(a.top_k))]
-        top_json = []
-        for row in top:
-            top_json.append({k: row[k] for k in row})
         (out / "top_samples.json").write_text(
-            json.dumps(top_json, indent=2, ensure_ascii=False), encoding="utf-8"
+            json.dumps([{k: row[k] for k in row} for row in top], indent=2, ensure_ascii=False),
+            encoding="utf-8",
         )
 
-        # ------------------------------------------------------------------
-        # 4) Render Figure-A-format previews for the top K.
-        # ------------------------------------------------------------------
         test_by_sid = {int(m["sid"]): m for m in test}
         for row in top[: max(0, int(a.preview_k))]:
             sid = int(row["sid"])
@@ -617,7 +648,7 @@ def main() -> None:
                 if hasattr(image, "convert"):
                     image = image.convert("RGB")
                 rank = int(row["rank"])
-                figA.plot_figure(
+                plot_figure_paper(
                     output_path=preview_dir / f"rank{rank:02d}_sid{sid}.png",
                     image=image,
                     subject=m["subject"],
@@ -651,6 +682,7 @@ def main() -> None:
             "train_n": len(train_valid),
             "test_n": len(test),
             "seed": a.seed,
+            "preview_style": "paper_friendly_no_suptitle_large_fonts_semantic_labels",
         }
         traj.write_json(out / "metadata.json", metadata)
 
