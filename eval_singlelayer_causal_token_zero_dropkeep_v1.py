@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-eval_singlelayer_causal_token_dropkeep_v1.py
+eval_singlelayer_causal_token_zero_dropkeep_v1.py
 
 Purpose
 =======
-Validate whether the decision-relevant TEXT-token updates at a single decoder
-layer form an important route to the final generation.
+Test whether gradient-ranked TEXT-token hidden states at a single decoder
+layer are more important for final generation than other text-token states.
 
 We test L25 and L26 independently by default.
 
@@ -28,31 +28,31 @@ For each sample and each tested layer L:
 
      and gradient norm.
 
-  2) Define the actual block update:
+  2) For diagnostics we can still export the actual block update score:
 
         a_L,p = h_real[L,p] - h_real[L-1,p]
 
   3) Run ACTUAL model.generate() under:
 
      drop_top:
-        remove the current layer's update only at Top-K positions
-        h_L,p <- h_{L-1,p}
+        zero the full token hidden state at Top-K positions
+        h_L,p <- 0
 
      keep_top:
-        keep the current layer's update only at Top-K eligible text positions;
-        remove the update from all other eligible text positions.
+        keep only Top-K eligible text hidden states unchanged;
+        zero all other eligible text hidden states.
 
      Optional category-matched random controls:
         drop_random / keep_random
 
      Optional layer reference:
-        drop_all_text removes the L-th block update from every eligible text
-        position.
+        drop_all_text zeros every eligible text hidden state at layer L.
 
 Important
 =========
-This does NOT zero the whole hidden state.  It only deletes the NEW update
-written by the tested block.  Information accumulated through L-1 is preserved.
+This experiment intentionally zeros the FULL hidden state at selected token
+positions.  The goal is a direct relative-importance test: Top-K and matched
+random tokens receive exactly the same intervention.
 
 Visual tokens and the prompt-final token are excluded from the eligible set by
 default and are never suppressed by keep_top/drop_top.
@@ -62,25 +62,25 @@ relation-specific late writer.
 
 Recommended first run
 =====================
-CUDA_VISIBLE_DEVICES=0 python -u eval_singlelayer_causal_token_dropkeep_v1.py \
+CUDA_VISIBLE_DEVICES=0 python -u eval_singlelayer_causal_token_zero_dropkeep_v1.py \
   --layers 25,26 \
   --ks 1,2,3,5,7,10,15,20 \
   --rank-by mediation \
   --eval-max-samples 80 \
   --conditions drop_top,keep_top,drop_random,keep_random \
   --random-repeats 1 \
-  --output-dir output/qwen3b_singlelayer_L25_L26_dropkeep_n80_v1 \
+  --output-dir output/qwen3b_singlelayer_L25_L26_zero_dropkeep_n80_v1 \
   --overwrite
 
 Faster smoke test
 =================
-CUDA_VISIBLE_DEVICES=0 python -u eval_singlelayer_causal_token_dropkeep_v1.py \
+CUDA_VISIBLE_DEVICES=0 python -u eval_singlelayer_causal_token_zero_dropkeep_v1.py \
   --layers 25,26 \
   --ks 1,3,5,7,10,15 \
   --rank-by mediation \
   --eval-max-samples 40 \
   --conditions drop_top,keep_top \
-  --output-dir output/qwen3b_singlelayer_L25_L26_dropkeep_n40_v1 \
+  --output-dir output/qwen3b_singlelayer_L25_L26_zero_dropkeep_n40_v1 \
   --overwrite
 
 Outputs
@@ -474,19 +474,18 @@ def calibrate_writers(
 # Single-layer update suppression
 # =============================================================================
 
-class SingleLayerUpdateSuppressor:
+class SingleLayerStateZeroer:
     """
-    Remove the tested block's NEW residual update at selected prompt positions:
-
-        h_L[p] <- h_{L-1}[p]
-
-    The entire pre-L representation is preserved.
+    Direct state ablation at one decoder layer.
 
     mode="drop":
-        suppress exactly selected_positions
+        zero exactly selected_positions
 
     mode="keep":
-        suppress eligible_positions - selected_positions
+        zero eligible_positions - selected_positions
+
+    Visual tokens and prompt-last are excluded upstream from eligible_positions,
+    so they remain untouched.
     """
 
     def __init__(
@@ -503,36 +502,22 @@ class SingleLayerUpdateSuppressor:
         self.eligible = set(map(int, eligible_positions))
         self.selected = set(map(int, selected_positions))
         self.mode = str(mode)
-        self.prev_state = None
         self.n_suppressed = 0
         self.handles = []
 
-        if self.layer < 1:
-            raise ValueError("SingleLayerUpdateSuppressor requires L>=1")
         if self.mode not in {"drop", "keep"}:
             raise ValueError(self.mode)
 
         self.handles.append(
-            decoder_layers[self.layer - 1].register_forward_hook(self._prev_hook)
-        )
-        self.handles.append(
             decoder_layers[self.layer].register_forward_hook(self._layer_hook)
         )
 
-    def _prev_hook(self, _m, _inp, out):
-        x = traj.first_tensor(out)
-        if int(x.shape[1]) == self.prompt_len:
-            self.prev_state = x.detach().clone()
-        return None
-
     def _layer_hook(self, _m, _inp, out):
         x = traj.first_tensor(out)
+
+        # Prefill only. Cached generation steps usually have length 1.
         if int(x.shape[1]) != self.prompt_len:
             return None
-        if self.prev_state is None:
-            raise RuntimeError(
-                f"L{self.layer}: previous-layer state was not captured."
-            )
 
         if self.mode == "drop":
             suppress = self.selected
@@ -546,13 +531,8 @@ class SingleLayerUpdateSuppressor:
         y = x.clone()
         count = 0
         for p in sorted(suppress):
-            if (
-                0 <= p < int(y.shape[1])
-                and p < int(self.prev_state.shape[1])
-            ):
-                y[0, p] = self.prev_state[0, p].to(
-                    device=y.device, dtype=y.dtype
-                )
+            if 0 <= p < int(y.shape[1]):
+                y[0, p, :] = 0
                 count += 1
 
         self.n_suppressed = count
@@ -563,7 +543,6 @@ class SingleLayerUpdateSuppressor:
             with contextlib.suppress(Exception):
                 h.remove()
         self.handles = []
-        self.prev_state = None
 
 
 @torch.inference_mode()
@@ -582,7 +561,7 @@ def generate_condition(
     editor = None
     try:
         if layer is not None:
-            editor = SingleLayerUpdateSuppressor(
+            editor = SingleLayerStateZeroer(
                 decoder_layers=decoder_layers,
                 layer=int(layer),
                 prompt_len=int(batch["input_ids"].shape[1]),
@@ -1040,7 +1019,7 @@ def main():
         overlap = len(cal_sids & eval_sids)
 
         print("\n" + "=" * 132)
-        print("SINGLE-LAYER DECISION-PATH TEST: DROP / KEEP TOP-K TEXT UPDATES")
+        print("SINGLE-LAYER CAUSAL-TOKEN IMPORTANCE: ZERO DROP / KEEP TOP-K TEXT STATES")
         print("=" * 132)
         print(f"model={a.model} repo={spec.repo_id}")
         print(f"decoder={decoder_path} n_layers={n_layers}")
@@ -1057,10 +1036,7 @@ def main():
             f"eval_scope={a.eval_scope} N={len(test)} "
             f"writer-cal/eval overlap={overlap}"
         )
-        print(
-            "Intervention removes ONLY the tested block update: "
-            "h_L[p] <- h_{L-1}[p]."
-        )
+        print("Intervention directly zeros full token states: h_L[p] <- 0.")
         print("visual and prompt-last positions are untouched.")
         print("=" * 132 + "\n")
 
@@ -1069,7 +1045,7 @@ def main():
         # -------------------------------------------------------------
         # Eval
         # -------------------------------------------------------------
-        for m in tqdm(test, desc="L25/L26 drop-keep"):
+        for m in tqdm(test, desc="L25/L26 zero drop-keep"):
             sid = int(m["sid"])
             gt = str(m["gt"])
             writers_r = {T: writers[T][gt] for T in targets}
@@ -1451,7 +1427,7 @@ def main():
         # -------------------------------------------------------------
         lines = []
         lines.append("=" * 132)
-        lines.append("SINGLE-LAYER CAUSAL-TOKEN DROP / KEEP SUMMARY")
+        lines.append("SINGLE-LAYER CAUSAL-TOKEN ZERO DROP / KEEP SUMMARY")
         lines.append("=" * 132)
 
         clean_rows = gen_df[gen_df["condition"] == "clean"].drop_duplicates("sid")
@@ -1520,8 +1496,8 @@ def main():
             "  Do not call K 'sparse' without reporting K / eligible-text count."
         )
         lines.append(
-            "  keep/drop manipulate ONLY the tested block update, not the whole "
-            "token hidden state."
+            "  keep/drop directly zero the full hidden state at selected eligible "
+            "text-token positions; Top-K and controls use the identical operation."
         )
 
         report = "\n".join(lines) + "\n"
@@ -1533,7 +1509,7 @@ def main():
         write_json(
             outdir / "metadata.json",
             {
-                "script": "eval_singlelayer_causal_token_dropkeep_v1.py",
+                "script": "eval_singlelayer_causal_token_zero_dropkeep_v1.py",
                 "model": a.model,
                 "repo_id": spec.repo_id,
                 "decoder_path": decoder_path,
@@ -1549,7 +1525,7 @@ def main():
                 "score_definition_real_update": (
                     "(h_real[L,p]-h_real[L-1,p])^T grad_h J_GT_writer"
                 ),
-                "intervention": "h_L[p] <- h_{L-1}[p]",
+                "intervention": "h_L[p] <- 0",
                 "eligible_categories": eligible_categories,
                 "visual_tokens_edited": False,
                 "prompt_last_edited": False,
