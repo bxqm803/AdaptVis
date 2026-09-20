@@ -22,7 +22,7 @@ A) Sparsity / behavioral sufficiency
    under the existing positive global_unique rule.  Nested prefixes of that
    SAME ranking are evaluated with actual model.generate():
 
-       K = 1,3,5,7,10,20,36    (configurable)
+       K = 1,2,3,4,5,7,10,15,20,28,36    (configurable)
 
    Main output used here:
        <prefix-dir>/summary.csv
@@ -74,26 +74,26 @@ Typical full run
 ----------------
 CUDA_VISIBLE_DEVICES=0 python -u run_qwen3b_coco_sparse_causal_bottleneck_v1.py \
   --oracle-run-dir output/qwen3b_coco_dynamic_L20_26_K36_all440 \
-  --prefix-dir output/qwen3b_sparse_bottleneck_prefix_all440_v1 \
-  --fourway-dir output/qwen3b_sparse_bottleneck_fourway_k7_all440_v1 \
-  --output-dir output/qwen3b_sparse_causal_bottleneck_figure_v1
+  --prefix-dir output/qwen3b_sparse_bottleneck_prefix_L31_35_denseK_all440_v1 \
+  --fourway-dir output/qwen3b_sparse_bottleneck_fourway_L31_35_k7_all440_v1 \
+  --output-dir output/qwen3b_sparse_causal_bottleneck_L31_35_denseK_v1
 
 If both component runs already exist, this command only post-processes/plots.
 To ONLY plot and never launch model jobs:
 
 python -u run_qwen3b_coco_sparse_causal_bottleneck_v1.py \
   --plot-only \
-  --prefix-dir output/qwen3b_sparse_bottleneck_prefix_all440_v1 \
-  --fourway-dir output/qwen3b_sparse_bottleneck_fourway_k7_all440_v1 \
-  --output-dir output/qwen3b_sparse_causal_bottleneck_figure_v1
+  --prefix-dir output/qwen3b_sparse_bottleneck_prefix_L31_35_denseK_all440_v1 \
+  --fourway-dir output/qwen3b_sparse_bottleneck_fourway_L31_35_k7_all440_v1 \
+  --output-dir output/qwen3b_sparse_causal_bottleneck_L31_35_denseK_v1
 
 Quick N=80 smoke test
 ---------------------
 CUDA_VISIBLE_DEVICES=0 python -u run_qwen3b_coco_sparse_causal_bottleneck_v1.py \
   --eval-max-samples 80 \
-  --prefix-dir output/qwen3b_sparse_bottleneck_prefix_N80_v1 \
-  --fourway-dir output/qwen3b_sparse_bottleneck_fourway_k7_N80_v1 \
-  --output-dir output/qwen3b_sparse_causal_bottleneck_figure_N80_v1
+  --prefix-dir output/qwen3b_sparse_bottleneck_prefix_L31_35_denseK_N80_v1 \
+  --fourway-dir output/qwen3b_sparse_bottleneck_fourway_L31_35_k7_N80_v1 \
+  --output-dir output/qwen3b_sparse_causal_bottleneck_L31_35_denseK_N80_v1
 """
 
 from __future__ import annotations
@@ -117,6 +117,7 @@ import matplotlib.pyplot as plt
 
 REL = ("left", "right", "above", "below")
 REL_DISPLAY = ("Left", "Right", "Above", "Below")
+REL_SURFACE = {"left": "left", "right": "right", "above": "on", "below": "under"}
 EPS = 1e-12
 
 
@@ -144,15 +145,15 @@ def parse_args():
 
     p.add_argument(
         "--prefix-dir",
-        default="output/qwen3b_sparse_bottleneck_prefix_all440_v1",
+        default="output/qwen3b_sparse_bottleneck_prefix_L31_35_denseK_all440_v1",
     )
     p.add_argument(
         "--fourway-dir",
-        default="output/qwen3b_sparse_bottleneck_fourway_k7_all440_v1",
+        default="output/qwen3b_sparse_bottleneck_fourway_L31_35_k7_all440_v1",
     )
     p.add_argument(
         "--output-dir",
-        default="output/qwen3b_sparse_causal_bottleneck_figure_v1",
+        default="output/qwen3b_sparse_causal_bottleneck_L31_35_denseK_v1",
     )
 
     p.add_argument("--model", default="qwen-3b")
@@ -162,11 +163,22 @@ def parse_args():
         default="prompts/COCO_QA_two_obj_with_answer_four_options.jsonl",
     )
     p.add_argument("--source-layers", default="20,21,22,23,24,25,26")
-    p.add_argument("--target-layers", default="32,34,35")
-    p.add_argument("--ks", default="1,3,5,7,10,20,36")
+    p.add_argument("--target-layers", default="31,32,33,34,35")
+    p.add_argument("--ks", default="1,2,3,4,5,7,10,15,20,28,36")
     p.add_argument("--max-rank", type=int, default=36)
     p.add_argument("--overlap-k", type=int, default=7)
     p.add_argument("--alpha", type=float, default=1.0)
+    p.add_argument("--writer-mode", default="centered", choices=["centered", "raw"])
+    p.add_argument("--train-ratio", type=float, default=0.30)
+    p.add_argument(
+        "--writer-run-dir",
+        default="",
+        help=(
+            "Compatible baseline.csv + learned_writers.npz for four-way tracing. "
+            "If empty, reuse --oracle-run-dir when it contains all requested target layers; "
+            "otherwise build <prefix-dir>_writers automatically."
+        ),
+    )
     p.add_argument("--seed", type=int, default=17)
     p.add_argument("--device", default="cuda:0")
     p.add_argument(
@@ -277,6 +289,8 @@ def maybe_run_prefix(a, ks: List[int]):
         "--ks", ",".join(map(str, ks)),
         "--max-rank", str(a.max_rank),
         "--alpha", str(a.alpha),
+        "--writer-mode", a.writer_mode,
+        "--train-ratio", str(a.train_ratio),
         "--eval-scope", "all_data",
         "--eval-max-samples", str(a.eval_max_samples),
         "--device", a.device,
@@ -287,6 +301,231 @@ def maybe_run_prefix(a, ks: List[int]):
     if a.overwrite_runs:
         cmd.append("--overwrite")
     run_command(cmd, "RUN A: ORACLE K36 NESTED-PREFIX GENERATION CURVE")
+
+
+def writer_npz_supports_targets(path: Path, targets: Sequence[int]) -> bool:
+    if not path.exists():
+        return False
+    try:
+        with np.load(path, allow_pickle=True) as z:
+            keys = set(z.files)
+            for T in targets:
+                for r in REL:
+                    candidates = {
+                        f"L{int(T)}_{r}",
+                        f"L{int(T)}_{REL_SURFACE[r]}",
+                    }
+                    if not (candidates & keys):
+                        return False
+        return True
+    except Exception:
+        return False
+
+
+def build_compatible_writer_run(a, targets: Sequence[int]) -> Path:
+    """Build late Real-Gray writers for the requested target layers.
+
+    The old full-K36 run only guarantees writers for its historical target
+    set (typically L32/L34/L35).  When this experiment uses a denser late
+    objective such as L31-L35, rebuild writers with the SAME 30% stratified
+    calibration protocol used by the prefix evaluator, then pair them with
+    prefix baseline.csv for four-way tracing.
+    """
+    import contextlib
+    import gc
+    import shutil
+
+    import torch
+    import transformers
+    from transformers import AutoProcessor
+
+    import analyze_coco_centroid_generation_step1_v4 as base
+    import eval_coco_multilayer_relation_trajectory_repair_v1 as traj
+    import eval_qwen_dynamic_k24_all440_v1 as dyn
+
+    if a.writer_run_dir:
+        out = Path(a.writer_run_dir)
+    else:
+        out = Path(str(Path(a.prefix_dir)) + "_writers")
+
+    writer_path = out / "learned_writers.npz"
+    baseline_path = out / "baseline.csv"
+    if writer_npz_supports_targets(writer_path, targets) and baseline_path.exists():
+        print(f"[reuse] compatible writers: {out}", flush=True)
+        return out
+
+    if out.exists() and any(out.iterdir()) and not a.overwrite_runs:
+        raise RuntimeError(
+            f"Compatible-writer directory exists but is incomplete/incompatible: {out}\n"
+            "Remove it or rerun with --overwrite-runs."
+        )
+    if out.exists() and a.overwrite_runs:
+        shutil.rmtree(out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Use the prefix evaluator's actual baseline so both panels refer to the
+    # same evaluation cohort/configuration.
+    prefix_baseline = Path(a.prefix_dir) / "baseline.csv"
+    require_file(prefix_baseline, "prefix baseline.csv")
+    shutil.copy2(prefix_baseline, baseline_path)
+
+    two = base.import_two_object_module()
+    prompts = base.load_standard_prompts(Path(a.prompt_jsonl))
+    records, _audit = two.load_records("coco_two", Path(a.data_root), None)
+    rec_by_sid = {int(r.sid): r for r in records}
+
+    meta = []
+    for rec in records:
+        sid = int(rec.sid)
+        if sid not in prompts:
+            continue
+        q = prompts[sid]
+        gt = traj.normalize_relation(base, q["answer_raw"])
+        if gt not in REL:
+            continue
+        meta.append({
+            "sid": sid,
+            "gt": gt,
+            "subject": str(q["subject"]),
+            "reference": str(q["reference"]),
+            "question_text": str(q["question_text"]),
+        })
+
+    train, _heldout = traj.stratified_split(meta, a.train_ratio, a.seed)
+
+    specs = base.merged_model_specs(two)
+    spec = specs[a.model]
+    cls = getattr(transformers, spec.model_class)
+    kw = dict(
+        dtype=base.resolve_dtype(spec.dtype_name),
+        low_cpu_mem_usage=True,
+        trust_remote_code=spec.trust_remote_code,
+        device_map={"": a.device},
+    )
+    if a.attn_impl != "none":
+        kw["attn_implementation"] = a.attn_impl
+
+    print("\n" + "=" * 140, flush=True)
+    print("BUILD COMPATIBLE LATE WRITERS", flush=True)
+    print("=" * 140, flush=True)
+    print(
+        f"targets={list(map(int, targets))} | calibration N={len(train)} | "
+        f"writer_mode={a.writer_mode}",
+        flush=True,
+    )
+
+    model = processor = None
+    try:
+        try:
+            model = cls.from_pretrained(spec.repo_id, **kw)
+        except TypeError:
+            kw["torch_dtype"] = kw.pop("dtype")
+            model = cls.from_pretrained(spec.repo_id, **kw)
+        model.eval()
+        processor = AutoProcessor.from_pretrained(
+            spec.repo_id, trust_remote_code=spec.trust_remote_code
+        )
+        base.configure_processor(model, processor)
+        for par in model.parameters():
+            par.requires_grad_(False)
+
+        decoder_layers, _decoder_path = base.resolve_decoder_layers(model)
+        for T in targets:
+            if not (0 <= int(T) < len(decoder_layers)):
+                raise ValueError(f"Target layer L{T} invalid for {len(decoder_layers)}-layer model")
+
+        q_by_sid = {}
+        from tqdm import tqdm
+        for m in tqdm(train, desc="CALIBRATE LATE WRITERS"):
+            sid = int(m["sid"])
+            real = gray = None
+            try:
+                real = base.record_image(rec_by_sid[sid])
+                if hasattr(real, "convert"):
+                    real = real.convert("RGB")
+                gray = dyn.make_gray_image(real, 128)
+                rb = base.make_question_batch(
+                    processor=processor,
+                    image=real,
+                    question_text=m["question_text"],
+                    device=torch.device(a.device),
+                )
+                gb = base.make_question_batch(
+                    processor=processor,
+                    image=gray,
+                    question_text=m["question_text"],
+                    device=torch.device(a.device),
+                )
+                hr = dyn.capture_cpu(model, decoder_layers, rb, targets)
+                hg = dyn.capture_cpu(model, decoder_layers, gb, targets)
+                q_by_sid[sid] = {
+                    int(T): (hr[int(T)][0, -1] - hg[int(T)][0, -1]).astype(np.float32)
+                    for T in targets
+                }
+            finally:
+                if real is not None:
+                    with contextlib.suppress(Exception):
+                        real.close()
+                if gray is not None:
+                    with contextlib.suppress(Exception):
+                        gray.close()
+                gc.collect()
+
+        writers, writer_geom = dyn.learn_writers(
+            train, q_by_sid, list(map(int, targets)), a.writer_mode
+        )
+
+        payload = {}
+        for T in targets:
+            T = int(T)
+            for r in REL:
+                payload[f"L{T}_{REL_SURFACE[r]}"] = np.asarray(
+                    writers[T][r], dtype=np.float32
+                )
+        np.savez_compressed(writer_path, **payload)
+        pd.DataFrame(writer_geom).to_csv(out / "writer_geometry.csv", index=False)
+        (out / "metadata.json").write_text(
+            json.dumps({
+                "model": a.model,
+                "dataset": "COCO-two",
+                "target_layers": list(map(int, targets)),
+                "writer_mode": a.writer_mode,
+                "train_ratio": float(a.train_ratio),
+                "seed": int(a.seed),
+                "calibration_N": len(train),
+                "definition": "centered Real-Gray prompt-final writers",
+                "baseline_source": str(prefix_baseline),
+            }, indent=2),
+            encoding="utf-8",
+        )
+    finally:
+        if model is not None:
+            del model
+        if processor is not None:
+            del processor
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if not writer_npz_supports_targets(writer_path, targets):
+        raise RuntimeError(f"Writer build completed but {writer_path} lacks targets={targets}")
+    return out
+
+
+def resolve_fourway_writer_run(a) -> Path:
+    targets = parse_ints(a.target_layers)
+
+    if a.writer_run_dir:
+        p = Path(a.writer_run_dir)
+        if writer_npz_supports_targets(p / "learned_writers.npz", targets) and (p / "baseline.csv").exists():
+            return p
+
+    oracle = Path(a.oracle_run_dir)
+    if writer_npz_supports_targets(oracle / "learned_writers.npz", targets) and (oracle / "baseline.csv").exists():
+        print(f"[reuse] oracle writers support requested targets: {oracle}", flush=True)
+        return oracle
+
+    return build_compatible_writer_run(a, targets)
 
 
 def maybe_run_fourway(a):
@@ -307,9 +546,9 @@ def maybe_run_fourway(a):
     script = Path(a.fourway_script)
     require_file(script, "four-way writer tracing script")
 
-    oracle = Path(a.oracle_run_dir)
-    require_file(oracle / "baseline.csv", "oracle baseline.csv")
-    require_file(oracle / "learned_writers.npz", "oracle learned_writers.npz")
+    oracle = resolve_fourway_writer_run(a)
+    require_file(oracle / "baseline.csv", "four-way baseline.csv")
+    require_file(oracle / "learned_writers.npz", "four-way learned_writers.npz")
 
     # This script is chunk-resumable.  Do not force overwrite unless explicitly
     # requested; if interrupted, rerunning this wrapper continues cached SIDs.
@@ -703,6 +942,9 @@ def main():
         "ks": ks,
         "overlap_k": int(a.overlap_k),
         "alpha": float(a.alpha),
+        "writer_mode": a.writer_mode,
+        "train_ratio": float(a.train_ratio),
+        "writer_run_dir": (a.writer_run_dir or str(Path(str(Path(a.prefix_dir)) + "_writers"))),
         "eval_max_samples": int(a.eval_max_samples),
         "position_overlap_definition": (
             "within-sample mean |TopK token positions for relation r ∩ TopK token positions "
