@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import importlib.util
 import json
 import math
 import os
@@ -46,13 +45,10 @@ SCRIPT_VERSION = "synthetic3d-to-spatialmqa-standalone-v1"
 # -----------------------------------------------------------------------------
 # load base standalone module
 # -----------------------------------------------------------------------------
-BASE_FILE = Path(__file__).with_name("eval_synthetic3d_controlledB_spatial_control_genflip_trust_standalone_v1.py")
-if not BASE_FILE.exists():
-    raise FileNotFoundError(f"Missing base file: {BASE_FILE}")
-_spec = importlib.util.spec_from_file_location("adaptvis_base_ctrlb", str(BASE_FILE))
-base = importlib.util.module_from_spec(_spec)
-assert _spec and _spec.loader
-_spec.loader.exec_module(base)
+# Use a normal Python import rather than importlib.exec_module.  The base file
+# defines @dataclass classes, which require the module to be registered in
+# sys.modules while its class body is executed.  A normal import does that.
+import eval_synthetic3d_controlledB_spatial_control_genflip_trust_standalone_v1 as base
 
 base.REL = REL
 base.MODEL_ORDER = MODEL_ORDER
